@@ -1,0 +1,21 @@
+{
+  "name": "ordadb",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.29.2",
+  "scripts": {
+    "dev": "pnpm --filter @ordadb/console dev",
+    "lint": "pnpm --filter @ordadb/console lint",
+    "typecheck": "pnpm --filter @ordadb/console typecheck",
+    "test": "pnpm --filter @ordadb/console test",
+    "test:e2e": "pnpm --filter @ordadb/console test:e2e",
+    "build": "pnpm --filter @ordadb/console build",
+    "desktop:dev": "pnpm --filter @ordadb/desktop dev",
+    "desktop:build:x64": "pnpm --filter @ordadb/desktop build:x64"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

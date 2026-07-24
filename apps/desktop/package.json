@@ -1,0 +1,13 @@
+{
+  "name": "@ordadb/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "build:x64": "tauri build --target x86_64-pc-windows-msvc --bundles nsis"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0"
+  }
+}
