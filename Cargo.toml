@@ -8,6 +8,7 @@ members = [
   "crates/ordadb-optimizer",
   "crates/ordadb-sql",
   "crates/ordadb-storage",
+  "crates/ordadb-transaction",
   "crates/ordadb-types",
 ]
 resolver = "2"

@@ -1,11 +1,13 @@
-//! SQL execution and persistent snapshot publication for OrdaDB.
+//! SQL execution, transaction coordination, and durable publication for OrdaDB.
 //!
 //! This crate owns SQL semantics and candidate-state atomicity. Physical page
-//! encoding belongs to `ordadb-storage`; WAL and crash recovery remain later
-//! milestones.
+//! encoding belongs to `ordadb-storage`; WAL and crash recovery belong to
+//! `ordadb-transaction`.
 
 use std::collections::{BTreeMap, HashSet};
+use std::mem;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ordadb_catalog::{Catalog, ColumnStatistics, TableDefinition, TableStatistics, indexable_type};
@@ -20,13 +22,19 @@ use ordadb_optimizer::{
 };
 use ordadb_sql::{
     BinaryOperator, BoundExpr, BoundExprKind, BoundJoin, BoundOrder, BoundProjection,
-    BoundStatement, BoundTable, JoinKind, bind, parse,
+    BoundStatement, BoundTable, JoinKind, ParsedStatement, bind, parse,
 };
-use ordadb_storage::{DatabaseStore, PersistentState, encode_row};
+use ordadb_storage::{ApplyPoint, DatabaseStore, DurabilityBarrier, PersistentState, encode_row};
+use ordadb_transaction::{
+    CheckpointState, FaultInjector, FaultPoint, NoFaultInjector, TransactionId, WalManager,
+    WriterCoordinator, WriterLease,
+};
 use ordadb_types::{
     Batch, CommandComplete, DbError, Field, IndexId, QueryEvent, QueryProgress, Result, Row,
     ScalarType, Schema, TableId, Value,
 };
+
+const AUTOMATIC_CHECKPOINT_INTERVAL: u64 = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
@@ -47,16 +55,34 @@ pub struct Engine {
     config: Arc<EngineConfig>,
     state: Arc<RwLock<DatabaseState>>,
     store: Arc<Mutex<DatabaseStore>>,
+    wal: Arc<WalManager>,
+    writer: Arc<WriterCoordinator>,
+    commits_since_checkpoint: Arc<AtomicU64>,
 }
 
 impl Engine {
     pub fn open(config: EngineConfig) -> Result<Self> {
-        let store = DatabaseStore::open(&config.data_dir)?;
+        Self::open_with_fault_injector(config, Arc::new(NoFaultInjector))
+    }
+
+    #[doc(hidden)]
+    pub fn open_with_fault_injector(
+        config: EngineConfig,
+        fault_injector: Arc<dyn FaultInjector>,
+    ) -> Result<Self> {
+        let wal = WalManager::open_with_fault_injector(&config.data_dir, fault_injector)?;
+        wal.recover(&config.data_dir)?;
+        let writer = WriterCoordinator::from_last_transaction_id(wal.last_transaction_id()?)?;
+        let barrier: Arc<dyn DurabilityBarrier> = wal.clone();
+        let store = DatabaseStore::open_with_barrier(&config.data_dir, barrier)?;
         let state = DatabaseState::from_persistent(store.committed_state().clone())?;
         Ok(Self {
             config: Arc::new(config),
             state: Arc::new(RwLock::new(state)),
             store: Arc::new(Mutex::new(store)),
+            wal,
+            writer,
+            commits_since_checkpoint: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -64,7 +90,17 @@ impl Engine {
         Ok(Session {
             state: Arc::clone(&self.state),
             store: Arc::clone(&self.store),
+            wal: Arc::clone(&self.wal),
+            writer: Arc::clone(&self.writer),
+            commits_since_checkpoint: Arc::clone(&self.commits_since_checkpoint),
+            sql_transaction: SqlTransactionState::Idle,
         })
+    }
+
+    pub fn checkpoint(&self) -> Result<()> {
+        checkpoint_shared(&self.state, &self.store, &self.wal, &self.writer)?;
+        self.commits_since_checkpoint.store(0, Ordering::Release);
+        Ok(())
     }
 
     #[must_use]
@@ -77,124 +113,307 @@ impl Engine {
 pub struct Session {
     state: Arc<RwLock<DatabaseState>>,
     store: Arc<Mutex<DatabaseStore>>,
+    wal: Arc<WalManager>,
+    writer: Arc<WriterCoordinator>,
+    commits_since_checkpoint: Arc<AtomicU64>,
+    sql_transaction: SqlTransactionState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionStatus {
+    Idle,
+    Active,
+    Failed,
+}
+
+#[derive(Debug)]
+enum SqlTransactionState {
+    Idle,
+    Active(ActiveSqlTransaction),
+    Failed,
+}
+
+#[derive(Debug)]
+struct ActiveSqlTransaction {
+    transaction_id: TransactionId,
+    working: Option<DatabaseState>,
+    lease: Option<WriterLease>,
+    stream_failed: Arc<AtomicBool>,
 }
 
 impl Session {
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryStream> {
-        let events = self
+        match self
             .execute_stream(sql, params)?
-            .collect::<Result<Vec<_>>>()?;
-        Ok(QueryStream::new(events))
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(events) => Ok(QueryStream::new(events)),
+            Err(error) => {
+                self.fail_sql_transaction();
+                Err(error)
+            }
+        }
     }
 
     pub fn execute_stream(&mut self, sql: &str, params: &[Value]) -> Result<TryQueryStream> {
-        let state = self
-            .state
-            .read()
-            .map_err(|_| internal_error("engine state lock is poisoned"))?;
-        let statement = bind(parse(sql)?, &state.catalog)?;
-        match statement {
-            BoundStatement::Select {
-                table_id,
-                schema,
-                projection,
-                filter,
-                order_by,
-                limit,
-            } => {
-                let (schema, cursor) = prepare_select_cursor(
-                    &state,
-                    SelectExecution {
-                        table_id,
-                        schema,
-                        projection,
-                        filter,
-                        order_by,
-                        limit,
-                    },
-                    params,
-                )?;
-                drop(state);
-                return Ok(TryQueryStream::select(
-                    schema,
-                    StreamBatchCursor::Simple(Box::new(cursor)),
-                ));
+        self.normalize_sql_transaction_failure();
+        let transaction_was_failed = self.transaction_status() == TransactionStatus::Failed;
+        let parsed = match parse(sql) {
+            Ok(parsed) => parsed,
+            Err(_) if transaction_was_failed => {
+                return Err(failed_transaction_error());
             }
-            BoundStatement::AdvancedSelect {
-                table,
-                joins,
-                schema,
-                projection,
-                filter,
-                group_by,
-                having,
-                order_by,
-                limit,
-                aggregate,
-            } => {
-                let (schema, cursor) = prepare_advanced_cursor(
-                    &state,
-                    AdvancedExecution {
-                        table,
-                        joins,
-                        schema,
-                        projection,
-                        filter,
-                        group_by,
-                        having,
-                        order_by,
-                        limit,
-                        aggregate,
-                    },
-                    params,
-                )?;
-                drop(state);
-                return Ok(TryQueryStream::select(
-                    schema,
-                    StreamBatchCursor::Advanced(Box::new(cursor)),
-                ));
+            Err(error) => {
+                self.fail_sql_transaction();
+                return Err(error);
             }
+        };
+        if transaction_was_failed {
+            return match parsed {
+                ParsedStatement::Rollback => self.rollback_sql_transaction(),
+                _ => Err(failed_transaction_error()),
+            };
+        }
+        let snapshot = self.statement_snapshot()?;
+        let statement = match bind(parsed, &snapshot.catalog) {
+            Ok(statement) => statement,
+            Err(error) => {
+                self.fail_sql_transaction();
+                return Err(error);
+            }
+        };
+
+        match &statement {
+            BoundStatement::Begin => return self.begin_sql_transaction(),
+            BoundStatement::Commit => return self.commit_sql_transaction(),
+            BoundStatement::Rollback => return self.rollback_sql_transaction(),
             _ => {}
         }
-        let (candidate, events, dirty) = execute_candidate(&state, sql, params)?;
+        match mem::replace(&mut self.sql_transaction, SqlTransactionState::Idle) {
+            SqlTransactionState::Idle => self.execute_auto_commit(sql, params, snapshot, statement),
+            SqlTransactionState::Active(mut transaction) => {
+                match self.execute_in_sql_transaction(
+                    &mut transaction,
+                    sql,
+                    params,
+                    snapshot,
+                    statement,
+                ) {
+                    Ok(stream) => {
+                        let stream =
+                            stream.with_failure_flag(Arc::clone(&transaction.stream_failed));
+                        self.sql_transaction = SqlTransactionState::Active(transaction);
+                        Ok(stream)
+                    }
+                    Err(error) => {
+                        self.sql_transaction = SqlTransactionState::Failed;
+                        Err(error)
+                    }
+                }
+            }
+            SqlTransactionState::Failed => {
+                self.sql_transaction = SqlTransactionState::Failed;
+                Err(failed_transaction_error())
+            }
+        }
+    }
+
+    pub fn begin(&mut self) -> Result<Transaction<'_>> {
+        if self.transaction_status() != TransactionStatus::Idle {
+            return Err(DbError::new(
+                "25001",
+                "a SQL transaction is already active in this session",
+            )
+            .with_hint("commit or roll back the SQL transaction before using Session::begin"));
+        }
+        Ok(Transaction {
+            state: &self.state,
+            store: &self.store,
+            wal: &self.wal,
+            writer: &self.writer,
+            commits_since_checkpoint: &self.commits_since_checkpoint,
+            transaction_id: self.writer.next_transaction_id()?,
+            working: None,
+            lease: None,
+            failed: false,
+        })
+    }
+
+    #[must_use]
+    pub fn transaction_status(&self) -> TransactionStatus {
+        match &self.sql_transaction {
+            SqlTransactionState::Idle => TransactionStatus::Idle,
+            SqlTransactionState::Active(transaction)
+                if transaction.stream_failed.load(Ordering::Acquire) =>
+            {
+                TransactionStatus::Failed
+            }
+            SqlTransactionState::Active(_) => TransactionStatus::Active,
+            SqlTransactionState::Failed => TransactionStatus::Failed,
+        }
+    }
+
+    fn statement_snapshot(&self) -> Result<DatabaseState> {
+        if let SqlTransactionState::Active(transaction) = &self.sql_transaction
+            && let Some(working) = &transaction.working
+        {
+            return Ok(working.clone());
+        }
+        committed_snapshot(&self.state)
+    }
+
+    fn begin_sql_transaction(&mut self) -> Result<TryQueryStream> {
+        match self.transaction_status() {
+            TransactionStatus::Idle => {
+                self.sql_transaction = SqlTransactionState::Active(ActiveSqlTransaction {
+                    transaction_id: self.writer.next_transaction_id()?,
+                    working: None,
+                    lease: None,
+                    stream_failed: Arc::new(AtomicBool::new(false)),
+                });
+                Ok(TryQueryStream::new(transaction_events("BEGIN")))
+            }
+            TransactionStatus::Active => {
+                Err(DbError::new("25001", "a transaction is already active")
+                    .with_hint("commit or roll back the current transaction first"))
+            }
+            TransactionStatus::Failed => Err(failed_transaction_error()),
+        }
+    }
+
+    fn commit_sql_transaction(&mut self) -> Result<TryQueryStream> {
+        match mem::replace(&mut self.sql_transaction, SqlTransactionState::Idle) {
+            SqlTransactionState::Idle => Err(no_active_transaction_error("commit")),
+            SqlTransactionState::Failed => {
+                self.sql_transaction = SqlTransactionState::Failed;
+                Err(failed_transaction_error())
+            }
+            SqlTransactionState::Active(transaction) => {
+                let transaction_id = transaction.transaction_id;
+                if let Some(candidate) = transaction.working {
+                    let mut state = self
+                        .state
+                        .write()
+                        .map_err(|_| internal_error("engine state lock is poisoned"))?;
+                    if let Err(error) = persist_candidate(
+                        &mut state,
+                        &self.store,
+                        &self.wal,
+                        transaction_id,
+                        candidate,
+                    ) {
+                        self.sql_transaction = SqlTransactionState::Failed;
+                        return Err(error);
+                    }
+                    drop(state);
+                    drop(transaction.lease);
+                    record_commit_and_maybe_checkpoint(
+                        &self.state,
+                        &self.store,
+                        &self.wal,
+                        &self.writer,
+                        &self.commits_since_checkpoint,
+                    )?;
+                }
+                Ok(TryQueryStream::new(transaction_events("COMMIT")))
+            }
+        }
+    }
+
+    fn rollback_sql_transaction(&mut self) -> Result<TryQueryStream> {
+        match mem::replace(&mut self.sql_transaction, SqlTransactionState::Idle) {
+            SqlTransactionState::Idle => Err(no_active_transaction_error("roll back")),
+            SqlTransactionState::Active(_) | SqlTransactionState::Failed => {
+                Ok(TryQueryStream::new(transaction_events("ROLLBACK")))
+            }
+        }
+    }
+
+    fn execute_auto_commit(
+        &self,
+        sql: &str,
+        params: &[Value],
+        snapshot: DatabaseState,
+        statement: BoundStatement,
+    ) -> Result<TryQueryStream> {
+        if let Some(stream) = prepare_read_stream(&snapshot, statement.clone(), params)? {
+            return Ok(stream);
+        }
+        let (_, events, dirty) = execute_bound_candidate(&snapshot, statement, params)?;
         if !dirty {
-            drop(state);
             return Ok(TryQueryStream::new(events));
         }
-        drop(candidate);
-        drop(state);
 
+        let transaction_id = self.writer.next_transaction_id()?;
+        let lease = self.writer.try_acquire(transaction_id)?;
         let mut state = self
             .state
             .write()
             .map_err(|_| internal_error("engine state lock is poisoned"))?;
-        let (mut candidate, events, dirty) = execute_candidate(&state, sql, params)?;
+        let (candidate, events, dirty) = execute_candidate(&state, sql, params)?;
         if dirty {
-            candidate.generation = state.generation.saturating_add(1);
-            self.store
-                .lock()
-                .map_err(|_| internal_error("database store lock is poisoned"))?
-                .commit(&PersistentState::from(&candidate))?;
-            *state = candidate;
+            persist_candidate(
+                &mut state,
+                &self.store,
+                &self.wal,
+                transaction_id,
+                candidate,
+            )?;
+            drop(state);
+            drop(lease);
+            record_commit_and_maybe_checkpoint(
+                &self.state,
+                &self.store,
+                &self.wal,
+                &self.writer,
+                &self.commits_since_checkpoint,
+            )?;
         }
         Ok(TryQueryStream::new(events))
     }
 
-    pub fn begin(&mut self) -> Result<Transaction<'_>> {
-        let state = self
-            .state
-            .read()
-            .map_err(|_| internal_error("engine state lock is poisoned"))?;
-        let base_generation = state.generation;
-        let working = state.clone();
-        drop(state);
-        Ok(Transaction {
-            state: &self.state,
-            store: &self.store,
-            working,
-            base_generation,
-            dirty: false,
-        })
+    fn execute_in_sql_transaction(
+        &self,
+        transaction: &mut ActiveSqlTransaction,
+        sql: &str,
+        params: &[Value],
+        snapshot: DatabaseState,
+        statement: BoundStatement,
+    ) -> Result<TryQueryStream> {
+        if let Some(stream) = prepare_read_stream(&snapshot, statement.clone(), params)? {
+            return Ok(stream);
+        }
+        let (candidate, events, dirty) = execute_bound_candidate(&snapshot, statement, params)?;
+        if !dirty {
+            return Ok(TryQueryStream::new(events));
+        }
+        if transaction.working.is_some() {
+            transaction.working = Some(candidate);
+            return Ok(TryQueryStream::new(events));
+        }
+
+        let lease = self.writer.try_acquire(transaction.transaction_id)?;
+        let committed = committed_snapshot(&self.state)?;
+        let (candidate, events, dirty) = execute_candidate(&committed, sql, params)?;
+        if dirty {
+            transaction.working = Some(candidate);
+            transaction.lease = Some(lease);
+        }
+        Ok(TryQueryStream::new(events))
+    }
+
+    fn fail_sql_transaction(&mut self) {
+        if matches!(&self.sql_transaction, SqlTransactionState::Active(_)) {
+            self.sql_transaction = SqlTransactionState::Failed;
+        }
+    }
+
+    fn normalize_sql_transaction_failure(&mut self) {
+        if self.transaction_status() == TransactionStatus::Failed
+            && matches!(&self.sql_transaction, SqlTransactionState::Active(_))
+        {
+            self.sql_transaction = SqlTransactionState::Failed;
+        }
     }
 }
 
@@ -202,112 +421,100 @@ impl Session {
 pub struct Transaction<'session> {
     state: &'session Arc<RwLock<DatabaseState>>,
     store: &'session Arc<Mutex<DatabaseStore>>,
-    working: DatabaseState,
-    base_generation: u64,
-    dirty: bool,
+    wal: &'session Arc<WalManager>,
+    writer: &'session Arc<WriterCoordinator>,
+    commits_since_checkpoint: &'session Arc<AtomicU64>,
+    transaction_id: TransactionId,
+    working: Option<DatabaseState>,
+    lease: Option<WriterLease>,
+    failed: bool,
 }
 
 impl Transaction<'_> {
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryStream> {
-        let statement = bind(parse(sql)?, &self.working.catalog)?;
-        let read_stream = match statement {
-            BoundStatement::Select {
-                table_id,
-                schema,
-                projection,
-                filter,
-                order_by,
-                limit,
-            } => {
-                let (schema, cursor) = prepare_select_cursor(
-                    &self.working,
-                    SelectExecution {
-                        table_id,
-                        schema,
-                        projection,
-                        filter,
-                        order_by,
-                        limit,
-                    },
-                    params,
-                )?;
-                Some(TryQueryStream::select(
-                    schema,
-                    StreamBatchCursor::Simple(Box::new(cursor)),
-                ))
-            }
-            BoundStatement::AdvancedSelect {
-                table,
-                joins,
-                schema,
-                projection,
-                filter,
-                group_by,
-                having,
-                order_by,
-                limit,
-                aggregate,
-            } => {
-                let (schema, cursor) = prepare_advanced_cursor(
-                    &self.working,
-                    AdvancedExecution {
-                        table,
-                        joins,
-                        schema,
-                        projection,
-                        filter,
-                        group_by,
-                        having,
-                        order_by,
-                        limit,
-                        aggregate,
-                    },
-                    params,
-                )?;
-                Some(TryQueryStream::select(
-                    schema,
-                    StreamBatchCursor::Advanced(Box::new(cursor)),
-                ))
-            }
-            _ => None,
-        };
-        if let Some(stream) = read_stream {
-            return stream.collect::<Result<Vec<_>>>().map(QueryStream::new);
+        if self.failed {
+            return Err(failed_transaction_error());
         }
-        let (candidate, events, dirty) = execute_candidate(&self.working, sql, params)?;
-        if dirty {
-            self.working = candidate;
-            self.dirty = true;
+        match self.execute_inner(sql, params) {
+            Ok(stream) => Ok(stream),
+            Err(error) => {
+                self.working = None;
+                self.lease = None;
+                self.failed = true;
+                Err(error)
+            }
         }
-        Ok(QueryStream::new(events))
     }
 
     pub fn commit(mut self) -> Result<()> {
-        if !self.dirty {
-            return Ok(());
+        if self.failed {
+            return Err(failed_transaction_error());
         }
+        let Some(candidate) = self.working else {
+            return Ok(());
+        };
         let mut state = self
             .state
             .write()
             .map_err(|_| internal_error("engine state lock is poisoned"))?;
-        if state.generation != self.base_generation {
-            return Err(DbError::new(
-                "40001",
-                "transaction snapshot conflicts with a committed change",
-            )
-            .with_hint("retry the transaction"));
-        }
-        self.working.generation = state.generation.saturating_add(1);
-        self.store
-            .lock()
-            .map_err(|_| internal_error("database store lock is poisoned"))?
-            .commit(&PersistentState::from(&self.working))?;
-        *state = self.working;
-        Ok(())
+        persist_candidate(
+            &mut state,
+            self.store,
+            self.wal,
+            self.transaction_id,
+            candidate,
+        )?;
+        drop(state);
+        self.lease = None;
+        record_commit_and_maybe_checkpoint(
+            self.state,
+            self.store,
+            self.wal,
+            self.writer,
+            self.commits_since_checkpoint,
+        )
     }
 
     pub fn rollback(self) -> Result<()> {
         Ok(())
+    }
+
+    fn execute_inner(&mut self, sql: &str, params: &[Value]) -> Result<QueryStream> {
+        let snapshot = match &self.working {
+            Some(working) => working.clone(),
+            None => committed_snapshot(self.state)?,
+        };
+        let statement = bind(parse(sql)?, &snapshot.catalog)?;
+        if matches!(
+            &statement,
+            BoundStatement::Begin | BoundStatement::Commit | BoundStatement::Rollback
+        ) {
+            return Err(DbError::new(
+                "25001",
+                "SQL transaction control is not allowed inside Session::begin",
+            )
+            .with_hint("use Transaction::commit or Transaction::rollback"));
+        }
+        if let Some(stream) = prepare_read_stream(&snapshot, statement.clone(), params)? {
+            return stream.collect::<Result<Vec<_>>>().map(QueryStream::new);
+        }
+        let (candidate, events, dirty) = execute_bound_candidate(&snapshot, statement, params)?;
+        if !dirty {
+            return Ok(QueryStream::new(events));
+        }
+        if self.working.is_some() {
+            self.working = Some(candidate);
+            return Ok(QueryStream::new(events));
+        }
+
+        let lease = self.writer.try_acquire(self.transaction_id)?;
+        let committed = committed_snapshot(self.state)?;
+        let (candidate, events, dirty) = execute_candidate(&committed, sql, params)?;
+        if dirty {
+            self.working = Some(candidate);
+            self.lease = Some(lease);
+        }
+        Ok(QueryStream::new(events))
     }
 }
 
@@ -319,6 +526,7 @@ pub struct QueryStream {
 pub struct TryQueryStream {
     state: TryQueryStreamState,
     failed: bool,
+    failure_flag: Option<Arc<AtomicBool>>,
 }
 
 enum TryQueryStreamState {
@@ -375,6 +583,7 @@ impl TryQueryStream {
                 events.into_iter().map(Ok).collect::<Vec<_>>().into_iter(),
             ),
             failed: false,
+            failure_flag: None,
         }
     }
 
@@ -388,7 +597,13 @@ impl TryQueryStream {
                 emitted_batch: false,
             })),
             failed: false,
+            failure_flag: None,
         }
+    }
+
+    fn with_failure_flag(mut self, failure_flag: Arc<AtomicBool>) -> Self {
+        self.failure_flag = Some(failure_flag);
+        self
     }
 }
 
@@ -412,6 +627,9 @@ impl Iterator for TryQueryStream {
             }
             Err(error) => {
                 self.failed = true;
+                if let Some(failure_flag) = &self.failure_flag {
+                    failure_flag.store(true, Ordering::Release);
+                }
                 self.state = TryQueryStreamState::Done;
                 Some(Err(error))
             }
@@ -559,6 +777,91 @@ impl From<&DatabaseState> for PersistentState {
     }
 }
 
+fn committed_snapshot(state: &Arc<RwLock<DatabaseState>>) -> Result<DatabaseState> {
+    state
+        .read()
+        .map(|state| state.clone())
+        .map_err(|_| internal_error("engine state lock is poisoned"))
+}
+
+fn prepare_read_stream(
+    state: &DatabaseState,
+    statement: BoundStatement,
+    params: &[Value],
+) -> Result<Option<TryQueryStream>> {
+    match statement {
+        BoundStatement::Select {
+            table_id,
+            schema,
+            projection,
+            filter,
+            order_by,
+            limit,
+        } => {
+            let (schema, cursor) = prepare_select_cursor(
+                state,
+                SelectExecution {
+                    table_id,
+                    schema,
+                    projection,
+                    filter,
+                    order_by,
+                    limit,
+                },
+                params,
+            )?;
+            Ok(Some(TryQueryStream::select(
+                schema,
+                StreamBatchCursor::Simple(Box::new(cursor)),
+            )))
+        }
+        BoundStatement::AdvancedSelect {
+            table,
+            joins,
+            schema,
+            projection,
+            filter,
+            group_by,
+            having,
+            order_by,
+            limit,
+            aggregate,
+        } => {
+            let (schema, cursor) = prepare_advanced_cursor(
+                state,
+                AdvancedExecution {
+                    table,
+                    joins,
+                    schema,
+                    projection,
+                    filter,
+                    group_by,
+                    having,
+                    order_by,
+                    limit,
+                    aggregate,
+                },
+                params,
+            )?;
+            Ok(Some(TryQueryStream::select(
+                schema,
+                StreamBatchCursor::Advanced(Box::new(cursor)),
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn execute_bound_candidate(
+    state: &DatabaseState,
+    statement: BoundStatement,
+    params: &[Value],
+) -> Result<(DatabaseState, Vec<QueryEvent>, bool)> {
+    let mut candidate = state.clone();
+    let (events, dirty) = execute_bound(&mut candidate, statement, params)?;
+    Ok((candidate, events, dirty))
+}
+
 fn execute_candidate(
     state: &DatabaseState,
     sql: &str,
@@ -569,6 +872,107 @@ fn execute_candidate(
     let mut candidate = state.clone();
     let (events, dirty) = execute_bound(&mut candidate, statement, params)?;
     Ok((candidate, events, dirty))
+}
+
+fn persist_candidate(
+    state: &mut DatabaseState,
+    store: &Arc<Mutex<DatabaseStore>>,
+    wal: &Arc<WalManager>,
+    transaction_id: TransactionId,
+    mut candidate: DatabaseState,
+) -> Result<()> {
+    candidate.generation = state.generation.checked_add(1).ok_or_else(|| {
+        DbError::new("54000", "database generation space is exhausted")
+            .with_hint("create a logical backup before retrying on a fresh database")
+    })?;
+    let persistent = PersistentState::from(&candidate);
+    let mut store = store
+        .lock()
+        .map_err(|_| internal_error("database store lock is poisoned"))?;
+    let mut prepared = store.prepare_commit(&persistent)?;
+    let logged = wal.log_prepared(transaction_id, &mut prepared)?;
+    store.apply_prepared_with_observer(&prepared, |point| {
+        wal.check_fault(match point {
+            ApplyPoint::BeforePageWrite(_) => FaultPoint::BeforeDataPageWrite,
+            ApplyPoint::AfterPageWrite(_) => FaultPoint::AfterDataPageWrite,
+            ApplyPoint::BeforeResize { .. } => FaultPoint::BeforeDataResize,
+            ApplyPoint::AfterResize { .. } => FaultPoint::AfterDataResize,
+            ApplyPoint::BeforeSync => FaultPoint::BeforeDataSync,
+            ApplyPoint::AfterSync => FaultPoint::AfterDataSync,
+        })
+    })?;
+    wal.commit(&logged)?;
+    store.publish_prepared(prepared)?;
+    *state = candidate;
+    Ok(())
+}
+
+fn checkpoint_shared(
+    state: &Arc<RwLock<DatabaseState>>,
+    store: &Arc<Mutex<DatabaseStore>>,
+    wal: &Arc<WalManager>,
+    writer: &Arc<WriterCoordinator>,
+) -> Result<()> {
+    let durable_data_generation = state
+        .read()
+        .map_err(|_| internal_error("engine state lock is poisoned"))?
+        .generation;
+    let data_file_page_count = store
+        .lock()
+        .map_err(|_| internal_error("database store lock is poisoned"))?
+        .page_count()?;
+    let mut active_transactions = BTreeMap::new();
+    if let Some(transaction_id) = writer.active_transaction()?
+        && let Some(last_lsn) = wal.last_lsn(transaction_id)?
+    {
+        active_transactions.insert(transaction_id, last_lsn);
+    }
+    wal.checkpoint(CheckpointState {
+        active_transactions,
+        dirty_pages: wal.dirty_pages()?,
+        durable_data_generation,
+        durable_wal_lsn: wal.durable_lsn()?,
+        data_file_page_count,
+    })?;
+    Ok(())
+}
+
+fn record_commit_and_maybe_checkpoint(
+    state: &Arc<RwLock<DatabaseState>>,
+    store: &Arc<Mutex<DatabaseStore>>,
+    wal: &Arc<WalManager>,
+    writer: &Arc<WriterCoordinator>,
+    commits_since_checkpoint: &AtomicU64,
+) -> Result<()> {
+    let count = commits_since_checkpoint
+        .fetch_add(1, Ordering::AcqRel)
+        .checked_add(1)
+        .ok_or_else(|| DbError::new("54000", "automatic checkpoint commit counter overflowed"))?;
+    if count < AUTOMATIC_CHECKPOINT_INTERVAL {
+        return Ok(());
+    }
+    checkpoint_shared(state, store, wal, writer)?;
+    commits_since_checkpoint.store(0, Ordering::Release);
+    Ok(())
+}
+
+fn transaction_events(tag: &str) -> Vec<QueryEvent> {
+    command_events(Schema::empty(), tag, 0, None)
+}
+
+fn no_active_transaction_error(action: &str) -> DbError {
+    DbError::new(
+        "25P01",
+        format!("cannot {action} because no transaction is active"),
+    )
+}
+
+fn failed_transaction_error() -> DbError {
+    DbError::new(
+        "25P02",
+        "the current transaction is aborted; commands are ignored until ROLLBACK",
+    )
+    .with_hint("issue ROLLBACK before starting new work")
 }
 
 fn execute_bound(
@@ -665,6 +1069,13 @@ fn execute_bound(
         } => execute_update(state, table_id, assignments, filter, params),
         BoundStatement::Delete { table_id, filter } => {
             execute_delete(state, table_id, filter, params)
+        }
+        BoundStatement::Begin | BoundStatement::Commit | BoundStatement::Rollback => {
+            Err(DbError::new(
+                "25000",
+                "transaction control was not routed through the session",
+            )
+            .with_hint("execute transaction control through Session"))
         }
     }
 }
@@ -1384,7 +1795,7 @@ mod tests {
     }
 
     #[test]
-    fn commits_rolls_back_and_detects_generation_conflicts() {
+    fn commits_rolls_back_and_rejects_competing_writers() {
         let (_directory, engine) = engine();
         let mut first = engine.connect().expect("first");
         let mut second = engine.connect().expect("second");
@@ -1411,17 +1822,20 @@ mod tests {
             1
         );
 
-        let mut transaction = first.begin().expect("begin conflict");
+        let mut transaction = first.begin().expect("begin writer");
         transaction
-            .execute("INSERT INTO documents VALUES (2, 'stale', 2)", &[])
+            .execute("INSERT INTO documents VALUES (2, 'rolled back', 2)", &[])
             .expect("transaction insert");
+        let error = second
+            .execute("INSERT INTO documents VALUES (3, 'blocked', 3)", &[])
+            .expect_err("competing writer");
+        assert_eq!(error.sql_state, "55P03");
+        transaction.rollback().expect("rollback writer");
         execute(
             &mut second,
-            "INSERT INTO documents VALUES (3, 'concurrent', 3)",
+            "INSERT INTO documents VALUES (3, 'after release', 3)",
             &[],
         );
-        let error = transaction.commit().expect_err("generation conflict");
-        assert_eq!(error.sql_state, "40001");
     }
 
     #[test]
@@ -1716,5 +2130,73 @@ mod tests {
             &b_before,
             state.rows.get(&TableId::new(2)).expect("b")
         ));
+    }
+
+    #[test]
+    fn a_lazy_stream_error_marks_its_sql_transaction_failed() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE stream_failures (id BIGINT PRIMARY KEY)",
+            &[],
+        );
+        execute(&mut session, "BEGIN", &[]);
+        let failure_flag = match &session.sql_transaction {
+            SqlTransactionState::Active(transaction) => Arc::clone(&transaction.stream_failed),
+            _ => panic!("expected active SQL transaction"),
+        };
+        let mut stream = TryQueryStream {
+            state: TryQueryStreamState::Events(
+                vec![Err(DbError::new("53200", "query memory limit exceeded"))].into_iter(),
+            ),
+            failed: false,
+            failure_flag: Some(failure_flag),
+        };
+
+        assert_eq!(
+            stream
+                .next()
+                .expect("stream error")
+                .expect_err("error")
+                .sql_state,
+            "53200"
+        );
+        assert_eq!(session.transaction_status(), TransactionStatus::Failed);
+        assert_eq!(
+            session
+                .execute("SELECT * FROM stream_failures", &[])
+                .expect_err("failed transaction")
+                .sql_state,
+            "25P02"
+        );
+        execute(&mut session, "ROLLBACK", &[]);
+        assert_eq!(session.transaction_status(), TransactionStatus::Idle);
+    }
+
+    #[test]
+    fn durable_commits_trigger_the_conservative_automatic_checkpoint() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        engine
+            .commits_since_checkpoint
+            .store(AUTOMATIC_CHECKPOINT_INTERVAL - 1, Ordering::Release);
+        execute(
+            &mut session,
+            "CREATE TABLE checkpoint_rows (id BIGINT PRIMARY KEY)",
+            &[],
+        );
+
+        let records = engine.wal.scan().expect("scan WAL").records;
+        assert!(
+            records
+                .iter()
+                .any(|record| { record.kind() == ordadb_transaction::RecordKind::CheckpointEnd })
+        );
+        assert_eq!(
+            engine.writer.active_transaction().expect("writer state"),
+            None
+        );
+        assert_eq!(engine.commits_since_checkpoint.load(Ordering::Acquire), 0);
     }
 }

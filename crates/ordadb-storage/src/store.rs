@@ -8,11 +8,11 @@ use ordadb_types::{DbError, IndexId, Result, Row, TableId};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BufferPool, DiskManager, FILE_FORMAT_VERSION, NoWalBarrier, PageId, PageType, SlottedPage,
-    corruption, decode_row, encode_row, io_error, unsupported_version,
+    BufferPool, DiskManager, DurabilityBarrier, FILE_FORMAT_VERSION, NoWalBarrier, PageId,
+    PageType, SlottedPage, corruption, decode_row, encode_row, io_error, unsupported_version,
 };
 
-const DATABASE_FILE_NAME: &str = "ordadb.data";
+pub(crate) const DATABASE_FILE_NAME: &str = "ordadb.data";
 const MANIFEST_MAGIC: &str = "ORDADB";
 const DEFAULT_BUFFER_CAPACITY: usize = 64;
 const INDEX_RECORD_VERSION: u16 = 1;
@@ -57,17 +57,117 @@ pub struct DatabaseStore {
     committed_indexes: Vec<IndexManifest>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PageDelta {
+    pub page_id: PageId,
+    pub before: Option<SlottedPage>,
+    pub after: Option<SlottedPage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyPoint {
+    BeforePageWrite(PageId),
+    AfterPageWrite(PageId),
+    BeforeResize {
+        before_page_count: u64,
+        after_page_count: u64,
+    },
+    AfterResize {
+        before_page_count: u64,
+        after_page_count: u64,
+    },
+    BeforeSync,
+    AfterSync,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedCommit {
+    candidate: PersistentState,
+    table_manifests: Vec<TableManifest>,
+    index_manifests: Vec<IndexManifest>,
+    page_deltas: Vec<PageDelta>,
+    before_page_count: u64,
+    after_page_count: u64,
+}
+
+impl PreparedCommit {
+    #[must_use]
+    pub fn page_deltas(&self) -> &[PageDelta] {
+        &self.page_deltas
+    }
+
+    pub fn mark_after_lsn(&mut self, page_id: PageId, lsn: u64) -> Result<()> {
+        if lsn == 0 {
+            return Err(DbError::new(
+                "22023",
+                "a WAL-backed page update requires a non-zero LSN",
+            ));
+        }
+        let delta_index = self
+            .page_deltas
+            .binary_search_by_key(&page_id, |delta| delta.page_id)
+            .map_err(|_| {
+                DbError::new(
+                    "22023",
+                    format!(
+                        "page {} is not changed by this prepared commit",
+                        page_id.get()
+                    ),
+                )
+            })?;
+        let after = self.page_deltas[delta_index]
+            .after
+            .as_mut()
+            .ok_or_else(|| {
+                DbError::new(
+                    "22023",
+                    format!(
+                        "page {} is removed by this prepared commit and has no after image",
+                        page_id.get()
+                    ),
+                )
+            })?;
+        after.set_lsn(lsn);
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn before_page_count(&self) -> u64 {
+        self.before_page_count
+    }
+
+    #[must_use]
+    pub const fn after_page_count(&self) -> u64 {
+        self.after_page_count
+    }
+}
+
 impl DatabaseStore {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_capacity(data_dir, DEFAULT_BUFFER_CAPACITY)
+        Self::open_with_barrier(data_dir, Arc::new(NoWalBarrier))
+    }
+
+    pub fn open_with_barrier(
+        data_dir: impl AsRef<Path>,
+        barrier: Arc<dyn DurabilityBarrier>,
+    ) -> Result<Self> {
+        Self::open_internal(data_dir, DEFAULT_BUFFER_CAPACITY, barrier)
     }
 
     pub fn open_with_capacity(data_dir: impl AsRef<Path>, capacity: usize) -> Result<Self> {
+        Self::open_internal(data_dir, capacity, Arc::new(NoWalBarrier))
+    }
+
+    fn open_internal(
+        data_dir: impl AsRef<Path>,
+        capacity: usize,
+        barrier: Arc<dyn DurabilityBarrier>,
+    ) -> Result<Self> {
         let data_dir = data_dir.as_ref();
         std::fs::create_dir_all(data_dir)
             .map_err(|error| io_error("failed to create database data directory", error))?;
         let disk = DiskManager::open(data_dir.join(DATABASE_FILE_NAME))?;
-        let pool = BufferPool::new(disk, capacity, Arc::new(NoWalBarrier))?;
+        let pool = BufferPool::new(disk, capacity, barrier)?;
         if pool.page_count()? == 0 {
             let mut store = Self {
                 pool,
@@ -105,18 +205,213 @@ impl DatabaseStore {
     }
 
     pub fn commit(&mut self, candidate: &PersistentState) -> Result<()> {
-        let (pages, table_manifests, index_manifests) = build_snapshot(candidate)?;
-        self.pool.reset_storage()?;
-        for page in pages {
-            self.pool.install(page, true)?;
+        let prepared = self.prepare_commit(candidate)?;
+        self.apply_prepared(&prepared)?;
+        self.publish_prepared(prepared)
+    }
+
+    pub fn prepare_commit(&self, candidate: &PersistentState) -> Result<PreparedCommit> {
+        let (after_pages, table_manifests, index_manifests) = build_snapshot(candidate)?;
+        let before_page_count = self.pool.page_count()?;
+        let after_page_count = u64::try_from(after_pages.len())
+            .map_err(|_| corruption("prepared snapshot page count exceeds the format limit"))?;
+        let compared_page_count = before_page_count.max(after_page_count);
+        let mut page_deltas = Vec::new();
+
+        for page_index in 0..compared_page_count {
+            let page_id = PageId::new(page_index);
+            let before = if page_index < before_page_count {
+                Some(self.pool.fetch(page_id)?.snapshot()?)
+            } else {
+                None
+            };
+            let mut after = if page_index < after_page_count {
+                let page_index = usize::try_from(page_index)
+                    .map_err(|_| corruption("prepared page index exceeds the platform limit"))?;
+                after_pages.get(page_index).cloned()
+            } else {
+                None
+            };
+
+            if let (Some(before), Some(after)) = (&before, &mut after) {
+                after.set_lsn(before.lsn());
+                if before.sealed_bytes() == after.sealed_bytes() {
+                    continue;
+                }
+            }
+            page_deltas.push(PageDelta {
+                page_id,
+                before,
+                after,
+            });
         }
-        self.pool.flush_all()?;
+
+        Ok(PreparedCommit {
+            candidate: candidate.clone(),
+            table_manifests,
+            index_manifests,
+            page_deltas,
+            before_page_count,
+            after_page_count,
+        })
+    }
+
+    pub fn apply_prepared(&mut self, prepared: &PreparedCommit) -> Result<()> {
+        self.apply_prepared_with_observer(prepared, |_| Ok(()))
+    }
+
+    pub fn apply_prepared_with_observer(
+        &mut self,
+        prepared: &PreparedCommit,
+        mut observe: impl FnMut(ApplyPoint) -> Result<()>,
+    ) -> Result<()> {
+        validate_prepared(&self.pool, prepared)?;
+        let affected_pages = prepared
+            .page_deltas
+            .iter()
+            .map(|delta| delta.page_id)
+            .collect::<Vec<_>>();
+        self.pool.invalidate_pages(&affected_pages)?;
+
+        for delta in &prepared.page_deltas {
+            if let Some(after) = &delta.after {
+                observe(ApplyPoint::BeforePageWrite(delta.page_id))?;
+                self.pool.install(after.clone(), true)?;
+                self.pool.flush_page(delta.page_id)?;
+                observe(ApplyPoint::AfterPageWrite(delta.page_id))?;
+            }
+        }
+        if prepared.before_page_count != prepared.after_page_count {
+            let resize = ApplyPoint::BeforeResize {
+                before_page_count: prepared.before_page_count,
+                after_page_count: prepared.after_page_count,
+            };
+            observe(resize)?;
+            self.pool.resize_pages(prepared.after_page_count)?;
+            observe(ApplyPoint::AfterResize {
+                before_page_count: prepared.before_page_count,
+                after_page_count: prepared.after_page_count,
+            })?;
+        }
+        observe(ApplyPoint::BeforeSync)?;
         self.pool.sync_all()?;
-        self.committed_state = candidate.clone();
-        self.committed_tables = table_manifests;
-        self.committed_indexes = index_manifests;
+        observe(ApplyPoint::AfterSync)?;
         Ok(())
     }
+
+    pub fn publish_prepared(&mut self, prepared: PreparedCommit) -> Result<()> {
+        validate_applied(&self.pool, &prepared)?;
+        self.committed_state = prepared.candidate;
+        self.committed_tables = prepared.table_manifests;
+        self.committed_indexes = prepared.index_manifests;
+        Ok(())
+    }
+
+    pub fn page_count(&self) -> Result<u64> {
+        self.pool.page_count()
+    }
+}
+
+fn validate_prepared(pool: &BufferPool, prepared: &PreparedCommit) -> Result<()> {
+    let actual_page_count = pool.page_count()?;
+    if actual_page_count != prepared.before_page_count {
+        return Err(DbError::new(
+            "55000",
+            "prepared commit no longer matches the database file length",
+        )
+        .with_detail(format!(
+            "prepared against {} pages, found {actual_page_count}",
+            prepared.before_page_count
+        ))
+        .with_hint("discard the prepared commit and prepare the candidate again"));
+    }
+
+    let compared_page_count = prepared.before_page_count.max(prepared.after_page_count);
+    let mut previous_page_id = None;
+    for delta in &prepared.page_deltas {
+        if delta.page_id.get() >= compared_page_count
+            || previous_page_id.is_some_and(|previous| previous >= delta.page_id)
+        {
+            return Err(corruption(
+                "prepared commit page deltas are not a sorted unique page sequence",
+            ));
+        }
+        let expects_before = delta.page_id.get() < prepared.before_page_count;
+        let expects_after = delta.page_id.get() < prepared.after_page_count;
+        if delta.before.is_some() != expects_before
+            || delta.after.is_some() != expects_after
+            || delta
+                .before
+                .as_ref()
+                .is_some_and(|page| page.page_id() != delta.page_id)
+            || delta
+                .after
+                .as_ref()
+                .is_some_and(|page| page.page_id() != delta.page_id)
+        {
+            return Err(corruption(
+                "prepared commit contains an invalid page delta identity",
+            ));
+        }
+        match &delta.before {
+            Some(before) => {
+                before.validate()?;
+                let current = pool.fetch(delta.page_id)?.snapshot()?;
+                if current.sealed_bytes() != before.sealed_bytes() {
+                    return Err(DbError::new(
+                        "55000",
+                        format!(
+                            "prepared before image for page {} no longer matches storage",
+                            delta.page_id.get()
+                        ),
+                    )
+                    .with_hint("run recovery or prepare the candidate again"));
+                }
+            }
+            None if delta.page_id.get() < actual_page_count => {
+                return Err(corruption(
+                    "prepared commit omits an existing page before image",
+                ));
+            }
+            None => {}
+        }
+        if let Some(after) = &delta.after {
+            after.validate()?;
+        }
+        previous_page_id = Some(delta.page_id);
+    }
+    Ok(())
+}
+
+fn validate_applied(pool: &BufferPool, prepared: &PreparedCommit) -> Result<()> {
+    let actual_page_count = pool.page_count()?;
+    if actual_page_count != prepared.after_page_count {
+        return Err(DbError::new(
+            "55000",
+            "applied commit no longer matches the prepared database file length",
+        )
+        .with_detail(format!(
+            "prepared {} pages, found {actual_page_count}",
+            prepared.after_page_count
+        ))
+        .with_hint("run recovery before publishing database state"));
+    }
+    for delta in &prepared.page_deltas {
+        if let Some(after) = &delta.after {
+            let current = pool.fetch(delta.page_id)?.snapshot()?;
+            if current.sealed_bytes() != after.sealed_bytes() {
+                return Err(DbError::new(
+                    "55000",
+                    format!(
+                        "applied page {} no longer matches its prepared after image",
+                        delta.page_id.get()
+                    ),
+                )
+                .with_hint("run recovery before publishing database state"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn build_snapshot(
@@ -629,6 +924,23 @@ mod tests {
     use super::*;
     use crate::PAGE_SIZE;
 
+    #[derive(Debug)]
+    struct LimitedBarrier {
+        durable_lsn: u64,
+    }
+
+    impl DurabilityBarrier for LimitedBarrier {
+        fn flush_through(&self, page_lsn: u64) -> Result<()> {
+            if page_lsn > self.durable_lsn {
+                return Err(io_error(
+                    "injected WAL durability failure",
+                    std::io::Error::other("LSN is not durable"),
+                ));
+            }
+            Ok(())
+        }
+    }
+
     fn populated_state() -> PersistentState {
         let mut catalog = Catalog::default();
         catalog
@@ -818,5 +1130,180 @@ mod tests {
             "54000"
         );
         assert_eq!(store.committed_state(), &baseline);
+    }
+
+    #[test]
+    fn prepared_commit_deltas_are_sorted_for_unchanged_growth_and_shrink() {
+        let directory = tempdir().expect("tempdir");
+        let mut store = DatabaseStore::open(directory.path()).expect("open");
+        let unchanged = store
+            .prepare_commit(store.committed_state())
+            .expect("prepare unchanged");
+        assert_eq!(unchanged.before_page_count(), 1);
+        assert_eq!(unchanged.after_page_count(), 1);
+        assert!(unchanged.page_deltas().is_empty());
+
+        let populated = populated_state();
+        let growth = store.prepare_commit(&populated).expect("prepare growth");
+        assert!(growth.after_page_count() > growth.before_page_count());
+        assert!(
+            growth
+                .page_deltas()
+                .windows(2)
+                .all(|pair| pair[0].page_id < pair[1].page_id)
+        );
+        assert!(
+            growth
+                .page_deltas()
+                .iter()
+                .any(|delta| delta.before.is_none() && delta.after.is_some())
+        );
+
+        store.commit(&populated).expect("commit growth");
+        let baseline_page_count = store.page_count().expect("page count");
+        let shrink = store
+            .prepare_commit(&PersistentState::default())
+            .expect("prepare shrink");
+        assert_eq!(shrink.before_page_count(), baseline_page_count);
+        assert_eq!(shrink.after_page_count(), 1);
+        assert!(
+            shrink
+                .page_deltas()
+                .windows(2)
+                .all(|pair| pair[0].page_id < pair[1].page_id)
+        );
+        assert!(
+            shrink
+                .page_deltas()
+                .iter()
+                .any(|delta| delta.before.is_some() && delta.after.is_none())
+        );
+    }
+
+    #[test]
+    fn prepared_after_images_receive_their_page_update_lsns() {
+        let directory = tempdir().expect("tempdir");
+        let store = DatabaseStore::open(directory.path()).expect("open");
+        let mut prepared = store
+            .prepare_commit(&populated_state())
+            .expect("prepare growth");
+        let page_id = prepared
+            .page_deltas()
+            .iter()
+            .find(|delta| delta.after.is_some())
+            .expect("after image")
+            .page_id;
+
+        prepared.mark_after_lsn(page_id, 42).expect("mark LSN");
+        assert_eq!(
+            prepared
+                .page_deltas()
+                .iter()
+                .find(|delta| delta.page_id == page_id)
+                .and_then(|delta| delta.after.as_ref())
+                .expect("marked after image")
+                .lsn(),
+            42
+        );
+        assert_eq!(
+            prepared
+                .mark_after_lsn(page_id, 0)
+                .expect_err("zero LSN")
+                .sql_state,
+            "22023"
+        );
+    }
+
+    #[test]
+    fn apply_failure_and_pre_commit_success_do_not_publish_metadata() {
+        let directory = tempdir().expect("tempdir");
+        let barrier = Arc::new(LimitedBarrier { durable_lsn: 1 });
+        let mut store = DatabaseStore::open_with_barrier(directory.path(), barrier).expect("open");
+        let baseline = store.committed_state().clone();
+        let baseline_tables = store.table_manifests().to_vec();
+        let candidate = populated_state();
+        let mut prepared = store.prepare_commit(&candidate).expect("prepare");
+        let after_page_ids = prepared
+            .page_deltas()
+            .iter()
+            .filter(|delta| delta.after.is_some())
+            .map(|delta| delta.page_id)
+            .collect::<Vec<_>>();
+        assert!(after_page_ids.len() > 1);
+        for (index, page_id) in after_page_ids.into_iter().enumerate() {
+            prepared
+                .mark_after_lsn(page_id, index as u64 + 1)
+                .expect("mark");
+        }
+
+        assert_eq!(
+            store
+                .apply_prepared(&prepared)
+                .expect_err("barrier failure")
+                .sql_state,
+            "58030"
+        );
+        assert_eq!(store.committed_state(), &baseline);
+        assert_eq!(store.table_manifests(), baseline_tables);
+
+        let clean_directory = tempdir().expect("clean tempdir");
+        let mut clean_store = DatabaseStore::open(clean_directory.path()).expect("open clean");
+        let clean_baseline = clean_store.committed_state().clone();
+        let clean_prepared = clean_store
+            .prepare_commit(&candidate)
+            .expect("prepare clean");
+        clean_store
+            .apply_prepared(&clean_prepared)
+            .expect("apply clean");
+        assert_eq!(clean_store.committed_state(), &clean_baseline);
+        clean_store
+            .publish_prepared(clean_prepared)
+            .expect("publish clean");
+        assert_eq!(clean_store.committed_state(), &candidate);
+    }
+
+    #[test]
+    fn prepared_apply_reports_ordered_page_resize_and_sync_boundaries() {
+        let directory = tempdir().expect("tempdir");
+        let mut store = DatabaseStore::open(directory.path()).expect("open");
+        let prepared = store
+            .prepare_commit(&populated_state())
+            .expect("prepare growth");
+        let mut points = Vec::new();
+
+        store
+            .apply_prepared_with_observer(&prepared, |point| {
+                points.push(point);
+                Ok(())
+            })
+            .expect("apply with observer");
+
+        assert!(matches!(
+            points.first(),
+            Some(ApplyPoint::BeforePageWrite(page_id)) if *page_id == PageId::new(0)
+        ));
+        assert!(points.windows(2).any(|pair| {
+            matches!(
+                pair,
+                [
+                    ApplyPoint::BeforeResize { .. },
+                    ApplyPoint::AfterResize { .. }
+                ]
+            )
+        }));
+        assert!(matches!(
+            points.as_slice(),
+            [.., ApplyPoint::BeforeSync, ApplyPoint::AfterSync]
+        ));
+        assert_eq!(
+            points
+                .iter()
+                .filter(|point| matches!(point, ApplyPoint::BeforePageWrite(_)))
+                .count(),
+            points
+                .iter()
+                .filter(|point| matches!(point, ApplyPoint::AfterPageWrite(_)))
+                .count()
+        );
     }
 }

@@ -1,13 +1,18 @@
 mod buffer;
 mod disk;
 mod page;
+mod recovery;
 mod store;
 mod tuple;
 
 pub use buffer::{BufferPool, DurabilityBarrier, NoWalBarrier, PageGuard};
 pub use disk::DiskManager;
 pub use page::{FILE_FORMAT_VERSION, PAGE_SIZE, PageId, PageType, SLOT_SIZE, SlottedPage};
-pub use store::{DatabaseStore, IndexManifest, PersistentState, TableManifest};
+pub use recovery::{RecoveryDataFile, RecoveryFileState, RecoveryPlan};
+pub use store::{
+    ApplyPoint, DatabaseStore, IndexManifest, PageDelta, PersistentState, PreparedCommit,
+    TableManifest,
+};
 pub use tuple::{decode_row, encode_row};
 
 use std::io;

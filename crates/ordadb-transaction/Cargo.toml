@@ -1,0 +1,16 @@
+[package]
+name = "ordadb-transaction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+crc32c.workspace = true
+ordadb-storage = { path = "../ordadb-storage" }
+ordadb-types = { path = "../ordadb-types" }
+
+[dev-dependencies]
+ordadb-catalog = { path = "../ordadb-catalog" }
+tempfile.workspace = true

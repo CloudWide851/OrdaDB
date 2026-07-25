@@ -2178,6 +2178,7 @@ dependencies = [
  "ordadb-optimizer",
  "ordadb-sql",
  "ordadb-storage",
+ "ordadb-transaction",
  "ordadb-types",
  "serde_json",
  "tempfile",
@@ -2241,6 +2242,17 @@ dependencies = [
  "serde_json",
  "tempfile",
  "uuid",
+]
+
+[[package]]
+name = "ordadb-transaction"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "ordadb-catalog",
+ "ordadb-storage",
+ "ordadb-types",
+ "tempfile",
 ]
 
 [[package]]
