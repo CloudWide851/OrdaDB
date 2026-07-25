@@ -3,6 +3,7 @@ import {
   CheckCircle2,
   Download,
   FileText,
+  ListTree,
   Rows3,
   Search,
 } from "lucide-react";
@@ -11,8 +12,9 @@ import type { ResultTab } from "../types";
 import { IconAction } from "./IconAction";
 
 const tabs: Array<{ id: ResultTab; label: string; icon: typeof Rows3 }> = [
-  { id: "data", label: "结果", icon: Rows3 },
+  { id: "data", label: "数据", icon: Rows3 },
   { id: "logs", label: "日志", icon: FileText },
+  { id: "plan", label: "执行计划", icon: ListTree },
 ];
 
 export function ResultsPane() {
@@ -71,6 +73,8 @@ export function ResultsPane() {
             errorMessage={errorMessage}
             durationMs={durationMs}
           />
+        ) : activeTab === "plan" ? (
+          <PlanView />
         ) : (
           <DataView queryState={queryState} rows={rows} />
         )}
@@ -99,8 +103,8 @@ function DataView({
     return (
       <div className="result-empty">
         <Braces size={24} strokeWidth={1.6} aria-hidden="true" />
-        <strong>运行查询以查看预览结果</strong>
-        <span>使用运行按钮或 Ctrl Enter</span>
+        <strong>运行查询</strong>
+        <span>Ctrl Enter</span>
       </div>
     );
   }
@@ -165,6 +169,30 @@ function LogView({
           <span>{errorMessage}</span>
         </div>
       )}
+    </div>
+  );
+}
+
+function PlanView() {
+  return (
+    <div className="execution-plan" aria-label="预览执行计划">
+      <div className="plan-node plan-node--root">
+        <ListTree size={16} aria-hidden="true" />
+        <span>Limit</span>
+        <span>rows=5</span>
+      </div>
+      <div className="plan-node plan-node--level-1">
+        <span>Sort</span>
+        <span>hybrid_score DESC</span>
+      </div>
+      <div className="plan-node plan-node--level-2">
+        <span>Filter</span>
+        <span>category = 'database'</span>
+      </div>
+      <div className="plan-node plan-node--level-3">
+        <span>Hybrid Scan</span>
+        <span>documents</span>
+      </div>
     </div>
   );
 }
