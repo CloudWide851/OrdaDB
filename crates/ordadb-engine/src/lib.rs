@@ -5,21 +5,29 @@
 //! milestones.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use ordadb_catalog::{Catalog, TableDefinition};
+use ordadb_catalog::{Catalog, ColumnStatistics, TableDefinition, TableStatistics, indexable_type};
+use ordadb_execution::{
+    ExecutionContext, coerce_value as coerce_execution_value,
+    compare_values as compare_execution_values, evaluate as evaluate_scalar, evaluate_group,
+    execute as execute_plan, predicate_matches as execution_predicate_matches,
+};
+use ordadb_index::{BPlusTree, IndexEntry, IndexKey, RowId};
+use ordadb_optimizer::{
+    JoinStrategy, choose_join_strategy, explain as explain_plan, optimize_select,
+};
 use ordadb_sql::{
-    BinaryOperator, BoundExpr, BoundExprKind, BoundOrder, BoundProjection, BoundStatement,
-    UnaryOperator, bind, parse,
+    BinaryOperator, BoundExpr, BoundExprKind, BoundJoin, BoundOrder, BoundProjection,
+    BoundStatement, BoundTable, JoinKind, bind, parse,
 };
-use ordadb_storage::{DatabaseStore, PersistentState};
+use ordadb_storage::{DatabaseStore, PersistentState, encode_row};
 use ordadb_types::{
-    Batch, CommandComplete, DbError, QueryEvent, QueryProgress, Result, Row, ScalarType, Schema,
-    TableId, Value,
+    Batch, CommandComplete, DbError, Field, IndexId, QueryEvent, QueryProgress, Result, Row,
+    ScalarType, Schema, TableId, Value,
 };
-use rust_decimal::Decimal;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
@@ -45,7 +53,7 @@ pub struct Engine {
 impl Engine {
     pub fn open(config: EngineConfig) -> Result<Self> {
         let store = DatabaseStore::open(&config.data_dir)?;
-        let state = DatabaseState::from(store.committed_state().clone());
+        let state = DatabaseState::from_persistent(store.committed_state().clone())?;
         Ok(Self {
             config: Arc::new(config),
             state: Arc::new(RwLock::new(state)),
@@ -181,16 +189,51 @@ impl Iterator for QueryStream {
 struct DatabaseState {
     catalog: Catalog,
     rows: BTreeMap<TableId, Vec<Row>>,
+    indexes: BTreeMap<IndexId, BPlusTree>,
     generation: u64,
 }
 
-impl From<PersistentState> for DatabaseState {
-    fn from(state: PersistentState) -> Self {
-        Self {
+struct SelectExecution {
+    table_id: TableId,
+    schema: Schema,
+    projection: Vec<BoundProjection>,
+    filter: Option<BoundExpr>,
+    order_by: Vec<BoundOrder>,
+    limit: Option<BoundExpr>,
+}
+
+struct AdvancedExecution {
+    table: BoundTable,
+    joins: Vec<BoundJoin>,
+    schema: Schema,
+    projection: Vec<BoundProjection>,
+    filter: Option<BoundExpr>,
+    group_by: Vec<BoundExpr>,
+    having: Option<BoundExpr>,
+    order_by: Vec<BoundOrder>,
+    limit: Option<BoundExpr>,
+    aggregate: bool,
+}
+
+impl DatabaseState {
+    fn from_persistent(state: PersistentState) -> Result<Self> {
+        let indexes = state
+            .indexes
+            .into_iter()
+            .map(|(index_id, entries)| {
+                let definition = state
+                    .catalog
+                    .index_by_id(index_id)
+                    .ok_or_else(|| internal_error("persistent index is absent from the catalog"))?;
+                BPlusTree::from_entries(definition.unique, entries).map(|tree| (index_id, tree))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        Ok(Self {
             catalog: state.catalog,
             rows: state.tables,
+            indexes,
             generation: state.generation,
-        }
+        })
     }
 }
 
@@ -200,6 +243,16 @@ impl From<&DatabaseState> for PersistentState {
             generation: state.generation,
             catalog: state.catalog.clone(),
             tables: state.rows.clone(),
+            indexes: state
+                .indexes
+                .iter()
+                .map(|(index_id, tree)| {
+                    (
+                        *index_id,
+                        tree.entries().into_iter().cloned().collect::<Vec<_>>(),
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -236,8 +289,17 @@ fn execute_bound(
         } => {
             let table_id = state.catalog.create_table(&schema, name, columns)?;
             state.rows.insert(table_id, Vec::new());
+            rebuild_table_derived(state, table_id)?;
             Ok((
                 command_events(Schema::empty(), "CREATE TABLE", 0, None),
+                true,
+            ))
+        }
+        BoundStatement::CreateIndex { table_id, index } => {
+            state.catalog.create_index(table_id, index)?;
+            rebuild_table_derived(state, table_id)?;
+            Ok((
+                command_events(Schema::empty(), "CREATE INDEX", 0, None),
                 true,
             ))
         }
@@ -254,8 +316,45 @@ fn execute_bound(
             order_by,
             limit,
         } => execute_select(
-            state, table_id, schema, projection, filter, order_by, limit, params,
+            state,
+            SelectExecution {
+                table_id,
+                schema,
+                projection,
+                filter,
+                order_by,
+                limit,
+            },
+            params,
         ),
+        BoundStatement::AdvancedSelect {
+            table,
+            joins,
+            schema,
+            projection,
+            filter,
+            group_by,
+            having,
+            order_by,
+            limit,
+            aggregate,
+        } => execute_advanced_select(
+            state,
+            AdvancedExecution {
+                table,
+                joins,
+                schema,
+                projection,
+                filter,
+                group_by,
+                having,
+                order_by,
+                limit,
+                aggregate,
+            },
+            params,
+        ),
+        BoundStatement::Explain { statement } => execute_explain(state, *statement),
         BoundStatement::Update {
             table_id,
             assignments,
@@ -280,12 +379,13 @@ fn execute_insert(
     for expressions in expressions {
         let mut values = vec![Value::Null; table.columns().len()];
         for (expression, column_index) in expressions.into_iter().zip(&column_indexes) {
-            values[*column_index] = evaluate(&expression, &[], params)?;
+            values[*column_index] = evaluate_scalar(&expression, &[], params)?;
         }
         candidate_rows.push(Row::new(values));
     }
     validate_rows(&table, &candidate_rows)?;
     state.rows.insert(table_id, candidate_rows);
+    rebuild_table_derived(state, table_id)?;
     Ok((
         command_events(
             Schema::empty(),
@@ -297,57 +397,34 @@ fn execute_insert(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn execute_select(
     state: &DatabaseState,
-    table_id: TableId,
-    schema: Schema,
-    projection: Vec<BoundProjection>,
-    filter: Option<BoundExpr>,
-    order_by: Vec<BoundOrder>,
-    limit: Option<BoundExpr>,
+    execution: SelectExecution,
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
-    let mut source_rows = state.rows.get(&table_id).cloned().unwrap_or_default();
-    if let Some(filter) = &filter {
-        let mut filtered = Vec::with_capacity(source_rows.len());
-        for row in source_rows {
-            if predicate_matches(filter, &row, params)? {
-                filtered.push(row);
-            }
-        }
-        source_rows = filtered;
-    }
-    if !order_by.is_empty() {
-        let mut sort_error = None;
-        source_rows.sort_by(|left, right| {
-            compare_rows(left, right, &order_by).unwrap_or_else(|error| {
-                sort_error = Some(error);
-                Ordering::Equal
-            })
-        });
-        if let Some(error) = sort_error {
-            return Err(error);
-        }
-    }
-    let limit = limit
-        .as_ref()
-        .map(|limit| evaluate_limit(limit, params))
-        .transpose()?;
-    if let Some(limit) = limit {
-        source_rows.truncate(limit);
-    }
-
-    let result_rows = source_rows
-        .iter()
-        .map(|row| {
-            projection
-                .iter()
-                .map(|projection| evaluate(&projection.expr, &row.values, params))
-                .collect::<Result<Vec<_>>>()
-                .map(Row::new)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let SelectExecution {
+        table_id,
+        schema,
+        projection,
+        filter,
+        order_by,
+        limit,
+    } = execution;
+    let plan = optimize_select(
+        table_definition(state, table_id)?,
+        projection,
+        filter,
+        order_by,
+        limit,
+    );
+    let result_rows = execute_plan(
+        &plan,
+        &ExecutionContext {
+            tables: &state.rows,
+            indexes: &state.indexes,
+            params,
+        },
+    )?;
     let count = result_rows.len() as u64;
     let batch = Batch {
         schema: schema.clone(),
@@ -357,6 +434,473 @@ fn execute_select(
         command_events(schema, format!("SELECT {count}"), count, Some(batch)),
         false,
     ))
+}
+
+fn execute_advanced_select(
+    state: &DatabaseState,
+    execution: AdvancedExecution,
+    params: &[Value],
+) -> Result<(Vec<QueryEvent>, bool)> {
+    let AdvancedExecution {
+        table,
+        joins,
+        schema,
+        projection,
+        filter,
+        group_by,
+        having,
+        order_by,
+        limit,
+        aggregate,
+    } = execution;
+    let mut source_rows = state.rows.get(&table.table_id).cloned().unwrap_or_default();
+    for join in &joins {
+        source_rows = execute_join(state, source_rows, join, params)?;
+    }
+    if let Some(filter) = &filter {
+        source_rows = source_rows
+            .into_iter()
+            .filter_map(
+                |row| match execution_predicate_matches(filter, &row, params) {
+                    Ok(true) => Some(Ok(row)),
+                    Ok(false) => None,
+                    Err(error) => Some(Err(error)),
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+    }
+
+    let result_rows = if aggregate {
+        execute_aggregate_projection(
+            source_rows,
+            &projection,
+            &group_by,
+            having.as_ref(),
+            &order_by,
+            limit.as_ref(),
+            params,
+        )?
+    } else {
+        sort_rows(&mut source_rows, &order_by)?;
+        if let Some(limit) = &limit {
+            source_rows.truncate(evaluate_limit_expr(limit, params)?);
+        }
+        source_rows
+            .iter()
+            .map(|row| {
+                projection
+                    .iter()
+                    .map(|projection| evaluate_scalar(&projection.expr, &row.values, params))
+                    .collect::<Result<Vec<_>>>()
+                    .map(Row::new)
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    let count = result_rows.len() as u64;
+    let batch = Batch {
+        schema: schema.clone(),
+        rows: result_rows,
+    };
+    Ok((
+        command_events(schema, format!("SELECT {count}"), count, Some(batch)),
+        false,
+    ))
+}
+
+fn execute_join(
+    state: &DatabaseState,
+    left_rows: Vec<Row>,
+    join: &BoundJoin,
+    params: &[Value],
+) -> Result<Vec<Row>> {
+    let right_rows = state
+        .rows
+        .get(&join.table.table_id)
+        .map_or(&[][..], Vec::as_slice);
+    let equi_columns = equi_join_columns(&join.on, join.table.offset);
+    let strategy = choose_join_strategy(
+        left_rows.len() as u64,
+        right_rows.len() as u64,
+        equi_columns.is_some(),
+    )
+    .strategy;
+    match (strategy, equi_columns) {
+        (JoinStrategy::Hash, Some((left_index, right_index))) => execute_hash_join(
+            left_rows,
+            right_rows,
+            join,
+            left_index,
+            right_index - join.table.offset,
+            params,
+        ),
+        _ => execute_nested_loop_join(left_rows, right_rows, join, params),
+    }
+}
+
+fn execute_nested_loop_join(
+    left_rows: Vec<Row>,
+    right_rows: &[Row],
+    join: &BoundJoin,
+    params: &[Value],
+) -> Result<Vec<Row>> {
+    let mut output = Vec::new();
+    for left in left_rows {
+        let mut matched = false;
+        for right in right_rows {
+            let mut values = left.values.clone();
+            values.extend(right.values.clone());
+            let row = Row::new(values);
+            if execution_predicate_matches(&join.on, &row, params)? {
+                matched = true;
+                output.push(row);
+            }
+        }
+        if !matched && join.kind == JoinKind::Left {
+            let mut values = left.values;
+            values.extend(std::iter::repeat_n(Value::Null, join.table.width));
+            output.push(Row::new(values));
+        }
+    }
+    Ok(output)
+}
+
+fn execute_hash_join(
+    left_rows: Vec<Row>,
+    right_rows: &[Row],
+    join: &BoundJoin,
+    left_index: usize,
+    right_index: usize,
+    params: &[Value],
+) -> Result<Vec<Row>> {
+    let mut buckets = HashMap::<Vec<u8>, Vec<&Row>>::new();
+    for right in right_rows {
+        let Some(value) = right.values.get(right_index) else {
+            return Err(internal_error("hash join right key is out of bounds"));
+        };
+        if value.is_null() {
+            continue;
+        }
+        buckets
+            .entry(encode_row(&Row::new(vec![value.clone()]))?)
+            .or_default()
+            .push(right);
+    }
+    let mut output = Vec::new();
+    for left in left_rows {
+        let Some(value) = left.values.get(left_index) else {
+            return Err(internal_error("hash join left key is out of bounds"));
+        };
+        let candidates = if value.is_null() {
+            None
+        } else {
+            buckets.get(&encode_row(&Row::new(vec![value.clone()]))?)
+        };
+        let mut matched = false;
+        if let Some(candidates) = candidates {
+            for right in candidates {
+                let mut values = left.values.clone();
+                values.extend(right.values.clone());
+                let row = Row::new(values);
+                if execution_predicate_matches(&join.on, &row, params)? {
+                    matched = true;
+                    output.push(row);
+                }
+            }
+        }
+        if !matched && join.kind == JoinKind::Left {
+            let mut values = left.values;
+            values.extend(std::iter::repeat_n(Value::Null, join.table.width));
+            output.push(Row::new(values));
+        }
+    }
+    Ok(output)
+}
+
+fn equi_join_columns(expr: &BoundExpr, right_offset: usize) -> Option<(usize, usize)> {
+    let BoundExprKind::Binary {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    let (BoundExprKind::Column { index: left_index }, BoundExprKind::Column { index: right_index }) =
+        (&left.kind, &right.kind)
+    else {
+        return None;
+    };
+    if *left_index < right_offset && *right_index >= right_offset {
+        Some((*left_index, *right_index))
+    } else if *right_index < right_offset && *left_index >= right_offset {
+        Some((*right_index, *left_index))
+    } else {
+        None
+    }
+}
+
+fn execute_aggregate_projection(
+    rows: Vec<Row>,
+    projection: &[BoundProjection],
+    group_by: &[BoundExpr],
+    having: Option<&BoundExpr>,
+    order_by: &[BoundOrder],
+    limit: Option<&BoundExpr>,
+    params: &[Value],
+) -> Result<Vec<Row>> {
+    let mut groups = Vec::<(Vec<Value>, Vec<Row>)>::new();
+    if group_by.is_empty() {
+        groups.push((Vec::new(), rows));
+    } else {
+        for row in rows {
+            let key = group_by
+                .iter()
+                .map(|expr| evaluate_scalar(expr, &row.values, params))
+                .collect::<Result<Vec<_>>>()?;
+            if let Some((_, group_rows)) = groups.iter_mut().find(|(existing, _)| existing == &key)
+            {
+                group_rows.push(row);
+            } else {
+                groups.push((key, vec![row]));
+            }
+        }
+    }
+    if let Some(having) = having {
+        groups = groups
+            .into_iter()
+            .filter_map(|(key, rows)| {
+                let result = {
+                    let representative = rows.first().map_or(&[][..], |row| row.values.as_slice());
+                    evaluate_group(having, &rows, representative, params)
+                };
+                match result {
+                    Ok(Value::Boolean(true)) => Some(Ok((key, rows))),
+                    Ok(Value::Boolean(false) | Value::Null) => None,
+                    Ok(_) => Some(Err(DbError::new(
+                        "42804",
+                        "HAVING must evaluate to boolean",
+                    ))),
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+    }
+    if !order_by.is_empty() {
+        let mut error = None;
+        groups.sort_by(|(_, left), (_, right)| {
+            let left = left
+                .first()
+                .cloned()
+                .unwrap_or_else(|| Row::new(Vec::new()));
+            let right = right
+                .first()
+                .cloned()
+                .unwrap_or_else(|| Row::new(Vec::new()));
+            compare_ordered_rows(&left, &right, order_by).unwrap_or_else(|sort_error| {
+                error = Some(sort_error);
+                Ordering::Equal
+            })
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+    }
+    if let Some(limit) = limit {
+        groups.truncate(evaluate_limit_expr(limit, params)?);
+    }
+
+    groups
+        .into_iter()
+        .map(|(_, rows)| {
+            let representative = rows.first().map_or(&[][..], |row| row.values.as_slice());
+            projection
+                .iter()
+                .map(|projection| evaluate_group(&projection.expr, &rows, representative, params))
+                .collect::<Result<Vec<_>>>()
+                .map(Row::new)
+        })
+        .collect()
+}
+
+fn sort_rows(rows: &mut [Row], order_by: &[BoundOrder]) -> Result<()> {
+    if order_by.is_empty() {
+        return Ok(());
+    }
+    let mut error = None;
+    rows.sort_by(|left, right| {
+        compare_ordered_rows(left, right, order_by).unwrap_or_else(|sort_error| {
+            error = Some(sort_error);
+            Ordering::Equal
+        })
+    });
+    if let Some(error) = error {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn compare_ordered_rows(left: &Row, right: &Row, order_by: &[BoundOrder]) -> Result<Ordering> {
+    for order in order_by {
+        let left_value = left
+            .values
+            .get(order.column_index)
+            .ok_or_else(|| internal_error("ORDER BY column is out of bounds"))?;
+        let right_value = right
+            .values
+            .get(order.column_index)
+            .ok_or_else(|| internal_error("ORDER BY column is out of bounds"))?;
+        let ordering = match (left_value.is_null(), right_value.is_null()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => {
+                if order.nulls_first.unwrap_or(!order.ascending) {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if order.nulls_first.unwrap_or(!order.ascending) {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, false) => {
+                let ordering = compare_execution_values(left_value, right_value)?;
+                if order.ascending {
+                    ordering
+                } else {
+                    ordering.reverse()
+                }
+            }
+        };
+        if ordering != Ordering::Equal {
+            return Ok(ordering);
+        }
+    }
+    Ok(Ordering::Equal)
+}
+
+fn evaluate_limit_expr(expr: &BoundExpr, params: &[Value]) -> Result<usize> {
+    match evaluate_scalar(expr, &[], params)? {
+        Value::Int64(value) if value >= 0 => {
+            usize::try_from(value).map_err(|_| DbError::new("22003", "LIMIT value is out of range"))
+        }
+        Value::Null => Err(DbError::new("22004", "LIMIT cannot be null")),
+        _ => Err(DbError::new(
+            "2201W",
+            "LIMIT must be a non-negative integer",
+        )),
+    }
+}
+
+fn execute_explain(
+    state: &DatabaseState,
+    statement: BoundStatement,
+) -> Result<(Vec<QueryEvent>, bool)> {
+    let lines = match statement {
+        BoundStatement::Select {
+            table_id,
+            projection,
+            filter,
+            order_by,
+            limit,
+            ..
+        } => explain_plan(&optimize_select(
+            table_definition(state, table_id)?,
+            projection,
+            filter,
+            order_by,
+            limit,
+        )),
+        BoundStatement::AdvancedSelect {
+            table,
+            joins,
+            filter,
+            aggregate,
+            ..
+        } => explain_advanced(state, &table, &joins, filter.is_some(), aggregate)?,
+        _ => {
+            return Err(DbError::new(
+                "0A000",
+                "EXPLAIN supports SELECT statements only",
+            ));
+        }
+    };
+    let schema = Schema::new(vec![Field::new("QUERY PLAN", ScalarType::Text, false)]);
+    let count = lines.len() as u64;
+    let batch = Batch {
+        schema: schema.clone(),
+        rows: lines
+            .into_iter()
+            .map(|line| Row::new(vec![Value::Text(line)]))
+            .collect(),
+    };
+    Ok((
+        command_events(schema, format!("EXPLAIN {count}"), count, Some(batch)),
+        false,
+    ))
+}
+
+fn explain_advanced(
+    state: &DatabaseState,
+    table: &BoundTable,
+    joins: &[BoundJoin],
+    filtered: bool,
+    aggregate: bool,
+) -> Result<Vec<String>> {
+    let base = table_definition(state, table.table_id)?;
+    let mut estimated_rows = base.statistics().row_count;
+    let mut lines = vec!["Projection  (cost=0.00 rows=1)".to_owned()];
+    if aggregate {
+        lines.push("  Aggregate  (cost=0.00 rows=1)".to_owned());
+    }
+    if filtered {
+        lines.push(format!(
+            "  Filter  (cost={:.2} rows={})",
+            estimated_rows as f64 * 0.01,
+            estimated_rows
+        ));
+    }
+    for join in joins {
+        let right = table_definition(state, join.table.table_id)?;
+        let choice = choose_join_strategy(
+            estimated_rows,
+            right.statistics().row_count,
+            equi_join_columns(&join.on, join.table.offset).is_some(),
+        );
+        let name = match choice.strategy {
+            JoinStrategy::NestedLoop => "Nested Loop",
+            JoinStrategy::Hash => "Hash Join",
+        };
+        let kind = if join.kind == JoinKind::Left {
+            "Left"
+        } else {
+            "Inner"
+        };
+        lines.push(format!(
+            "  {name} {kind}  (cost={:.2} rows={:.0})",
+            choice.estimated_cost, choice.estimated_rows
+        ));
+        estimated_rows = choice.estimated_rows as u64;
+    }
+    lines.push(format!(
+        "    Seq Scan on {}  (cost={:.2} rows={})",
+        table.binding,
+        estimated_rows as f64 * 0.01,
+        base.statistics().row_count
+    ));
+    for join in joins {
+        let right = table_definition(state, join.table.table_id)?;
+        lines.push(format!(
+            "    Seq Scan on {}  (cost={:.2} rows={})",
+            join.table.binding,
+            right.statistics().row_count as f64 * 0.01,
+            right.statistics().row_count
+        ));
+    }
+    Ok(lines)
 }
 
 fn execute_update(
@@ -372,14 +916,17 @@ fn execute_update(
     for row in &mut candidate_rows {
         if filter
             .as_ref()
-            .map(|filter| predicate_matches(filter, row, params))
+            .map(|filter| execution_predicate_matches(filter, row, params))
             .transpose()?
             .unwrap_or(true)
         {
             let original = row.values.clone();
             let mut replacements = Vec::with_capacity(assignments.len());
             for (column_index, expression) in &assignments {
-                replacements.push((*column_index, evaluate(expression, &original, params)?));
+                replacements.push((
+                    *column_index,
+                    evaluate_scalar(expression, &original, params)?,
+                ));
             }
             for (column_index, value) in replacements {
                 row.values[column_index] = value;
@@ -389,6 +936,7 @@ fn execute_update(
     }
     validate_rows(&table, &candidate_rows)?;
     state.rows.insert(table_id, candidate_rows);
+    rebuild_table_derived(state, table_id)?;
     Ok((
         command_events(Schema::empty(), format!("UPDATE {updated}"), updated, None),
         true,
@@ -406,13 +954,15 @@ fn execute_delete(
     let original_len = rows.len();
     if let Some(filter) = &filter {
         let mut error = None;
-        rows.retain(|row| match predicate_matches(filter, row, params) {
-            Ok(matches) => !matches,
-            Err(predicate_error) => {
-                error = Some(predicate_error);
-                true
-            }
-        });
+        rows.retain(
+            |row| match execution_predicate_matches(filter, row, params) {
+                Ok(matches) => !matches,
+                Err(predicate_error) => {
+                    error = Some(predicate_error);
+                    true
+                }
+            },
+        );
         if let Some(error) = error {
             return Err(error);
         }
@@ -420,188 +970,11 @@ fn execute_delete(
         rows.clear();
     }
     let deleted = (original_len - rows.len()) as u64;
+    rebuild_table_derived(state, table_id)?;
     Ok((
         command_events(Schema::empty(), format!("DELETE {deleted}"), deleted, None),
         true,
     ))
-}
-
-fn evaluate(expr: &BoundExpr, row: &[Value], params: &[Value]) -> Result<Value> {
-    let value = match &expr.kind {
-        BoundExprKind::Column { index } => row
-            .get(*index)
-            .cloned()
-            .ok_or_else(|| internal_error(format!("bound column index {index} is out of range")))?,
-        BoundExprKind::Literal(value) => value.clone(),
-        BoundExprKind::Parameter { index } => params.get(index - 1).cloned().ok_or_else(|| {
-            DbError::new("42P02", format!("no value supplied for parameter ${index}"))
-        })?,
-        BoundExprKind::Unary { op, expr } => {
-            let value = evaluate(expr, row, params)?;
-            evaluate_unary(*op, value)?
-        }
-        BoundExprKind::Binary { left, op, right } => {
-            let left = evaluate(left, row, params)?;
-            let right = evaluate(right, row, params)?;
-            evaluate_binary(left, *op, right)?
-        }
-    };
-    coerce_value(value, &expr.data_type)
-}
-
-fn evaluate_unary(operator: UnaryOperator, value: Value) -> Result<Value> {
-    match (operator, value) {
-        (_, Value::Null) => Ok(Value::Null),
-        (UnaryOperator::Not, Value::Boolean(value)) => Ok(Value::Boolean(!value)),
-        (UnaryOperator::Negate, Value::Int16(value)) => value
-            .checked_neg()
-            .map(Value::Int16)
-            .ok_or_else(|| DbError::new("22003", "numeric value out of range")),
-        (UnaryOperator::Negate, Value::Int32(value)) => value
-            .checked_neg()
-            .map(Value::Int32)
-            .ok_or_else(|| DbError::new("22003", "numeric value out of range")),
-        (UnaryOperator::Negate, Value::Int64(value)) => value
-            .checked_neg()
-            .map(Value::Int64)
-            .ok_or_else(|| DbError::new("22003", "numeric value out of range")),
-        (UnaryOperator::Negate, Value::Float32(value)) => Ok(Value::Float32(-value)),
-        (UnaryOperator::Negate, Value::Float64(value)) => Ok(Value::Float64(-value)),
-        (UnaryOperator::Negate, Value::Decimal(value)) => Ok(Value::Decimal(-value)),
-        _ => Err(DbError::new(
-            "42804",
-            "unary operator received an incompatible value",
-        )),
-    }
-}
-
-fn evaluate_binary(left: Value, operator: BinaryOperator, right: Value) -> Result<Value> {
-    if matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
-        return evaluate_boolean_binary(left, operator, right);
-    }
-    if left.is_null() || right.is_null() {
-        return Ok(Value::Null);
-    }
-    match operator {
-        BinaryOperator::Eq => return Ok(Value::Boolean(left == right)),
-        BinaryOperator::NotEq => return Ok(Value::Boolean(left != right)),
-        _ => {}
-    }
-    let ordering = compare_values(&left, &right)?;
-    let result = match operator {
-        BinaryOperator::Lt => ordering == Ordering::Less,
-        BinaryOperator::LtEq => ordering != Ordering::Greater,
-        BinaryOperator::Gt => ordering == Ordering::Greater,
-        BinaryOperator::GtEq => ordering != Ordering::Less,
-        BinaryOperator::Eq | BinaryOperator::NotEq | BinaryOperator::And | BinaryOperator::Or => {
-            unreachable!("handled above")
-        }
-    };
-    Ok(Value::Boolean(result))
-}
-
-fn evaluate_boolean_binary(left: Value, operator: BinaryOperator, right: Value) -> Result<Value> {
-    let left = boolean_or_null(left)?;
-    let right = boolean_or_null(right)?;
-    let value = match operator {
-        BinaryOperator::And => match (left, right) {
-            (Some(false), _) | (_, Some(false)) => Some(false),
-            (Some(true), Some(true)) => Some(true),
-            _ => None,
-        },
-        BinaryOperator::Or => match (left, right) {
-            (Some(true), _) | (_, Some(true)) => Some(true),
-            (Some(false), Some(false)) => Some(false),
-            _ => None,
-        },
-        _ => unreachable!("only boolean operators are accepted"),
-    };
-    Ok(value.map_or(Value::Null, Value::Boolean))
-}
-
-fn boolean_or_null(value: Value) -> Result<Option<bool>> {
-    match value {
-        Value::Null => Ok(None),
-        Value::Boolean(value) => Ok(Some(value)),
-        _ => Err(DbError::new("42804", "boolean value required")),
-    }
-}
-
-fn predicate_matches(expr: &BoundExpr, row: &Row, params: &[Value]) -> Result<bool> {
-    match evaluate(expr, &row.values, params)? {
-        Value::Boolean(value) => Ok(value),
-        Value::Null => Ok(false),
-        _ => Err(DbError::new("42804", "predicate must evaluate to boolean")),
-    }
-}
-
-fn evaluate_limit(expr: &BoundExpr, params: &[Value]) -> Result<usize> {
-    match evaluate(expr, &[], params)? {
-        Value::Int64(value) if value >= 0 => {
-            usize::try_from(value).map_err(|_| DbError::new("22003", "LIMIT value is out of range"))
-        }
-        Value::Null => Err(DbError::new("22004", "LIMIT cannot be null")),
-        _ => Err(DbError::new(
-            "2201W",
-            "LIMIT must be a non-negative integer",
-        )),
-    }
-}
-
-fn coerce_value(value: Value, target: &ScalarType) -> Result<Value> {
-    if value.is_null() {
-        return Ok(value);
-    }
-    match (value, target) {
-        (Value::Boolean(value), ScalarType::Boolean) => Ok(Value::Boolean(value)),
-        (Value::Int16(value), ScalarType::Int16) => Ok(Value::Int16(value)),
-        (Value::Int16(value), ScalarType::Int32) => Ok(Value::Int32(i32::from(value))),
-        (Value::Int16(value), ScalarType::Int64) => Ok(Value::Int64(i64::from(value))),
-        (Value::Int16(value), ScalarType::Float32) => Ok(Value::Float32(f32::from(value))),
-        (Value::Int16(value), ScalarType::Float64) => Ok(Value::Float64(f64::from(value))),
-        (Value::Int16(value), ScalarType::Decimal { .. }) => {
-            Ok(Value::Decimal(Decimal::from(value)))
-        }
-        (Value::Int32(value), ScalarType::Int32) => Ok(Value::Int32(value)),
-        (Value::Int32(value), ScalarType::Int64) => Ok(Value::Int64(i64::from(value))),
-        (Value::Int32(value), ScalarType::Float64) => Ok(Value::Float64(f64::from(value))),
-        (Value::Int32(value), ScalarType::Decimal { .. }) => {
-            Ok(Value::Decimal(Decimal::from(value)))
-        }
-        (Value::Int64(value), ScalarType::Int64) => Ok(Value::Int64(value)),
-        (Value::Int64(value), ScalarType::Float64) => Ok(Value::Float64(value as f64)),
-        (Value::Int64(value), ScalarType::Decimal { .. }) => {
-            Ok(Value::Decimal(Decimal::from(value)))
-        }
-        (Value::Float32(value), ScalarType::Float32) => Ok(Value::Float32(value)),
-        (Value::Float64(value), ScalarType::Float64) => Ok(Value::Float64(value)),
-        (Value::Decimal(value), ScalarType::Decimal { .. }) => Ok(Value::Decimal(value)),
-        (
-            Value::Text(value),
-            ScalarType::Text | ScalarType::Char { .. } | ScalarType::Varchar { .. },
-        ) => Ok(Value::Text(value)),
-        (Value::Binary(value), ScalarType::Binary) => Ok(Value::Binary(value)),
-        (Value::Date(value), ScalarType::Date) => Ok(Value::Date(value)),
-        (Value::Time(value), ScalarType::Time) => Ok(Value::Time(value)),
-        (
-            Value::Timestamp(value),
-            ScalarType::Timestamp {
-                with_timezone: false,
-            },
-        ) => Ok(Value::Timestamp(value)),
-        (Value::Json(value), ScalarType::Json) => Ok(Value::Json(value)),
-        (Value::Jsonb(value), ScalarType::Jsonb) => Ok(Value::Jsonb(value)),
-        (Value::Uuid(value), ScalarType::Uuid) => Ok(Value::Uuid(value)),
-        (Value::Vector(value), ScalarType::Vector { dimensions })
-            if dimensions.is_none_or(|dimensions| dimensions == value.len()) =>
-        {
-            Ok(Value::Vector(value))
-        }
-        (value, target) => Err(DbError::new(
-            "42804",
-            format!("value {value:?} cannot be assigned to {target:?}"),
-        )),
-    }
 }
 
 fn validate_rows(table: &TableDefinition, rows: &[Row]) -> Result<()> {
@@ -619,7 +992,7 @@ fn validate_rows(table: &TableDefinition, rows: &[Row]) -> Result<()> {
                     ),
                 ));
             }
-            coerce_value(value.clone(), &column.data_type)?;
+            coerce_execution_value(value.clone(), &column.data_type)?;
         }
     }
     for (column_index, column) in table.columns().iter().enumerate() {
@@ -647,70 +1020,107 @@ fn validate_rows(table: &TableDefinition, rows: &[Row]) -> Result<()> {
     Ok(())
 }
 
-fn compare_rows(left: &Row, right: &Row, order_by: &[BoundOrder]) -> Result<Ordering> {
-    for order in order_by {
-        let left_value = &left.values[order.column_index];
-        let right_value = &right.values[order.column_index];
-        let ordering = match (left_value.is_null(), right_value.is_null()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => {
-                if order.nulls_first.unwrap_or(!order.ascending) {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                }
-            }
-            (false, true) => {
-                if order.nulls_first.unwrap_or(!order.ascending) {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
-            (false, false) => {
-                let ordering = compare_values(left_value, right_value)?;
-                if order.ascending {
-                    ordering
-                } else {
-                    ordering.reverse()
-                }
-            }
-        };
-        if ordering != Ordering::Equal {
-            return Ok(ordering);
-        }
+fn rebuild_table_derived(state: &mut DatabaseState, table_id: TableId) -> Result<()> {
+    let table = table_definition(state, table_id)?.clone();
+    let rows = state.rows.get(&table_id).cloned().unwrap_or_default();
+    let mut rebuilt = Vec::new();
+    for definition in table.indexes() {
+        let key_positions = definition
+            .key_columns
+            .iter()
+            .map(|column_id| {
+                table
+                    .column_index_by_id(*column_id)
+                    .ok_or_else(|| internal_error("index key column is absent from its table"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let include_positions = definition
+            .include_columns
+            .iter()
+            .map(|column_id| {
+                table
+                    .column_index_by_id(*column_id)
+                    .ok_or_else(|| internal_error("index include column is absent from its table"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let entries = rows
+            .iter()
+            .enumerate()
+            .map(|(row_index, row)| {
+                let row_id = u64::try_from(row_index)
+                    .map(RowId::new)
+                    .map_err(|_| DbError::new("54000", "table row count exceeds index limits"))?;
+                let key_values = key_positions
+                    .iter()
+                    .map(|position| row.values[*position].clone())
+                    .collect::<Vec<_>>();
+                let included = include_positions
+                    .iter()
+                    .map(|position| row.values[*position].clone())
+                    .collect();
+                IndexEntry::new(&key_values, row_id, included)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let tree = BPlusTree::from_entries(definition.unique, entries)?;
+        rebuilt.push((definition.id, tree));
     }
-    Ok(Ordering::Equal)
+    state
+        .indexes
+        .retain(|index_id, _| state.catalog.index_by_id(*index_id).is_some());
+    for (index_id, tree) in rebuilt {
+        state.indexes.insert(index_id, tree);
+    }
+    state
+        .catalog
+        .set_table_statistics(table_id, compute_statistics(&table, &rows)?)?;
+    Ok(())
 }
 
-fn compare_values(left: &Value, right: &Value) -> Result<Ordering> {
-    let ordering = match (left, right) {
-        (Value::Boolean(left), Value::Boolean(right)) => left.cmp(right),
-        (Value::Int16(left), Value::Int16(right)) => left.cmp(right),
-        (Value::Int32(left), Value::Int32(right)) => left.cmp(right),
-        (Value::Int64(left), Value::Int64(right)) => left.cmp(right),
-        (Value::Float32(left), Value::Float32(right)) => left
-            .partial_cmp(right)
-            .ok_or_else(|| DbError::new("22003", "NaN values cannot be ordered"))?,
-        (Value::Float64(left), Value::Float64(right)) => left
-            .partial_cmp(right)
-            .ok_or_else(|| DbError::new("22003", "NaN values cannot be ordered"))?,
-        (Value::Decimal(left), Value::Decimal(right)) => left.cmp(right),
-        (Value::Text(left), Value::Text(right)) => left.cmp(right),
-        (Value::Binary(left), Value::Binary(right)) => left.cmp(right),
-        (Value::Date(left), Value::Date(right)) => left.cmp(right),
-        (Value::Time(left), Value::Time(right)) => left.cmp(right),
-        (Value::Timestamp(left), Value::Timestamp(right)) => left.cmp(right),
-        (Value::Uuid(left), Value::Uuid(right)) => left.cmp(right),
-        _ if left == right => Ordering::Equal,
-        _ => {
-            return Err(DbError::new(
-                "42883",
-                "values do not support this comparison",
-            ));
+fn compute_statistics(table: &TableDefinition, rows: &[Row]) -> Result<TableStatistics> {
+    let mut columns = BTreeMap::new();
+    for (column_index, column) in table.columns().iter().enumerate() {
+        let values = rows
+            .iter()
+            .filter_map(|row| row.values.get(column_index))
+            .collect::<Vec<_>>();
+        let null_count = values.iter().filter(|value| value.is_null()).count() as u64;
+        let mut distinct = HashSet::new();
+        for value in values.iter().filter(|value| !value.is_null()) {
+            distinct.insert(encode_row(&Row::new(vec![(*value).clone()]))?);
         }
-    };
-    Ok(ordering)
+        let (min, max) = if indexable_type(&column.data_type) {
+            let mut minimum: Option<(IndexKey, Value)> = None;
+            let mut maximum: Option<(IndexKey, Value)> = None;
+            for value in values.iter().filter(|value| !value.is_null()) {
+                let key = IndexKey::from_values(&[(*value).clone()])?;
+                if minimum.as_ref().is_none_or(|(minimum, _)| key < *minimum) {
+                    minimum = Some((key.clone(), (*value).clone()));
+                }
+                if maximum.as_ref().is_none_or(|(maximum, _)| key > *maximum) {
+                    maximum = Some((key, (*value).clone()));
+                }
+            }
+            (
+                minimum.map(|(_, value)| value),
+                maximum.map(|(_, value)| value),
+            )
+        } else {
+            (None, None)
+        };
+        columns.insert(
+            column.id,
+            ColumnStatistics {
+                null_count,
+                distinct_count: distinct.len() as u64,
+                min,
+                max,
+            },
+        );
+    }
+    Ok(TableStatistics {
+        row_count: rows.len() as u64,
+        columns,
+    })
 }
 
 fn table_definition(state: &DatabaseState, table_id: TableId) -> Result<&TableDefinition> {
@@ -976,5 +1386,135 @@ mod tests {
         }
         assert!(directory.path().join("ordadb.data").is_file());
         assert!(Engine::open(EngineConfig::new(directory.path())).is_ok());
+    }
+
+    #[test]
+    fn executes_inner_left_join_grouped_aggregates_and_having() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE customers (id BIGINT PRIMARY KEY, name TEXT NOT NULL)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "CREATE TABLE orders (id BIGINT PRIMARY KEY, customer_id BIGINT, amount BIGINT)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob')",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO orders VALUES (10, 1, 5), (11, 1, 7)",
+            &[],
+        );
+
+        let grouped = execute(
+            &mut session,
+            "SELECT c.id, COUNT(o.id) AS order_count, SUM(o.amount) AS total \
+             FROM customers c LEFT JOIN orders o ON c.id = o.customer_id \
+             GROUP BY c.id ORDER BY c.id",
+            &[],
+        );
+        assert_eq!(
+            rows(&grouped),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Int64(2), Value::Int64(12)]),
+                Row::new(vec![Value::Int64(2), Value::Int64(0), Value::Null]),
+            ]
+        );
+
+        let having = execute(
+            &mut session,
+            "SELECT c.id, COUNT(o.id) AS order_count \
+             FROM customers c INNER JOIN orders o ON c.id = o.customer_id \
+             GROUP BY c.id HAVING COUNT(o.id) > 1",
+            &[],
+        );
+        assert_eq!(
+            rows(&having),
+            vec![Row::new(vec![Value::Int64(1), Value::Int64(2)])]
+        );
+
+        let aggregate = execute(
+            &mut session,
+            "SELECT COUNT(*), AVG(amount), MIN(amount), MAX(amount) FROM orders",
+            &[],
+        );
+        assert_eq!(
+            rows(&aggregate),
+            vec![Row::new(vec![
+                Value::Int64(2),
+                Value::Float64(6.0),
+                Value::Int64(5),
+                Value::Int64(7),
+            ])]
+        );
+    }
+
+    #[test]
+    fn persists_covering_indexes_statistics_and_explains_real_access_paths() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let engine = Engine::open(EngineConfig::new(directory.path())).expect("open");
+            let mut session = engine.connect().expect("connect");
+            execute(
+                &mut session,
+                "CREATE TABLE metrics (id BIGINT PRIMARY KEY, bucket BIGINT, score BIGINT, payload TEXT)",
+                &[],
+            );
+            let values = (0..512)
+                .map(|value| format!("({value}, {}, {value}, 'p{value}')", value % 8))
+                .collect::<Vec<_>>()
+                .join(", ");
+            execute(
+                &mut session,
+                &format!("INSERT INTO metrics VALUES {values}"),
+                &[],
+            );
+            let duplicate = session
+                .execute(
+                    "CREATE UNIQUE INDEX metrics_bucket_unique ON metrics (bucket)",
+                    &[],
+                )
+                .expect_err("duplicate unique build");
+            assert_eq!(duplicate.sql_state, "23505");
+            execute(
+                &mut session,
+                "CREATE INDEX metrics_score_idx ON metrics (score) INCLUDE (payload)",
+                &[],
+            );
+        }
+
+        let engine = Engine::open(EngineConfig::new(directory.path())).expect("reopen");
+        let mut session = engine.connect().expect("connect");
+        let explain = execute(
+            &mut session,
+            "EXPLAIN SELECT payload FROM metrics WHERE score = 511",
+            &[],
+        );
+        let plan = rows(&explain)
+            .into_iter()
+            .filter_map(|row| match row.values.as_slice() {
+                [Value::Text(line)] => Some(line.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            plan.iter().any(|line| line.contains("Index Scan")),
+            "{plan:?}"
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT payload FROM metrics WHERE score = 511",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Text("p511".into())])]
+        );
     }
 }

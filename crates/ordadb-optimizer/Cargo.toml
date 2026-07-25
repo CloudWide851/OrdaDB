@@ -1,0 +1,12 @@
+[package]
+name = "ordadb-optimizer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ordadb-catalog = { path = "../ordadb-catalog" }
+ordadb-sql = { path = "../ordadb-sql" }
+ordadb-types = { path = "../ordadb-types" }

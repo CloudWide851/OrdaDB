@@ -1,5 +1,5 @@
 [package]
-name = "ordadb-storage"
+name = "ordadb-index"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,14 +8,6 @@ authors.workspace = true
 
 [dependencies]
 chrono.workspace = true
-crc32c.workspace = true
-ordadb-catalog = { path = "../ordadb-catalog" }
-ordadb-index = { path = "../ordadb-index" }
 ordadb-types = { path = "../ordadb-types" }
 rust_decimal.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

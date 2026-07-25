@@ -1,5 +1,5 @@
 [package]
-name = "ordadb-engine"
+name = "ordadb-execution"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,14 +7,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-ordadb-catalog = { path = "../ordadb-catalog" }
-ordadb-execution = { path = "../ordadb-execution" }
 ordadb-index = { path = "../ordadb-index" }
 ordadb-optimizer = { path = "../ordadb-optimizer" }
 ordadb-sql = { path = "../ordadb-sql" }
-ordadb-storage = { path = "../ordadb-storage" }
 ordadb-types = { path = "../ordadb-types" }
-
-[dev-dependencies]
-serde_json.workspace = true
-tempfile.workspace = true
+rust_decimal.workspace = true

@@ -8,15 +8,17 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::str::FromStr;
 
-use ordadb_catalog::{Catalog, NewColumn, TableDefinition};
+use ordadb_catalog::{Catalog, NewColumn, NewIndex, TableDefinition, indexable_type};
 use ordadb_types::{DbError, Field, Identifier, Result, ScalarType, Schema, TableId, Value};
 use rust_decimal::Decimal;
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator as SqlBinaryOperator, CharacterLength, ColumnOption,
-    CreateTable, DataType, ExactNumberInfo, Expr as SqlExpr, FromTable, GroupByExpr, Ident,
+    CreateTable, DataType, ExactNumberInfo, Expr as SqlExpr, FromTable, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
     LimitClause, ObjectName, ObjectNamePart, OrderByKind, Query, SchemaName, Select, SelectItem,
-    SetExpr, Spanned, Statement as SqlStatement, TableConstraint, TableFactor, TableObject,
-    TableWithJoins, TimezoneInfo, UnaryOperator as SqlUnaryOperator, Value as SqlValue,
+    SetExpr, Spanned, Statement as SqlStatement, TableAlias, TableConstraint, TableFactor,
+    TableObject, TableWithJoins, TimezoneInfo, UnaryOperator as SqlUnaryOperator,
+    Value as SqlValue,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -61,6 +63,19 @@ pub enum ParsedExprKind {
         op: BinaryOperator,
         right: Box<ParsedExpr>,
     },
+    Aggregate {
+        function: AggregateFunction,
+        argument: Option<Box<ParsedExpr>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunction {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +121,25 @@ pub struct ParsedColumn {
     pub unique: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedTable {
+    pub name: ParsedObjectName,
+    pub alias: Option<ParsedIdentifier>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedJoin {
+    pub table: ParsedTable,
+    pub kind: JoinKind,
+    pub on: ParsedExpr,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedStatement {
     CreateSchema {
@@ -114,6 +148,13 @@ pub enum ParsedStatement {
     CreateTable {
         name: ParsedObjectName,
         columns: Vec<ParsedColumn>,
+    },
+    CreateIndex {
+        name: ParsedIdentifier,
+        table: ParsedObjectName,
+        key_columns: Vec<ParsedIdentifier>,
+        include_columns: Vec<ParsedIdentifier>,
+        unique: bool,
     },
     Insert {
         table: ParsedObjectName,
@@ -126,6 +167,19 @@ pub enum ParsedStatement {
         filter: Option<ParsedExpr>,
         order_by: Vec<ParsedOrder>,
         limit: Option<ParsedExpr>,
+    },
+    AdvancedSelect {
+        table: ParsedTable,
+        joins: Vec<ParsedJoin>,
+        projection: Vec<ParsedProjection>,
+        filter: Option<ParsedExpr>,
+        group_by: Vec<ParsedExpr>,
+        having: Option<ParsedExpr>,
+        order_by: Vec<ParsedOrder>,
+        limit: Option<ParsedExpr>,
+    },
+    Explain {
+        statement: Box<ParsedStatement>,
     },
     Update {
         table: ParsedObjectName,
@@ -163,6 +217,10 @@ pub enum BoundExprKind {
         op: BinaryOperator,
         right: Box<BoundExpr>,
     },
+    Aggregate {
+        function: AggregateFunction,
+        argument: Option<Box<BoundExpr>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -178,6 +236,22 @@ pub struct BoundOrder {
     pub nulls_first: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundTable {
+    pub table_id: TableId,
+    pub binding: Identifier,
+    pub offset: usize,
+    pub width: usize,
+    pub nullable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundJoin {
+    pub table: BoundTable,
+    pub kind: JoinKind,
+    pub on: BoundExpr,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundStatement {
     CreateSchema {
@@ -187,6 +261,10 @@ pub enum BoundStatement {
         schema: Identifier,
         name: Identifier,
         columns: Vec<NewColumn>,
+    },
+    CreateIndex {
+        table_id: TableId,
+        index: NewIndex,
     },
     Insert {
         table_id: TableId,
@@ -200,6 +278,21 @@ pub enum BoundStatement {
         filter: Option<BoundExpr>,
         order_by: Vec<BoundOrder>,
         limit: Option<BoundExpr>,
+    },
+    AdvancedSelect {
+        table: BoundTable,
+        joins: Vec<BoundJoin>,
+        schema: Schema,
+        projection: Vec<BoundProjection>,
+        filter: Option<BoundExpr>,
+        group_by: Vec<BoundExpr>,
+        having: Option<BoundExpr>,
+        order_by: Vec<BoundOrder>,
+        limit: Option<BoundExpr>,
+        aggregate: bool,
+    },
+    Explain {
+        statement: Box<BoundStatement>,
     },
     Update {
         table_id: TableId,
@@ -251,6 +344,13 @@ pub fn bind(statement: ParsedStatement, catalog: &Catalog) -> Result<BoundStatem
             Ok(BoundStatement::CreateSchema { name: name.name })
         }
         ParsedStatement::CreateTable { name, columns } => bind_create_table(name, columns, catalog),
+        ParsedStatement::CreateIndex {
+            name,
+            table,
+            key_columns,
+            include_columns,
+            unique,
+        } => bind_create_index(name, table, key_columns, include_columns, unique, catalog),
         ParsedStatement::Insert {
             table,
             columns,
@@ -263,6 +363,40 @@ pub fn bind(statement: ParsedStatement, catalog: &Catalog) -> Result<BoundStatem
             order_by,
             limit,
         } => bind_select(table, projection, filter, order_by, limit, catalog),
+        ParsedStatement::AdvancedSelect {
+            table,
+            joins,
+            projection,
+            filter,
+            group_by,
+            having,
+            order_by,
+            limit,
+        } => bind_advanced_select(
+            AdvancedSelectInput {
+                table,
+                joins,
+                projection,
+                filter,
+                group_by,
+                having,
+                order_by,
+                limit,
+            },
+            catalog,
+        ),
+        ParsedStatement::Explain { statement } => {
+            let statement = bind(*statement, catalog)?;
+            if !matches!(
+                statement,
+                BoundStatement::Select { .. } | BoundStatement::AdvancedSelect { .. }
+            ) {
+                return unsupported("EXPLAIN supports SELECT statements only");
+            }
+            Ok(BoundStatement::Explain {
+                statement: Box::new(statement),
+            })
+        }
         ParsedStatement::Update {
             table,
             assignments,
@@ -300,6 +434,40 @@ fn convert_statement(statement: SqlStatement, sql: &str) -> Result<ParsedStateme
             Ok(ParsedStatement::CreateSchema { name: name.clone() })
         }
         SqlStatement::CreateTable(table) => convert_create_table(table, sql),
+        SqlStatement::CreateIndex(index) => {
+            if index.using.is_some()
+                || index.concurrently
+                || index.if_not_exists
+                || index.nulls_distinct.is_some()
+                || !index.with.is_empty()
+                || index.predicate.is_some()
+                || !index.index_options.is_empty()
+                || !index.alter_options.is_empty()
+            {
+                return unsupported("this CREATE INDEX form is not supported yet");
+            }
+            let name = index
+                .name
+                .ok_or_else(|| DbError::new(SYNTAX_ERROR, "CREATE INDEX requires a name"))?;
+            let name = convert_single_identifier(name, sql)?;
+            let key_columns = index
+                .columns
+                .iter()
+                .map(|column| convert_index_column(column, sql))
+                .collect::<Result<Vec<_>>>()?;
+            let include_columns = index
+                .include
+                .into_iter()
+                .map(|column| convert_ident(column, sql))
+                .collect();
+            Ok(ParsedStatement::CreateIndex {
+                name,
+                table: convert_object_name(index.table_name, sql)?,
+                key_columns,
+                include_columns,
+                unique: index.unique,
+            })
+        }
         SqlStatement::Insert(insert) => {
             if !insert.optimizer_hints.is_empty()
                 || insert.or.is_some()
@@ -400,6 +568,24 @@ fn convert_statement(statement: SqlStatement, sql: &str) -> Result<ParsedStateme
                     .selection
                     .map(|expr| convert_expr(expr, sql))
                     .transpose()?,
+            })
+        }
+        SqlStatement::Explain {
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement,
+            format,
+            options,
+            ..
+        } => {
+            if analyze || verbose || query_plan || estimate || format.is_some() || options.is_some()
+            {
+                return unsupported("EXPLAIN options and EXPLAIN ANALYZE are not supported yet");
+            }
+            Ok(ParsedStatement::Explain {
+                statement: Box::new(convert_statement(*statement, sql)?),
             })
         }
         _ => unsupported("SQL statement is not supported in this milestone"),
@@ -592,8 +778,6 @@ fn convert_select(
     limit: Option<ParsedExpr>,
     sql: &str,
 ) -> Result<ParsedStatement> {
-    let group_by_is_empty = matches!(&select.group_by, GroupByExpr::Expressions(expressions, modifiers)
-            if expressions.is_empty() && modifiers.is_empty());
     if !select.optimizer_hints.is_empty()
         || select.distinct.is_some()
         || select.select_modifiers.is_some()
@@ -603,18 +787,14 @@ fn convert_select(
         || !select.lateral_views.is_empty()
         || select.prewhere.is_some()
         || !select.connect_by.is_empty()
-        || !group_by_is_empty
         || !select.cluster_by.is_empty()
         || !select.distribute_by.is_empty()
         || !select.sort_by.is_empty()
-        || select.having.is_some()
         || !select.named_window.is_empty()
         || select.qualify.is_some()
         || select.value_table_mode.is_some()
     {
-        return unsupported(
-            "joins, aggregates, DISTINCT, and extended SELECT clauses are not supported yet",
-        );
+        return unsupported("DISTINCT and extended SELECT clauses are not supported yet");
     }
     if select.from.len() != 1 {
         return unsupported("SELECT supports exactly one table");
@@ -636,24 +816,147 @@ fn convert_select(
             _ => unsupported("qualified wildcards and multiple aliases are not supported yet"),
         })
         .collect::<Result<Vec<_>>>()?;
-
-    Ok(ParsedStatement::Select {
-        table: convert_table_with_joins(
-            select
-                .from
-                .into_iter()
-                .next()
-                .ok_or_else(|| DbError::new(SYNTAX_ERROR, "SELECT requires a table"))?,
-            sql,
-        )?,
-        projection,
-        filter: select
-            .selection
+    let filter = select
+        .selection
+        .map(|expr| convert_expr(expr, sql))
+        .transpose()?;
+    let group_by = match select.group_by {
+        GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => expressions
+            .into_iter()
             .map(|expr| convert_expr(expr, sql))
+            .collect::<Result<Vec<_>>>()?,
+        GroupByExpr::Expressions(_, _) => {
+            return unsupported("GROUP BY modifiers are not supported yet");
+        }
+        GroupByExpr::All(_) => return unsupported("GROUP BY ALL is not supported yet"),
+    };
+    let having = select
+        .having
+        .map(|expr| convert_expr(expr, sql))
+        .transpose()?;
+    let from = select
+        .from
+        .into_iter()
+        .next()
+        .ok_or_else(|| DbError::new(SYNTAX_ERROR, "SELECT requires a table"))?;
+    let advanced = !from.joins.is_empty()
+        || !group_by.is_empty()
+        || having.is_some()
+        || projection.iter().any(projection_has_aggregate);
+    if advanced {
+        let (table, joins) = convert_select_from(from, sql)?;
+        Ok(ParsedStatement::AdvancedSelect {
+            table,
+            joins,
+            projection,
+            filter,
+            group_by,
+            having,
+            order_by,
+            limit,
+        })
+    } else {
+        Ok(ParsedStatement::Select {
+            table: convert_table_with_joins(from, sql)?,
+            projection,
+            filter,
+            order_by,
+            limit,
+        })
+    }
+}
+
+fn convert_select_from(table: TableWithJoins, sql: &str) -> Result<(ParsedTable, Vec<ParsedJoin>)> {
+    let first = convert_select_table(table.relation, sql)?;
+    let joins = table
+        .joins
+        .into_iter()
+        .map(|join| {
+            if join.global {
+                return unsupported("GLOBAL joins are not supported");
+            }
+            let (kind, constraint) = match join.join_operator {
+                JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
+                    (JoinKind::Inner, constraint)
+                }
+                JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
+                    (JoinKind::Left, constraint)
+                }
+                _ => return unsupported("only INNER and LEFT joins are supported"),
+            };
+            let JoinConstraint::On(on) = constraint else {
+                return unsupported("joins require an ON predicate");
+            };
+            Ok(ParsedJoin {
+                table: convert_select_table(join.relation, sql)?,
+                kind,
+                on: convert_expr(on, sql)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((first, joins))
+}
+
+fn convert_select_table(table: TableFactor, sql: &str) -> Result<ParsedTable> {
+    let TableFactor::Table {
+        name,
+        alias,
+        args,
+        with_hints,
+        version,
+        with_ordinality,
+        partitions,
+        json_path,
+        sample,
+        index_hints,
+    } = table
+    else {
+        return unsupported("derived tables and table functions are not supported yet");
+    };
+    if args.is_some()
+        || !with_hints.is_empty()
+        || version.is_some()
+        || with_ordinality
+        || !partitions.is_empty()
+        || json_path.is_some()
+        || sample.is_some()
+        || !index_hints.is_empty()
+    {
+        return unsupported("table modifiers are not supported yet");
+    }
+    Ok(ParsedTable {
+        name: convert_object_name(name, sql)?,
+        alias: alias
+            .map(|alias| convert_table_alias(alias, sql))
             .transpose()?,
-        order_by,
-        limit,
     })
+}
+
+fn convert_table_alias(alias: TableAlias, sql: &str) -> Result<ParsedIdentifier> {
+    if !alias.columns.is_empty() {
+        return unsupported("column aliases on table bindings are not supported yet");
+    }
+    Ok(convert_ident(alias.name, sql))
+}
+
+fn projection_has_aggregate(projection: &ParsedProjection) -> bool {
+    match projection {
+        ParsedProjection::Wildcard => false,
+        ParsedProjection::Expression { expr, .. } => expr_has_aggregate(expr),
+    }
+}
+
+fn expr_has_aggregate(expr: &ParsedExpr) -> bool {
+    match &expr.kind {
+        ParsedExprKind::Aggregate { .. } => true,
+        ParsedExprKind::Unary { expr, .. } => expr_has_aggregate(expr),
+        ParsedExprKind::Binary { left, right, .. } => {
+            expr_has_aggregate(left) || expr_has_aggregate(right)
+        }
+        ParsedExprKind::Column(_) | ParsedExprKind::Literal(_) | ParsedExprKind::Parameter(_) => {
+            false
+        }
+    }
 }
 
 fn convert_values_query(query: Query, sql: &str) -> Result<Vec<Vec<ParsedExpr>>> {
@@ -763,6 +1066,58 @@ fn convert_expr(expr: SqlExpr, sql: &str) -> Result<ParsedExpr> {
                 left: Box::new(convert_expr(*left, sql)?),
                 op,
                 right: Box::new(convert_expr(*right, sql)?),
+            }
+        }
+        SqlExpr::Function(function) => {
+            if function.uses_odbc_syntax
+                || !matches!(function.parameters, FunctionArguments::None)
+                || function.filter.is_some()
+                || function.null_treatment.is_some()
+                || function.over.is_some()
+                || !function.within_group.is_empty()
+            {
+                return unsupported_at(
+                    "aggregate options and window functions are not supported yet",
+                    position,
+                );
+            }
+            let function_name = function.name.to_string().to_ascii_lowercase();
+            let aggregate_function = match function_name.as_str() {
+                "count" => AggregateFunction::Count,
+                "sum" => AggregateFunction::Sum,
+                "avg" => AggregateFunction::Avg,
+                "min" => AggregateFunction::Min,
+                "max" => AggregateFunction::Max,
+                _ => return unsupported_at("this SQL function is not supported yet", position),
+            };
+            let FunctionArguments::List(arguments) = function.args else {
+                return unsupported_at("aggregate arguments must use parentheses", position);
+            };
+            if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+                return unsupported_at(
+                    "DISTINCT and ordered aggregate arguments are not supported yet",
+                    position,
+                );
+            }
+            let argument = match arguments.args.as_slice() {
+                [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
+                    if aggregate_function == AggregateFunction::Count =>
+                {
+                    None
+                }
+                [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] => {
+                    Some(Box::new(convert_expr(argument.clone(), sql)?))
+                }
+                _ => {
+                    return unsupported_at(
+                        "aggregate requires one expression, or COUNT(*)",
+                        position,
+                    );
+                }
+            };
+            ParsedExprKind::Aggregate {
+                function: aggregate_function,
+                argument,
             }
         }
         _ => return unsupported_at("this SQL expression is not supported yet", position),
@@ -1054,6 +1409,559 @@ fn bind_insert(
     })
 }
 
+fn bind_create_index(
+    name: ParsedIdentifier,
+    table_name: ParsedObjectName,
+    key_columns: Vec<ParsedIdentifier>,
+    include_columns: Vec<ParsedIdentifier>,
+    unique: bool,
+    catalog: &Catalog,
+) -> Result<BoundStatement> {
+    let table = resolve_table(&table_name, catalog)?;
+    if key_columns.is_empty() {
+        return Err(DbError::new(
+            SYNTAX_ERROR,
+            "CREATE INDEX requires at least one key column",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for column in key_columns.iter().chain(&include_columns) {
+        let definition = table.column(&column.name).ok_or_else(|| {
+            DbError::new(
+                UNDEFINED_COLUMN,
+                format!("column {} does not exist", column.name),
+            )
+            .with_position_opt(column.position)
+        })?;
+        if !seen.insert(definition.id) {
+            return Err(DbError::new(
+                "42701",
+                format!("column {} specified more than once", column.name),
+            )
+            .with_position_opt(column.position));
+        }
+    }
+    for column in &key_columns {
+        let definition = table
+            .column(&column.name)
+            .ok_or_else(|| DbError::internal("validated index column disappeared"))?;
+        if !indexable_type(&definition.data_type) {
+            return Err(DbError::new(
+                DATATYPE_MISMATCH,
+                format!("column {} has no B+Tree ordering", column.name),
+            )
+            .with_position_opt(column.position));
+        }
+    }
+    Ok(BoundStatement::CreateIndex {
+        table_id: table.id,
+        index: NewIndex {
+            name: name.name,
+            key_columns: key_columns.into_iter().map(|column| column.name).collect(),
+            include_columns: include_columns
+                .into_iter()
+                .map(|column| column.name)
+                .collect(),
+            unique,
+        },
+    })
+}
+
+#[derive(Debug, Clone)]
+struct InputColumn {
+    binding: Identifier,
+    name: Identifier,
+    index: usize,
+    data_type: ScalarType,
+    nullable: bool,
+}
+
+struct AdvancedSelectInput {
+    table: ParsedTable,
+    joins: Vec<ParsedJoin>,
+    projection: Vec<ParsedProjection>,
+    filter: Option<ParsedExpr>,
+    group_by: Vec<ParsedExpr>,
+    having: Option<ParsedExpr>,
+    order_by: Vec<ParsedOrder>,
+    limit: Option<ParsedExpr>,
+}
+
+fn bind_advanced_select(input: AdvancedSelectInput, catalog: &Catalog) -> Result<BoundStatement> {
+    let AdvancedSelectInput {
+        table,
+        joins,
+        projection,
+        filter,
+        group_by,
+        having,
+        order_by,
+        limit,
+    } = input;
+    let mut inputs = Vec::new();
+    let table = bind_input_table(table, false, catalog, &mut inputs)?;
+    let mut bound_joins = Vec::new();
+    for join in joins {
+        let nullable = join.kind == JoinKind::Left;
+        let table = bind_input_table(join.table, nullable, catalog, &mut inputs)?;
+        let on = bind_multi_boolean(join.on, &inputs)?;
+        if bound_expr_has_aggregate(&on) {
+            return Err(DbError::new(
+                "42803",
+                "aggregate functions are not allowed in JOIN conditions",
+            ));
+        }
+        bound_joins.push(BoundJoin {
+            table,
+            kind: join.kind,
+            on,
+        });
+    }
+
+    let mut bound_projection = Vec::new();
+    for item in projection {
+        match item {
+            ParsedProjection::Wildcard => {
+                for input in &inputs {
+                    bound_projection.push(BoundProjection {
+                        expr: BoundExpr {
+                            kind: BoundExprKind::Column { index: input.index },
+                            data_type: input.data_type.clone(),
+                            nullable: input.nullable,
+                        },
+                        field: Field::new(
+                            input.name.as_str(),
+                            input.data_type.clone(),
+                            input.nullable,
+                        ),
+                    });
+                }
+            }
+            ParsedProjection::Expression { expr, alias } => {
+                let default_name = projection_name(&expr);
+                let bound = bind_expr_multi(expr, &inputs, None, true)?;
+                bound_projection.push(BoundProjection {
+                    field: Field::new(
+                        alias
+                            .as_ref()
+                            .map_or(default_name.as_str(), |alias| alias.name.as_str()),
+                        bound.data_type.clone(),
+                        bound.nullable,
+                    ),
+                    expr: bound,
+                });
+            }
+        }
+    }
+    if bound_projection.is_empty() {
+        return Err(DbError::new(SYNTAX_ERROR, "SELECT projection is empty"));
+    }
+
+    let filter = filter
+        .map(|expr| bind_multi_boolean(expr, &inputs))
+        .transpose()?;
+    if filter.as_ref().is_some_and(bound_expr_has_aggregate) {
+        return Err(DbError::new(
+            "42803",
+            "aggregate functions are not allowed in WHERE",
+        ));
+    }
+    let group_by = group_by
+        .into_iter()
+        .map(|expr| bind_expr_multi(expr, &inputs, None, false))
+        .collect::<Result<Vec<_>>>()?;
+    let having = having
+        .map(|expr| bind_multi_boolean(expr, &inputs))
+        .transpose()?;
+    let aggregate = !group_by.is_empty()
+        || bound_projection
+            .iter()
+            .any(|projection| bound_expr_has_aggregate(&projection.expr))
+        || having.as_ref().is_some_and(bound_expr_has_aggregate);
+    if aggregate {
+        for projection in &bound_projection {
+            validate_grouped_expr(&projection.expr, &group_by)?;
+        }
+        if let Some(having) = &having {
+            validate_grouped_expr(having, &group_by)?;
+        }
+    } else if having.is_some() {
+        return Err(DbError::new(
+            "42803",
+            "HAVING requires grouping or an aggregate",
+        ));
+    }
+
+    let order_by = order_by
+        .into_iter()
+        .map(|order| {
+            let ParsedExprKind::Column(column) = order.expr.kind else {
+                return unsupported_at(
+                    "ORDER BY supports source columns only",
+                    order.expr.position,
+                );
+            };
+            Ok(BoundOrder {
+                column_index: resolve_input_column(&column, &inputs)?.index,
+                ascending: order.ascending,
+                nulls_first: order.nulls_first,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let limit = limit
+        .map(|expr| bind_expr_multi(expr, &inputs, Some(&ScalarType::Int64), false))
+        .transpose()?;
+    let schema = Schema::new(
+        bound_projection
+            .iter()
+            .map(|projection| projection.field.clone())
+            .collect(),
+    );
+    Ok(BoundStatement::AdvancedSelect {
+        table,
+        joins: bound_joins,
+        schema,
+        projection: bound_projection,
+        filter,
+        group_by,
+        having,
+        order_by,
+        limit,
+        aggregate,
+    })
+}
+
+fn bind_input_table(
+    parsed: ParsedTable,
+    nullable: bool,
+    catalog: &Catalog,
+    inputs: &mut Vec<InputColumn>,
+) -> Result<BoundTable> {
+    let table = resolve_table(&parsed.name, catalog)?;
+    let binding = parsed
+        .alias
+        .as_ref()
+        .map_or_else(|| table.name.clone(), |alias| alias.name.clone());
+    if inputs.iter().any(|input| input.binding == binding) {
+        return Err(DbError::new(
+            "42712",
+            format!("table name {binding} specified more than once"),
+        ));
+    }
+    let offset = inputs.len();
+    inputs.extend(
+        table
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(column_offset, column)| InputColumn {
+                binding: binding.clone(),
+                name: column.name.clone(),
+                index: offset + column_offset,
+                data_type: column.data_type.clone(),
+                nullable: nullable || column.nullable,
+            }),
+    );
+    Ok(BoundTable {
+        table_id: table.id,
+        binding,
+        offset,
+        width: table.columns().len(),
+        nullable,
+    })
+}
+
+fn bind_multi_boolean(expr: ParsedExpr, inputs: &[InputColumn]) -> Result<BoundExpr> {
+    let position = expr.position;
+    let bound = bind_expr_multi(expr, inputs, Some(&ScalarType::Boolean), true)?;
+    if bound.data_type != ScalarType::Boolean {
+        return Err(DbError::new(DATATYPE_MISMATCH, "predicate must be boolean")
+            .with_position_opt(position));
+    }
+    Ok(bound)
+}
+
+fn bind_expr_multi(
+    expr: ParsedExpr,
+    inputs: &[InputColumn],
+    expected: Option<&ScalarType>,
+    allow_aggregate: bool,
+) -> Result<BoundExpr> {
+    let position = expr.position;
+    match expr.kind {
+        ParsedExprKind::Column(name) => {
+            let column = resolve_input_column(&name, inputs)?;
+            if let Some(expected) = expected {
+                ensure_types_compatible(&column.data_type, expected, position)?;
+            }
+            Ok(BoundExpr {
+                kind: BoundExprKind::Column {
+                    index: column.index,
+                },
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+            })
+        }
+        ParsedExprKind::Literal(value) => bind_literal(value, expected, position),
+        ParsedExprKind::Parameter(index) => {
+            let data_type = expected.cloned().ok_or_else(|| {
+                DbError::new(
+                    INDETERMINATE_DATATYPE,
+                    format!("could not determine data type of parameter ${index}"),
+                )
+                .with_position_opt(position)
+            })?;
+            Ok(BoundExpr {
+                kind: BoundExprKind::Parameter { index },
+                data_type,
+                nullable: true,
+            })
+        }
+        ParsedExprKind::Unary { op, expr } => {
+            let expected_type = match op {
+                UnaryOperator::Not => Some(&ScalarType::Boolean),
+                UnaryOperator::Negate => expected,
+            };
+            let bound = bind_expr_multi(*expr, inputs, expected_type, allow_aggregate)?;
+            match op {
+                UnaryOperator::Not if bound.data_type != ScalarType::Boolean => Err(DbError::new(
+                    DATATYPE_MISMATCH,
+                    "NOT operand must be boolean",
+                )
+                .with_position_opt(position)),
+                UnaryOperator::Negate if !is_numeric(&bound.data_type) => Err(DbError::new(
+                    DATATYPE_MISMATCH,
+                    "unary minus requires a numeric operand",
+                )
+                .with_position_opt(position)),
+                _ => {
+                    let data_type = bound.data_type.clone();
+                    let nullable = bound.nullable;
+                    Ok(BoundExpr {
+                        kind: BoundExprKind::Unary {
+                            op,
+                            expr: Box::new(bound),
+                        },
+                        data_type,
+                        nullable,
+                    })
+                }
+            }
+        }
+        ParsedExprKind::Binary { left, op, right } => {
+            bind_multi_binary(*left, op, *right, inputs, position, allow_aggregate)
+        }
+        ParsedExprKind::Aggregate { function, argument } => {
+            if !allow_aggregate {
+                return Err(DbError::new(
+                    "42803",
+                    "aggregate functions are not allowed in this clause",
+                )
+                .with_position_opt(position));
+            }
+            let argument = argument
+                .map(|argument| bind_expr_multi(*argument, inputs, None, false))
+                .transpose()?;
+            let (data_type, nullable) = match (function, argument.as_ref()) {
+                (AggregateFunction::Count, _) => (ScalarType::Int64, false),
+                (AggregateFunction::Avg, Some(argument)) if is_numeric(&argument.data_type) => {
+                    (ScalarType::Float64, true)
+                }
+                (AggregateFunction::Sum, Some(argument)) if is_numeric(&argument.data_type) => {
+                    let data_type = match argument.data_type {
+                        ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64 => {
+                            ScalarType::Int64
+                        }
+                        ScalarType::Float32 | ScalarType::Float64 => ScalarType::Float64,
+                        ScalarType::Decimal { .. } => argument.data_type.clone(),
+                        _ => unreachable!("numeric guard"),
+                    };
+                    (data_type, true)
+                }
+                (AggregateFunction::Min | AggregateFunction::Max, Some(argument))
+                    if indexable_type(&argument.data_type) =>
+                {
+                    (argument.data_type.clone(), true)
+                }
+                _ => {
+                    return Err(DbError::new(
+                        DATATYPE_MISMATCH,
+                        "aggregate argument has an incompatible type",
+                    )
+                    .with_position_opt(position));
+                }
+            };
+            Ok(BoundExpr {
+                kind: BoundExprKind::Aggregate {
+                    function,
+                    argument: argument.map(Box::new),
+                },
+                data_type,
+                nullable,
+            })
+        }
+    }
+}
+
+fn bind_multi_binary(
+    left: ParsedExpr,
+    op: BinaryOperator,
+    right: ParsedExpr,
+    inputs: &[InputColumn],
+    position: Option<usize>,
+    allow_aggregate: bool,
+) -> Result<BoundExpr> {
+    if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+        let left = bind_expr_multi(left, inputs, Some(&ScalarType::Boolean), allow_aggregate)?;
+        let right = bind_expr_multi(right, inputs, Some(&ScalarType::Boolean), allow_aggregate)?;
+        return Ok(BoundExpr {
+            nullable: left.nullable || right.nullable,
+            data_type: ScalarType::Boolean,
+            kind: BoundExprKind::Binary {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            },
+        });
+    }
+    let left_type = infer_multi_type(&left, inputs)?;
+    let right_type = infer_multi_type(&right, inputs)?;
+    let comparison_type = match (left_type, right_type) {
+        (Some(left), Some(right)) => common_type(&left, &right).ok_or_else(|| {
+            DbError::new(
+                DATATYPE_MISMATCH,
+                format!("cannot compare {left:?} with {right:?}"),
+            )
+            .with_position_opt(position)
+        })?,
+        (Some(data_type), None) | (None, Some(data_type)) => data_type,
+        (None, None) => {
+            return Err(DbError::new(
+                INDETERMINATE_DATATYPE,
+                "could not determine comparison operand types",
+            )
+            .with_position_opt(position));
+        }
+    };
+    let left = bind_expr_multi(left, inputs, Some(&comparison_type), allow_aggregate)?;
+    let right = bind_expr_multi(right, inputs, Some(&comparison_type), allow_aggregate)?;
+    Ok(BoundExpr {
+        nullable: left.nullable || right.nullable,
+        data_type: ScalarType::Boolean,
+        kind: BoundExprKind::Binary {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        },
+    })
+}
+
+fn infer_multi_type(expr: &ParsedExpr, inputs: &[InputColumn]) -> Result<Option<ScalarType>> {
+    match &expr.kind {
+        ParsedExprKind::Column(column) => Ok(Some(
+            resolve_input_column(column, inputs)?.data_type.clone(),
+        )),
+        ParsedExprKind::Literal(value) => Ok(value.scalar_type()),
+        ParsedExprKind::Parameter(_) => Ok(None),
+        ParsedExprKind::Unary { op, expr } => match op {
+            UnaryOperator::Not => Ok(Some(ScalarType::Boolean)),
+            UnaryOperator::Negate => infer_multi_type(expr, inputs),
+        },
+        ParsedExprKind::Binary { .. } => Ok(Some(ScalarType::Boolean)),
+        ParsedExprKind::Aggregate { function, argument } => match function {
+            AggregateFunction::Count => Ok(Some(ScalarType::Int64)),
+            AggregateFunction::Avg => Ok(Some(ScalarType::Float64)),
+            AggregateFunction::Sum => {
+                let data_type = argument
+                    .as_ref()
+                    .ok_or_else(|| {
+                        DbError::new(DATATYPE_MISMATCH, "aggregate requires an argument")
+                            .with_position_opt(expr.position)
+                    })
+                    .and_then(|argument| infer_multi_type(argument, inputs))?;
+                Ok(data_type.map(|data_type| match data_type {
+                    ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64 => ScalarType::Int64,
+                    ScalarType::Float32 | ScalarType::Float64 => ScalarType::Float64,
+                    other => other,
+                }))
+            }
+            AggregateFunction::Min | AggregateFunction::Max => argument
+                .as_ref()
+                .ok_or_else(|| {
+                    DbError::new(DATATYPE_MISMATCH, "aggregate requires an argument")
+                        .with_position_opt(expr.position)
+                })
+                .and_then(|argument| infer_multi_type(argument, inputs)),
+        },
+    }
+}
+
+fn resolve_input_column<'a>(
+    name: &ParsedObjectName,
+    inputs: &'a [InputColumn],
+) -> Result<&'a InputColumn> {
+    let (qualifier, column, position) = match name.parts.as_slice() {
+        [column] => (None, &column.name, column.position),
+        [qualifier, column] => (Some(&qualifier.name), &column.name, column.position),
+        _ => {
+            return unsupported_at(
+                "column references may contain at most a table qualifier",
+                name.parts.first().and_then(|part| part.position),
+            );
+        }
+    };
+    let matches = inputs
+        .iter()
+        .filter(|input| {
+            &input.name == column && qualifier.is_none_or(|qualifier| &input.binding == qualifier)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [column] => Ok(*column),
+        [] => Err(
+            DbError::new(UNDEFINED_COLUMN, format!("column {column} does not exist"))
+                .with_position_opt(position),
+        ),
+        _ => Err(
+            DbError::new("42702", format!("column reference {column} is ambiguous"))
+                .with_position_opt(position),
+        ),
+    }
+}
+
+fn bound_expr_has_aggregate(expr: &BoundExpr) -> bool {
+    match &expr.kind {
+        BoundExprKind::Aggregate { .. } => true,
+        BoundExprKind::Unary { expr, .. } => bound_expr_has_aggregate(expr),
+        BoundExprKind::Binary { left, right, .. } => {
+            bound_expr_has_aggregate(left) || bound_expr_has_aggregate(right)
+        }
+        BoundExprKind::Column { .. }
+        | BoundExprKind::Literal(_)
+        | BoundExprKind::Parameter { .. } => false,
+    }
+}
+
+fn validate_grouped_expr(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()> {
+    if group_by.iter().any(|group| group == expr) {
+        return Ok(());
+    }
+    match &expr.kind {
+        BoundExprKind::Aggregate { .. }
+        | BoundExprKind::Literal(_)
+        | BoundExprKind::Parameter { .. } => Ok(()),
+        BoundExprKind::Column { .. } => Err(DbError::new(
+            "42803",
+            "column must appear in GROUP BY or be used in an aggregate function",
+        )),
+        BoundExprKind::Unary { expr, .. } => validate_grouped_expr(expr, group_by),
+        BoundExprKind::Binary { left, right, .. } => {
+            validate_grouped_expr(left, group_by)?;
+            validate_grouped_expr(right, group_by)
+        }
+    }
+}
+
 fn bind_select(
     table_name: ParsedObjectName,
     projection: Vec<ParsedProjection>,
@@ -1283,6 +2191,9 @@ fn bind_expr(
         ParsedExprKind::Binary { left, op, right } => {
             bind_binary(*left, op, *right, table, position)
         }
+        ParsedExprKind::Aggregate { .. } => {
+            unsupported_at("aggregate is not valid in this statement", position)
+        }
     }
 }
 
@@ -1370,6 +2281,9 @@ fn infer_expr_type(
             UnaryOperator::Negate => infer_expr_type(inner, table),
         },
         ParsedExprKind::Binary { .. } => Ok(Some(ScalarType::Boolean)),
+        ParsedExprKind::Aggregate { .. } => {
+            unsupported_at("aggregate is not valid in this statement", expr.position)
+        }
     }
 }
 
@@ -1695,9 +2609,7 @@ mod tests {
     fn rejects_unsupported_syntax_without_panicking() {
         let catalog = catalog_with_documents();
         for sql in [
-            "SELECT * FROM documents d JOIN documents e ON d.id = e.id",
             "WITH d AS (SELECT * FROM documents) SELECT * FROM d",
-            "SELECT COUNT(*) FROM documents",
             "CREATE VIEW docs AS SELECT * FROM documents",
             "CREATE TABLE composite (a BIGINT, b BIGINT, PRIMARY KEY (a, b))",
         ] {
@@ -1706,6 +2618,48 @@ mod tests {
                 .expect_err("unsupported syntax");
             assert_eq!(error.sql_state, FEATURE_NOT_SUPPORTED, "{sql}");
         }
+    }
+
+    #[test]
+    fn binds_indexes_joins_aggregates_and_explain() {
+        let catalog = catalog_with_documents();
+        let index = bind(
+            parse("CREATE INDEX documents_title_idx ON documents (title) INCLUDE (id)")
+                .expect("parse index"),
+            &catalog,
+        )
+        .expect("bind index");
+        assert!(matches!(index, BoundStatement::CreateIndex { .. }));
+
+        let grouped = bind(
+            parse(
+                "SELECT d.id, COUNT(e.id) AS total \
+                 FROM documents d LEFT JOIN documents e ON d.id = e.id \
+                 GROUP BY d.id HAVING COUNT(e.id) > 0",
+            )
+            .expect("parse grouped join"),
+            &catalog,
+        )
+        .expect("bind grouped join");
+        let BoundStatement::AdvancedSelect {
+            joins,
+            aggregate,
+            group_by,
+            ..
+        } = grouped
+        else {
+            panic!("advanced select");
+        };
+        assert_eq!(joins.len(), 1);
+        assert!(aggregate);
+        assert_eq!(group_by.len(), 1);
+
+        let explain = bind(
+            parse("EXPLAIN SELECT id FROM documents WHERE id = 1").expect("parse explain"),
+            &catalog,
+        )
+        .expect("bind explain");
+        assert!(matches!(explain, BoundStatement::Explain { .. }));
     }
 
     #[test]

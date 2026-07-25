@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use ordadb_types::{
-    ColumnId, DatabaseId, DbError, Identifier, Result, ScalarType, SchemaId, TableId,
+    ColumnId, DatabaseId, DbError, Identifier, IndexId, Result, ScalarType, SchemaId, TableId,
+    Value,
 };
 use serde::{Deserialize, Serialize};
 
@@ -38,11 +39,48 @@ pub struct ColumnDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexDefinition {
+    pub id: IndexId,
+    pub table_id: TableId,
+    pub name: Identifier,
+    pub key_columns: Vec<ColumnId>,
+    pub include_columns: Vec<ColumnId>,
+    pub unique: bool,
+    pub primary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewIndex {
+    pub name: Identifier,
+    pub key_columns: Vec<Identifier>,
+    pub include_columns: Vec<Identifier>,
+    pub unique: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ColumnStatistics {
+    pub null_count: u64,
+    pub distinct_count: u64,
+    pub min: Option<Value>,
+    pub max: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TableStatistics {
+    pub row_count: u64,
+    pub columns: BTreeMap<ColumnId, ColumnStatistics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableDefinition {
     pub id: TableId,
     pub schema_id: SchemaId,
     pub name: Identifier,
     columns: Vec<ColumnDefinition>,
+    #[serde(default)]
+    indexes: BTreeMap<Identifier, IndexDefinition>,
+    #[serde(default)]
+    statistics: TableStatistics,
 }
 
 impl TableDefinition {
@@ -60,9 +98,28 @@ impl TableDefinition {
     pub fn column_index(&self, name: &Identifier) -> Option<usize> {
         self.columns.iter().position(|column| &column.name == name)
     }
+
+    #[must_use]
+    pub fn column_index_by_id(&self, id: ColumnId) -> Option<usize> {
+        self.columns.iter().position(|column| column.id == id)
+    }
+
+    pub fn indexes(&self) -> impl Iterator<Item = &IndexDefinition> {
+        self.indexes.values()
+    }
+
+    #[must_use]
+    pub fn index(&self, name: &Identifier) -> Option<&IndexDefinition> {
+        self.indexes.get(name)
+    }
+
+    #[must_use]
+    pub const fn statistics(&self) -> &TableStatistics {
+        &self.statistics
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaDefinition {
     pub id: SchemaId,
     pub database_id: DatabaseId,
@@ -81,7 +138,7 @@ impl SchemaDefinition {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatabaseDefinition {
     pub id: DatabaseId,
     pub name: Identifier,
@@ -99,12 +156,18 @@ impl DatabaseDefinition {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Catalog {
     database: DatabaseDefinition,
     next_schema_id: u64,
     next_table_id: u64,
     next_column_id: u64,
+    #[serde(default = "initial_index_id")]
+    next_index_id: u64,
+}
+
+const fn initial_index_id() -> u64 {
+    1
 }
 
 impl Default for Catalog {
@@ -135,6 +198,7 @@ impl Catalog {
             next_schema_id: 2,
             next_table_id: 1,
             next_column_id: 1,
+            next_index_id: initial_index_id(),
         }
     }
 
@@ -219,6 +283,32 @@ impl Catalog {
 
         let table_id = TableId::new(self.next_table_id);
         self.next_table_id += 1;
+        let mut indexes = BTreeMap::new();
+        for column in &definitions {
+            if column.unique {
+                let suffix = if column.primary_key { "pkey" } else { "key" };
+                let name = Identifier::unquoted(format!(
+                    "{}_{}_{}",
+                    table_name.as_str(),
+                    column.name.as_str(),
+                    suffix
+                ));
+                let id = IndexId::new(self.next_index_id);
+                self.next_index_id += 1;
+                indexes.insert(
+                    name.clone(),
+                    IndexDefinition {
+                        id,
+                        table_id,
+                        name,
+                        key_columns: vec![column.id],
+                        include_columns: Vec::new(),
+                        unique: true,
+                        primary: column.primary_key,
+                    },
+                );
+            }
+        }
         schema.tables.insert(
             table_name.clone(),
             TableDefinition {
@@ -226,6 +316,8 @@ impl Catalog {
                 schema_id: schema.id,
                 name: table_name,
                 columns: definitions,
+                indexes,
+                statistics: TableStatistics::default(),
             },
         );
         Ok(table_id)
@@ -247,13 +339,137 @@ impl Catalog {
             .flat_map(SchemaDefinition::tables)
             .find(|table| table.id == table_id)
     }
+
+    #[must_use]
+    pub fn index_by_id(&self, index_id: IndexId) -> Option<&IndexDefinition> {
+        self.database
+            .schemas()
+            .flat_map(SchemaDefinition::tables)
+            .flat_map(TableDefinition::indexes)
+            .find(|index| index.id == index_id)
+    }
+
+    pub fn create_index(&mut self, table_id: TableId, new_index: NewIndex) -> Result<IndexId> {
+        if new_index.key_columns.is_empty() {
+            return Err(DbError::new(
+                "42601",
+                "an index must contain at least one key column",
+            ));
+        }
+        if self
+            .database
+            .schemas()
+            .flat_map(SchemaDefinition::tables)
+            .any(|table| table.index(&new_index.name).is_some())
+        {
+            return Err(DbError::new(
+                "42P07",
+                format!("relation {} already exists", new_index.name),
+            ));
+        }
+
+        let table = self
+            .table_by_id(table_id)
+            .ok_or_else(|| DbError::new("42P01", "index owner table does not exist"))?;
+        let mut seen = BTreeMap::<ColumnId, ()>::new();
+        let key_columns = new_index
+            .key_columns
+            .iter()
+            .map(|name| {
+                let column = table.column(name).ok_or_else(|| {
+                    DbError::new("42703", format!("column {name} does not exist"))
+                })?;
+                if !indexable_type(&column.data_type) {
+                    return Err(DbError::new(
+                        "42804",
+                        format!("column {name} has no B+Tree ordering"),
+                    ));
+                }
+                if seen.insert(column.id, ()).is_some() {
+                    return Err(DbError::new(
+                        "42701",
+                        format!("column {name} specified more than once"),
+                    ));
+                }
+                Ok(column.id)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let include_columns = new_index
+            .include_columns
+            .iter()
+            .map(|name| {
+                let column = table.column(name).ok_or_else(|| {
+                    DbError::new("42703", format!("column {name} does not exist"))
+                })?;
+                if seen.insert(column.id, ()).is_some() {
+                    return Err(DbError::new(
+                        "42701",
+                        format!("column {name} specified more than once"),
+                    ));
+                }
+                Ok(column.id)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let id = IndexId::new(self.next_index_id);
+        self.next_index_id += 1;
+        let definition = IndexDefinition {
+            id,
+            table_id,
+            name: new_index.name.clone(),
+            key_columns,
+            include_columns,
+            unique: new_index.unique,
+            primary: false,
+        };
+        self.table_by_id_mut(table_id)?
+            .indexes
+            .insert(new_index.name, definition);
+        Ok(id)
+    }
+
+    pub fn set_table_statistics(
+        &mut self,
+        table_id: TableId,
+        statistics: TableStatistics,
+    ) -> Result<()> {
+        let table = self.table_by_id_mut(table_id)?;
+        if statistics
+            .columns
+            .keys()
+            .any(|column_id| table.column_index_by_id(*column_id).is_none())
+        {
+            return Err(DbError::internal(
+                "statistics reference a column outside their owner table",
+            ));
+        }
+        table.statistics = statistics;
+        Ok(())
+    }
+
+    fn table_by_id_mut(&mut self, table_id: TableId) -> Result<&mut TableDefinition> {
+        self.database
+            .schemas
+            .values_mut()
+            .flat_map(|schema| schema.tables.values_mut())
+            .find(|table| table.id == table_id)
+            .ok_or_else(|| DbError::new("42P01", "table does not exist"))
+    }
+}
+
+#[must_use]
+pub const fn indexable_type(data_type: &ScalarType) -> bool {
+    !matches!(
+        data_type,
+        ScalarType::Json | ScalarType::Jsonb | ScalarType::Vector { .. }
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use ordadb_types::{Identifier, ScalarType, SchemaId, TableId};
 
-    use super::{Catalog, NewColumn};
+    use super::{Catalog, NewColumn, NewIndex};
 
     #[test]
     fn bootstraps_public_schema_with_deterministic_ids() {
@@ -340,5 +556,64 @@ mod tests {
             .columns()[0];
         assert!(!column.nullable);
         assert!(column.unique);
+        let index = catalog
+            .table_by_id(table_id)
+            .expect("table")
+            .indexes()
+            .next()
+            .expect("primary index");
+        assert!(index.primary);
+        assert!(index.unique);
+    }
+
+    #[test]
+    fn creates_composite_covering_indexes_and_rejects_overlap() {
+        let mut catalog = Catalog::default();
+        let table_id = catalog
+            .create_table(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("events"),
+                vec![
+                    NewColumn::new(Identifier::unquoted("tenant"), ScalarType::Int64),
+                    NewColumn::new(
+                        Identifier::unquoted("created_at"),
+                        ScalarType::Timestamp {
+                            with_timezone: false,
+                        },
+                    ),
+                    NewColumn::new(Identifier::unquoted("payload"), ScalarType::Jsonb),
+                ],
+            )
+            .expect("table");
+        let index_id = catalog
+            .create_index(
+                table_id,
+                NewIndex {
+                    name: Identifier::unquoted("events_tenant_created"),
+                    key_columns: vec![
+                        Identifier::unquoted("tenant"),
+                        Identifier::unquoted("created_at"),
+                    ],
+                    include_columns: vec![Identifier::unquoted("payload")],
+                    unique: false,
+                },
+            )
+            .expect("index");
+        let index = catalog.index_by_id(index_id).expect("index by id");
+        assert_eq!(index.key_columns.len(), 2);
+        assert_eq!(index.include_columns.len(), 1);
+
+        let overlap = catalog
+            .create_index(
+                table_id,
+                NewIndex {
+                    name: Identifier::unquoted("bad"),
+                    key_columns: vec![Identifier::unquoted("tenant")],
+                    include_columns: vec![Identifier::unquoted("tenant")],
+                    unique: false,
+                },
+            )
+            .expect_err("overlap");
+        assert_eq!(overlap.sql_state, "42701");
     }
 }
