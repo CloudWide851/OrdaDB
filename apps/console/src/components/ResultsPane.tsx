@@ -66,7 +66,7 @@ export function ResultsPane() {
         </div>
       </div>
 
-      <div className="result-content" role="tabpanel">
+      <div className="result-content" role="tabpanel" key={activeTab}>
         {activeTab === "logs" ? (
           <LogView
             queryState={queryState}

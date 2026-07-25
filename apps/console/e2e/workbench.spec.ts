@@ -11,6 +11,22 @@ test.describe("OrdaDB SQL workbench", () => {
 
     await expect(page.getByText("OrdaDB", { exact: true })).toBeVisible();
     await expect(page.locator(".brand-logo")).toBeVisible();
+    await expect(page.locator(".titlebar")).toHaveCSS("height", "38px");
+    await expect(page.locator(".command-strip")).toHaveCount(0);
+    await expect(page.getByText("OrdaDB Local / default")).toHaveCount(0);
+    await expect(page.getByText("query_01.sql", { exact: true })).toHaveCount(1);
+    await expect(
+      page.getByText("query_01.sql", { exact: true }).locator(".."),
+    ).toHaveClass(/query-tab/);
+    await expect(page.locator("body")).toHaveCSS("font-size", "13px");
+    await expect(page.locator(".tree-row").first()).toHaveCSS(
+      "min-height",
+      "26px",
+    );
+    await expect(page.locator(".island").first()).toHaveCSS(
+      "border-radius",
+      "8px",
+    );
     await expect(
       page.getByRole("complementary", { name: "数据库浏览器" }),
     ).toBeVisible();
@@ -44,6 +60,10 @@ test.describe("OrdaDB SQL workbench", () => {
     await expect(page.getByRole("menuitem", { name: "编辑" })).toBeFocused();
     await page.keyboard.press("ArrowDown");
     await expect(page.getByRole("menu", { name: "编辑" })).toBeVisible();
+    await expect(page.getByRole("menu", { name: "编辑" })).toHaveCSS(
+      "animation-duration",
+      "0.13s",
+    );
     await expect(
       page.getByRole("menuitem", { name: "格式化 SQL" }),
     ).toBeVisible();
@@ -66,9 +86,14 @@ test.describe("OrdaDB SQL workbench", () => {
     await expect(
       page.getByText("向量检索在事务系统中的边界"),
     ).toBeVisible();
+    await expect(page.locator(".result-table")).toHaveCSS("font-size", "14px");
 
     await page.getByRole("button", { name: "执行计划" }).click();
     await expect(page.getByText("Hybrid Scan")).toBeVisible();
+    await expect(page.locator(".result-content")).toHaveCSS(
+      "animation-duration",
+      "0.13s",
+    );
 
     await page.screenshot({
       path: "test-results/ordadb-workbench.png",
@@ -79,6 +104,14 @@ test.describe("OrdaDB SQL workbench", () => {
     await expect(
       page.getByRole("button", { name: "显示数据库浏览器" }),
     ).toBeVisible();
+    const panelAnimationDurations = await page
+      .locator(".center-workspace")
+      .evaluate((element) =>
+        element
+          .getAnimations()
+          .map((animation) => animation.effect?.getTiming().duration),
+      );
+    expect(panelAnimationDurations).toContain(180);
   });
 
   test("runs from Monaco and contains every accepted viewport", async ({
@@ -101,6 +134,36 @@ test.describe("OrdaDB SQL workbench", () => {
     await sqlEditor.focus();
     await expect(sqlEditor).toBeFocused();
     await page.keyboard.press("Control+Enter");
+    await expect(page.getByText("5 行 · 36 ms")).toBeVisible();
+  });
+
+  test("reduces positional motion without removing essential query feedback", async ({
+    page,
+  }) => {
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    await page
+      .getByRole("button", { name: "隐藏数据库浏览器" })
+      .click();
+    const panelAnimations = await page
+      .locator(".center-workspace")
+      .evaluate((element) => element.getAnimations().length);
+    expect(panelAnimations).toBe(0);
+
+    await page.getByRole("tab", { name: "日志" }).click();
+    await expect(page.locator(".result-content")).toHaveCSS(
+      "animation-duration",
+      "0.001s",
+    );
+    await expect(page.locator(".result-content")).toHaveCSS(
+      "transform",
+      "none",
+    );
+
+    await page.getByRole("button", { name: /^运行/ }).click();
+    await expect(page.locator(".loading-orbit")).toBeVisible();
     await expect(page.getByText("5 行 · 36 ms")).toBeVisible();
   });
 });

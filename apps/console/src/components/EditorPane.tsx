@@ -144,10 +144,10 @@ export function EditorPane() {
             ariaLabel: "SQL 编辑器",
             fontFamily:
               '"Cascadia Code", "SFMono-Regular", Consolas, monospace',
-            fontSize: 15,
-            lineHeight: 24,
+            fontSize: 14,
+            lineHeight: 22,
             minimap: { enabled: false },
-            padding: { top: 22, bottom: 22 },
+            padding: { top: 16, bottom: 16 },
             scrollBeyondLastLine: false,
             smoothScrolling: true,
             renderLineHighlight: "all",

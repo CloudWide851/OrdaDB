@@ -73,6 +73,8 @@ describe("OrdaDB workbench", () => {
     renderApp();
 
     expect(screen.getByText("OrdaDB")).toBeInTheDocument();
+    expect(screen.queryByText("OrdaDB Local / default")).not.toBeInTheDocument();
+    expect(screen.getAllByText("query_01.sql")).toHaveLength(1);
     expect(
       screen.getByRole("complementary", { name: "数据库浏览器" }),
     ).toBeVisible();
@@ -80,7 +82,13 @@ describe("OrdaDB workbench", () => {
     expect(
       screen.getByRole("complementary", { name: "对象检查器" }),
     ).toBeVisible();
-    expect(screen.getByRole("menubar", { name: "应用菜单" })).toBeVisible();
+    const menuBar = screen.getByRole("menubar", { name: "应用菜单" });
+    expect(menuBar).toBeVisible();
+    expect(menuBar.closest(".titlebar")).not.toBeNull();
+    expect(
+      screen.getByLabelText("快捷工具").closest(".titlebar"),
+    ).not.toBeNull();
+    expect(document.querySelector(".command-strip")).toBeNull();
     expect(screen.getByText("物化视图")).toBeVisible();
     expect(await screen.findByText("界面预览")).toBeVisible();
 
@@ -174,6 +182,11 @@ describe("OrdaDB workbench", () => {
 
     await user.click(screen.getByRole("tab", { name: "DDL" }));
     expect(screen.getByText(/CREATE TABLE public\.documents/)).toBeVisible();
+
+    await user.click(screen.getByRole("tab", { name: "日志" }));
+    expect(
+      screen.getByText(/不会连接真实数据库/),
+    ).toBeVisible();
 
     await user.keyboard("{Control>}{Enter}{/Control}");
     await waitFor(() => {
