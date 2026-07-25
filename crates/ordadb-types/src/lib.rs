@@ -31,6 +31,7 @@ object_id!(DatabaseId);
 object_id!(SchemaId);
 object_id!(TableId);
 object_id!(ColumnId);
+object_id!(IndexId);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Identifier {

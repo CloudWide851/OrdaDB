@@ -37,6 +37,7 @@ impl PageId {
 pub enum PageType {
     Metadata = 1,
     Heap = 2,
+    Index = 3,
 }
 
 impl TryFrom<u8> for PageType {
@@ -46,6 +47,7 @@ impl TryFrom<u8> for PageType {
         match value {
             1 => Ok(Self::Metadata),
             2 => Ok(Self::Heap),
+            3 => Ok(Self::Index),
             _ => Err(corruption(format!("unknown page type {value}"))),
         }
     }

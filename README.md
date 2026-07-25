@@ -4,15 +4,20 @@
 
 # OrdaDB
 
-OrdaDB 是一个以 Rust 构建的 AI 原生混合型关系数据库项目。当前仓库首先提供可运行的 Windows x64 桌面工作台，用于验证专业数据库管理界面的工程基础与交互方向。
+OrdaDB 是一个以 Rust 构建的 AI 原生混合型关系数据库项目。仓库目前同时包含可运行的 Windows x64 桌面工作台，以及正在按独立里程碑演进的持久化关系数据库内核。
 
 ## 当前能力
 
 - React、TypeScript、Vite 和 pnpm 管理端
 - Monaco SQL 编辑器、Schema 浏览器、结果/日志视图和 AI 建议面板
 - Tauri 2 Windows 桌面壳与最小 Rust 状态桥接
-- 清晰标识的本地示例查询，不会连接或伪装真实数据库内核
 - macOS 风格的浅色玻璃层次、标准 SVG 图标、tooltip 和键盘操作
+- Rust 2024 内核工作区、PostgreSQL 方言解析/绑定和结构化查询事件
+- v1 8 KiB 校验和页面、Heap、Buffer Pool、Catalog 与索引快照持久化
+- 主键、唯一、复合、覆盖 B+Tree 索引和统计信息驱动的基础成本规划
+- 单表 CRUD、INNER/LEFT JOIN、分组聚合、HAVING、排序、限制和 `EXPLAIN`
+
+Console 的查询区域目前仍明确使用预览 fixture，尚未连接数据库内核；真实 Console 集成属于后续里程碑。
 
 ## 开发
 
@@ -48,4 +53,4 @@ pnpm desktop:build:x64
 
 ## 项目阶段
 
-本阶段不包含数据库内核、真实 SQL 执行、存储、事务、网络协议或 AI 推理。后续内核实现将继续遵循 Rust 负责语义正确性与事务兜底、AI 负责估计与建议的边界。
+当前内核仍使用提交前完整候选快照和单写冲突检测，不宣称 Read Committed、WAL、检查点或崩溃恢复。PostgreSQL Wire、Windows 服务/CLI、广泛 DDL/PLpgSQL、全文/向量检索、真实 Console 集成与 AI 推理属于后续里程碑。

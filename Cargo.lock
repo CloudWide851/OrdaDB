@@ -2173,12 +2173,44 @@ name = "ordadb-engine"
 version = "0.1.0"
 dependencies = [
  "ordadb-catalog",
+ "ordadb-execution",
+ "ordadb-index",
+ "ordadb-optimizer",
  "ordadb-sql",
  "ordadb-storage",
  "ordadb-types",
- "rust_decimal",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "ordadb-execution"
+version = "0.1.0"
+dependencies = [
+ "ordadb-index",
+ "ordadb-optimizer",
+ "ordadb-sql",
+ "ordadb-types",
+ "rust_decimal",
+]
+
+[[package]]
+name = "ordadb-index"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "ordadb-types",
+ "rust_decimal",
+ "uuid",
+]
+
+[[package]]
+name = "ordadb-optimizer"
+version = "0.1.0"
+dependencies = [
+ "ordadb-catalog",
+ "ordadb-sql",
+ "ordadb-types",
 ]
 
 [[package]]
@@ -2198,6 +2230,7 @@ dependencies = [
  "chrono",
  "crc32c",
  "ordadb-catalog",
+ "ordadb-index",
  "ordadb-types",
  "rust_decimal",
  "serde",
