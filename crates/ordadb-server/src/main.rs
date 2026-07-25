@@ -1,0 +1,122 @@
+use std::path::PathBuf;
+
+use ordadb_server::{
+    ServerConfig, TlsPaths, default_data_dir, dispatch_windows_service, start_server,
+};
+use ordadb_types::{DbError, Result};
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{}: {}", error.sql_state, error.message);
+        if let Some(detail) = error.detail {
+            eprintln!("{detail}");
+        }
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.iter().any(|argument| argument == "--service") {
+        return dispatch_windows_service();
+    }
+    let config = parse_config(&arguments)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            DbError::new("XX000", "failed to create server runtime").with_detail(error.to_string())
+        })?;
+    runtime.block_on(async move {
+        let server = start_server(config).await?;
+        println!(
+            "{{\"state\":\"ready\",\"pgAddress\":\"{}\",\"adminAddress\":\"{}\",\"bootstrapPipe\":{}}}",
+            server.pg_address,
+            server.admin_address,
+            server
+                .bootstrap_pipe
+                .as_ref()
+                .map_or_else(|| "null".to_owned(), |pipe| format!("{pipe:?}"))
+        );
+        tokio::signal::ctrl_c().await.map_err(|error| {
+            DbError::new("58030", "failed to wait for Ctrl+C").with_detail(error.to_string())
+        })?;
+        server.shutdown().await
+    })
+}
+
+fn parse_config(arguments: &[String]) -> Result<ServerConfig> {
+    let mut data_dir = default_data_dir();
+    let mut pg_bind = None;
+    let mut admin_bind = None;
+    let mut certificate: Option<PathBuf> = None;
+    let mut private_key: Option<PathBuf> = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = &arguments[index];
+        let value = arguments
+            .get(index + 1)
+            .ok_or_else(|| DbError::new("22023", format!("{option} requires a value")))?;
+        match option.as_str() {
+            "--data-dir" => data_dir = PathBuf::from(value),
+            "--pg-bind" => {
+                pg_bind = Some(value.parse().map_err(|_| {
+                    DbError::new("22023", "--pg-bind must be an IP socket address")
+                })?);
+            }
+            "--admin-bind" => {
+                admin_bind = Some(value.parse().map_err(|_| {
+                    DbError::new("22023", "--admin-bind must be an IP socket address")
+                })?);
+            }
+            "--tls-cert" => certificate = Some(PathBuf::from(value)),
+            "--tls-key" => private_key = Some(PathBuf::from(value)),
+            unknown => {
+                return Err(DbError::new(
+                    "22023",
+                    format!("unknown server option {unknown}"),
+                ));
+            }
+        }
+        index += 2;
+    }
+    let mut config = ServerConfig::new(data_dir);
+    if let Some(pg_bind) = pg_bind {
+        config.pg_bind = pg_bind;
+    }
+    if let Some(admin_bind) = admin_bind {
+        config.admin_bind = admin_bind;
+    }
+    config.tls = match (certificate, private_key) {
+        (Some(certificate), Some(private_key)) => Some(TlsPaths {
+            certificate,
+            private_key,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(DbError::new(
+                "22023",
+                "--tls-cert and --tls-key must be provided together",
+            ));
+        }
+    };
+    config.validate()?;
+    Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_line_tls_paths_must_be_paired() {
+        let error = parse_config(&[
+            "--data-dir".into(),
+            r"C:\temp\ordadb".into(),
+            "--tls-cert".into(),
+            "server.pem".into(),
+        ])
+        .expect_err("pair");
+        assert_eq!(error.sql_state, "22023");
+    }
+}

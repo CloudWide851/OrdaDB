@@ -2,10 +2,14 @@
 members = [
   "apps/desktop/src-tauri",
   "crates/ordadb-catalog",
+  "crates/ordadb-admin",
+  "crates/ordadb-cli",
   "crates/ordadb-engine",
   "crates/ordadb-execution",
   "crates/ordadb-index",
   "crates/ordadb-optimizer",
+  "crates/ordadb-protocol",
+  "crates/ordadb-server",
   "crates/ordadb-sql",
   "crates/ordadb-storage",
   "crates/ordadb-transaction",
@@ -21,12 +25,39 @@ license = "Apache-2.0"
 authors = ["CloudWide851"]
 
 [workspace.dependencies]
+argon2 = "0.5.3"
+async-stream = "0.3.6"
+axum = { version = "0.8.9", features = ["http1", "json", "tokio"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+base64 = "0.22.1"
 chrono = { version = "0.4.42", features = ["serde"] }
 crc32c = "0.6.8"
+csv = "1.4.0"
+futures-core = "0.3.32"
+hmac = "0.12.1"
+pbkdf2 = "0.12.2"
+rand = "0.8.7"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+rustls = "0.23.36"
 rust_decimal = { version = "1.42.1", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+sha2 = "0.10.9"
 sqlparser = "0.62.0"
+subtle = "2.6.1"
 tempfile = "3.23.0"
 thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.6.11", features = ["cors", "trace"] }
 uuid = { version = "1.21.0", features = ["serde", "v4"] }
+windows-service = "0.8.1"
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Threading",
+] }
+zeroize = { version = "1.9.0", features = ["derive"] }

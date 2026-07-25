@@ -1,0 +1,31 @@
+[package]
+name = "ordadb-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+csv.workspace = true
+hmac.workspace = true
+ordadb-admin = { path = "../ordadb-admin" }
+ordadb-catalog = { path = "../ordadb-catalog" }
+ordadb-engine = { path = "../ordadb-engine" }
+ordadb-types = { path = "../ordadb-types" }
+pbkdf2.workspace = true
+rand.workspace = true
+rust_decimal.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
