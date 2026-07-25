@@ -1,12 +1,13 @@
 import Editor, { type BeforeMount } from "@monaco-editor/react";
 import {
+  AlignLeft,
   ChevronDown,
-  Clock3,
   History,
+  ListTree,
   MoreHorizontal,
   Play,
   Plus,
-  WandSparkles,
+  Square,
 } from "lucide-react";
 import { useWorkbenchStore } from "../store/workbench";
 import { IconAction } from "./IconAction";
@@ -40,6 +41,10 @@ export function EditorPane() {
   const setSql = useWorkbenchStore((state) => state.setSql);
   const queryState = useWorkbenchStore((state) => state.queryState);
   const runPreviewQuery = useWorkbenchStore((state) => state.runPreviewQuery);
+  const setActiveResultTab = useWorkbenchStore(
+    (state) => state.setActiveResultTab,
+  );
+  const setNotice = useWorkbenchStore((state) => state.setNotice);
 
   return (
     <section className="editor-pane" aria-label="SQL 编辑器">
@@ -51,7 +56,15 @@ export function EditorPane() {
           aria-selected="true"
         >
           <span className="query-dot" aria-hidden="true" />
-          查询 01
+          query_01.sql
+        </button>
+        <button
+          type="button"
+          className="query-tab"
+          role="tab"
+          aria-selected="false"
+        >
+          scratch_02.sql
         </button>
         <IconAction
           label="新建查询"
@@ -59,11 +72,11 @@ export function EditorPane() {
           icon={<Plus size={17} aria-hidden="true" />}
         />
         <span className="query-tabs-spacer" />
-        <div className="connection-selector">
+        <button className="connection-selector" type="button">
           <span className="connection-dot" aria-hidden="true" />
-          ordadb_local
+          OrdaDB Local
           <ChevronDown size={14} aria-hidden="true" />
-        </div>
+        </button>
       </div>
 
       <div className="editor-toolbar">
@@ -77,21 +90,41 @@ export function EditorPane() {
           {queryState === "running" ? "运行中" : "运行"}
           <kbd>Ctrl↵</kbd>
         </button>
+        <IconAction
+          label="停止查询"
+          disabled={queryState !== "running"}
+          icon={<Square size={14} fill="currentColor" aria-hidden="true" />}
+          onClick={() => setNotice("停止查询 · 预览入口")}
+        />
         <span className="toolbar-divider" aria-hidden="true" />
         <IconAction
           label="格式化 SQL"
-          icon={<WandSparkles size={17} aria-hidden="true" />}
+          icon={<AlignLeft size={17} aria-hidden="true" />}
+          onClick={() => setNotice("格式化 SQL · 预览入口")}
         />
         <IconAction
           label="查询历史"
           icon={<History size={17} aria-hidden="true" />}
+          onClick={() => setNotice("SQL 历史 · 预览入口")}
         />
         <IconAction
           label="执行计划"
-          icon={<Clock3 size={17} aria-hidden="true" />}
+          icon={<ListTree size={17} aria-hidden="true" />}
+          onClick={() => {
+            setActiveResultTab("plan");
+            setNotice("执行计划 · 预览数据");
+          }}
         />
+        <button
+          className="transaction-mode"
+          type="button"
+          onClick={() => setNotice("自动提交 · 预览模式")}
+        >
+          自动提交
+          <ChevronDown size={14} aria-hidden="true" />
+        </button>
         <span className="toolbar-spacer" />
-        <span className="preview-badge">PREVIEW</span>
+        <span className="preview-badge">预览</span>
         <IconAction
           label="更多查询操作"
           icon={<MoreHorizontal size={18} aria-hidden="true" />}

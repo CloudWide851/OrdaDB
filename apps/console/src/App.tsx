@@ -1,26 +1,40 @@
 import { useQuery } from "@tanstack/react-query";
-import {
-  PanelLeftClose,
-  PanelLeftOpen,
-  PanelRightClose,
-  PanelRightOpen,
-} from "lucide-react";
-import { useEffect } from "react";
+import { useCallback, useEffect } from "react";
 import { Route, Routes } from "react-router-dom";
-import { AssistantPane } from "./components/AssistantPane";
+import { CommandPalette } from "./components/CommandPalette";
+import { CommandToolbar } from "./components/CommandToolbar";
 import { EditorPane } from "./components/EditorPane";
-import { IconAction } from "./components/IconAction";
+import { MenuBar } from "./components/MenuBar";
+import { ObjectInspector } from "./components/ObjectInspector";
 import { ResultsPane } from "./components/ResultsPane";
 import { SchemaPane } from "./components/SchemaPane";
+import { StatusBar } from "./components/StatusBar";
 import { TitleBar } from "./components/TitleBar";
+import {
+  commandById,
+  type WorkbenchCommandId,
+} from "./data/commands";
 import { getAppStatus } from "./lib/tauri";
 import { useWorkbenchStore } from "./store/workbench";
 
 function Workbench() {
   const schemaVisible = useWorkbenchStore((state) => state.schemaVisible);
-  const assistantVisible = useWorkbenchStore((state) => state.assistantVisible);
+  const inspectorVisible = useWorkbenchStore(
+    (state) => state.inspectorVisible,
+  );
+  const commandPaletteOpen = useWorkbenchStore(
+    (state) => state.commandPaletteOpen,
+  );
   const toggleSchema = useWorkbenchStore((state) => state.toggleSchema);
-  const toggleAssistant = useWorkbenchStore((state) => state.toggleAssistant);
+  const toggleInspector = useWorkbenchStore((state) => state.toggleInspector);
+  const setCommandPaletteOpen = useWorkbenchStore(
+    (state) => state.setCommandPaletteOpen,
+  );
+  const setActiveResultTab = useWorkbenchStore(
+    (state) => state.setActiveResultTab,
+  );
+  const setSql = useWorkbenchStore((state) => state.setSql);
+  const setNotice = useWorkbenchStore((state) => state.setNotice);
   const runPreviewQuery = useWorkbenchStore((state) => state.runPreviewQuery);
   const statusQuery = useQuery({
     queryKey: ["app-status"],
@@ -29,71 +43,123 @@ function Workbench() {
     retry: 1,
   });
 
+  const handleCommand = useCallback(
+    (commandId: WorkbenchCommandId) => {
+      if (commandId === "toggle-explorer") {
+        toggleSchema();
+        return;
+      }
+      if (commandId === "toggle-inspector") {
+        toggleInspector();
+        return;
+      }
+      if (commandId === "command-palette") {
+        setCommandPaletteOpen(true);
+        return;
+      }
+      if (commandId === "run-query") {
+        void runPreviewQuery();
+        return;
+      }
+      if (commandId === "explain-query") {
+        setActiveResultTab("plan");
+        setNotice("执行计划 · 预览数据");
+        return;
+      }
+      if (commandId === "new-query") {
+        setSql("SELECT *\nFROM public.documents\nORDER BY updated_at DESC\nLIMIT 100;");
+        setNotice("新查询已创建 · 本地草稿");
+        return;
+      }
+
+      const command = commandById.get(commandId);
+      setNotice(`${command?.label ?? "命令"} · 预览入口`);
+    },
+    [
+      runPreviewQuery,
+      setActiveResultTab,
+      setCommandPaletteOpen,
+      setNotice,
+      setSql,
+      toggleInspector,
+      toggleSchema,
+    ],
+  );
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
         event.preventDefault();
         void runPreviewQuery();
+      } else if (
+        (event.metaKey || event.ctrlKey) &&
+        event.shiftKey &&
+        event.key.toLowerCase() === "p"
+      ) {
+        event.preventDefault();
+        setCommandPaletteOpen(true);
+      } else if (event.altKey && event.key === "1") {
+        event.preventDefault();
+        toggleSchema();
+      } else if (event.altKey && event.key === "2") {
+        event.preventDefault();
+        toggleInspector();
       }
     };
 
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [runPreviewQuery]);
+  }, [
+    runPreviewQuery,
+    setCommandPaletteOpen,
+    toggleInspector,
+    toggleSchema,
+  ]);
 
   return (
     <div className="app-shell">
-      <TitleBar status={statusQuery.data} loading={statusQuery.isLoading} />
+      <TitleBar />
 
-      <div className="workspace-toolbar" aria-label="工作区布局">
-        <IconAction
-          label={schemaVisible ? "隐藏 Schema" : "显示 Schema"}
-          icon={
-            schemaVisible ? (
-              <PanelLeftClose size={17} aria-hidden="true" />
-            ) : (
-              <PanelLeftOpen size={17} aria-hidden="true" />
-            )
-          }
-          onClick={toggleSchema}
-        />
-        <span className="workspace-title">documents / 混合检索</span>
-        <span className="workspace-toolbar-spacer" />
-        <span className="autosave-state">已自动保存</span>
-        <IconAction
-          label={assistantVisible ? "隐藏查询助手" : "显示查询助手"}
-          icon={
-            assistantVisible ? (
-              <PanelRightClose size={17} aria-hidden="true" />
-            ) : (
-              <PanelRightOpen size={17} aria-hidden="true" />
-            )
-          }
-          onClick={toggleAssistant}
+      <div className="command-strip">
+        <MenuBar onCommand={handleCommand} />
+        <CommandToolbar
+          schemaVisible={schemaVisible}
+          inspectorVisible={inspectorVisible}
+          onCommand={handleCommand}
         />
       </div>
 
       <main
         className={`workbench ${
           schemaVisible ? "" : "workbench--schema-hidden"
-        } ${assistantVisible ? "" : "workbench--assistant-hidden"}`}
+        } ${inspectorVisible ? "" : "workbench--inspector-hidden"}`}
       >
-        <div className="pane-slot pane-slot--schema" aria-hidden={!schemaVisible}>
+        <div
+          className="pane-slot pane-slot--schema island"
+          aria-hidden={!schemaVisible}
+        >
           {schemaVisible && <SchemaPane />}
         </div>
 
-        <div className="center-workspace">
+        <div className="center-workspace island">
           <EditorPane />
           <ResultsPane />
         </div>
 
         <div
-          className="pane-slot pane-slot--assistant"
-          aria-hidden={!assistantVisible}
+          className="pane-slot pane-slot--inspector island"
+          aria-hidden={!inspectorVisible}
         >
-          {assistantVisible && <AssistantPane />}
+          {inspectorVisible && <ObjectInspector />}
         </div>
       </main>
+
+      <StatusBar status={statusQuery.data} loading={statusQuery.isLoading} />
+      <CommandPalette
+        open={commandPaletteOpen}
+        onClose={() => setCommandPaletteOpen(false)}
+        onCommand={handleCommand}
+      />
     </div>
   );
 }
