@@ -62,7 +62,7 @@ export function ObjectInspector() {
         ))}
       </div>
 
-      <div className="inspector-content" role="tabpanel">
+      <div className="inspector-content" role="tabpanel" key={activeTab}>
         <InspectorContent activeTab={activeTab} objectName={selectedObject} />
       </div>
 

@@ -1,10 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { Route, Routes } from "react-router-dom";
 import { CommandPalette } from "./components/CommandPalette";
-import { CommandToolbar } from "./components/CommandToolbar";
 import { EditorPane } from "./components/EditorPane";
-import { MenuBar } from "./components/MenuBar";
 import { ObjectInspector } from "./components/ObjectInspector";
 import { ResultsPane } from "./components/ResultsPane";
 import { SchemaPane } from "./components/SchemaPane";
@@ -16,6 +14,62 @@ import {
 } from "./data/commands";
 import { getAppStatus } from "./lib/tauri";
 import { useWorkbenchStore } from "./store/workbench";
+
+const PANEL_MOTION_MS = 180;
+const PANEL_EASING = "cubic-bezier(0.16, 1, 0.3, 1)";
+
+function useCenterWorkspaceFlip(
+  schemaVisible: boolean,
+  inspectorVisible: boolean,
+) {
+  const centerRef = useRef<HTMLDivElement>(null);
+  const previousRectRef = useRef<DOMRect | null>(null);
+
+  useLayoutEffect(() => {
+    const element = centerRef.current;
+    if (!element) return;
+
+    const nextRect = element.getBoundingClientRect();
+    const previousRect = previousRectRef.current;
+    previousRectRef.current = nextRect;
+
+    const reducedMotion =
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+    if (
+      !previousRect ||
+      reducedMotion ||
+      typeof element.animate !== "function" ||
+      nextRect.width === 0
+    ) {
+      return;
+    }
+
+    const deltaX = previousRect.left - nextRect.left;
+    const scaleX = previousRect.width / nextRect.width;
+    if (Math.abs(deltaX) < 0.5 && Math.abs(scaleX - 1) < 0.002) return;
+
+    const animation = element.animate(
+      [
+        {
+          transform: `translateX(${deltaX}px) scaleX(${scaleX})`,
+          transformOrigin: "left center",
+        },
+        {
+          transform: "translateX(0) scaleX(1)",
+          transformOrigin: "left center",
+        },
+      ],
+      {
+        duration: PANEL_MOTION_MS,
+        easing: PANEL_EASING,
+      },
+    );
+
+    return () => animation.cancel();
+  }, [inspectorVisible, schemaVisible]);
+
+  return centerRef;
+}
 
 function Workbench() {
   const schemaVisible = useWorkbenchStore((state) => state.schemaVisible);
@@ -36,6 +90,10 @@ function Workbench() {
   const setSql = useWorkbenchStore((state) => state.setSql);
   const setNotice = useWorkbenchStore((state) => state.setNotice);
   const runPreviewQuery = useWorkbenchStore((state) => state.runPreviewQuery);
+  const centerWorkspaceRef = useCenterWorkspaceFlip(
+    schemaVisible,
+    inspectorVisible,
+  );
   const statusQuery = useQuery({
     queryKey: ["app-status"],
     queryFn: getAppStatus,
@@ -118,16 +176,11 @@ function Workbench() {
 
   return (
     <div className="app-shell">
-      <TitleBar />
-
-      <div className="command-strip">
-        <MenuBar onCommand={handleCommand} />
-        <CommandToolbar
-          schemaVisible={schemaVisible}
-          inspectorVisible={inspectorVisible}
-          onCommand={handleCommand}
-        />
-      </div>
+      <TitleBar
+        schemaVisible={schemaVisible}
+        inspectorVisible={inspectorVisible}
+        onCommand={handleCommand}
+      />
 
       <main
         className={`workbench ${
@@ -141,7 +194,7 @@ function Workbench() {
           {schemaVisible && <SchemaPane />}
         </div>
 
-        <div className="center-workspace island">
+        <div className="center-workspace island" ref={centerWorkspaceRef}>
           <EditorPane />
           <ResultsPane />
         </div>

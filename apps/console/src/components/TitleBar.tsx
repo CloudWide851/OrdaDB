@@ -1,21 +1,40 @@
 import { Minus, Square, X } from "lucide-react";
 import logoUrl from "../../../../logo.svg?url";
+import type { WorkbenchCommandId } from "../data/commands";
 import { runWindowAction } from "../lib/tauri";
+import { CommandToolbar } from "./CommandToolbar";
 import { IconAction } from "./IconAction";
+import { MenuBar } from "./MenuBar";
 
-export function TitleBar() {
+interface TitleBarProps {
+  schemaVisible: boolean;
+  inspectorVisible: boolean;
+  onCommand: (commandId: WorkbenchCommandId) => void;
+}
+
+export function TitleBar({
+  schemaVisible,
+  inspectorVisible,
+  onCommand,
+}: TitleBarProps) {
   return (
     <header className="titlebar">
-      <div className="titlebar-identity" data-tauri-drag-region>
+      <div className="titlebar-brand" data-tauri-drag-region>
         <img src={logoUrl} alt="" className="brand-logo" />
         <span className="brand-name">OrdaDB</span>
-        <span className="brand-divider" aria-hidden="true" />
-        <span className="brand-context">OrdaDB Local / default</span>
       </div>
 
-      <span className="titlebar-document" data-tauri-drag-region>
-        query_01.sql
-      </span>
+      <MenuBar onCommand={onCommand} />
+      <CommandToolbar
+        schemaVisible={schemaVisible}
+        inspectorVisible={inspectorVisible}
+        onCommand={onCommand}
+      />
+      <div
+        className="titlebar-drag-region"
+        data-tauri-drag-region
+        aria-hidden="true"
+      />
 
       <div className="window-controls">
         <IconAction

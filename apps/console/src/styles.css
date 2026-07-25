@@ -1,10 +1,25 @@
 :root {
   font-family:
-    "Manrope Variable", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+    "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif;
   color: oklch(0.32 0.032 238);
   background: oklch(0.945 0.014 232);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+  --font-ui: 0.8125rem;
+  --font-data: 0.875rem;
+  --font-heading: 0.9375rem;
+  --font-heading-lg: 1rem;
+  --control-sm: 28px;
+  --control-md: 30px;
+  --control-lg: 32px;
+  --tree-row: 26px;
+  --tab-height: 30px;
+  --space-workbench: 8px;
+  --island-radius: 8px;
+  --motion-press: 80ms;
+  --motion-fast: 130ms;
+  --motion-panel: 180ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --brand: #416e95;
   --brand-strong: oklch(0.46 0.085 242);
   --brand-soft: oklch(0.91 0.028 235);
@@ -44,7 +59,7 @@ body {
     ),
     oklch(0.94 0.016 232);
   color: var(--ink);
-  font-size: 15px;
+  font-size: var(--font-ui);
 }
 
 button,
@@ -85,7 +100,7 @@ button:disabled {
   width: 100%;
   height: 100%;
   display: grid;
-  grid-template-rows: 40px 38px minmax(0, 1fr) 28px;
+  grid-template-rows: 38px minmax(0, 1fr) 24px;
   overflow: hidden;
   background: var(--canvas);
   border: 1px solid oklch(0.86 0.02 232 / 0.92);
@@ -95,10 +110,12 @@ button:disabled {
 }
 
 .titlebar {
+  position: relative;
+  z-index: 30;
   min-width: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  display: flex;
   align-items: center;
+  gap: 3px;
   background: oklch(0.978 0.009 228 / 0.82);
   backdrop-filter: blur(24px) saturate(124%);
   -webkit-backdrop-filter: blur(24px) saturate(124%);
@@ -106,63 +123,45 @@ button:disabled {
   user-select: none;
 }
 
-.titlebar-identity {
+.titlebar-brand {
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding-left: 12px;
+  flex: 0 0 auto;
+  gap: 7px;
+  padding-left: 8px;
   overflow: hidden;
 }
 
 .brand-logo {
-  width: 24px;
-  height: 24px;
+  width: 22px;
+  height: 22px;
   flex: 0 0 auto;
 }
 
 .brand-name {
   color: var(--ink);
-  font-size: 15px;
-  font-weight: 760;
+  font-size: var(--font-heading);
+  font-weight: 680;
   letter-spacing: -0.02em;
 }
 
-.brand-divider {
-  width: 1px;
-  height: 17px;
-  flex: 0 0 auto;
-  background: var(--line);
-}
-
-.brand-context,
-.titlebar-document {
-  min-width: 0;
-  color: var(--ink-muted);
-  font-size: 14px;
-  font-weight: 560;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.titlebar-document {
-  justify-self: center;
-  max-width: 260px;
-  color: var(--ink);
-  font-weight: 620;
+.titlebar-drag-region {
+  min-width: 8px;
+  align-self: stretch;
+  flex: 1 1 auto;
 }
 
 .window-controls {
-  justify-self: end;
   align-self: stretch;
+  flex: 0 0 auto;
   display: flex;
   align-items: stretch;
 }
 
 .icon-action {
-  width: 32px;
-  height: 32px;
+  width: var(--control-lg);
+  height: var(--control-lg);
   display: inline-grid;
   place-items: center;
   padding: 0;
@@ -172,9 +171,9 @@ button:disabled {
   background: transparent;
   cursor: pointer;
   transition:
-    background-color 130ms ease,
-    color 130ms ease,
-    transform 150ms cubic-bezier(0.16, 1, 0.3, 1);
+    background-color var(--motion-fast) var(--ease-out),
+    color var(--motion-fast) var(--ease-out),
+    transform var(--motion-press) var(--ease-out);
 }
 
 .icon-action:hover:not(:disabled) {
@@ -183,7 +182,7 @@ button:disabled {
 }
 
 .icon-action:active:not(:disabled) {
-  transform: scale(0.95);
+  transform: scale(0.97);
 }
 
 .icon-action--brand {
@@ -197,8 +196,8 @@ button:disabled {
 }
 
 .window-control {
-  width: 46px;
-  height: 39px;
+  width: 44px;
+  height: 37px;
   border-radius: 0;
   color: var(--ink);
 }
@@ -213,32 +212,19 @@ button:disabled {
 }
 
 .ant-tooltip .ant-tooltip-inner {
-  min-height: 30px;
+  min-height: 28px;
   display: flex;
   align-items: center;
-  padding: 5px 9px;
-  font-size: 14px;
-  line-height: 1.4;
-}
-
-.command-strip {
-  position: relative;
-  z-index: 30;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 7px 0 5px;
-  background: oklch(0.97 0.01 229 / 0.92);
-  backdrop-filter: blur(22px) saturate(118%);
-  -webkit-backdrop-filter: blur(22px) saturate(118%);
-  border-bottom: 1px solid var(--line);
+  padding: 4px 8px;
+  font-size: var(--font-ui);
+  line-height: 1.35;
 }
 
 .menu-bar-shell {
   position: relative;
   min-width: 0;
   align-self: stretch;
+  flex: 0 0 auto;
 }
 
 .menu-bar {
@@ -248,13 +234,13 @@ button:disabled {
 }
 
 .menu-trigger {
-  height: 30px;
-  padding: 0 10px;
+  height: var(--control-sm);
+  padding: 0 8px;
   border: 0;
   border-radius: 6px;
   color: var(--ink);
   background: transparent;
-  font-size: 14px;
+  font-size: var(--font-ui);
   cursor: default;
 }
 
@@ -268,33 +254,34 @@ button:disabled {
   --menu-index: 0;
   position: absolute;
   z-index: 100;
-  top: 35px;
-  left: calc(var(--menu-index) * 52px);
-  width: 268px;
-  max-height: min(620px, calc(100vh - 112px));
+  top: 34px;
+  left: calc(var(--menu-index) * 44px);
+  width: 248px;
+  max-height: min(620px, calc(100vh - 72px));
   overflow: auto;
-  padding: 6px;
+  padding: 5px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 8px;
   background: oklch(0.985 0.006 226 / 0.98);
   box-shadow:
     0 18px 46px oklch(0.34 0.045 238 / 0.2),
     0 2px 10px oklch(0.34 0.045 238 / 0.1);
+  animation: menu-enter var(--motion-fast) var(--ease-out) both;
 }
 
 .app-menu-item {
   width: 100%;
-  min-height: 36px;
+  min-height: 32px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 14px;
-  padding: 6px 9px;
+  padding: 4px 8px;
   border: 0;
   border-radius: 6px;
   color: var(--ink);
   background: transparent;
-  font-size: 14px;
+  font-size: var(--font-ui);
   text-align: left;
   cursor: default;
 }
@@ -324,15 +311,16 @@ button:disabled {
 
 .command-toolbar {
   min-width: 0;
-  margin-left: auto;
+  margin-left: 3px;
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 3px;
 }
 
 .command-toolbar .icon-action {
-  width: 29px;
-  height: 29px;
+  width: var(--control-sm);
+  height: var(--control-sm);
 }
 
 .command-divider,
@@ -354,7 +342,7 @@ button:disabled {
   border-radius: 6px;
   color: var(--ink-muted);
   background: transparent;
-  font-size: 14px;
+  font-size: var(--font-ui);
   cursor: pointer;
 }
 
@@ -365,16 +353,16 @@ button:disabled {
 }
 
 .workbench {
-  --schema-width: 242px;
-  --inspector-width: 292px;
+  --schema-width: 232px;
+  --inspector-width: 278px;
   min-width: 0;
   min-height: 0;
   display: grid;
   grid-template-columns:
     var(--schema-width) minmax(0, 1fr)
     var(--inspector-width);
-  gap: 10px;
-  padding: 10px;
+  gap: var(--space-workbench);
+  padding: var(--space-workbench);
   overflow: hidden;
   background:
     radial-gradient(
@@ -402,14 +390,13 @@ button:disabled {
   min-height: 0;
   overflow: hidden;
   border: 1px solid oklch(0.86 0.018 232 / 0.94);
-  border-radius: 10px;
+  border-radius: var(--island-radius);
   background: var(--surface);
   box-shadow:
-    0 7px 20px oklch(0.39 0.04 238 / 0.08),
+    0 5px 16px oklch(0.39 0.04 238 / 0.07),
     inset 0 1px 0 oklch(0.995 0.002 225 / 0.92);
   backdrop-filter: blur(20px) saturate(116%);
   -webkit-backdrop-filter: blur(20px) saturate(116%);
-  animation: island-enter 300ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 .pane-slot[aria-hidden="true"] {
@@ -425,7 +412,7 @@ button:disabled {
 
 .schema-pane {
   display: grid;
-  grid-template-rows: 45px auto minmax(0, 1fr) 38px;
+  grid-template-rows: 38px auto minmax(0, 1fr) 32px;
 }
 
 .pane-heading,
@@ -443,7 +430,7 @@ button:disabled {
 .inspector-heading h2 {
   margin: 0;
   color: var(--ink);
-  font-size: 16px;
+  font-size: var(--font-heading);
   line-height: 1.2;
   letter-spacing: -0.015em;
 }
@@ -455,18 +442,18 @@ button:disabled {
 
 .heading-actions .icon-action,
 .inspector-heading .icon-action {
-  width: 29px;
-  height: 29px;
+  width: var(--control-sm);
+  height: var(--control-sm);
 }
 
 .schema-search {
-  height: 34px;
-  margin: 8px 9px;
+  height: var(--control-md);
+  margin: 6px 8px;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 7px;
-  padding: 0 8px;
+  padding: 0 7px;
   color: var(--ink-muted);
   background: oklch(0.95 0.011 231);
   border: 1px solid var(--line);
@@ -486,7 +473,7 @@ button:disabled {
   outline: 0;
   color: var(--ink);
   background: transparent;
-  font-size: 14px;
+  font-size: var(--font-ui);
 }
 
 .schema-search input::placeholder,
@@ -503,7 +490,7 @@ kbd {
   background: oklch(0.985 0.005 226);
   color: var(--ink-muted);
   font-family: inherit;
-  font-size: 14px;
+  font-size: var(--font-ui);
   line-height: 1.1;
   text-align: center;
   white-space: nowrap;
@@ -513,23 +500,23 @@ kbd {
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 2px 7px 10px;
+  padding: 2px 6px 8px;
   scrollbar-width: thin;
   scrollbar-color: oklch(0.76 0.025 233) transparent;
 }
 
 .tree-row {
   width: 100%;
-  min-height: 30px;
+  min-height: var(--tree-row);
   display: flex;
   align-items: center;
-  gap: 7px;
-  padding: 4px 7px;
+  gap: 6px;
+  padding: 2px 6px;
   border: 0;
   border-radius: 6px;
   color: var(--ink-muted);
   background: transparent;
-  font-size: 14px;
+  font-size: var(--font-ui);
   text-align: left;
 }
 
@@ -555,23 +542,23 @@ button.tree-row:hover {
 }
 
 .tree-row--database {
-  padding-left: 18px;
+  padding-left: 16px;
   color: var(--ink);
   font-weight: 650;
 }
 
 .tree-row--schema {
-  padding-left: 34px;
+  padding-left: 30px;
   color: var(--ink);
   font-weight: 620;
 }
 
 .tree-row--group {
-  padding-left: 50px;
+  padding-left: 44px;
 }
 
 .tree-row--object {
-  padding-left: 77px;
+  padding-left: 66px;
 }
 
 .tree-row--active {
@@ -583,7 +570,7 @@ button.tree-row:hover {
 .tree-status {
   margin-left: auto;
   color: var(--brand-strong);
-  font-size: 14px;
+  font-size: var(--font-ui);
   font-weight: 720;
 }
 
@@ -601,25 +588,26 @@ button.tree-row:hover {
   padding: 0 7px 0 13px;
   border-top: 1px solid var(--line-soft);
   color: var(--ink-muted);
-  font-size: 14px;
+  font-size: var(--font-ui);
 }
 
 .schema-footer .icon-action {
-  width: 29px;
-  height: 29px;
+  width: var(--control-sm);
+  height: var(--control-sm);
 }
 
 .center-workspace {
   display: grid;
-  grid-template-rows: minmax(248px, 56%) minmax(220px, 44%);
+  grid-template-rows: minmax(220px, 55%) minmax(180px, 45%);
   background: var(--surface-solid);
+  will-change: transform;
 }
 
 .editor-pane {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: 39px 40px minmax(0, 1fr);
+  grid-template-rows: var(--tab-height) 34px minmax(0, 1fr);
   border-bottom: 1px solid var(--line);
 }
 
@@ -636,17 +624,17 @@ button.tree-row:hover {
 
 .query-tab {
   max-width: 150px;
-  min-width: 108px;
+  min-width: 100px;
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 0 10px;
+  padding: 0 8px;
   overflow: hidden;
   border: 0;
   border-bottom: 2px solid transparent;
   color: var(--ink-muted);
   background: transparent;
-  font-size: 14px;
+  font-size: var(--font-ui);
   text-overflow: ellipsis;
   white-space: nowrap;
   cursor: pointer;
@@ -670,13 +658,13 @@ button.tree-row:hover {
 
 .query-add {
   align-self: center;
-  width: 28px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
   flex: 0 0 auto;
 }
 
 .connection-selector {
-  height: 28px;
+  height: var(--control-sm);
   align-self: center;
   margin-left: auto;
   display: flex;
@@ -687,7 +675,7 @@ button.tree-row:hover {
   border-radius: 6px;
   color: var(--ink-muted);
   background: transparent;
-  font-size: 14px;
+  font-size: var(--font-ui);
   white-space: nowrap;
   cursor: pointer;
 }
@@ -708,19 +696,19 @@ button.tree-row:hover {
   display: flex;
   align-items: center;
   gap: 2px;
-  padding: 0 8px;
+  padding: 0 7px;
   background: oklch(0.976 0.007 227);
   border-bottom: 1px solid var(--line-soft);
 }
 
 .editor-toolbar .icon-action,
 .result-actions .icon-action {
-  width: 29px;
-  height: 29px;
+  width: var(--control-sm);
+  height: var(--control-sm);
 }
 
 .run-query {
-  height: 30px;
+  height: var(--control-sm);
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -730,7 +718,7 @@ button.tree-row:hover {
   color: oklch(0.98 0.006 226);
   background: var(--brand);
   box-shadow: 0 4px 10px oklch(0.42 0.08 242 / 0.18);
-  font-size: 14px;
+  font-size: var(--font-ui);
   font-weight: 690;
   cursor: pointer;
 }
@@ -746,7 +734,7 @@ button.tree-row:hover {
 }
 
 .transaction-mode {
-  height: 29px;
+  height: var(--control-sm);
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -755,7 +743,7 @@ button.tree-row:hover {
   border-radius: 6px;
   color: var(--ink-muted);
   background: transparent;
-  font-size: 14px;
+  font-size: var(--font-ui);
   cursor: pointer;
 }
 
@@ -773,7 +761,7 @@ button.tree-row:hover {
   border-radius: 5px;
   color: var(--brand-strong);
   background: var(--brand-soft);
-  font-size: 14px;
+  font-size: var(--font-ui);
   font-weight: 710;
 }
 
@@ -791,14 +779,14 @@ button.tree-row:hover {
   display: grid;
   place-items: center;
   color: var(--ink-muted);
-  font-size: 15px;
+  font-size: var(--font-data);
 }
 
 .results-pane {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: 39px minmax(0, 1fr);
+  grid-template-rows: var(--tab-height) minmax(0, 1fr);
   background: var(--surface-solid);
 }
 
@@ -808,7 +796,7 @@ button.tree-row:hover {
 }
 
 .result-tab {
-  min-width: 78px;
+  min-width: 70px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -818,7 +806,7 @@ button.tree-row:hover {
   border-bottom: 2px solid transparent;
   color: var(--ink-muted);
   background: transparent;
-  font-size: 14px;
+  font-size: var(--font-ui);
   cursor: pointer;
 }
 
@@ -842,7 +830,7 @@ button.tree-row:hover {
   gap: 5px;
   margin-right: 4px;
   color: var(--success);
-  font-size: 14px;
+  font-size: var(--font-ui);
   font-weight: 650;
   white-space: nowrap;
 }
@@ -851,6 +839,7 @@ button.tree-row:hover {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  animation: tab-content-enter var(--motion-fast) var(--ease-out) both;
 }
 
 .result-empty {
@@ -865,11 +854,11 @@ button.tree-row:hover {
 
 .result-empty strong {
   color: var(--ink);
-  font-size: 15px;
+  font-size: var(--font-data);
 }
 
 .result-empty span {
-  font-size: 14px;
+  font-size: var(--font-ui);
 }
 
 .result-empty--loading {
@@ -895,7 +884,7 @@ button.tree-row:hover {
   width: 100%;
   min-width: 760px;
   border-collapse: collapse;
-  font-size: 14px;
+  font-size: var(--font-data);
   font-variant-numeric: tabular-nums;
 }
 
@@ -903,20 +892,20 @@ button.tree-row:hover {
   position: sticky;
   top: 0;
   z-index: 1;
-  height: 34px;
-  padding: 0 13px;
+  height: 30px;
+  padding: 0 10px;
   color: var(--ink-muted);
   background: oklch(0.956 0.011 229);
   border-right: 1px solid var(--line-soft);
   border-bottom: 1px solid var(--line);
-  font-size: 14px;
+  font-size: var(--font-data);
   font-weight: 690;
   text-align: left;
 }
 
 .result-table td {
-  height: 38px;
-  padding: 0 13px;
+  height: 32px;
+  padding: 0 10px;
   border-right: 1px solid var(--line-soft);
   border-bottom: 1px solid var(--line-soft);
   color: var(--ink-muted);
@@ -949,15 +938,15 @@ button.tree-row:hover {
 .log-view {
   height: 100%;
   overflow: auto;
-  padding: 13px 15px;
+  padding: 10px 12px;
   color: var(--ink-muted);
   background: oklch(0.958 0.011 229);
   font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
-  font-size: 14px;
+  font-size: var(--font-data);
 }
 
 .log-line {
-  min-height: 31px;
+  min-height: 28px;
   display: grid;
   grid-template-columns: 76px 72px minmax(0, 1fr);
   gap: 10px;
@@ -985,12 +974,12 @@ button.tree-row:hover {
 .execution-plan {
   height: 100%;
   overflow: auto;
-  padding: 13px 15px;
+  padding: 10px 12px;
   background: oklch(0.979 0.006 227);
 }
 
 .plan-node {
-  min-height: 36px;
+  min-height: 32px;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
@@ -998,7 +987,7 @@ button.tree-row:hover {
   padding: 0 9px;
   border-bottom: 1px solid var(--line-soft);
   color: var(--ink);
-  font-size: 14px;
+  font-size: var(--font-data);
 }
 
 .plan-node > span:last-child {
@@ -1025,14 +1014,14 @@ button.tree-row:hover {
 .inspector-pane {
   min-width: 0;
   display: grid;
-  grid-template-rows: 52px auto minmax(0, 1fr) 40px;
+  grid-template-rows: 42px auto minmax(0, 1fr) 34px;
 }
 
 .inspector-object {
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   color: var(--brand);
 }
 
@@ -1051,24 +1040,24 @@ button.tree-row:hover {
 
 .inspector-object span {
   color: var(--ink-muted);
-  font-size: 14px;
+  font-size: var(--font-ui);
 }
 
 .inspector-tabs {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  padding: 5px;
+  padding: 4px;
   border-bottom: 1px solid var(--line-soft);
 }
 
 .inspector-tab {
-  min-height: 30px;
+  min-height: var(--control-sm);
   padding: 0 4px;
   border: 0;
   border-radius: 5px;
   color: var(--ink-muted);
   background: transparent;
-  font-size: 14px;
+  font-size: var(--font-ui);
   cursor: pointer;
 }
 
@@ -1087,7 +1076,8 @@ button.tree-row:hover {
   min-width: 0;
   min-height: 0;
   overflow: auto;
-  padding: 8px 11px;
+  padding: 6px 9px;
+  animation: tab-content-enter var(--motion-fast) var(--ease-out) both;
 }
 
 .property-list {
@@ -1095,13 +1085,13 @@ button.tree-row:hover {
 }
 
 .property-row {
-  min-height: 37px;
+  min-height: 32px;
   display: grid;
   grid-template-columns: minmax(88px, 0.8fr) minmax(0, 1.2fr);
   align-items: center;
   gap: 10px;
   border-bottom: 1px solid var(--line-soft);
-  font-size: 14px;
+  font-size: var(--font-ui);
 }
 
 .property-row dt {
@@ -1118,18 +1108,18 @@ button.tree-row:hover {
 }
 
 .inspector-section-heading {
-  height: 32px;
+  height: 30px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   color: var(--ink);
-  font-size: 14px;
+  font-size: var(--font-ui);
   font-weight: 680;
 }
 
 .inspector-section-heading .icon-action {
-  width: 28px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
 }
 
 .ddl-view pre {
@@ -1141,20 +1131,20 @@ button.tree-row:hover {
   color: var(--ink);
   background: oklch(0.96 0.011 229);
   font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
-  font-size: 14px;
-  line-height: 1.6;
+  font-size: var(--font-data);
+  line-height: 1.5;
   white-space: pre;
 }
 
 .inspector-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 14px;
+  font-size: var(--font-data);
 }
 
 .inspector-table th,
 .inspector-table td {
-  height: 36px;
+  height: 32px;
   padding: 0 7px;
   border-bottom: 1px solid var(--line-soft);
   text-align: left;
@@ -1175,7 +1165,7 @@ button.tree-row:hover {
 }
 
 .inspector-list-row {
-  min-height: 45px;
+  min-height: 36px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
@@ -1185,7 +1175,7 @@ button.tree-row:hover {
   border-bottom: 1px solid var(--line-soft);
   color: var(--ink);
   background: transparent;
-  font-size: 14px;
+  font-size: var(--font-ui);
   text-align: left;
   cursor: pointer;
 }
@@ -1216,7 +1206,7 @@ button.tree-row:hover {
   border-top: 1px solid var(--line-soft);
   color: var(--ink-muted);
   background: transparent;
-  font-size: 14px;
+  font-size: var(--font-ui);
   text-align: left;
   cursor: pointer;
 }
@@ -1235,13 +1225,13 @@ button.tree-row:hover {
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 0 10px;
+  gap: 10px;
+  padding: 0 8px;
   overflow: hidden;
   color: var(--ink-muted);
   background: oklch(0.955 0.012 230);
   border-top: 1px solid var(--line);
-  font-size: 14px;
+  font-size: var(--font-ui);
 }
 
 .status-primary,
@@ -1272,7 +1262,7 @@ button.tree-row:hover {
 
 .status-details {
   margin-left: auto;
-  gap: 13px;
+  gap: 10px;
   white-space: nowrap;
 }
 
@@ -1300,14 +1290,14 @@ button.tree-row:hover {
   grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: 10px;
   background: oklch(0.988 0.005 226 / 0.99);
   box-shadow: 0 28px 80px oklch(0.3 0.04 238 / 0.28);
-  animation: palette-enter 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation: palette-enter var(--motion-fast) var(--ease-out) both;
 }
 
 .command-search {
-  height: 51px;
+  height: 44px;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
@@ -1319,7 +1309,7 @@ button.tree-row:hover {
 
 .command-search input {
   height: 100%;
-  font-size: 15px;
+  font-size: var(--font-data);
 }
 
 .command-results {
@@ -1330,7 +1320,7 @@ button.tree-row:hover {
 
 .command-result {
   width: 100%;
-  min-height: 39px;
+  min-height: 34px;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
@@ -1340,7 +1330,7 @@ button.tree-row:hover {
   border-radius: 7px;
   color: var(--ink-muted);
   background: transparent;
-  font-size: 14px;
+  font-size: var(--font-ui);
   text-align: left;
   cursor: pointer;
 }
@@ -1365,13 +1355,24 @@ button.tree-row:hover {
   display: grid;
   place-items: center;
   color: var(--ink-muted);
-  font-size: 15px;
+  font-size: var(--font-data);
 }
 
-@keyframes island-enter {
+@keyframes menu-enter {
   from {
     opacity: 0;
-    transform: translateY(4px);
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes tab-content-enter {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
   }
   to {
     opacity: 1;
@@ -1398,16 +1399,16 @@ button.tree-row:hover {
 
 @media (max-width: 1220px) {
   .workbench {
-    --schema-width: 220px;
-    --inspector-width: 250px;
+    --schema-width: 208px;
+    --inspector-width: 236px;
   }
 
   .tree-row--group {
-    padding-left: 42px;
+    padding-left: 38px;
   }
 
   .tree-row--object {
-    padding-left: 65px;
+    padding-left: 56px;
   }
 
   .status-details > span:nth-child(1),
@@ -1425,8 +1426,20 @@ button.tree-row:hover {
   *::before,
   *::after {
     scroll-behavior: auto !important;
-    animation-duration: 0.01ms !important;
+    animation-duration: 1ms !important;
     animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
+    transition-duration: 1ms !important;
+  }
+
+  .app-menu,
+  .command-palette,
+  .result-content,
+  .inspector-content {
+    transform: none !important;
+  }
+
+  .loading-orbit {
+    animation-duration: 760ms !important;
+    animation-iteration-count: infinite !important;
   }
 }
