@@ -12,3 +12,9 @@ ordadb-optimizer = { path = "../ordadb-optimizer" }
 ordadb-sql = { path = "../ordadb-sql" }
 ordadb-types = { path = "../ordadb-types" }
 rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+ordadb-catalog = { path = "../ordadb-catalog" }
+tempfile.workspace = true

@@ -2187,11 +2187,15 @@ dependencies = [
 name = "ordadb-execution"
 version = "0.1.0"
 dependencies = [
+ "ordadb-catalog",
  "ordadb-index",
  "ordadb-optimizer",
  "ordadb-sql",
  "ordadb-types",
  "rust_decimal",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -4,16 +4,15 @@
 //! encoding belongs to `ordadb-storage`; WAL and crash recovery remain later
 //! milestones.
 
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ordadb_catalog::{Catalog, ColumnStatistics, TableDefinition, TableStatistics, indexable_type};
 use ordadb_execution::{
-    ExecutionContext, coerce_value as coerce_execution_value,
-    compare_values as compare_execution_values, evaluate as evaluate_scalar, evaluate_group,
-    execute as execute_plan, predicate_matches as execution_predicate_matches,
+    AdvancedExecutionCursor, AdvancedExecutionPlan, ExecutionContext, ExecutionCursor,
+    coerce_value as coerce_execution_value, evaluate as evaluate_scalar,
+    predicate_matches as execution_predicate_matches,
 };
 use ordadb_index::{BPlusTree, IndexEntry, IndexKey, RowId};
 use ordadb_optimizer::{
@@ -82,6 +81,89 @@ pub struct Session {
 
 impl Session {
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryStream> {
+        let events = self
+            .execute_stream(sql, params)?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(QueryStream::new(events))
+    }
+
+    pub fn execute_stream(&mut self, sql: &str, params: &[Value]) -> Result<TryQueryStream> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| internal_error("engine state lock is poisoned"))?;
+        let statement = bind(parse(sql)?, &state.catalog)?;
+        match statement {
+            BoundStatement::Select {
+                table_id,
+                schema,
+                projection,
+                filter,
+                order_by,
+                limit,
+            } => {
+                let (schema, cursor) = prepare_select_cursor(
+                    &state,
+                    SelectExecution {
+                        table_id,
+                        schema,
+                        projection,
+                        filter,
+                        order_by,
+                        limit,
+                    },
+                    params,
+                )?;
+                drop(state);
+                return Ok(TryQueryStream::select(
+                    schema,
+                    StreamBatchCursor::Simple(Box::new(cursor)),
+                ));
+            }
+            BoundStatement::AdvancedSelect {
+                table,
+                joins,
+                schema,
+                projection,
+                filter,
+                group_by,
+                having,
+                order_by,
+                limit,
+                aggregate,
+            } => {
+                let (schema, cursor) = prepare_advanced_cursor(
+                    &state,
+                    AdvancedExecution {
+                        table,
+                        joins,
+                        schema,
+                        projection,
+                        filter,
+                        group_by,
+                        having,
+                        order_by,
+                        limit,
+                        aggregate,
+                    },
+                    params,
+                )?;
+                drop(state);
+                return Ok(TryQueryStream::select(
+                    schema,
+                    StreamBatchCursor::Advanced(Box::new(cursor)),
+                ));
+            }
+            _ => {}
+        }
+        let (candidate, events, dirty) = execute_candidate(&state, sql, params)?;
+        if !dirty {
+            drop(state);
+            return Ok(TryQueryStream::new(events));
+        }
+        drop(candidate);
+        drop(state);
+
         let mut state = self
             .state
             .write()
@@ -95,7 +177,7 @@ impl Session {
                 .commit(&PersistentState::from(&candidate))?;
             *state = candidate;
         }
-        Ok(QueryStream::new(events))
+        Ok(TryQueryStream::new(events))
     }
 
     pub fn begin(&mut self) -> Result<Transaction<'_>> {
@@ -127,6 +209,71 @@ pub struct Transaction<'session> {
 
 impl Transaction<'_> {
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryStream> {
+        let statement = bind(parse(sql)?, &self.working.catalog)?;
+        let read_stream = match statement {
+            BoundStatement::Select {
+                table_id,
+                schema,
+                projection,
+                filter,
+                order_by,
+                limit,
+            } => {
+                let (schema, cursor) = prepare_select_cursor(
+                    &self.working,
+                    SelectExecution {
+                        table_id,
+                        schema,
+                        projection,
+                        filter,
+                        order_by,
+                        limit,
+                    },
+                    params,
+                )?;
+                Some(TryQueryStream::select(
+                    schema,
+                    StreamBatchCursor::Simple(Box::new(cursor)),
+                ))
+            }
+            BoundStatement::AdvancedSelect {
+                table,
+                joins,
+                schema,
+                projection,
+                filter,
+                group_by,
+                having,
+                order_by,
+                limit,
+                aggregate,
+            } => {
+                let (schema, cursor) = prepare_advanced_cursor(
+                    &self.working,
+                    AdvancedExecution {
+                        table,
+                        joins,
+                        schema,
+                        projection,
+                        filter,
+                        group_by,
+                        having,
+                        order_by,
+                        limit,
+                        aggregate,
+                    },
+                    params,
+                )?;
+                Some(TryQueryStream::select(
+                    schema,
+                    StreamBatchCursor::Advanced(Box::new(cursor)),
+                ))
+            }
+            _ => None,
+        };
+        if let Some(stream) = read_stream {
+            return stream.collect::<Result<Vec<_>>>().map(QueryStream::new);
+        }
         let (candidate, events, dirty) = execute_candidate(&self.working, sql, params)?;
         if dirty {
             self.working = candidate;
@@ -169,6 +316,157 @@ pub struct QueryStream {
     events: std::vec::IntoIter<QueryEvent>,
 }
 
+pub struct TryQueryStream {
+    state: TryQueryStreamState,
+    failed: bool,
+}
+
+enum TryQueryStreamState {
+    Events(std::vec::IntoIter<Result<QueryEvent>>),
+    Select(Box<SelectStreamState>),
+    Done,
+}
+
+struct SelectStreamState {
+    schema: Schema,
+    cursor: StreamBatchCursor,
+    phase: SelectStreamPhase,
+    rows_processed: u64,
+    emitted_batch: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectStreamPhase {
+    Schema,
+    Batches,
+    EmptyBatch,
+    Progress,
+    Complete,
+    Done,
+}
+
+enum StreamBatchCursor {
+    Simple(Box<ExecutionCursor>),
+    Advanced(Box<AdvancedExecutionCursor>),
+}
+
+impl StreamBatchCursor {
+    fn next_batch(&mut self) -> Result<Option<Batch>> {
+        match self {
+            Self::Simple(cursor) => cursor.next_batch(),
+            Self::Advanced(cursor) => cursor.next_batch(),
+        }
+    }
+}
+
+impl std::fmt::Debug for TryQueryStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TryQueryStream")
+            .field("failed", &self.failed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TryQueryStream {
+    fn new(events: Vec<QueryEvent>) -> Self {
+        Self {
+            state: TryQueryStreamState::Events(
+                events.into_iter().map(Ok).collect::<Vec<_>>().into_iter(),
+            ),
+            failed: false,
+        }
+    }
+
+    fn select(schema: Schema, cursor: StreamBatchCursor) -> Self {
+        Self {
+            state: TryQueryStreamState::Select(Box::new(SelectStreamState {
+                schema,
+                cursor,
+                phase: SelectStreamPhase::Schema,
+                rows_processed: 0,
+                emitted_batch: false,
+            })),
+            failed: false,
+        }
+    }
+}
+
+impl Iterator for TryQueryStream {
+    type Item = Result<QueryEvent>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        let event = match &mut self.state {
+            TryQueryStreamState::Events(events) => events.next().transpose(),
+            TryQueryStreamState::Select(stream) => stream.next_event(),
+            TryQueryStreamState::Done => Ok(None),
+        };
+        match event {
+            Ok(Some(event)) => Some(Ok(event)),
+            Ok(None) => {
+                self.state = TryQueryStreamState::Done;
+                None
+            }
+            Err(error) => {
+                self.failed = true;
+                self.state = TryQueryStreamState::Done;
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+impl SelectStreamState {
+    fn next_event(&mut self) -> Result<Option<QueryEvent>> {
+        match self.phase {
+            SelectStreamPhase::Schema => {
+                self.phase = SelectStreamPhase::Batches;
+                Ok(Some(QueryEvent::Schema(self.schema.clone())))
+            }
+            SelectStreamPhase::Batches => match self.cursor.next_batch()? {
+                Some(batch) => {
+                    self.rows_processed =
+                        self.rows_processed.saturating_add(batch.rows.len() as u64);
+                    self.emitted_batch = true;
+                    Ok(Some(QueryEvent::Batch(batch)))
+                }
+                None if !self.emitted_batch => {
+                    self.phase = SelectStreamPhase::EmptyBatch;
+                    Ok(Some(QueryEvent::Batch(Batch {
+                        schema: self.schema.clone(),
+                        rows: Vec::new(),
+                    })))
+                }
+                None => {
+                    self.phase = SelectStreamPhase::Progress;
+                    self.next_event()
+                }
+            },
+            SelectStreamPhase::EmptyBatch => {
+                self.phase = SelectStreamPhase::Progress;
+                self.next_event()
+            }
+            SelectStreamPhase::Progress => {
+                self.phase = SelectStreamPhase::Complete;
+                Ok(Some(QueryEvent::Progress(QueryProgress {
+                    rows_processed: self.rows_processed,
+                })))
+            }
+            SelectStreamPhase::Complete => {
+                self.phase = SelectStreamPhase::Done;
+                Ok(Some(QueryEvent::Complete(CommandComplete {
+                    tag: format!("SELECT {}", self.rows_processed),
+                    rows_affected: self.rows_processed,
+                })))
+            }
+            SelectStreamPhase::Done => Ok(None),
+        }
+    }
+}
+
 impl QueryStream {
     fn new(events: Vec<QueryEvent>) -> Self {
         Self {
@@ -187,9 +485,9 @@ impl Iterator for QueryStream {
 
 #[derive(Debug, Clone, Default)]
 struct DatabaseState {
-    catalog: Catalog,
-    rows: BTreeMap<TableId, Vec<Row>>,
-    indexes: BTreeMap<IndexId, BPlusTree>,
+    catalog: Arc<Catalog>,
+    rows: BTreeMap<TableId, Arc<Vec<Row>>>,
+    indexes: BTreeMap<IndexId, Arc<BPlusTree>>,
     generation: u64,
 }
 
@@ -225,12 +523,17 @@ impl DatabaseState {
                     .catalog
                     .index_by_id(index_id)
                     .ok_or_else(|| internal_error("persistent index is absent from the catalog"))?;
-                BPlusTree::from_entries(definition.unique, entries).map(|tree| (index_id, tree))
+                BPlusTree::from_entries(definition.unique, entries)
+                    .map(|tree| (index_id, Arc::new(tree)))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Self {
-            catalog: state.catalog,
-            rows: state.tables,
+            catalog: Arc::new(state.catalog),
+            rows: state
+                .tables
+                .into_iter()
+                .map(|(table_id, rows)| (table_id, Arc::new(rows)))
+                .collect(),
             indexes,
             generation: state.generation,
         })
@@ -241,17 +544,16 @@ impl From<&DatabaseState> for PersistentState {
     fn from(state: &DatabaseState) -> Self {
         Self {
             generation: state.generation,
-            catalog: state.catalog.clone(),
-            tables: state.rows.clone(),
+            catalog: (*state.catalog).clone(),
+            tables: state
+                .rows
+                .iter()
+                .map(|(table_id, rows)| (*table_id, (**rows).clone()))
+                .collect(),
             indexes: state
                 .indexes
                 .iter()
-                .map(|(index_id, tree)| {
-                    (
-                        *index_id,
-                        tree.entries().into_iter().cloned().collect::<Vec<_>>(),
-                    )
-                })
+                .map(|(index_id, tree)| (*index_id, tree.iter().cloned().collect::<Vec<_>>()))
                 .collect(),
         }
     }
@@ -276,7 +578,7 @@ fn execute_bound(
 ) -> Result<(Vec<QueryEvent>, bool)> {
     match statement {
         BoundStatement::CreateSchema { name } => {
-            state.catalog.create_schema(name)?;
+            Arc::make_mut(&mut state.catalog).create_schema(name)?;
             Ok((
                 command_events(Schema::empty(), "CREATE SCHEMA", 0, None),
                 true,
@@ -287,8 +589,9 @@ fn execute_bound(
             name,
             columns,
         } => {
-            let table_id = state.catalog.create_table(&schema, name, columns)?;
-            state.rows.insert(table_id, Vec::new());
+            let table_id =
+                Arc::make_mut(&mut state.catalog).create_table(&schema, name, columns)?;
+            state.rows.insert(table_id, Arc::new(Vec::new()));
             rebuild_table_derived(state, table_id)?;
             Ok((
                 command_events(Schema::empty(), "CREATE TABLE", 0, None),
@@ -296,7 +599,7 @@ fn execute_bound(
             ))
         }
         BoundStatement::CreateIndex { table_id, index } => {
-            state.catalog.create_index(table_id, index)?;
+            Arc::make_mut(&mut state.catalog).create_index(table_id, index)?;
             rebuild_table_derived(state, table_id)?;
             Ok((
                 command_events(Schema::empty(), "CREATE INDEX", 0, None),
@@ -374,7 +677,11 @@ fn execute_insert(
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
     let table = table_definition(state, table_id)?.clone();
-    let mut candidate_rows = state.rows.get(&table_id).cloned().unwrap_or_default();
+    let mut candidate_rows = state
+        .rows
+        .get(&table_id)
+        .map(|rows| (**rows).clone())
+        .unwrap_or_default();
     let inserted = expressions.len() as u64;
     for expressions in expressions {
         let mut values = vec![Value::Null; table.columns().len()];
@@ -384,7 +691,7 @@ fn execute_insert(
         candidate_rows.push(Row::new(values));
     }
     validate_rows(&table, &candidate_rows)?;
-    state.rows.insert(table_id, candidate_rows);
+    state.rows.insert(table_id, Arc::new(candidate_rows));
     rebuild_table_derived(state, table_id)?;
     Ok((
         command_events(
@@ -402,6 +709,36 @@ fn execute_select(
     execution: SelectExecution,
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
+    let (schema, mut cursor) = prepare_select_cursor(state, execution, params)?;
+    let mut events = vec![QueryEvent::Schema(schema.clone())];
+    let mut count = 0_u64;
+    let mut emitted_batch = false;
+    while let Some(batch) = cursor.next_batch()? {
+        count = count.saturating_add(batch.rows.len() as u64);
+        emitted_batch = true;
+        events.push(QueryEvent::Batch(batch));
+    }
+    if !emitted_batch {
+        events.push(QueryEvent::Batch(Batch {
+            schema,
+            rows: Vec::new(),
+        }));
+    }
+    events.push(QueryEvent::Progress(QueryProgress {
+        rows_processed: count,
+    }));
+    events.push(QueryEvent::Complete(CommandComplete {
+        tag: format!("SELECT {count}"),
+        rows_affected: count,
+    }));
+    Ok((events, false))
+}
+
+fn prepare_select_cursor(
+    state: &DatabaseState,
+    execution: SelectExecution,
+    params: &[Value],
+) -> Result<(Schema, ExecutionCursor)> {
     let SelectExecution {
         table_id,
         schema,
@@ -417,23 +754,13 @@ fn execute_select(
         order_by,
         limit,
     );
-    let result_rows = execute_plan(
-        &plan,
-        &ExecutionContext {
-            tables: &state.rows,
-            indexes: &state.indexes,
-            params,
-        },
-    )?;
-    let count = result_rows.len() as u64;
-    let batch = Batch {
-        schema: schema.clone(),
-        rows: result_rows,
+    let context = ExecutionContext {
+        tables: &state.rows,
+        indexes: &state.indexes,
+        params,
     };
-    Ok((
-        command_events(schema, format!("SELECT {count}"), count, Some(batch)),
-        false,
-    ))
+    let cursor = ExecutionCursor::new(&plan, &context, schema.clone())?;
+    Ok((schema, cursor))
 }
 
 fn execute_advanced_select(
@@ -441,6 +768,36 @@ fn execute_advanced_select(
     execution: AdvancedExecution,
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
+    let (schema, mut cursor) = prepare_advanced_cursor(state, execution, params)?;
+    let mut events = vec![QueryEvent::Schema(schema.clone())];
+    let mut count = 0_u64;
+    let mut emitted_batch = false;
+    while let Some(batch) = cursor.next_batch()? {
+        count = count.saturating_add(batch.rows.len() as u64);
+        emitted_batch = true;
+        events.push(QueryEvent::Batch(batch));
+    }
+    if !emitted_batch {
+        events.push(QueryEvent::Batch(Batch {
+            schema,
+            rows: Vec::new(),
+        }));
+    }
+    events.push(QueryEvent::Progress(QueryProgress {
+        rows_processed: count,
+    }));
+    events.push(QueryEvent::Complete(CommandComplete {
+        tag: format!("SELECT {count}"),
+        rows_affected: count,
+    }));
+    Ok((events, false))
+}
+
+fn prepare_advanced_cursor(
+    state: &DatabaseState,
+    execution: AdvancedExecution,
+    params: &[Value],
+) -> Result<(Schema, AdvancedExecutionCursor)> {
     let AdvancedExecution {
         table,
         joins,
@@ -453,167 +810,27 @@ fn execute_advanced_select(
         limit,
         aggregate,
     } = execution;
-    let mut source_rows = state.rows.get(&table.table_id).cloned().unwrap_or_default();
-    for join in &joins {
-        source_rows = execute_join(state, source_rows, join, params)?;
-    }
-    if let Some(filter) = &filter {
-        source_rows = source_rows
-            .into_iter()
-            .filter_map(
-                |row| match execution_predicate_matches(filter, &row, params) {
-                    Ok(true) => Some(Ok(row)),
-                    Ok(false) => None,
-                    Err(error) => Some(Err(error)),
-                },
-            )
-            .collect::<Result<Vec<_>>>()?;
-    }
-
-    let result_rows = if aggregate {
-        execute_aggregate_projection(
-            source_rows,
-            &projection,
-            &group_by,
-            having.as_ref(),
-            &order_by,
-            limit.as_ref(),
-            params,
-        )?
-    } else {
-        sort_rows(&mut source_rows, &order_by)?;
-        if let Some(limit) = &limit {
-            source_rows.truncate(evaluate_limit_expr(limit, params)?);
-        }
-        source_rows
-            .iter()
-            .map(|row| {
-                projection
-                    .iter()
-                    .map(|projection| evaluate_scalar(&projection.expr, &row.values, params))
-                    .collect::<Result<Vec<_>>>()
-                    .map(Row::new)
-            })
-            .collect::<Result<Vec<_>>>()?
+    let context = ExecutionContext {
+        tables: &state.rows,
+        indexes: &state.indexes,
+        params,
     };
-    let count = result_rows.len() as u64;
-    let batch = Batch {
-        schema: schema.clone(),
-        rows: result_rows,
-    };
-    Ok((
-        command_events(schema, format!("SELECT {count}"), count, Some(batch)),
-        false,
-    ))
-}
-
-fn execute_join(
-    state: &DatabaseState,
-    left_rows: Vec<Row>,
-    join: &BoundJoin,
-    params: &[Value],
-) -> Result<Vec<Row>> {
-    let right_rows = state
-        .rows
-        .get(&join.table.table_id)
-        .map_or(&[][..], Vec::as_slice);
-    let equi_columns = equi_join_columns(&join.on, join.table.offset);
-    let strategy = choose_join_strategy(
-        left_rows.len() as u64,
-        right_rows.len() as u64,
-        equi_columns.is_some(),
-    )
-    .strategy;
-    match (strategy, equi_columns) {
-        (JoinStrategy::Hash, Some((left_index, right_index))) => execute_hash_join(
-            left_rows,
-            right_rows,
-            join,
-            left_index,
-            right_index - join.table.offset,
-            params,
-        ),
-        _ => execute_nested_loop_join(left_rows, right_rows, join, params),
-    }
-}
-
-fn execute_nested_loop_join(
-    left_rows: Vec<Row>,
-    right_rows: &[Row],
-    join: &BoundJoin,
-    params: &[Value],
-) -> Result<Vec<Row>> {
-    let mut output = Vec::new();
-    for left in left_rows {
-        let mut matched = false;
-        for right in right_rows {
-            let mut values = left.values.clone();
-            values.extend(right.values.clone());
-            let row = Row::new(values);
-            if execution_predicate_matches(&join.on, &row, params)? {
-                matched = true;
-                output.push(row);
-            }
-        }
-        if !matched && join.kind == JoinKind::Left {
-            let mut values = left.values;
-            values.extend(std::iter::repeat_n(Value::Null, join.table.width));
-            output.push(Row::new(values));
-        }
-    }
-    Ok(output)
-}
-
-fn execute_hash_join(
-    left_rows: Vec<Row>,
-    right_rows: &[Row],
-    join: &BoundJoin,
-    left_index: usize,
-    right_index: usize,
-    params: &[Value],
-) -> Result<Vec<Row>> {
-    let mut buckets = HashMap::<Vec<u8>, Vec<&Row>>::new();
-    for right in right_rows {
-        let Some(value) = right.values.get(right_index) else {
-            return Err(internal_error("hash join right key is out of bounds"));
-        };
-        if value.is_null() {
-            continue;
-        }
-        buckets
-            .entry(encode_row(&Row::new(vec![value.clone()]))?)
-            .or_default()
-            .push(right);
-    }
-    let mut output = Vec::new();
-    for left in left_rows {
-        let Some(value) = left.values.get(left_index) else {
-            return Err(internal_error("hash join left key is out of bounds"));
-        };
-        let candidates = if value.is_null() {
-            None
-        } else {
-            buckets.get(&encode_row(&Row::new(vec![value.clone()]))?)
-        };
-        let mut matched = false;
-        if let Some(candidates) = candidates {
-            for right in candidates {
-                let mut values = left.values.clone();
-                values.extend(right.values.clone());
-                let row = Row::new(values);
-                if execution_predicate_matches(&join.on, &row, params)? {
-                    matched = true;
-                    output.push(row);
-                }
-            }
-        }
-        if !matched && join.kind == JoinKind::Left {
-            let mut values = left.values;
-            values.extend(std::iter::repeat_n(Value::Null, join.table.width));
-            output.push(Row::new(values));
-        }
-    }
-    Ok(output)
+    let cursor = AdvancedExecutionCursor::new(
+        AdvancedExecutionPlan {
+            table,
+            joins,
+            schema: schema.clone(),
+            projection,
+            filter,
+            group_by,
+            having,
+            order_by,
+            limit,
+            aggregate,
+        },
+        &context,
+    )?;
+    Ok((schema, cursor))
 }
 
 fn equi_join_columns(expr: &BoundExpr, right_offset: usize) -> Option<(usize, usize)> {
@@ -636,162 +853,6 @@ fn equi_join_columns(expr: &BoundExpr, right_offset: usize) -> Option<(usize, us
         Some((*right_index, *left_index))
     } else {
         None
-    }
-}
-
-fn execute_aggregate_projection(
-    rows: Vec<Row>,
-    projection: &[BoundProjection],
-    group_by: &[BoundExpr],
-    having: Option<&BoundExpr>,
-    order_by: &[BoundOrder],
-    limit: Option<&BoundExpr>,
-    params: &[Value],
-) -> Result<Vec<Row>> {
-    let mut groups = Vec::<(Vec<Value>, Vec<Row>)>::new();
-    if group_by.is_empty() {
-        groups.push((Vec::new(), rows));
-    } else {
-        for row in rows {
-            let key = group_by
-                .iter()
-                .map(|expr| evaluate_scalar(expr, &row.values, params))
-                .collect::<Result<Vec<_>>>()?;
-            if let Some((_, group_rows)) = groups.iter_mut().find(|(existing, _)| existing == &key)
-            {
-                group_rows.push(row);
-            } else {
-                groups.push((key, vec![row]));
-            }
-        }
-    }
-    if let Some(having) = having {
-        groups = groups
-            .into_iter()
-            .filter_map(|(key, rows)| {
-                let result = {
-                    let representative = rows.first().map_or(&[][..], |row| row.values.as_slice());
-                    evaluate_group(having, &rows, representative, params)
-                };
-                match result {
-                    Ok(Value::Boolean(true)) => Some(Ok((key, rows))),
-                    Ok(Value::Boolean(false) | Value::Null) => None,
-                    Ok(_) => Some(Err(DbError::new(
-                        "42804",
-                        "HAVING must evaluate to boolean",
-                    ))),
-                    Err(error) => Some(Err(error)),
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-    }
-    if !order_by.is_empty() {
-        let mut error = None;
-        groups.sort_by(|(_, left), (_, right)| {
-            let left = left
-                .first()
-                .cloned()
-                .unwrap_or_else(|| Row::new(Vec::new()));
-            let right = right
-                .first()
-                .cloned()
-                .unwrap_or_else(|| Row::new(Vec::new()));
-            compare_ordered_rows(&left, &right, order_by).unwrap_or_else(|sort_error| {
-                error = Some(sort_error);
-                Ordering::Equal
-            })
-        });
-        if let Some(error) = error {
-            return Err(error);
-        }
-    }
-    if let Some(limit) = limit {
-        groups.truncate(evaluate_limit_expr(limit, params)?);
-    }
-
-    groups
-        .into_iter()
-        .map(|(_, rows)| {
-            let representative = rows.first().map_or(&[][..], |row| row.values.as_slice());
-            projection
-                .iter()
-                .map(|projection| evaluate_group(&projection.expr, &rows, representative, params))
-                .collect::<Result<Vec<_>>>()
-                .map(Row::new)
-        })
-        .collect()
-}
-
-fn sort_rows(rows: &mut [Row], order_by: &[BoundOrder]) -> Result<()> {
-    if order_by.is_empty() {
-        return Ok(());
-    }
-    let mut error = None;
-    rows.sort_by(|left, right| {
-        compare_ordered_rows(left, right, order_by).unwrap_or_else(|sort_error| {
-            error = Some(sort_error);
-            Ordering::Equal
-        })
-    });
-    if let Some(error) = error {
-        Err(error)
-    } else {
-        Ok(())
-    }
-}
-
-fn compare_ordered_rows(left: &Row, right: &Row, order_by: &[BoundOrder]) -> Result<Ordering> {
-    for order in order_by {
-        let left_value = left
-            .values
-            .get(order.column_index)
-            .ok_or_else(|| internal_error("ORDER BY column is out of bounds"))?;
-        let right_value = right
-            .values
-            .get(order.column_index)
-            .ok_or_else(|| internal_error("ORDER BY column is out of bounds"))?;
-        let ordering = match (left_value.is_null(), right_value.is_null()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => {
-                if order.nulls_first.unwrap_or(!order.ascending) {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                }
-            }
-            (false, true) => {
-                if order.nulls_first.unwrap_or(!order.ascending) {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
-            (false, false) => {
-                let ordering = compare_execution_values(left_value, right_value)?;
-                if order.ascending {
-                    ordering
-                } else {
-                    ordering.reverse()
-                }
-            }
-        };
-        if ordering != Ordering::Equal {
-            return Ok(ordering);
-        }
-    }
-    Ok(Ordering::Equal)
-}
-
-fn evaluate_limit_expr(expr: &BoundExpr, params: &[Value]) -> Result<usize> {
-    match evaluate_scalar(expr, &[], params)? {
-        Value::Int64(value) if value >= 0 => {
-            usize::try_from(value).map_err(|_| DbError::new("22003", "LIMIT value is out of range"))
-        }
-        Value::Null => Err(DbError::new("22004", "LIMIT cannot be null")),
-        _ => Err(DbError::new(
-            "2201W",
-            "LIMIT must be a non-negative integer",
-        )),
     }
 }
 
@@ -911,7 +972,11 @@ fn execute_update(
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
     let table = table_definition(state, table_id)?.clone();
-    let mut candidate_rows = state.rows.get(&table_id).cloned().unwrap_or_default();
+    let mut candidate_rows = state
+        .rows
+        .get(&table_id)
+        .map(|rows| (**rows).clone())
+        .unwrap_or_default();
     let mut updated = 0u64;
     for row in &mut candidate_rows {
         if filter
@@ -935,7 +1000,7 @@ fn execute_update(
         }
     }
     validate_rows(&table, &candidate_rows)?;
-    state.rows.insert(table_id, candidate_rows);
+    state.rows.insert(table_id, Arc::new(candidate_rows));
     rebuild_table_derived(state, table_id)?;
     Ok((
         command_events(Schema::empty(), format!("UPDATE {updated}"), updated, None),
@@ -950,7 +1015,12 @@ fn execute_delete(
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
     table_definition(state, table_id)?;
-    let rows = state.rows.entry(table_id).or_default();
+    let rows = Arc::make_mut(
+        state
+            .rows
+            .entry(table_id)
+            .or_insert_with(|| Arc::new(Vec::new())),
+    );
     let original_len = rows.len();
     if let Some(filter) = &filter {
         let mut error = None;
@@ -1068,10 +1138,9 @@ fn rebuild_table_derived(state: &mut DatabaseState, table_id: TableId) -> Result
         .indexes
         .retain(|index_id, _| state.catalog.index_by_id(*index_id).is_some());
     for (index_id, tree) in rebuilt {
-        state.indexes.insert(index_id, tree);
+        state.indexes.insert(index_id, Arc::new(tree));
     }
-    state
-        .catalog
+    Arc::make_mut(&mut state.catalog)
         .set_table_statistics(table_id, compute_statistics(&table, &rows)?)?;
     Ok(())
 }
@@ -1516,5 +1585,136 @@ mod tests {
             )),
             vec![Row::new(vec![Value::Text("p511".into())])]
         );
+    }
+
+    #[test]
+    fn fallible_stream_preserves_event_order_and_legacy_adapter() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE stream_items (id BIGINT PRIMARY KEY)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO stream_items VALUES (1), (2), (3)",
+            &[],
+        );
+
+        let events = session
+            .execute_stream("SELECT id FROM stream_items ORDER BY id", &[])
+            .expect("stream")
+            .collect::<Result<Vec<_>>>()
+            .expect("fallible events");
+        assert!(matches!(events.first(), Some(QueryEvent::Schema(_))));
+        assert!(matches!(events.last(), Some(QueryEvent::Complete(_))));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, QueryEvent::Complete(_)))
+                .count(),
+            1
+        );
+        assert_eq!(rows(&events).len(), 3);
+        assert_eq!(
+            session
+                .execute("SELECT id FROM stream_items", &[])
+                .expect("legacy")
+                .filter(|event| matches!(event, QueryEvent::Complete(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn fallible_stream_owns_a_lazy_arc_snapshot() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE lazy_items (id BIGINT PRIMARY KEY)",
+            &[],
+        );
+        execute(&mut session, "INSERT INTO lazy_items VALUES (1), (2)", &[]);
+
+        let snapshot = session
+            .execute_stream("SELECT id FROM lazy_items ORDER BY id", &[])
+            .expect("lazy stream");
+        execute(&mut session, "INSERT INTO lazy_items VALUES (3)", &[]);
+
+        let events = snapshot
+            .collect::<Result<Vec<_>>>()
+            .expect("snapshot events");
+        assert_eq!(
+            rows(&events),
+            vec![
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(2)]),
+            ]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT id FROM lazy_items ORDER BY id",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(2)]),
+                Row::new(vec![Value::Int64(3)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_snapshots_share_arcs_and_writes_copy_only_the_affected_table() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE cow_a (id BIGINT PRIMARY KEY)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "CREATE TABLE cow_b (id BIGINT PRIMARY KEY)",
+            &[],
+        );
+        execute(&mut session, "INSERT INTO cow_a VALUES (1)", &[]);
+        execute(&mut session, "INSERT INTO cow_b VALUES (2)", &[]);
+
+        let (a_before, b_before, catalog_before) = {
+            let state = session.state.read().expect("state");
+            (
+                state.rows.get(&TableId::new(1)).expect("a").clone(),
+                state.rows.get(&TableId::new(2)).expect("b").clone(),
+                state.catalog.clone(),
+            )
+        };
+        execute(&mut session, "SELECT id FROM cow_a", &[]);
+        {
+            let state = session.state.read().expect("state");
+            assert!(Arc::ptr_eq(
+                &a_before,
+                state.rows.get(&TableId::new(1)).expect("a")
+            ));
+            assert!(Arc::ptr_eq(
+                &b_before,
+                state.rows.get(&TableId::new(2)).expect("b")
+            ));
+            assert!(Arc::ptr_eq(&catalog_before, &state.catalog));
+        }
+
+        execute(&mut session, "UPDATE cow_a SET id = 3", &[]);
+        let state = session.state.read().expect("state");
+        assert!(!Arc::ptr_eq(
+            &a_before,
+            state.rows.get(&TableId::new(1)).expect("a")
+        ));
+        assert!(Arc::ptr_eq(
+            &b_before,
+            state.rows.get(&TableId::new(2)).expect("b")
+        ));
     }
 }
