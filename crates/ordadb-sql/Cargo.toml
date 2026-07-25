@@ -1,0 +1,13 @@
+[package]
+name = "ordadb-sql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ordadb-catalog = { path = "../ordadb-catalog" }
+ordadb-types = { path = "../ordadb-types" }
+rust_decimal.workspace = true
+sqlparser.workspace = true
