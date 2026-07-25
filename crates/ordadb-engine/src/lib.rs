@@ -41,6 +41,17 @@ pub struct EngineConfig {
     pub data_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineStatusSnapshot {
+    pub generation: u64,
+    pub table_count: usize,
+    pub row_count: u64,
+    pub index_count: usize,
+    pub durable_lsn: Option<u64>,
+    pub dirty_page_count: usize,
+    pub commits_since_checkpoint: u64,
+}
+
 impl EngineConfig {
     #[must_use]
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
@@ -107,6 +118,44 @@ impl Engine {
     pub fn config(&self) -> &EngineConfig {
         &self.config
     }
+
+    pub fn catalog_snapshot(&self) -> Result<Arc<Catalog>> {
+        self.state
+            .read()
+            .map(|state| Arc::clone(&state.catalog))
+            .map_err(|_| internal_error("engine state lock is poisoned"))
+    }
+
+    pub fn status_snapshot(&self) -> Result<EngineStatusSnapshot> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| internal_error("engine state lock is poisoned"))?;
+        let table_count = state
+            .catalog
+            .database()
+            .schemas()
+            .map(|schema| schema.tables().count())
+            .sum();
+        let row_count = state.rows.values().try_fold(0_u64, |total, rows| {
+            let rows = u64::try_from(rows.len())
+                .map_err(|_| internal_error("table row count does not fit in u64"))?;
+            total
+                .checked_add(rows)
+                .ok_or_else(|| internal_error("database row count overflowed"))
+        })?;
+        let durable_lsn = self.wal.durable_lsn()?.map(|lsn| lsn.get());
+        let dirty_page_count = self.wal.dirty_pages()?.len();
+        Ok(EngineStatusSnapshot {
+            generation: state.generation,
+            table_count,
+            row_count,
+            index_count: state.indexes.len(),
+            durable_lsn,
+            dirty_page_count,
+            commits_since_checkpoint: self.commits_since_checkpoint.load(Ordering::Acquire),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -153,6 +202,23 @@ impl Session {
                 Err(error)
             }
         }
+    }
+
+    /// Bind a statement against the session's current catalog snapshot without
+    /// executing it and return the row schema exposed to protocol clients.
+    pub fn describe(&mut self, sql: &str) -> Result<Schema> {
+        self.normalize_sql_transaction_failure();
+        if self.transaction_status() == TransactionStatus::Failed {
+            return Err(failed_transaction_error());
+        }
+        let snapshot = self.statement_snapshot()?;
+        let described = parse(sql)
+            .and_then(|statement| bind(statement, &snapshot.catalog))
+            .map(|statement| bound_statement_schema(&statement));
+        if described.is_err() {
+            self.fail_sql_transaction();
+        }
+        described
     }
 
     pub fn execute_stream(&mut self, sql: &str, params: &[Value]) -> Result<TryQueryStream> {
@@ -414,6 +480,26 @@ impl Session {
         {
             self.sql_transaction = SqlTransactionState::Failed;
         }
+    }
+}
+
+fn bound_statement_schema(statement: &BoundStatement) -> Schema {
+    match statement {
+        BoundStatement::Select { schema, .. } | BoundStatement::AdvancedSelect { schema, .. } => {
+            schema.clone()
+        }
+        BoundStatement::Explain { .. } => {
+            Schema::new(vec![Field::new("QUERY PLAN", ScalarType::Text, false)])
+        }
+        BoundStatement::Begin
+        | BoundStatement::Commit
+        | BoundStatement::Rollback
+        | BoundStatement::CreateSchema { .. }
+        | BoundStatement::CreateTable { .. }
+        | BoundStatement::CreateIndex { .. }
+        | BoundStatement::Insert { .. }
+        | BoundStatement::Update { .. }
+        | BoundStatement::Delete { .. } => Schema::empty(),
     }
 }
 
