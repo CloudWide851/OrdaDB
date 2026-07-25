@@ -189,6 +189,50 @@ impl BufferPool {
         inner.disk.truncate_pages(0)
     }
 
+    pub(crate) fn invalidate_pages(&self, page_ids: &[PageId]) -> Result<()> {
+        let mut inner = self.lock()?;
+        if let Some(page_id) = page_ids.iter().find(|page_id| {
+            inner
+                .frames
+                .get(page_id)
+                .is_some_and(|frame| frame.pin_count > 0)
+        }) {
+            return Err(DbError::new(
+                "55000",
+                format!(
+                    "cannot invalidate pinned page {} during prepared commit",
+                    page_id.get()
+                ),
+            )
+            .with_hint("release page guards before applying a prepared commit"));
+        }
+        for page_id in page_ids {
+            inner.frames.remove(page_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resize_pages(&self, page_count: u64) -> Result<()> {
+        let mut inner = self.lock()?;
+        if let Some(page_id) = inner
+            .frames
+            .iter()
+            .find(|(page_id, frame)| page_id.get() >= page_count && frame.pin_count > 0)
+            .map(|(page_id, _)| *page_id)
+        {
+            return Err(DbError::new(
+                "55000",
+                format!(
+                    "cannot remove pinned page {} while resizing database storage",
+                    page_id.get()
+                ),
+            )
+            .with_hint("release page guards before resizing database storage"));
+        }
+        inner.frames.retain(|page_id, _| page_id.get() < page_count);
+        inner.disk.truncate_pages(page_count)
+    }
+
     pub fn sync_all(&self) -> Result<()> {
         self.lock()?.disk.sync_all()
     }

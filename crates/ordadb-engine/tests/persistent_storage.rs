@@ -75,7 +75,7 @@ fn public_api_reopens_persisted_catalog_rows_and_generation() {
 }
 
 #[test]
-fn rollback_failed_statement_and_generation_conflict_do_not_reappear() {
+fn rollback_failed_statement_and_competing_writer_do_not_reappear() {
     let directory = tempdir().expect("tempdir");
     {
         let engine = Engine::open(EngineConfig::new(directory.path())).expect("open");
@@ -110,22 +110,23 @@ fn rollback_failed_statement_and_generation_conflict_do_not_reappear() {
             .expect_err("statement atomicity");
         assert_eq!(duplicate.sql_state, "23505");
 
-        let mut transaction = first.begin().expect("begin conflict");
+        let mut transaction = first.begin().expect("begin writer");
         transaction
-            .execute("INSERT INTO events VALUES (4, 'stale')", &[])
-            .expect("stale insert")
-            .for_each(drop);
-        second
-            .execute("INSERT INTO events VALUES (5, 'concurrent')", &[])
-            .expect("concurrent insert")
+            .execute("INSERT INTO events VALUES (4, 'rolled back writer')", &[])
+            .expect("transaction insert")
             .for_each(drop);
         assert_eq!(
-            transaction
-                .commit()
-                .expect_err("generation conflict")
+            second
+                .execute("INSERT INTO events VALUES (5, 'concurrent')", &[])
+                .expect_err("competing writer")
                 .sql_state,
-            "40001"
+            "55P03"
         );
+        transaction.rollback().expect("rollback writer");
+        second
+            .execute("INSERT INTO events VALUES (5, 'after release')", &[])
+            .expect("released writer")
+            .for_each(drop);
     }
 
     let engine = Engine::open(EngineConfig::new(directory.path())).expect("reopen");

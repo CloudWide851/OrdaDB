@@ -12,8 +12,8 @@ use ordadb_catalog::{Catalog, NewColumn, NewIndex, TableDefinition, indexable_ty
 use ordadb_types::{DbError, Field, Identifier, Result, ScalarType, Schema, TableId, Value};
 use rust_decimal::Decimal;
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator as SqlBinaryOperator, CharacterLength, ColumnOption,
-    CreateTable, DataType, ExactNumberInfo, Expr as SqlExpr, FromTable, FunctionArg,
+    AssignmentTarget, BeginTransactionKind, BinaryOperator as SqlBinaryOperator, CharacterLength,
+    ColumnOption, CreateTable, DataType, ExactNumberInfo, Expr as SqlExpr, FromTable, FunctionArg,
     FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
     LimitClause, ObjectName, ObjectNamePart, OrderByKind, Query, SchemaName, Select, SelectItem,
     SetExpr, Spanned, Statement as SqlStatement, TableAlias, TableConstraint, TableFactor,
@@ -22,7 +22,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
-use sqlparser::tokenizer::{Location, Span};
+use sqlparser::tokenizer::{Location, Span, Token, Tokenizer};
 
 const FEATURE_NOT_SUPPORTED: &str = "0A000";
 const SYNTAX_ERROR: &str = "42601";
@@ -142,6 +142,9 @@ pub struct ParsedJoin {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedStatement {
+    Begin,
+    Commit,
+    Rollback,
     CreateSchema {
         name: ParsedIdentifier,
     },
@@ -254,6 +257,9 @@ pub struct BoundJoin {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundStatement {
+    Begin,
+    Commit,
+    Rollback,
     CreateSchema {
         name: Identifier,
     },
@@ -308,13 +314,19 @@ pub enum BoundStatement {
 /// Parse exactly one statement using PostgreSQL dialect rules.
 pub fn parse(sql: &str) -> Result<ParsedStatement> {
     let dialect = PostgreSqlDialect {};
-    let mut statements = Parser::parse_sql(&dialect, sql).map_err(|error| {
-        let message = error.to_string();
-        let position = parser_error_position(sql, &message);
-        let mut error = DbError::new(SYNTAX_ERROR, message);
-        error.position = position;
-        error
-    })?;
+    let mut statements = match Parser::parse_sql(&dialect, sql) {
+        Ok(statements) => statements,
+        Err(error) => {
+            if has_unrepresented_transaction_option(sql) {
+                return unsupported("transaction modes and options are not supported yet");
+            }
+            let message = error.to_string();
+            let position = parser_error_position(sql, &message);
+            let mut error = DbError::new(SYNTAX_ERROR, message);
+            error.position = position;
+            return Err(error);
+        }
+    };
 
     if statements.len() != 1 {
         return Err(DbError::new(
@@ -334,6 +346,9 @@ pub fn parse(sql: &str) -> Result<ParsedStatement> {
 /// Bind an OrdaDB-owned parsed statement against an immutable catalog view.
 pub fn bind(statement: ParsedStatement, catalog: &Catalog) -> Result<BoundStatement> {
     match statement {
+        ParsedStatement::Begin => Ok(BoundStatement::Begin),
+        ParsedStatement::Commit => Ok(BoundStatement::Commit),
+        ParsedStatement::Rollback => Ok(BoundStatement::Rollback),
         ParsedStatement::CreateSchema { name } => {
             if catalog.schema(&name.name).is_some() {
                 return Err(
@@ -408,6 +423,60 @@ pub fn bind(statement: ParsedStatement, catalog: &Catalog) -> Result<BoundStatem
 
 fn convert_statement(statement: SqlStatement, sql: &str) -> Result<ParsedStatement> {
     match statement {
+        SqlStatement::StartTransaction {
+            modes,
+            begin,
+            transaction,
+            modifier,
+            statements,
+            exception,
+            has_end_keyword,
+        } => {
+            let supported_keyword = if begin {
+                matches!(
+                    transaction,
+                    None | Some(BeginTransactionKind::Transaction)
+                        | Some(BeginTransactionKind::Work)
+                )
+            } else {
+                matches!(transaction, Some(BeginTransactionKind::Transaction))
+            };
+            if !modes.is_empty()
+                || !supported_keyword
+                || modifier.is_some()
+                || !statements.is_empty()
+                || exception.is_some()
+                || has_end_keyword
+            {
+                return unsupported("transaction modes and options are not supported yet");
+            }
+            Ok(ParsedStatement::Begin)
+        }
+        SqlStatement::Commit {
+            chain,
+            end,
+            modifier,
+        } => {
+            if chain
+                || end
+                || modifier.is_some()
+                || has_keyword_sequence(sql, &["AND", "NO", "CHAIN"])
+                || has_keyword_sequence(sql, &["COMMIT", "TRAN"])
+            {
+                return unsupported("COMMIT options are not supported yet");
+            }
+            Ok(ParsedStatement::Commit)
+        }
+        SqlStatement::Rollback { chain, savepoint } => {
+            if chain
+                || savepoint.is_some()
+                || has_keyword_sequence(sql, &["AND", "NO", "CHAIN"])
+                || has_keyword_sequence(sql, &["ROLLBACK", "TRAN"])
+            {
+                return unsupported("ROLLBACK options and savepoints are not supported yet");
+            }
+            Ok(ParsedStatement::Rollback)
+        }
         SqlStatement::CreateSchema {
             schema_name,
             if_not_exists,
@@ -2452,6 +2521,51 @@ fn unsupported_at<T>(message: impl Into<String>, position: Option<usize>) -> Res
     Err(DbError::new(FEATURE_NOT_SUPPORTED, message).with_position_opt(position))
 }
 
+fn has_unrepresented_transaction_option(sql: &str) -> bool {
+    let tokens = significant_tokens(sql);
+    let begins_transaction = tokens.first().is_some_and(|token| {
+        is_unquoted_word(token, "BEGIN")
+            || (is_unquoted_word(token, "START")
+                && tokens
+                    .get(1)
+                    .is_some_and(|token| is_unquoted_word(token, "TRANSACTION")))
+    });
+    begins_transaction
+        && tokens
+            .iter()
+            .any(|token| is_unquoted_word(token, "DEFERRABLE"))
+}
+
+fn has_keyword_sequence(sql: &str, sequence: &[&str]) -> bool {
+    significant_tokens(sql)
+        .windows(sequence.len())
+        .any(|window| {
+            window
+                .iter()
+                .zip(sequence)
+                .all(|(token, keyword)| is_unquoted_word(token, keyword))
+        })
+}
+
+fn significant_tokens(sql: &str) -> Vec<Token> {
+    let dialect = PostgreSqlDialect {};
+    let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize() else {
+        return Vec::new();
+    };
+    tokens
+        .into_iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect()
+}
+
+fn is_unquoted_word(token: &Token, expected: &str) -> bool {
+    matches!(
+        token,
+        Token::Word(word)
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected)
+    )
+}
+
 fn span_position(sql: &str, span: Span) -> Option<usize> {
     location_position(sql, span.start)
 }
@@ -2553,6 +2667,63 @@ mod tests {
         assert_eq!(order_by[0].column_index, 0);
         assert!(!order_by[0].ascending);
         assert!(limit.is_some());
+    }
+
+    #[test]
+    fn parses_and_binds_owned_transaction_control_variants() {
+        let catalog = Catalog::default();
+        for (sql, parsed, bound) in [
+            ("BEGIN", ParsedStatement::Begin, BoundStatement::Begin),
+            (
+                "  bEgIn \n TrAnSaCtIoN ; ",
+                ParsedStatement::Begin,
+                BoundStatement::Begin,
+            ),
+            (
+                "\n StArT \t TrAnSaCtIoN ;",
+                ParsedStatement::Begin,
+                BoundStatement::Begin,
+            ),
+            (
+                "cOmMiT \n WoRk;",
+                ParsedStatement::Commit,
+                BoundStatement::Commit,
+            ),
+            (
+                "\r\n RoLlBaCk \t TrAnSaCtIoN ;",
+                ParsedStatement::Rollback,
+                BoundStatement::Rollback,
+            ),
+        ] {
+            let actual = parse(sql).expect("parse transaction control");
+            assert_eq!(actual, parsed, "{sql}");
+            assert_eq!(
+                bind(actual, &catalog).expect("bind transaction control"),
+                bound,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_transaction_modes_chaining_and_savepoints() {
+        for sql in [
+            "BEGIN ISOLATION LEVEL SERIALIZABLE",
+            "START TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            "BEGIN READ ONLY",
+            "START TRANSACTION READ WRITE",
+            "BEGIN DEFERRABLE",
+            "START TRANSACTION NOT DEFERRABLE",
+            "COMMIT AND CHAIN",
+            "COMMIT AND NO CHAIN",
+            "ROLLBACK AND CHAIN",
+            "ROLLBACK AND NO CHAIN",
+            "ROLLBACK TO SAVEPOINT before_update",
+            "ROLLBACK TO before_update",
+        ] {
+            let error = parse(sql).expect_err("unsupported transaction control");
+            assert_eq!(error.sql_state, FEATURE_NOT_SUPPORTED, "{sql}");
+        }
     }
 
     #[test]

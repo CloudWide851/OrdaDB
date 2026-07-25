@@ -13,6 +13,7 @@ ordadb-index = { path = "../ordadb-index" }
 ordadb-optimizer = { path = "../ordadb-optimizer" }
 ordadb-sql = { path = "../ordadb-sql" }
 ordadb-storage = { path = "../ordadb-storage" }
+ordadb-transaction = { path = "../ordadb-transaction" }
 ordadb-types = { path = "../ordadb-types" }
 
 [dev-dependencies]
