@@ -1,5 +1,6 @@
 use ordadb_engine::{Engine, EngineConfig};
 use ordadb_types::{QueryEvent, Row, Value};
+use tempfile::tempdir;
 
 fn rows(events: impl Iterator<Item = QueryEvent>) -> Vec<Row> {
     events
@@ -13,8 +14,8 @@ fn rows(events: impl Iterator<Item = QueryEvent>) -> Vec<Row> {
 
 #[test]
 fn public_api_executes_committed_and_rolled_back_work() {
-    let engine = Engine::open(EngineConfig::new("reserved-for-future-storage"))
-        .expect("open in-memory engine");
+    let directory = tempdir().expect("tempdir");
+    let engine = Engine::open(EngineConfig::new(directory.path())).expect("open persistent engine");
     let mut session = engine.connect().expect("connect");
     session
         .execute("CREATE SCHEMA app", &[])
@@ -71,8 +72,8 @@ fn public_api_executes_committed_and_rolled_back_work() {
 
 #[test]
 fn public_api_preserves_errors_and_statement_atomicity() {
-    let engine = Engine::open(EngineConfig::new("reserved-for-future-storage"))
-        .expect("open in-memory engine");
+    let directory = tempdir().expect("tempdir");
+    let engine = Engine::open(EngineConfig::new(directory.path())).expect("open persistent engine");
     let mut session = engine.connect().expect("connect");
     session
         .execute(

@@ -2,7 +2,7 @@ use std::fmt;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -32,7 +32,7 @@ object_id!(SchemaId);
 object_id!(TableId);
 object_id!(ColumnId);
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Identifier {
     value: String,
     quoted: bool,
@@ -66,6 +66,34 @@ impl Identifier {
     #[must_use]
     pub const fn is_quoted(&self) -> bool {
         self.quoted
+    }
+}
+
+impl Serialize for Identifier {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let kind = if self.quoted { 'q' } else { 'u' };
+        serializer.serialize_str(&format!("{kind}:{}", self.value))
+    }
+}
+
+impl<'de> Deserialize<'de> for Identifier {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        if let Some(value) = encoded.strip_prefix("u:") {
+            Ok(Self::unquoted(value))
+        } else if let Some(value) = encoded.strip_prefix("q:") {
+            Ok(Self::quoted(value))
+        } else {
+            Err(de::Error::custom(
+                "identifier must start with the v1 `u:` or `q:` marker",
+            ))
+        }
     }
 }
 
@@ -333,6 +361,8 @@ pub type Result<T> = std::result::Result<T, DbError>;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
     use rust_decimal::Decimal;
     use uuid::Uuid;
@@ -343,6 +373,20 @@ mod tests {
     fn normalizes_unquoted_identifiers_but_preserves_quoted_names() {
         assert_eq!(Identifier::unquoted("MixedCase").as_str(), "mixedcase");
         assert_eq!(Identifier::quoted("MixedCase").as_str(), "MixedCase");
+    }
+
+    #[test]
+    fn identifier_json_is_reversible_and_valid_as_a_map_key() {
+        let identifiers = BTreeMap::from([
+            (Identifier::unquoted("MixedCase"), 1),
+            (Identifier::quoted("MixedCase"), 2),
+        ]);
+        let encoded = serde_json::to_string(&identifiers).expect("serialize identifiers");
+        assert!(encoded.contains("\"u:mixedcase\""));
+        assert!(encoded.contains("\"q:MixedCase\""));
+        let decoded: BTreeMap<Identifier, i32> =
+            serde_json::from_str(&encoded).expect("deserialize identifiers");
+        assert_eq!(decoded, identifiers);
     }
 
     #[test]

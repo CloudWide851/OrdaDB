@@ -1,19 +1,20 @@
-//! In-memory execution foundation for OrdaDB.
+//! SQL execution and persistent snapshot publication for OrdaDB.
 //!
-//! This crate intentionally performs no disk I/O. It establishes stable
-//! engine/session/transaction contracts while later milestones replace the
-//! in-memory state with persistent pages, WAL, and recovery.
+//! This crate owns SQL semantics and candidate-state atomicity. Physical page
+//! encoding belongs to `ordadb-storage`; WAL and crash recovery remain later
+//! milestones.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use ordadb_catalog::{Catalog, TableDefinition};
 use ordadb_sql::{
     BinaryOperator, BoundExpr, BoundExprKind, BoundOrder, BoundProjection, BoundStatement,
     UnaryOperator, bind, parse,
 };
+use ordadb_storage::{DatabaseStore, PersistentState};
 use ordadb_types::{
     Batch, CommandComplete, DbError, QueryEvent, QueryProgress, Result, Row, ScalarType, Schema,
     TableId, Value,
@@ -38,20 +39,24 @@ impl EngineConfig {
 pub struct Engine {
     config: Arc<EngineConfig>,
     state: Arc<RwLock<DatabaseState>>,
+    store: Arc<Mutex<DatabaseStore>>,
 }
 
 impl Engine {
-    /// Open an engine without touching the configured data directory.
     pub fn open(config: EngineConfig) -> Result<Self> {
+        let store = DatabaseStore::open(&config.data_dir)?;
+        let state = DatabaseState::from(store.committed_state().clone());
         Ok(Self {
             config: Arc::new(config),
-            state: Arc::new(RwLock::new(DatabaseState::default())),
+            state: Arc::new(RwLock::new(state)),
+            store: Arc::new(Mutex::new(store)),
         })
     }
 
     pub fn connect(&self) -> Result<Session> {
         Ok(Session {
             state: Arc::clone(&self.state),
+            store: Arc::clone(&self.store),
         })
     }
 
@@ -64,6 +69,7 @@ impl Engine {
 #[derive(Debug)]
 pub struct Session {
     state: Arc<RwLock<DatabaseState>>,
+    store: Arc<Mutex<DatabaseStore>>,
 }
 
 impl Session {
@@ -75,6 +81,10 @@ impl Session {
         let (mut candidate, events, dirty) = execute_candidate(&state, sql, params)?;
         if dirty {
             candidate.generation = state.generation.saturating_add(1);
+            self.store
+                .lock()
+                .map_err(|_| internal_error("database store lock is poisoned"))?
+                .commit(&PersistentState::from(&candidate))?;
             *state = candidate;
         }
         Ok(QueryStream::new(events))
@@ -90,6 +100,7 @@ impl Session {
         drop(state);
         Ok(Transaction {
             state: &self.state,
+            store: &self.store,
             working,
             base_generation,
             dirty: false,
@@ -100,6 +111,7 @@ impl Session {
 #[derive(Debug)]
 pub struct Transaction<'session> {
     state: &'session Arc<RwLock<DatabaseState>>,
+    store: &'session Arc<Mutex<DatabaseStore>>,
     working: DatabaseState,
     base_generation: u64,
     dirty: bool,
@@ -131,6 +143,10 @@ impl Transaction<'_> {
             .with_hint("retry the transaction"));
         }
         self.working.generation = state.generation.saturating_add(1);
+        self.store
+            .lock()
+            .map_err(|_| internal_error("database store lock is poisoned"))?
+            .commit(&PersistentState::from(&self.working))?;
         *state = self.working;
         Ok(())
     }
@@ -166,6 +182,26 @@ struct DatabaseState {
     catalog: Catalog,
     rows: BTreeMap<TableId, Vec<Row>>,
     generation: u64,
+}
+
+impl From<PersistentState> for DatabaseState {
+    fn from(state: PersistentState) -> Self {
+        Self {
+            catalog: state.catalog,
+            rows: state.tables,
+            generation: state.generation,
+        }
+    }
+}
+
+impl From<&DatabaseState> for PersistentState {
+    fn from(state: &DatabaseState) -> Self {
+        Self {
+            generation: state.generation,
+            catalog: state.catalog.clone(),
+            tables: state.rows.clone(),
+        }
+    }
 }
 
 fn execute_candidate(
@@ -715,10 +751,14 @@ pub fn configured_data_dir(config: &EngineConfig) -> &Path {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::{TempDir, tempdir};
+
     use super::*;
 
-    fn engine() -> Engine {
-        Engine::open(EngineConfig::new("unused-data-directory")).expect("open engine")
+    fn engine() -> (TempDir, Engine) {
+        let directory = tempdir().expect("tempdir");
+        let engine = Engine::open(EngineConfig::new(directory.path())).expect("open engine");
+        (directory, engine)
     }
 
     fn execute(session: &mut Session, sql: &str, params: &[Value]) -> Vec<QueryEvent> {
@@ -753,7 +793,7 @@ mod tests {
 
     #[test]
     fn executes_crud_with_parameters_ordering_and_limits() {
-        let engine = engine();
+        let (_directory, engine) = engine();
         let mut session = engine.connect().expect("connect");
         create_documents(&mut session);
         execute(
@@ -802,7 +842,7 @@ mod tests {
 
     #[test]
     fn compares_jsonb_parameters_by_equality_without_requiring_ordering() {
-        let engine = engine();
+        let (_directory, engine) = engine();
         let mut session = engine.connect().expect("connect");
         execute(
             &mut session,
@@ -835,7 +875,7 @@ mod tests {
 
     #[test]
     fn enforces_not_null_primary_key_and_unique_constraints_atomically() {
-        let engine = engine();
+        let (_directory, engine) = engine();
         let mut session = engine.connect().expect("connect");
         execute(
             &mut session,
@@ -866,7 +906,7 @@ mod tests {
 
     #[test]
     fn commits_rolls_back_and_detects_generation_conflicts() {
-        let engine = engine();
+        let (_directory, engine) = engine();
         let mut first = engine.connect().expect("first");
         let mut second = engine.connect().expect("second");
         create_documents(&mut first);
@@ -907,7 +947,7 @@ mod tests {
 
     #[test]
     fn emits_schema_then_work_then_exactly_one_completion() {
-        let engine = engine();
+        let (_directory, engine) = engine();
         let mut session = engine.connect().expect("connect");
         create_documents(&mut session);
         let events = execute(&mut session, "SELECT * FROM documents", &[]);
@@ -928,11 +968,13 @@ mod tests {
     }
 
     #[test]
-    fn open_does_not_create_persistent_files() {
-        let path = std::env::temp_dir().join(format!("ordadb-foundation-{}", std::process::id()));
-        assert!(!path.exists());
-        let engine = Engine::open(EngineConfig::new(&path)).expect("open");
-        assert_eq!(configured_data_dir(engine.config()), path);
-        assert!(!path.exists());
+    fn open_bootstraps_and_reopens_the_persistent_store() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let engine = Engine::open(EngineConfig::new(directory.path())).expect("open");
+            assert_eq!(configured_data_dir(engine.config()), directory.path());
+        }
+        assert!(directory.path().join("ordadb.data").is_file());
+        assert!(Engine::open(EngineConfig::new(directory.path())).is_ok());
     }
 }
