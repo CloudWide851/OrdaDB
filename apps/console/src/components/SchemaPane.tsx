@@ -3,6 +3,7 @@ import {
   ChevronRight,
   FolderTree,
   MoreHorizontal,
+  PlugZap,
   Plus,
   RefreshCw,
   Search,
@@ -26,6 +27,9 @@ export function SchemaPane() {
     (state) => state.setSelectedObject,
   );
   const setNotice = useWorkbenchStore((state) => state.setNotice);
+  const setPluginManagerOpen = useWorkbenchStore(
+    (state) => state.setPluginManagerOpen,
+  );
 
   const visibleGroups = useMemo(() => {
     const normalized = filter.trim().toLowerCase();
@@ -59,6 +63,11 @@ export function SchemaPane() {
       <div className="pane-heading">
         <h2>数据库</h2>
         <div className="heading-actions">
+          <IconAction
+            label="管理连接插件"
+            icon={<PlugZap size={16} aria-hidden="true" />}
+            onClick={() => setPluginManagerOpen(true)}
+          />
           <IconAction
             label="新建数据库对象"
             icon={<Plus size={17} aria-hidden="true" />}
