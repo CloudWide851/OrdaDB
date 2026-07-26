@@ -957,6 +957,7 @@ mod tests {
                         nullable: false,
                         primary_key: true,
                         unique: true,
+                        default: None,
                     },
                     NewColumn::new(Identifier::unquoted("payload"), ScalarType::Text),
                 ],

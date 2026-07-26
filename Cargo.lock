@@ -2528,6 +2528,7 @@ version = "0.1.0"
 dependencies = [
  "ordadb-types",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2561,6 +2562,7 @@ dependencies = [
  "ordadb-execution",
  "ordadb-index",
  "ordadb-optimizer",
+ "ordadb-plpgsql",
  "ordadb-sql",
  "ordadb-storage",
  "ordadb-transaction",
@@ -2604,6 +2606,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ordadb-plpgsql"
+version = "0.1.0"
+dependencies = [
+ "ordadb-types",
+]
+
+[[package]]
 name = "ordadb-protocol"
 version = "0.1.0"
 dependencies = [
@@ -2622,6 +2631,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqlparser",
  "subtle",
  "tempfile",
  "tokio-util",

@@ -112,25 +112,74 @@ impl Authorizer {
 fn object_matches(granted: &DbObject, requested: &DbObject) -> bool {
     match granted {
         DbObject::Server => true,
+        DbObject::Database(_) => !matches!(requested, DbObject::Server),
+        DbObject::Schema(schema) => match requested {
+            DbObject::Schema(requested) => requested == schema,
+            DbObject::Table(requested)
+            | DbObject::Sequence(requested)
+            | DbObject::Function(requested) => requested
+                .strip_prefix(schema)
+                .is_some_and(|suffix| suffix.starts_with('.')),
+            DbObject::Server | DbObject::Database(_) => false,
+        },
         _ => granted == requested,
     }
 }
 
 fn classify_sql(database: &str, sql: &str) -> (Action, DbObject) {
     let normalized = sql.trim_start();
-    let keyword = normalized
-        .split_ascii_whitespace()
-        .next()
+    let tokens = normalized.split_ascii_whitespace().collect::<Vec<_>>();
+    let keyword = tokens
+        .first()
+        .copied()
         .unwrap_or_default()
         .to_ascii_uppercase();
     let action = match keyword.as_str() {
         "SELECT" | "EXPLAIN" | "SHOW" => Action::Read,
         "INSERT" | "UPDATE" | "DELETE" | "COPY" => Action::Write,
         "CREATE" | "ALTER" | "DROP" | "TRUNCATE" => Action::Ddl,
-        "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SET" => Action::Connect,
+        "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SET" | "CONNECT" => Action::Connect,
         _ => Action::Execute,
     };
-    (action, DbObject::Database(database.to_ascii_lowercase()))
+    let object = match keyword.as_str() {
+        "SELECT" => token_after(&tokens, "FROM").map(DbObject::Table),
+        "INSERT" => token_after(&tokens, "INTO").map(DbObject::Table),
+        "UPDATE" => tokens
+            .get(1)
+            .and_then(|token| object_token(token))
+            .map(DbObject::Table),
+        "DELETE" => token_after(&tokens, "FROM").map(DbObject::Table),
+        "CALL" => tokens
+            .get(1)
+            .and_then(|token| object_token(token))
+            .map(DbObject::Function),
+        _ => None,
+    }
+    .unwrap_or_else(|| DbObject::Database(database.to_ascii_lowercase()));
+    (action, object)
+}
+
+fn token_after(tokens: &[&str], keyword: &str) -> Option<String> {
+    tokens.windows(2).find_map(|window| {
+        window[0]
+            .eq_ignore_ascii_case(keyword)
+            .then(|| object_token(window[1]))
+            .flatten()
+    })
+}
+
+fn object_token(value: &str) -> Option<String> {
+    let value = value
+        .trim_matches(|character: char| matches!(character, '"' | '\'' | '(' | ')' | ',' | ';'))
+        .split('(')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    (!value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')))
+    .then_some(value)
 }
 
 #[cfg(test)]
@@ -191,5 +240,39 @@ mod tests {
             .effective_roles(&BTreeSet::from([format!("role{}", MAX_ROLE_DEPTH + 1)]))
             .expect_err("depth");
         assert_eq!(error.sql_state, "54001");
+    }
+
+    #[test]
+    fn sql_classification_respects_database_schema_and_table_grants() {
+        let principal = Principal {
+            user: "alice".into(),
+            roles: BTreeSet::from(["reader".into()]),
+        };
+        let role = Role {
+            name: "reader".into(),
+            inherits: BTreeSet::new(),
+        };
+        let authorizer = Authorizer {
+            roles: BTreeMap::from([("reader".into(), role)]),
+            grants: vec![Grant {
+                role: "reader".into(),
+                action: Action::Read,
+                object: DbObject::Schema("app".into()),
+            }],
+        };
+        authorizer
+            .authorize_sql(&principal, "ordadb", "SELECT * FROM app.items")
+            .expect("schema covers table");
+        assert_eq!(
+            authorizer
+                .authorize_sql(&principal, "ordadb", "SELECT * FROM private.items")
+                .expect_err("different schema")
+                .sql_state,
+            "42501"
+        );
+        assert_eq!(
+            classify_sql("ordadb", "UPDATE app.items SET value = 1"),
+            (Action::Write, DbObject::Table("app.items".into()))
+        );
     }
 }

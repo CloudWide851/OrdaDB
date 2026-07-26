@@ -11,6 +11,7 @@ ordadb-catalog = { path = "../ordadb-catalog" }
 ordadb-execution = { path = "../ordadb-execution" }
 ordadb-index = { path = "../ordadb-index" }
 ordadb-optimizer = { path = "../ordadb-optimizer" }
+ordadb-plpgsql = { path = "../ordadb-plpgsql" }
 ordadb-sql = { path = "../ordadb-sql" }
 ordadb-storage = { path = "../ordadb-storage" }
 ordadb-transaction = { path = "../ordadb-transaction" }

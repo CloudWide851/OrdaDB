@@ -32,6 +32,11 @@ object_id!(SchemaId);
 object_id!(TableId);
 object_id!(ColumnId);
 object_id!(IndexId);
+object_id!(ConstraintId);
+object_id!(SequenceId);
+object_id!(ViewId);
+object_id!(RoutineId);
+object_id!(TriggerId);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Identifier {

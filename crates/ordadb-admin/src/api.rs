@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,9 +15,14 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use zeroize::Zeroizing;
 
-use ordadb_catalog::Catalog;
+use ordadb_catalog::{
+    Catalog, ColumnDefinition, ConstraintDefinition, IndexDefinition, RoutineArgument, RoutineKind,
+    SequenceDefinition, TriggerDefinition, ViewKind,
+};
 use ordadb_engine::{Engine, EngineStatusSnapshot};
-use ordadb_types::DbError;
+use ordadb_types::{
+    DatabaseId, DbError, Identifier, RoutineId, ScalarType, Schema, SchemaId, TableId, ViewId,
+};
 
 use crate::{Action, AuthStore, Authorizer, DbObject, Principal, SessionRegistry, TokenStore};
 
@@ -147,15 +153,141 @@ async fn issue_token(
 async fn catalog(
     State(state): State<AdminState>,
     headers: HeaderMap,
-) -> std::result::Result<Json<ApiEnvelope<Catalog>>, ApiError> {
+) -> std::result::Result<Json<ApiEnvelope<CatalogProjection>>, ApiError> {
     require(
         &state,
         &headers,
         Action::Read,
         DbObject::Database("ordadb".into()),
     )?;
-    let catalog = (*state.engine.catalog_snapshot().map_err(ApiError::from)?).clone();
-    Ok(Json(ApiEnvelope::new(catalog)))
+    let catalog = state.engine.catalog_snapshot().map_err(ApiError::from)?;
+    Ok(Json(ApiEnvelope::new(CatalogProjection::from_catalog(
+        &catalog,
+    ))))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogProjection {
+    database: DatabaseProjection,
+}
+
+impl CatalogProjection {
+    fn from_catalog(catalog: &Catalog) -> Self {
+        let database = catalog.database();
+        Self {
+            database: DatabaseProjection {
+                id: database.id,
+                name: database.name.clone(),
+                schemas: database
+                    .schemas()
+                    .map(|schema| {
+                        let materialized_tables = schema
+                            .views()
+                            .filter_map(|view| view.materialized_table_id)
+                            .collect::<BTreeSet<_>>();
+                        SchemaProjection {
+                            id: schema.id,
+                            name: schema.name.clone(),
+                            tables: schema
+                                .tables()
+                                .filter(|table| !materialized_tables.contains(&table.id))
+                                .map(|table| TableProjection {
+                                    id: table.id,
+                                    name: table.name.clone(),
+                                    columns: table.columns().to_vec(),
+                                    indexes: table.indexes().cloned().collect(),
+                                    constraints: table.constraints().cloned().collect(),
+                                    triggers: table.triggers().cloned().collect(),
+                                })
+                                .collect(),
+                            sequences: schema.sequences().cloned().collect(),
+                            views: schema
+                                .views()
+                                .map(|view| ViewProjection {
+                                    id: view.id,
+                                    name: view.name.clone(),
+                                    kind: view.kind,
+                                    output: view.output.clone(),
+                                    populated: view.populated,
+                                    indexes: view
+                                        .materialized_table_id
+                                        .and_then(|table_id| catalog.table_by_id(table_id))
+                                        .map(|table| table.indexes().cloned().collect())
+                                        .unwrap_or_default(),
+                                })
+                                .collect(),
+                            routines: schema
+                                .routines()
+                                .map(|routine| RoutineProjection {
+                                    id: routine.id,
+                                    name: routine.name.clone(),
+                                    kind: routine.kind,
+                                    arguments: routine.arguments.clone(),
+                                    return_type: routine.return_type.clone(),
+                                    returns_set: routine.returns_set,
+                                    language: routine.language.clone(),
+                                })
+                                .collect(),
+                        }
+                    })
+                    .collect(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DatabaseProjection {
+    id: DatabaseId,
+    name: Identifier,
+    schemas: Vec<SchemaProjection>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SchemaProjection {
+    id: SchemaId,
+    name: Identifier,
+    tables: Vec<TableProjection>,
+    sequences: Vec<SequenceDefinition>,
+    views: Vec<ViewProjection>,
+    routines: Vec<RoutineProjection>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TableProjection {
+    id: TableId,
+    name: Identifier,
+    columns: Vec<ColumnDefinition>,
+    indexes: Vec<IndexDefinition>,
+    constraints: Vec<ConstraintDefinition>,
+    triggers: Vec<TriggerDefinition>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewProjection {
+    id: ViewId,
+    name: Identifier,
+    kind: ViewKind,
+    output: Schema,
+    populated: bool,
+    indexes: Vec<IndexDefinition>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutineProjection {
+    id: RoutineId,
+    name: Identifier,
+    kind: RoutineKind,
+    arguments: Vec<RoutineArgument>,
+    return_type: Option<ScalarType>,
+    returns_set: bool,
+    language: String,
 }
 
 async fn sessions(
