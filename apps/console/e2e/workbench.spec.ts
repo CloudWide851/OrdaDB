@@ -38,6 +38,21 @@ test.describe("OrdaDB SQL workbench", () => {
       page.getByRole("complementary", { name: "对象检查器" }),
     ).toBeVisible();
     await expect(page.locator(".island")).toHaveCount(3);
+    const dialectSelector = page.getByRole("combobox", { name: "SQL 方言" });
+    await expect(dialectSelector).toHaveValue("postgresql");
+    await expect(page.getByText("参数 $1", { exact: true })).toBeVisible();
+    await dialectSelector.hover();
+    await expect(
+      page.getByRole("tooltip", { name: "SQL 方言 · 参数 $1" }),
+    ).toBeVisible();
+    await dialectSelector.selectOption("mysql");
+    await expect(page.getByText("参数 ?", { exact: true })).toBeVisible();
+    await expect(page.getByText("SQL · MySQL", { exact: true })).toBeVisible();
+    await dialectSelector.selectOption("sqlite");
+    await expect(dialectSelector).toHaveValue("sqlite");
+    await dialectSelector.selectOption("sqlServer");
+    await expect(page.getByText("参数 @p1", { exact: true })).toBeVisible();
+    await dialectSelector.selectOption("postgresql");
 
     const windowControls = page.locator(".window-controls button");
     await expect(windowControls).toHaveCount(3);
@@ -112,6 +127,7 @@ test.describe("OrdaDB SQL workbench", () => {
           .map((animation) => animation.effect?.getTiming().duration),
       );
     expect(panelAnimationDurations).toContain(180);
+    await expect(dialectSelector).toHaveValue("postgresql");
   });
 
   test("runs from Monaco and contains every accepted viewport", async ({

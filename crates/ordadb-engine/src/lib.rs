@@ -30,8 +30,8 @@ use ordadb_plpgsql::{
 use ordadb_sql::{
     BinaryOperator, BoundAlterTableOperation, BoundExpr, BoundExprKind, BoundJoin, BoundOrder,
     BoundProjection, BoundSequenceOperation, BoundStatement, BoundTable, DdlObjectKind, JoinKind,
-    ParsedStatement, bind, bind_catalog_expression, bind_catalog_expression_with_parameter_types,
-    parse,
+    ParsedStatement, SqlDialect, bind, bind_catalog_expression,
+    bind_catalog_expression_with_parameter_types, parse, parse_with_dialect,
 };
 use ordadb_storage::{ApplyPoint, DatabaseStore, DurabilityBarrier, PersistentState, encode_row};
 use ordadb_transaction::{
@@ -50,6 +50,11 @@ const PLPGSQL_EXECUTION_STACK_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
     pub data_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionOptions {
+    pub dialect: SqlDialect,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +114,10 @@ impl Engine {
     }
 
     pub fn connect(&self) -> Result<Session> {
+        self.connect_with_options(SessionOptions::default())
+    }
+
+    pub fn connect_with_options(&self, options: SessionOptions) -> Result<Session> {
         Ok(Session {
             state: Arc::clone(&self.state),
             store: Arc::clone(&self.store),
@@ -117,6 +126,7 @@ impl Engine {
             commits_since_checkpoint: Arc::clone(&self.commits_since_checkpoint),
             sql_transaction: SqlTransactionState::Idle,
             sequence_currvals: BTreeMap::new(),
+            options,
         })
     }
 
@@ -179,6 +189,7 @@ pub struct Session {
     commits_since_checkpoint: Arc<AtomicU64>,
     sql_transaction: SqlTransactionState,
     sequence_currvals: BTreeMap<SequenceId, i64>,
+    options: SessionOptions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,7 +236,7 @@ impl Session {
             return Err(failed_transaction_error());
         }
         let snapshot = self.statement_snapshot()?;
-        let described = parse(sql)
+        let described = parse_with_dialect(sql, self.options.dialect)
             .and_then(|statement| bind(statement, &snapshot.catalog))
             .map(|statement| bound_statement_schema(&statement));
         if described.is_err() {
@@ -255,7 +266,7 @@ impl Session {
     ) -> Result<TryQueryStream> {
         self.normalize_sql_transaction_failure();
         let transaction_was_failed = self.transaction_status() == TransactionStatus::Failed;
-        let parsed = match parse(sql) {
+        let parsed = match parse_with_dialect(sql, self.options.dialect) {
             Ok(parsed) => parsed,
             Err(_) if transaction_was_failed => {
                 return Err(failed_transaction_error());
@@ -333,6 +344,7 @@ impl Session {
             writer: &self.writer,
             commits_since_checkpoint: &self.commits_since_checkpoint,
             sequence_currvals: &mut self.sequence_currvals,
+            dialect: self.options.dialect,
             transaction_id: self.writer.next_transaction_id()?,
             working: None,
             lease: None,
@@ -352,6 +364,11 @@ impl Session {
             SqlTransactionState::Active(_) => TransactionStatus::Active,
             SqlTransactionState::Failed => TransactionStatus::Failed,
         }
+    }
+
+    #[must_use]
+    pub const fn options(&self) -> SessionOptions {
+        self.options
     }
 
     fn statement_snapshot(&self) -> Result<DatabaseState> {
@@ -454,7 +471,8 @@ impl Session {
             .map_err(|_| internal_error("engine state lock is poisoned"))?;
         let mut committed = state.clone();
         committed.cancellation = snapshot.cancellation.clone();
-        let (candidate, events, dirty) = execute_candidate(&committed, sql, params)?;
+        let (candidate, events, dirty) =
+            execute_candidate(&committed, sql, params, self.options.dialect)?;
         if dirty {
             let sequence_value = sequence_id
                 .map(|sequence_id| candidate_sequence_value(&candidate, sequence_id))
@@ -512,7 +530,8 @@ impl Session {
         let lease = self.writer.try_acquire(transaction.transaction_id)?;
         let mut committed = committed_snapshot(&self.state)?;
         committed.cancellation = snapshot.cancellation.clone();
-        let (candidate, events, dirty) = execute_candidate(&committed, sql, params)?;
+        let (candidate, events, dirty) =
+            execute_candidate(&committed, sql, params, self.options.dialect)?;
         if dirty {
             if let Some(sequence_id) = sequence_id {
                 self.sequence_currvals.insert(
@@ -626,6 +645,7 @@ pub struct Transaction<'session> {
     writer: &'session Arc<WriterCoordinator>,
     commits_since_checkpoint: &'session Arc<AtomicU64>,
     sequence_currvals: &'session mut BTreeMap<SequenceId, i64>,
+    dialect: SqlDialect,
     transaction_id: TransactionId,
     working: Option<DatabaseState>,
     lease: Option<WriterLease>,
@@ -687,7 +707,7 @@ impl Transaction<'_> {
             None => committed_snapshot(self.state)?,
         };
         let statement = resolve_sequence_currval(
-            bind(parse(sql)?, &snapshot.catalog)?,
+            bind(parse_with_dialect(sql, self.dialect)?, &snapshot.catalog)?,
             self.sequence_currvals,
         )?;
         if matches!(
@@ -721,7 +741,7 @@ impl Transaction<'_> {
 
         let lease = self.writer.try_acquire(self.transaction_id)?;
         let committed = committed_snapshot(self.state)?;
-        let (candidate, events, dirty) = execute_candidate(&committed, sql, params)?;
+        let (candidate, events, dirty) = execute_candidate(&committed, sql, params, self.dialect)?;
         if dirty {
             if let Some(sequence_id) = sequence_id {
                 self.sequence_currvals.insert(
@@ -1122,8 +1142,9 @@ fn execute_candidate(
     state: &DatabaseState,
     sql: &str,
     params: &[Value],
+    dialect: SqlDialect,
 ) -> Result<(DatabaseState, Vec<QueryEvent>, bool)> {
-    let parsed = parse(sql)?;
+    let parsed = parse_with_dialect(sql, dialect)?;
     let statement = bind(parsed, &state.catalog)?;
     let mut candidate = state.clone();
     candidate.trigger_depth = 0;

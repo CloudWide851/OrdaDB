@@ -1,5 +1,12 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -55,6 +62,7 @@ describe("OrdaDB workbench", () => {
   beforeEach(() => {
     useWorkbenchStore.setState({
       sql: initialSql,
+      dialect: "postgresql",
       schemaVisible: true,
       inspectorVisible: true,
       activeResultTab: "data",
@@ -168,9 +176,9 @@ describe("OrdaDB workbench", () => {
       name: "隐藏数据库浏览器",
     });
     await user.hover(schemaToggle);
-    expect(await screen.findByRole("tooltip")).toHaveTextContent(
-      "隐藏数据库浏览器",
-    );
+    expect(
+      await screen.findByRole("tooltip", { name: "隐藏数据库浏览器" }),
+    ).toHaveTextContent("隐藏数据库浏览器");
 
     await user.click(schemaToggle);
     expect(
@@ -192,5 +200,47 @@ describe("OrdaDB workbench", () => {
     await waitFor(() => {
       expect(screen.getByText("5 行 · 36 ms")).toBeVisible();
     });
+  });
+
+  it("switches SQL dialect hints without losing the workbench state", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    const dialectSelector = screen.getByRole("combobox", { name: "SQL 方言" });
+    expect(dialectSelector).toHaveValue("postgresql");
+    expect(screen.getByText("参数 $1", { exact: true })).toBeVisible();
+    expect(screen.getByText("SQL · PostgreSQL", { exact: true })).toBeVisible();
+    expect(screen.getByText("预览", { exact: true })).toBeVisible();
+
+    for (const [value, label, parameter] of [
+      ["mysql", "MySQL", "?"],
+      ["sqlite", "SQLite", "?"],
+      ["sqlServer", "SQL Server", "@p1"],
+      ["postgresql", "PostgreSQL", "$1"],
+    ] as const) {
+      await user.selectOptions(dialectSelector, value);
+      expect(dialectSelector).toHaveValue(value);
+      expect(screen.getByText(`参数 ${parameter}`, { exact: true })).toBeVisible();
+      expect(screen.getByText(`SQL · ${label}`, { exact: true })).toBeVisible();
+    }
+
+    await user.selectOptions(dialectSelector, "sqlServer");
+    const editor = screen.getByRole("textbox", { name: "SQL 编辑器" });
+    fireEvent.change(editor, {
+      target: { value: "select [id] from [items] where [id] = @p1" },
+    });
+    await user.click(screen.getByRole("button", { name: "格式化 SQL" }));
+    expect(editor).toHaveValue(
+      "SELECT [id] FROM [items] WHERE [id] = @p1",
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "隐藏对象检查器" }),
+    );
+    expect(
+      screen.queryByRole("complementary", { name: "对象检查器" }),
+    ).not.toBeInTheDocument();
+    expect(dialectSelector).toHaveValue("sqlServer");
+    expect(screen.getByText("SQL · SQL Server", { exact: true })).toBeVisible();
   });
 });

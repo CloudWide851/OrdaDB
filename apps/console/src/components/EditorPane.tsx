@@ -1,4 +1,8 @@
-import Editor, { type BeforeMount } from "@monaco-editor/react";
+import Editor, {
+  type BeforeMount,
+  type Monaco,
+  type OnMount,
+} from "@monaco-editor/react";
 import {
   AlignLeft,
   ChevronDown,
@@ -9,6 +13,13 @@ import {
   Plus,
   Square,
 } from "lucide-react";
+import { useCallback, useEffect, useRef } from "react";
+import {
+  formatSqlForDialect,
+  getSqlDialect,
+  sqlDialects,
+  type SqlDialectDescriptor,
+} from "../data/dialects";
 import { useWorkbenchStore } from "../store/workbench";
 import { IconAction } from "./IconAction";
 
@@ -36,15 +47,112 @@ const configureMonaco: BeforeMount = (monaco) => {
   });
 };
 
+function registerDialectCompletion(
+  monaco: Monaco,
+  dialect: SqlDialectDescriptor,
+) {
+  const completion = monaco.languages.registerCompletionItemProvider("sql", {
+    triggerCharacters: ["$", "@", "?", "`", "["],
+    provideCompletionItems(model, position) {
+      const word = model.getWordUntilPosition(position);
+      const range = {
+        startLineNumber: position.lineNumber,
+        endLineNumber: position.lineNumber,
+        startColumn: word.startColumn,
+        endColumn: word.endColumn,
+      };
+      const keywordSuggestions = dialect.keywords.map((keyword) => ({
+        label: keyword,
+        kind: monaco.languages.CompletionItemKind.Keyword,
+        insertText: keyword,
+        detail: `${dialect.label} 关键字`,
+        range,
+      }));
+
+      return {
+        suggestions: [
+          ...keywordSuggestions,
+          {
+            label: dialect.parameterExample,
+            kind: monaco.languages.CompletionItemKind.Variable,
+            insertText: dialect.parameterExample,
+            detail: `${dialect.label} 位置参数`,
+            range,
+          },
+          {
+            label: dialect.paginationExample,
+            kind: monaco.languages.CompletionItemKind.Snippet,
+            insertText: dialect.paginationExample,
+            detail: `${dialect.label} 分页`,
+            range,
+          },
+        ],
+      };
+    },
+  });
+  const formatting = monaco.languages.registerDocumentFormattingEditProvider(
+    "sql",
+    {
+      provideDocumentFormattingEdits(model) {
+        return [
+          {
+            range: model.getFullModelRange(),
+            text: formatSqlForDialect(model.getValue(), dialect),
+          },
+        ];
+      },
+    },
+  );
+
+  return {
+    dispose() {
+      completion.dispose();
+      formatting.dispose();
+    },
+  };
+}
+
 export function EditorPane() {
+  const monacoRef = useRef<Monaco | null>(null);
+  const completionRef = useRef<{ dispose: () => void } | null>(null);
   const sql = useWorkbenchStore((state) => state.sql);
   const setSql = useWorkbenchStore((state) => state.setSql);
+  const dialect = useWorkbenchStore((state) => state.dialect);
+  const setDialect = useWorkbenchStore((state) => state.setDialect);
   const queryState = useWorkbenchStore((state) => state.queryState);
   const runPreviewQuery = useWorkbenchStore((state) => state.runPreviewQuery);
   const setActiveResultTab = useWorkbenchStore(
     (state) => state.setActiveResultTab,
   );
   const setNotice = useWorkbenchStore((state) => state.setNotice);
+  const dialectDescriptor = getSqlDialect(dialect);
+
+  const installCompletion = useCallback(
+    (monaco: Monaco) => {
+      completionRef.current?.dispose();
+      completionRef.current = registerDialectCompletion(
+        monaco,
+        dialectDescriptor,
+      );
+    },
+    [dialectDescriptor],
+  );
+
+  const handleEditorMount: OnMount = (_editor, monaco) => {
+    monacoRef.current = monaco;
+    installCompletion(monaco);
+  };
+
+  useEffect(() => {
+    if (monacoRef.current) {
+      installCompletion(monacoRef.current);
+    }
+
+    return () => {
+      completionRef.current?.dispose();
+      completionRef.current = null;
+    };
+  }, [installCompletion]);
 
   return (
     <section className="editor-pane" aria-label="SQL 编辑器">
@@ -72,11 +180,36 @@ export function EditorPane() {
           icon={<Plus size={17} aria-hidden="true" />}
         />
         <span className="query-tabs-spacer" />
-        <button className="connection-selector" type="button">
+        <label className="dialect-selector">
           <span className="connection-dot" aria-hidden="true" />
-          OrdaDB Local
-          <ChevronDown size={14} aria-hidden="true" />
-        </button>
+          <select
+            aria-label="SQL 方言"
+            aria-describedby="dialect-tooltip"
+            value={dialect}
+            onChange={(event) => {
+              const nextDialect = sqlDialects.find(
+                (candidate) => candidate.id === event.target.value,
+              );
+              if (nextDialect) {
+                setDialect(nextDialect.id);
+              }
+            }}
+          >
+            {sqlDialects.map((candidate) => (
+              <option key={candidate.id} value={candidate.id}>
+                {candidate.label}
+              </option>
+            ))}
+          </select>
+          <ChevronDown className="dialect-chevron" size={14} aria-hidden="true" />
+          <span
+            className="dialect-tooltip"
+            id="dialect-tooltip"
+            role="tooltip"
+          >
+            SQL 方言 · 参数 {dialectDescriptor.parameterExample}
+          </span>
+        </label>
       </div>
 
       <div className="editor-toolbar">
@@ -100,7 +233,10 @@ export function EditorPane() {
         <IconAction
           label="格式化 SQL"
           icon={<AlignLeft size={17} aria-hidden="true" />}
-          onClick={() => setNotice("格式化 SQL · 预览入口")}
+          onClick={() => {
+            setSql(formatSqlForDialect(sql, dialectDescriptor));
+            setNotice(`格式化 SQL · ${dialectDescriptor.label} · 预览入口`);
+          }}
         />
         <IconAction
           label="查询历史"
@@ -124,6 +260,12 @@ export function EditorPane() {
           <ChevronDown size={14} aria-hidden="true" />
         </button>
         <span className="toolbar-spacer" />
+        <span
+          className="dialect-parameter"
+          title={`${dialectDescriptor.label} 位置参数`}
+        >
+          参数 {dialectDescriptor.parameterExample}
+        </span>
         <span className="preview-badge">预览</span>
         <IconAction
           label="更多查询操作"
@@ -134,8 +276,10 @@ export function EditorPane() {
       <div className="monaco-shell">
         <Editor
           beforeMount={configureMonaco}
+          onMount={handleEditorMount}
           height="100%"
           language="sql"
+          path={`query_01.${dialect}.sql`}
           theme="ordadb-light"
           value={sql}
           onChange={(value) => setSql(value ?? "")}

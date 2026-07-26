@@ -1,14 +1,17 @@
 import { create } from "zustand";
+import { getSqlDialect } from "../data/dialects";
 import { initialSql, previewRows } from "../data/preview";
 import type {
   InspectorTab,
   QueryRow,
   QueryState,
   ResultTab,
+  SqlDialect,
 } from "../types";
 
 interface WorkbenchState {
   sql: string;
+  dialect: SqlDialect;
   schemaVisible: boolean;
   inspectorVisible: boolean;
   activeResultTab: ResultTab;
@@ -21,6 +24,7 @@ interface WorkbenchState {
   errorMessage: string | null;
   durationMs: number | null;
   setSql: (sql: string) => void;
+  setDialect: (dialect: SqlDialect) => void;
   toggleSchema: () => void;
   toggleInspector: () => void;
   setActiveResultTab: (tab: ResultTab) => void;
@@ -38,6 +42,7 @@ const wait = (milliseconds: number) =>
 
 export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   sql: initialSql,
+  dialect: "postgresql",
   schemaVisible: true,
   inspectorVisible: true,
   activeResultTab: "data",
@@ -50,6 +55,11 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   errorMessage: null,
   durationMs: null,
   setSql: (sql) => set({ sql }),
+  setDialect: (dialect) =>
+    set({
+      dialect,
+      notice: `SQL 方言已切换 · ${getSqlDialect(dialect).label} · 预览`,
+    }),
   toggleSchema: () => set((state) => ({ schemaVisible: !state.schemaVisible })),
   toggleInspector: () =>
     set((state) => ({ inspectorVisible: !state.inspectorVisible })),
