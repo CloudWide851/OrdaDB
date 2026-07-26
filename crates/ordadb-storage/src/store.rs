@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use ordadb_catalog::{Catalog, IndexDefinition, TableDefinition};
+use ordadb_catalog::{Catalog, IndexDefinition, IndexMethod, TableDefinition};
 use ordadb_index::{IndexEntry, IndexKey, RowId};
 use ordadb_types::{DbError, IndexId, Result, Row, TableId};
 use serde::{Deserialize, Serialize};
@@ -488,6 +488,7 @@ fn build_snapshot(
         .schemas()
         .flat_map(|schema| schema.tables())
         .flat_map(|table| table.indexes())
+        .filter(|index| index.method == IndexMethod::BTree)
         .map(|index| index.id)
         .collect::<BTreeSet<_>>();
     if state.indexes.keys().copied().collect::<BTreeSet<_>>() != catalog_index_ids {
@@ -664,6 +665,7 @@ fn load_state(
         .schemas()
         .flat_map(|schema| schema.tables())
         .flat_map(|table| table.indexes())
+        .filter(|index| index.method == IndexMethod::BTree)
         .map(|index| index.id)
         .collect::<BTreeSet<_>>();
     let manifest_index_ids = manifest

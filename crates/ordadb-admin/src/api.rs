@@ -670,6 +670,38 @@ mod tests {
         assert_eq!(metrics.status(), StatusCode::OK);
     }
 
+    #[test]
+    fn catalog_projection_exposes_only_safe_search_index_metadata() {
+        let (_directory, state) = state();
+        let mut session = state.engine.connect().expect("session");
+        for sql in [
+            "CREATE TABLE documents (title TEXT, embedding VECTOR(3))",
+            "CREATE INDEX documents_fts ON documents USING fulltext (title) \
+             WITH (analyzer = 'whitespace')",
+            "CREATE INDEX documents_hnsw ON documents USING hnsw (embedding) \
+             WITH (metric = 'cosine', m = 8, ef_construction = 32, ef_search = 24)",
+        ] {
+            session
+                .execute_stream(sql, &[])
+                .expect("execute")
+                .collect::<ordadb_types::Result<Vec<_>>>()
+                .expect("drain");
+        }
+        let catalog = state.engine.catalog_snapshot().expect("catalog");
+        let projection =
+            serde_json::to_value(CatalogProjection::from_catalog(&catalog)).expect("projection");
+        let indexes = projection["database"]["schemas"][0]["tables"][0]["indexes"]
+            .as_array()
+            .expect("indexes");
+        assert_eq!(indexes[0]["method"], "full_text");
+        assert_eq!(indexes[0]["options"]["kind"], "full_text");
+        assert_eq!(indexes[0]["options"]["analyzer"], "whitespace");
+        assert_eq!(indexes[1]["method"], "hnsw");
+        assert_eq!(indexes[1]["options"]["kind"], "hnsw");
+        assert!(indexes[1].get("path").is_none());
+        assert!(indexes[1].get("graph").is_none());
+    }
+
     #[tokio::test]
     async fn every_management_route_has_an_authenticated_contract() {
         let (_directory, state) = state();

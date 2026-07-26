@@ -85,6 +85,10 @@ pub struct IndexDefinition {
     pub include_columns: Vec<ColumnId>,
     pub unique: bool,
     pub primary: bool,
+    #[serde(default)]
+    pub method: IndexMethod,
+    #[serde(default)]
+    pub options: IndexOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +97,62 @@ pub struct NewIndex {
     pub key_columns: Vec<Identifier>,
     pub include_columns: Vec<Identifier>,
     pub unique: bool,
+    pub method: IndexMethod,
+    pub options: IndexOptions,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexMethod {
+    #[default]
+    BTree,
+    FullText,
+    Hnsw,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FullTextAnalyzer {
+    #[default]
+    Standard,
+    Whitespace,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorDistanceMetric {
+    #[default]
+    Cosine,
+    L2,
+    Dot,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IndexOptions {
+    #[default]
+    BTree,
+    FullText {
+        analyzer: FullTextAnalyzer,
+    },
+    Hnsw {
+        metric: VectorDistanceMetric,
+        dimensions: usize,
+        m: usize,
+        ef_construction: usize,
+        ef_search: usize,
+    },
+}
+
+impl IndexOptions {
+    #[must_use]
+    pub const fn method(&self) -> IndexMethod {
+        match self {
+            Self::BTree => IndexMethod::BTree,
+            Self::FullText { .. } => IndexMethod::FullText,
+            Self::Hnsw { .. } => IndexMethod::Hnsw,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -967,6 +1027,8 @@ impl Catalog {
                         include_columns: Vec::new(),
                         unique: true,
                         primary: column.primary_key,
+                        method: IndexMethod::BTree,
+                        options: IndexOptions::BTree,
                     },
                 );
             }
@@ -1172,6 +1234,12 @@ impl Catalog {
                 "an index must contain at least one key column",
             ));
         }
+        if new_index.method != new_index.options.method() {
+            return Err(DbError::new(
+                "22023",
+                "index method and options do not describe the same index kind",
+            ));
+        }
         if self
             .database
             .schemas()
@@ -1195,12 +1263,6 @@ impl Catalog {
                 let column = table.column(name).ok_or_else(|| {
                     DbError::new("42703", format!("column {name} does not exist"))
                 })?;
-                if !indexable_type(&column.data_type) {
-                    return Err(DbError::new(
-                        "42804",
-                        format!("column {name} has no B+Tree ordering"),
-                    ));
-                }
                 if seen.insert(column.id, ()).is_some() {
                     return Err(DbError::new(
                         "42701",
@@ -1227,6 +1289,111 @@ impl Catalog {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        match (&new_index.method, &new_index.options) {
+            (IndexMethod::BTree, IndexOptions::BTree) => {
+                for name in &new_index.key_columns {
+                    let column = table
+                        .column(name)
+                        .ok_or_else(|| DbError::internal("validated B+Tree column disappeared"))?;
+                    if !indexable_type(&column.data_type) {
+                        return Err(DbError::new(
+                            "42804",
+                            format!("column {name} has no B+Tree ordering"),
+                        ));
+                    }
+                }
+            }
+            (IndexMethod::FullText, IndexOptions::FullText { .. }) => {
+                if new_index.unique || !new_index.include_columns.is_empty() {
+                    return Err(DbError::new(
+                        "0A000",
+                        "full-text indexes do not support UNIQUE or INCLUDE",
+                    ));
+                }
+                for name in &new_index.key_columns {
+                    let column = table.column(name).ok_or_else(|| {
+                        DbError::internal("validated full-text column disappeared")
+                    })?;
+                    if !text_search_type(&column.data_type) {
+                        return Err(DbError::new(
+                            "42804",
+                            format!("full-text index column {name} must be character or text"),
+                        ));
+                    }
+                }
+            }
+            (
+                IndexMethod::Hnsw,
+                IndexOptions::Hnsw {
+                    dimensions,
+                    m,
+                    ef_construction,
+                    ef_search,
+                    ..
+                },
+            ) => {
+                if new_index.unique
+                    || !new_index.include_columns.is_empty()
+                    || new_index.key_columns.len() != 1
+                {
+                    return Err(DbError::new(
+                        "0A000",
+                        "HNSW indexes require one VECTOR column and do not support UNIQUE or INCLUDE",
+                    ));
+                }
+                if !(2..=64).contains(m)
+                    || *ef_construction < *m
+                    || *ef_construction > 4_096
+                    || !(1..=4_096).contains(ef_search)
+                {
+                    return Err(DbError::new(
+                        "22023",
+                        "HNSW options require m 2..64, ef_construction m..4096, and ef_search 1..4096",
+                    ));
+                }
+                let name = new_index
+                    .key_columns
+                    .first()
+                    .ok_or_else(|| DbError::internal("validated HNSW key disappeared"))?;
+                let column = table
+                    .column(name)
+                    .ok_or_else(|| DbError::internal("validated HNSW column disappeared"))?;
+                match column.data_type {
+                    ScalarType::Vector {
+                        dimensions: Some(column_dimensions),
+                    } if column_dimensions == *dimensions && *dimensions > 0 => {}
+                    ScalarType::Vector { dimensions: None } => {
+                        return Err(DbError::new(
+                            "42804",
+                            format!("HNSW index column {name} requires a fixed VECTOR dimension"),
+                        ));
+                    }
+                    ScalarType::Vector {
+                        dimensions: Some(column_dimensions),
+                    } => {
+                        return Err(DbError::new(
+                            "22023",
+                            format!(
+                                "HNSW dimensions {dimensions} do not match column dimension {column_dimensions}"
+                            ),
+                        ));
+                    }
+                    _ => {
+                        return Err(DbError::new(
+                            "42804",
+                            format!("HNSW index column {name} must be VECTOR"),
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(DbError::new(
+                    "22023",
+                    "index method and options do not describe the same index kind",
+                ));
+            }
+        }
+
         let id = IndexId::new(self.next_index_id);
         self.next_index_id += 1;
         let definition = IndexDefinition {
@@ -1237,6 +1404,8 @@ impl Catalog {
             include_columns,
             unique: new_index.unique,
             primary: false,
+            method: new_index.method,
+            options: new_index.options,
         };
         self.table_by_id_mut(table_id)?
             .indexes
@@ -1417,6 +1586,8 @@ impl Catalog {
                     include_columns: Vec::new(),
                     unique: true,
                     primary: matches!(kind, ConstraintKind::PrimaryKey { .. }),
+                    method: IndexMethod::BTree,
+                    options: IndexOptions::BTree,
                 },
             );
             dependencies.add(object, CatalogObjectRef::Index(index_id))?;
@@ -2320,6 +2491,14 @@ pub const fn indexable_type(data_type: &ScalarType) -> bool {
     )
 }
 
+#[must_use]
+pub const fn text_search_type(data_type: &ScalarType) -> bool {
+    matches!(
+        data_type,
+        ScalarType::Char { .. } | ScalarType::Varchar { .. } | ScalarType::Text
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -2327,9 +2506,10 @@ mod tests {
     use ordadb_types::{Identifier, ScalarType, Schema, SchemaId, TableId};
 
     use super::{
-        Catalog, CatalogObjectRef, ConstraintKind, DependencyGraph, DropBehavior, NewColumn,
-        NewConstraint, NewConstraintKind, NewIndex, NewRoutine, NewSequence, NewView,
-        ReferentialAction, RoutineArgument, RoutineKind, TriggerEvent, TriggerTiming, ViewKind,
+        Catalog, CatalogObjectRef, ConstraintKind, DependencyGraph, DropBehavior, FullTextAnalyzer,
+        IndexDefinition, IndexMethod, IndexOptions, NewColumn, NewConstraint, NewConstraintKind,
+        NewIndex, NewRoutine, NewSequence, NewView, ReferentialAction, RoutineArgument,
+        RoutineKind, TriggerEvent, TriggerTiming, VectorDistanceMetric, ViewKind,
     };
 
     #[test]
@@ -2457,6 +2637,8 @@ mod tests {
                     ],
                     include_columns: vec![Identifier::unquoted("payload")],
                     unique: false,
+                    method: IndexMethod::BTree,
+                    options: IndexOptions::BTree,
                 },
             )
             .expect("index");
@@ -2472,10 +2654,102 @@ mod tests {
                     key_columns: vec![Identifier::unquoted("tenant")],
                     include_columns: vec![Identifier::unquoted("tenant")],
                     unique: false,
+                    method: IndexMethod::BTree,
+                    options: IndexOptions::BTree,
                 },
             )
             .expect_err("overlap");
         assert_eq!(overlap.sql_state, "42701");
+    }
+
+    #[test]
+    fn creates_search_indexes_and_preserves_btree_serde_defaults() {
+        let mut catalog = Catalog::default();
+        let table_id = catalog
+            .create_table(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("documents"),
+                vec![
+                    NewColumn::new(Identifier::unquoted("title"), ScalarType::Text),
+                    NewColumn::new(
+                        Identifier::unquoted("embedding"),
+                        ScalarType::Vector {
+                            dimensions: Some(3),
+                        },
+                    ),
+                ],
+            )
+            .expect("table");
+        let full_text_id = catalog
+            .create_index(
+                table_id,
+                NewIndex {
+                    name: Identifier::unquoted("documents_fts"),
+                    key_columns: vec![Identifier::unquoted("title")],
+                    include_columns: Vec::new(),
+                    unique: false,
+                    method: IndexMethod::FullText,
+                    options: IndexOptions::FullText {
+                        analyzer: FullTextAnalyzer::Whitespace,
+                    },
+                },
+            )
+            .expect("full-text index");
+        let hnsw_id = catalog
+            .create_index(
+                table_id,
+                NewIndex {
+                    name: Identifier::unquoted("documents_embedding_hnsw"),
+                    key_columns: vec![Identifier::unquoted("embedding")],
+                    include_columns: Vec::new(),
+                    unique: false,
+                    method: IndexMethod::Hnsw,
+                    options: IndexOptions::Hnsw {
+                        metric: VectorDistanceMetric::Cosine,
+                        dimensions: 3,
+                        m: 16,
+                        ef_construction: 64,
+                        ef_search: 40,
+                    },
+                },
+            )
+            .expect("HNSW index");
+        assert_eq!(
+            catalog.index_by_id(full_text_id).expect("full-text").method,
+            IndexMethod::FullText
+        );
+        assert_eq!(
+            catalog.index_by_id(hnsw_id).expect("HNSW").method,
+            IndexMethod::Hnsw
+        );
+
+        let definition = IndexDefinition {
+            id: ordadb_types::IndexId::new(999),
+            table_id,
+            name: Identifier::unquoted("legacy"),
+            key_columns: vec![
+                catalog
+                    .table_by_id(table_id)
+                    .expect("table")
+                    .columns()
+                    .first()
+                    .expect("column")
+                    .id,
+            ],
+            include_columns: Vec::new(),
+            unique: false,
+            primary: false,
+            method: IndexMethod::BTree,
+            options: IndexOptions::BTree,
+        };
+        let mut encoded = serde_json::to_value(definition).expect("serialize legacy definition");
+        let object = encoded.as_object_mut().expect("definition object");
+        object.remove("method");
+        object.remove("options");
+        let decoded: IndexDefinition =
+            serde_json::from_value(encoded).expect("decode old B+Tree definition");
+        assert_eq!(decoded.method, IndexMethod::BTree);
+        assert_eq!(decoded.options, IndexOptions::BTree);
     }
 
     #[test]
