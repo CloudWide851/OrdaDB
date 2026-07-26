@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
@@ -16,8 +16,10 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use ordadb_admin::{AuthStore, Authorizer, CancellationHandle, QueryOutcome, SessionRegistry};
-use ordadb_catalog::ColumnDefinition;
+use ordadb_admin::{
+    Action, AuthStore, Authorizer, CancellationHandle, DbObject, QueryOutcome, SessionRegistry,
+};
+use ordadb_catalog::{Catalog, ColumnDefinition, RoutineKind, ViewKind};
 use ordadb_engine::{Engine, Session, TransactionStatus};
 use ordadb_types::{
     Batch, CommandComplete, DbError, Field, Identifier, QueryEvent, QueryProgress, Result, Row,
@@ -32,6 +34,9 @@ use crate::codec::{
     write_portal_suspended, write_ready,
 };
 use crate::scram::authenticate;
+use crate::security::{
+    execute_security_statement, is_security_sql, parse_security_statement, redacted_security_sql,
+};
 use crate::value::{
     decode_parameters, encode_text, type_oid, write_data_row, write_row_description,
 };
@@ -595,8 +600,11 @@ impl Connection {
         self.authorize(sql)?;
         self.registry.reset_cancellation(self.handle.process_id())?;
         let query_id = Uuid::new_v4().to_string();
-        self.registry
-            .begin_query(self.handle.process_id(), query_id.clone(), sql.to_owned())?;
+        self.registry.begin_query(
+            self.handle.process_id(),
+            query_id.clone(),
+            redacted_security_sql(sql),
+        )?;
         let result = (|| {
             let stream = self.statement_stream(sql, &[])?;
             let mut schema = Schema::empty();
@@ -747,7 +755,7 @@ impl Connection {
             self.registry.begin_query(
                 self.handle.process_id(),
                 query_id.clone(),
-                portal.sql.clone(),
+                redacted_security_sql(&portal.sql),
             )?;
             portal.query_id = Some(query_id);
             portal.stream = Some(self.statement_stream(&portal.sql, &portal.parameters)?);
@@ -849,14 +857,47 @@ impl Connection {
         sql: &str,
         parameters: &[Value],
     ) -> Result<Box<dyn Iterator<Item = Result<QueryEvent>>>> {
-        if let Some(events) = virtual_query(sql, &self.principal.user, &self.database) {
+        if let Some(statement) = parse_security_statement(sql)? {
+            if !parameters.is_empty() {
+                return Err(DbError::new(
+                    "0A000",
+                    "security DDL does not support protocol parameters",
+                ));
+            }
+            if !matches!(self.session.transaction_status(), TransactionStatus::Idle) {
+                return Err(DbError::new(
+                    "25001",
+                    "security DDL must execute outside a transaction",
+                ));
+            }
+            let tag = execute_security_statement(&self.auth, &mut self.principal, statement)?;
+            let events = vec![
+                QueryEvent::Schema(Schema::empty()),
+                QueryEvent::Progress(QueryProgress { rows_processed: 0 }),
+                QueryEvent::Complete(CommandComplete {
+                    tag: tag.to_owned(),
+                    rows_affected: 0,
+                }),
+            ];
             return Ok(Box::new(events.into_iter().map(Ok)));
         }
-        Ok(Box::new(self.session.execute_stream(sql, parameters)?))
+        let catalog = self.engine.catalog_snapshot()?;
+        if let Some(events) = virtual_query(sql, &self.principal.user, &self.database, &catalog) {
+            return Ok(Box::new(events.into_iter().map(Ok)));
+        }
+        Ok(Box::new(self.session.execute_stream_with_cancellation(
+            sql,
+            parameters,
+            self.handle.cancellation_flag(),
+        )?))
     }
 
     fn statement_schema(&mut self, sql: &str) -> Result<Schema> {
-        if let Some(events) = virtual_query(sql, &self.principal.user, &self.database) {
+        if parse_security_statement(sql)?.is_some() {
+            return Ok(Schema::empty());
+        }
+        let catalog = self.engine.catalog_snapshot()?;
+        if let Some(events) = virtual_query(sql, &self.principal.user, &self.database, &catalog) {
             return events
                 .into_iter()
                 .find_map(|event| match event {
@@ -869,7 +910,17 @@ impl Connection {
     }
 
     fn authorize(&self, sql: &str) -> Result<()> {
-        Authorizer::from_store(&self.auth)?.authorize_sql(&self.principal, &self.database, sql)
+        let authorizer = Authorizer::from_store(&self.auth)?;
+        if is_security_sql(sql) {
+            authorizer.authorize(&self.principal, Action::Manage, &DbObject::Server)
+        } else if catalog_query_source(sql).is_some() {
+            // PostgreSQL exposes system catalogs to authenticated sessions.
+            // The projection below contains metadata only and deliberately
+            // excludes routine bodies and authentication material.
+            Ok(())
+        } else {
+            authorizer.authorize_sql(&self.principal, &self.database, sql)
+        }
     }
 
     fn check_cancelled(&self) -> Result<()> {
@@ -1036,7 +1087,49 @@ fn command_tag(complete: &CommandComplete) -> String {
     }
 }
 
-fn virtual_query(sql: &str, user: &str, database: &str) -> Option<Vec<QueryEvent>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogQuerySource {
+    Namespace,
+    Class,
+    Procedure,
+    Trigger,
+    InformationSchemaTables,
+}
+
+fn catalog_query_source(sql: &str) -> Option<CatalogQuerySource> {
+    let normalized = sql
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('"', "")
+        .to_ascii_uppercase();
+    if !normalized.trim_start().starts_with("SELECT ") {
+        return None;
+    }
+    [
+        ("PG_CATALOG.PG_NAMESPACE", CatalogQuerySource::Namespace),
+        ("PG_CATALOG.PG_CLASS", CatalogQuerySource::Class),
+        ("PG_CATALOG.PG_PROC", CatalogQuerySource::Procedure),
+        ("PG_CATALOG.PG_TRIGGER", CatalogQuerySource::Trigger),
+        (
+            "INFORMATION_SCHEMA.TABLES",
+            CatalogQuerySource::InformationSchemaTables,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(relation, source)| {
+        normalized
+            .contains(&format!("FROM {relation}"))
+            .then_some(source)
+    })
+}
+
+fn virtual_query(
+    sql: &str,
+    user: &str,
+    database: &str,
+    catalog: &Catalog,
+) -> Option<Vec<QueryEvent>> {
     let normalized = sql
         .split_ascii_whitespace()
         .collect::<Vec<_>>()
@@ -1045,18 +1138,7 @@ fn virtual_query(sql: &str, user: &str, database: &str) -> Option<Vec<QueryEvent
         .to_ascii_uppercase();
     let text_result = |name: &str, value: String, tag: &str| {
         let schema = Schema::new(vec![Field::new(name, ScalarType::Text, false)]);
-        vec![
-            QueryEvent::Schema(schema.clone()),
-            QueryEvent::Batch(Batch {
-                schema,
-                rows: vec![Row::new(vec![Value::Text(value)])],
-            }),
-            QueryEvent::Progress(QueryProgress { rows_processed: 1 }),
-            QueryEvent::Complete(CommandComplete {
-                tag: tag.into(),
-                rows_affected: 1,
-            }),
-        ]
+        result_events(schema, vec![Row::new(vec![Value::Text(value)])], tag)
     };
     if normalized.starts_with("SET ") || normalized.starts_with("RESET ") {
         return Some(command_events("SET", 0));
@@ -1076,6 +1158,9 @@ fn virtual_query(sql: &str, user: &str, database: &str) -> Option<Vec<QueryEvent
             "read committed".into(),
             "SHOW",
         ));
+    }
+    if let Some(source) = catalog_query_source(sql) {
+        return Some(catalog_query_events(source, catalog, database));
     }
     if normalized.contains("VERSION()") {
         return Some(text_result(
@@ -1099,20 +1184,272 @@ fn virtual_query(sql: &str, user: &str, database: &str) -> Option<Vec<QueryEvent
     }
     if normalized == "SELECT 1" {
         let schema = Schema::new(vec![Field::new("?column?", ScalarType::Int32, false)]);
-        return Some(vec![
-            QueryEvent::Schema(schema.clone()),
-            QueryEvent::Batch(Batch {
-                schema,
-                rows: vec![Row::new(vec![Value::Int32(1)])],
-            }),
-            QueryEvent::Progress(QueryProgress { rows_processed: 1 }),
-            QueryEvent::Complete(CommandComplete {
-                tag: "SELECT".into(),
-                rows_affected: 1,
-            }),
-        ]);
+        return Some(result_events(
+            schema,
+            vec![Row::new(vec![Value::Int32(1)])],
+            "SELECT",
+        ));
     }
     None
+}
+
+fn catalog_query_events(
+    source: CatalogQuerySource,
+    catalog: &Catalog,
+    connection_database: &str,
+) -> Vec<QueryEvent> {
+    const SCHEMA_OID_BASE: i64 = 10_000_000;
+    const TABLE_OID_BASE: i64 = 20_000_000;
+    const VIEW_OID_BASE: i64 = 30_000_000;
+    const ROUTINE_OID_BASE: i64 = 40_000_000;
+    const TRIGGER_OID_BASE: i64 = 50_000_000;
+    const SEQUENCE_OID_BASE: i64 = 60_000_000;
+    const INDEX_OID_BASE: i64 = 70_000_000;
+
+    let oid = |base: i64, id: u64| base.saturating_add(i64::try_from(id).unwrap_or(i64::MAX));
+    let catalog_database = catalog.database();
+    let (schema, rows) = match source {
+        CatalogQuerySource::Namespace => (
+            Schema::new(vec![
+                Field::new("oid", ScalarType::Int64, false),
+                Field::new("nspname", ScalarType::Text, false),
+            ]),
+            catalog_database
+                .schemas()
+                .map(|schema| {
+                    Row::new(vec![
+                        Value::Int64(oid(SCHEMA_OID_BASE, schema.id.get())),
+                        Value::Text(schema.name.as_str().to_owned()),
+                    ])
+                })
+                .collect(),
+        ),
+        CatalogQuerySource::Class => {
+            let mut rows = Vec::new();
+            for schema in catalog_database.schemas() {
+                let namespace_oid = oid(SCHEMA_OID_BASE, schema.id.get());
+                let materialized_tables = schema
+                    .views()
+                    .filter_map(|view| view.materialized_table_id)
+                    .collect::<BTreeSet<_>>();
+                for table in schema
+                    .tables()
+                    .filter(|table| !materialized_tables.contains(&table.id))
+                {
+                    rows.push(Row::new(vec![
+                        Value::Int64(oid(TABLE_OID_BASE, table.id.get())),
+                        Value::Text(table.name.as_str().to_owned()),
+                        Value::Int64(namespace_oid),
+                        Value::Text("r".into()),
+                        Value::Text("p".into()),
+                        Value::Int32(i32::try_from(table.columns().len()).unwrap_or(i32::MAX)),
+                        Value::Boolean(table.indexes().next().is_some()),
+                    ]));
+                    rows.extend(table.indexes().map(|index| {
+                        Row::new(vec![
+                            Value::Int64(oid(INDEX_OID_BASE, index.id.get())),
+                            Value::Text(index.name.as_str().to_owned()),
+                            Value::Int64(namespace_oid),
+                            Value::Text("i".into()),
+                            Value::Text("p".into()),
+                            Value::Int32(0),
+                            Value::Boolean(false),
+                        ])
+                    }));
+                }
+                rows.extend(schema.sequences().map(|sequence| {
+                    Row::new(vec![
+                        Value::Int64(oid(SEQUENCE_OID_BASE, sequence.id.get())),
+                        Value::Text(sequence.name.as_str().to_owned()),
+                        Value::Int64(namespace_oid),
+                        Value::Text("S".into()),
+                        Value::Text("p".into()),
+                        Value::Int32(0),
+                        Value::Boolean(false),
+                    ])
+                }));
+                rows.extend(schema.views().map(|view| {
+                    Row::new(vec![
+                        Value::Int64(oid(VIEW_OID_BASE, view.id.get())),
+                        Value::Text(view.name.as_str().to_owned()),
+                        Value::Int64(namespace_oid),
+                        Value::Text(
+                            match view.kind {
+                                ViewKind::Regular => "v",
+                                ViewKind::Materialized => "m",
+                            }
+                            .into(),
+                        ),
+                        Value::Text("p".into()),
+                        Value::Int32(i32::try_from(view.output.fields.len()).unwrap_or(i32::MAX)),
+                        Value::Boolean(view.materialized_table_id.is_some_and(|table_id| {
+                            catalog
+                                .table_by_id(table_id)
+                                .is_some_and(|table| table.indexes().next().is_some())
+                        })),
+                    ])
+                }));
+            }
+            (
+                Schema::new(vec![
+                    Field::new("oid", ScalarType::Int64, false),
+                    Field::new("relname", ScalarType::Text, false),
+                    Field::new("relnamespace", ScalarType::Int64, false),
+                    Field::new("relkind", ScalarType::Text, false),
+                    Field::new("relpersistence", ScalarType::Text, false),
+                    Field::new("relnatts", ScalarType::Int32, false),
+                    Field::new("relhasindex", ScalarType::Boolean, false),
+                ]),
+                rows,
+            )
+        }
+        CatalogQuerySource::Procedure => {
+            let rows = catalog_database
+                .schemas()
+                .flat_map(|schema| {
+                    let namespace_oid = oid(SCHEMA_OID_BASE, schema.id.get());
+                    schema.routines().map(move |routine| {
+                        let return_oid = routine.return_type.as_ref().map_or(2278, type_oid);
+                        let argument_oids = routine
+                            .arguments
+                            .iter()
+                            .map(|argument| type_oid(&argument.data_type).to_string())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        Row::new(vec![
+                            Value::Int64(oid(ROUTINE_OID_BASE, routine.id.get())),
+                            Value::Text(routine.name.as_str().to_owned()),
+                            Value::Int64(namespace_oid),
+                            Value::Text(
+                                match routine.kind {
+                                    RoutineKind::Function => "f",
+                                    RoutineKind::Procedure => "p",
+                                }
+                                .into(),
+                            ),
+                            Value::Int64(i64::from(return_oid)),
+                            Value::Boolean(routine.returns_set),
+                            Value::Text(argument_oids),
+                            Value::Text(routine.language.clone()),
+                        ])
+                    })
+                })
+                .collect();
+            (
+                Schema::new(vec![
+                    Field::new("oid", ScalarType::Int64, false),
+                    Field::new("proname", ScalarType::Text, false),
+                    Field::new("pronamespace", ScalarType::Int64, false),
+                    Field::new("prokind", ScalarType::Text, false),
+                    Field::new("prorettype", ScalarType::Int64, false),
+                    Field::new("proretset", ScalarType::Boolean, false),
+                    Field::new("proargtypes", ScalarType::Text, false),
+                    Field::new("prolang", ScalarType::Text, false),
+                ]),
+                rows,
+            )
+        }
+        CatalogQuerySource::Trigger => {
+            let rows = catalog_database
+                .schemas()
+                .flat_map(|schema| {
+                    let materialized_tables = schema
+                        .views()
+                        .filter_map(|view| view.materialized_table_id)
+                        .collect::<BTreeSet<_>>();
+                    schema
+                        .tables()
+                        .filter(move |table| !materialized_tables.contains(&table.id))
+                        .flat_map(|table| {
+                            table.triggers().map(|trigger| {
+                                Row::new(vec![
+                                    Value::Int64(oid(TRIGGER_OID_BASE, trigger.id.get())),
+                                    Value::Text(trigger.name.as_str().to_owned()),
+                                    Value::Int64(oid(TABLE_OID_BASE, table.id.get())),
+                                    Value::Text(if trigger.enabled { "O" } else { "D" }.into()),
+                                    Value::Boolean(false),
+                                    Value::Int64(oid(ROUTINE_OID_BASE, trigger.routine_id.get())),
+                                ])
+                            })
+                        })
+                })
+                .collect();
+            (
+                Schema::new(vec![
+                    Field::new("oid", ScalarType::Int64, false),
+                    Field::new("tgname", ScalarType::Text, false),
+                    Field::new("tgrelid", ScalarType::Int64, false),
+                    Field::new("tgenabled", ScalarType::Text, false),
+                    Field::new("tgisinternal", ScalarType::Boolean, false),
+                    Field::new("tgfoid", ScalarType::Int64, false),
+                ]),
+                rows,
+            )
+        }
+        CatalogQuerySource::InformationSchemaTables => {
+            let mut rows = Vec::new();
+            for schema in catalog_database.schemas() {
+                let materialized_tables = schema
+                    .views()
+                    .filter_map(|view| view.materialized_table_id)
+                    .collect::<BTreeSet<_>>();
+                rows.extend(
+                    schema
+                        .tables()
+                        .filter(|table| !materialized_tables.contains(&table.id))
+                        .map(|table| {
+                            Row::new(vec![
+                                Value::Text(connection_database.to_owned()),
+                                Value::Text(schema.name.as_str().to_owned()),
+                                Value::Text(table.name.as_str().to_owned()),
+                                Value::Text("BASE TABLE".into()),
+                                Value::Text("YES".into()),
+                            ])
+                        }),
+                );
+                rows.extend(schema.views().map(|view| {
+                    Row::new(vec![
+                        Value::Text(connection_database.to_owned()),
+                        Value::Text(schema.name.as_str().to_owned()),
+                        Value::Text(view.name.as_str().to_owned()),
+                        Value::Text(
+                            match view.kind {
+                                ViewKind::Regular => "VIEW",
+                                ViewKind::Materialized => "MATERIALIZED VIEW",
+                            }
+                            .into(),
+                        ),
+                        Value::Text("NO".into()),
+                    ])
+                }));
+            }
+            (
+                Schema::new(vec![
+                    Field::new("table_catalog", ScalarType::Text, false),
+                    Field::new("table_schema", ScalarType::Text, false),
+                    Field::new("table_name", ScalarType::Text, false),
+                    Field::new("table_type", ScalarType::Text, false),
+                    Field::new("is_insertable_into", ScalarType::Text, false),
+                ]),
+                rows,
+            )
+        }
+    };
+    result_events(schema, rows, "SELECT")
+}
+
+fn result_events(schema: Schema, rows: Vec<Row>, tag: &str) -> Vec<QueryEvent> {
+    let rows_processed = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+    let mut events = vec![QueryEvent::Schema(schema.clone())];
+    if !rows.is_empty() {
+        events.push(QueryEvent::Batch(Batch { schema, rows }));
+    }
+    events.push(QueryEvent::Progress(QueryProgress { rows_processed }));
+    events.push(QueryEvent::Complete(CommandComplete {
+        tag: tag.into(),
+        rows_affected: rows_processed,
+    }));
+    events
 }
 
 fn command_events(tag: &str, rows_affected: u64) -> Vec<QueryEvent> {
@@ -1134,8 +1471,20 @@ fn split_statements(sql: &str) -> Result<Vec<String>> {
     let characters: Vec<char> = sql.chars().collect();
     let mut single_quote = false;
     let mut double_quote = false;
+    let mut dollar_quote: Option<Vec<char>> = None;
     let mut index = 0;
     while index < characters.len() {
+        if let Some(delimiter) = dollar_quote.as_ref() {
+            if characters[index..].starts_with(delimiter) {
+                current.extend(delimiter.iter().copied());
+                index += delimiter.len();
+                dollar_quote = None;
+            } else {
+                current.push(characters[index]);
+                index += 1;
+            }
+            continue;
+        }
         let character = characters[index];
         match character {
             '\'' if !double_quote => {
@@ -1168,6 +1517,14 @@ fn split_statements(sql: &str) -> Result<Vec<String>> {
                 index += 1;
                 continue;
             }
+            '$' if !single_quote && !double_quote => {
+                if let Some(delimiter) = dollar_quote_delimiter(&characters, index) {
+                    current.extend(delimiter.iter().copied());
+                    index += delimiter.len();
+                    dollar_quote = Some(delimiter);
+                    continue;
+                }
+            }
             ';' if !single_quote && !double_quote => {
                 if !current.trim().is_empty() {
                     statements.push(current.trim().to_owned());
@@ -1184,10 +1541,43 @@ fn split_statements(sql: &str) -> Result<Vec<String>> {
     if single_quote || double_quote {
         return Err(DbError::new("42601", "unterminated SQL quote"));
     }
+    if dollar_quote.is_some() {
+        return Err(DbError::new(
+            "42601",
+            "unterminated dollar-quoted SQL string",
+        ));
+    }
     if !current.trim().is_empty() {
         statements.push(current.trim().to_owned());
     }
     Ok(statements)
+}
+
+fn dollar_quote_delimiter(characters: &[char], start: usize) -> Option<Vec<char>> {
+    if characters.get(start) != Some(&'$') {
+        return None;
+    }
+    let mut end = start + 1;
+    while let Some(character) = characters.get(end) {
+        if *character == '$' {
+            let tag = &characters[start + 1..end];
+            if tag
+                .first()
+                .is_some_and(|value| !(value.is_ascii_alphabetic() || *value == '_'))
+                || !tag
+                    .iter()
+                    .all(|value| value.is_ascii_alphanumeric() || *value == '_')
+            {
+                return None;
+            }
+            return Some(characters[start..=end].to_vec());
+        }
+        if !(character.is_ascii_alphanumeric() || *character == '_') {
+            return None;
+        }
+        end += 1;
+    }
+    None
 }
 
 enum CopyDirection {
@@ -1368,6 +1758,35 @@ mod tests {
             split_statements(r"SELECT E'escaped\\'; SELECT 2").expect("even backslashes"),
             vec![r"SELECT E'escaped\\'", "SELECT 2"]
         );
+        assert_eq!(
+            split_statements(
+                "CREATE PROCEDURE p() AS $body$
+                 BEGIN
+                 PERFORM ';';
+                 END;
+                 $body$ LANGUAGE plpgsql;
+                 SELECT $1"
+            )
+            .expect("dollar quote"),
+            vec![
+                "CREATE PROCEDURE p() AS $body$
+                 BEGIN
+                 PERFORM ';';
+                 END;
+                 $body$ LANGUAGE plpgsql",
+                "SELECT $1",
+            ]
+        );
+        assert_eq!(
+            split_statements("SELECT $$semi;colon$$; SELECT 2").expect("empty dollar tag"),
+            vec!["SELECT $$semi;colon$$", "SELECT 2"]
+        );
+        assert_eq!(
+            split_statements("SELECT $body$missing")
+                .expect_err("unterminated dollar quote")
+                .sql_state,
+            "42601"
+        );
         let copy = parse_copy("COPY public.items TO STDOUT")
             .expect("copy")
             .expect("command");
@@ -1389,7 +1808,8 @@ mod tests {
 
     #[test]
     fn synthetic_compatibility_queries_have_real_rows() {
-        let events = virtual_query("SELECT version()", "dba", "ordadb").expect("virtual");
+        let events = virtual_query("SELECT version()", "dba", "ordadb", &Catalog::default())
+            .expect("virtual");
         assert!(matches!(events.first(), Some(QueryEvent::Schema(_))));
         assert!(matches!(events.last(), Some(QueryEvent::Complete(_))));
     }

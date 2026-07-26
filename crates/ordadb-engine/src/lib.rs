@@ -4,13 +4,17 @@
 //! encoding belongs to `ordadb-storage`; WAL and crash recovery belong to
 //! `ordadb-transaction`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use ordadb_catalog::{Catalog, ColumnStatistics, TableDefinition, TableStatistics, indexable_type};
+use ordadb_catalog::{
+    Catalog, CatalogExpression, CatalogObjectRef, ColumnStatistics, ConstraintKind, DropBehavior,
+    NewColumn, NewRoutine, NewView, ReferentialAction, SequenceAlteration, TableDefinition,
+    TableStatistics, TriggerEvent, TriggerTiming, ViewKind, indexable_type,
+};
 use ordadb_execution::{
     AdvancedExecutionCursor, AdvancedExecutionPlan, ExecutionContext, ExecutionCursor,
     coerce_value as coerce_execution_value, evaluate as evaluate_scalar,
@@ -20,9 +24,14 @@ use ordadb_index::{BPlusTree, IndexEntry, IndexKey, RowId};
 use ordadb_optimizer::{
     JoinStrategy, choose_join_strategy, explain as explain_plan, optimize_select,
 };
+use ordadb_plpgsql::{
+    PlpgsqlHost, compile_with_arguments as compile_plpgsql, execute as execute_plpgsql,
+};
 use ordadb_sql::{
-    BinaryOperator, BoundExpr, BoundExprKind, BoundJoin, BoundOrder, BoundProjection,
-    BoundStatement, BoundTable, JoinKind, ParsedStatement, bind, parse,
+    BinaryOperator, BoundAlterTableOperation, BoundExpr, BoundExprKind, BoundJoin, BoundOrder,
+    BoundProjection, BoundSequenceOperation, BoundStatement, BoundTable, DdlObjectKind, JoinKind,
+    ParsedStatement, bind, bind_catalog_expression, bind_catalog_expression_with_parameter_types,
+    parse,
 };
 use ordadb_storage::{ApplyPoint, DatabaseStore, DurabilityBarrier, PersistentState, encode_row};
 use ordadb_transaction::{
@@ -30,11 +39,13 @@ use ordadb_transaction::{
     WriterCoordinator, WriterLease,
 };
 use ordadb_types::{
-    Batch, CommandComplete, DbError, Field, IndexId, QueryEvent, QueryProgress, Result, Row,
-    ScalarType, Schema, TableId, Value,
+    Batch, CommandComplete, DbError, Field, Identifier, IndexId, QueryEvent, QueryProgress, Result,
+    Row, ScalarType, Schema, SequenceId, TableId, Value, ViewId,
 };
 
 const AUTOMATIC_CHECKPOINT_INTERVAL: u64 = 64;
+const MAX_REFERENTIAL_ACTIONS: usize = 16_384;
+const PLPGSQL_EXECUTION_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
@@ -105,6 +116,7 @@ impl Engine {
             writer: Arc::clone(&self.writer),
             commits_since_checkpoint: Arc::clone(&self.commits_since_checkpoint),
             sql_transaction: SqlTransactionState::Idle,
+            sequence_currvals: BTreeMap::new(),
         })
     }
 
@@ -166,6 +178,7 @@ pub struct Session {
     writer: Arc<WriterCoordinator>,
     commits_since_checkpoint: Arc<AtomicU64>,
     sql_transaction: SqlTransactionState,
+    sequence_currvals: BTreeMap<SequenceId, i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +235,24 @@ impl Session {
     }
 
     pub fn execute_stream(&mut self, sql: &str, params: &[Value]) -> Result<TryQueryStream> {
+        self.execute_stream_controlled(sql, params, None)
+    }
+
+    pub fn execute_stream_with_cancellation(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<TryQueryStream> {
+        self.execute_stream_controlled(sql, params, Some(cancellation))
+    }
+
+    fn execute_stream_controlled(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        cancellation: Option<Arc<AtomicBool>>,
+    ) -> Result<TryQueryStream> {
         self.normalize_sql_transaction_failure();
         let transaction_was_failed = self.transaction_status() == TransactionStatus::Failed;
         let parsed = match parse(sql) {
@@ -240,8 +271,11 @@ impl Session {
                 _ => Err(failed_transaction_error()),
             };
         }
-        let snapshot = self.statement_snapshot()?;
-        let statement = match bind(parsed, &snapshot.catalog) {
+        let mut snapshot = self.statement_snapshot()?;
+        snapshot.cancellation = cancellation;
+        let statement = match bind(parsed, &snapshot.catalog)
+            .and_then(|statement| resolve_sequence_currval(statement, &self.sequence_currvals))
+        {
             Ok(statement) => statement,
             Err(error) => {
                 self.fail_sql_transaction();
@@ -298,6 +332,7 @@ impl Session {
             wal: &self.wal,
             writer: &self.writer,
             commits_since_checkpoint: &self.commits_since_checkpoint,
+            sequence_currvals: &mut self.sequence_currvals,
             transaction_id: self.writer.next_transaction_id()?,
             working: None,
             lease: None,
@@ -396,7 +431,7 @@ impl Session {
     }
 
     fn execute_auto_commit(
-        &self,
+        &mut self,
         sql: &str,
         params: &[Value],
         snapshot: DatabaseState,
@@ -405,6 +440,7 @@ impl Session {
         if let Some(stream) = prepare_read_stream(&snapshot, statement.clone(), params)? {
             return Ok(stream);
         }
+        let sequence_id = sequence_mutation_id(&statement);
         let (_, events, dirty) = execute_bound_candidate(&snapshot, statement, params)?;
         if !dirty {
             return Ok(TryQueryStream::new(events));
@@ -416,8 +452,13 @@ impl Session {
             .state
             .write()
             .map_err(|_| internal_error("engine state lock is poisoned"))?;
-        let (candidate, events, dirty) = execute_candidate(&state, sql, params)?;
+        let mut committed = state.clone();
+        committed.cancellation = snapshot.cancellation.clone();
+        let (candidate, events, dirty) = execute_candidate(&committed, sql, params)?;
         if dirty {
+            let sequence_value = sequence_id
+                .map(|sequence_id| candidate_sequence_value(&candidate, sequence_id))
+                .transpose()?;
             persist_candidate(
                 &mut state,
                 &self.store,
@@ -434,12 +475,15 @@ impl Session {
                 &self.writer,
                 &self.commits_since_checkpoint,
             )?;
+            if let Some((sequence_id, value)) = sequence_id.zip(sequence_value) {
+                self.sequence_currvals.insert(sequence_id, value);
+            }
         }
         Ok(TryQueryStream::new(events))
     }
 
     fn execute_in_sql_transaction(
-        &self,
+        &mut self,
         transaction: &mut ActiveSqlTransaction,
         sql: &str,
         params: &[Value],
@@ -449,19 +493,33 @@ impl Session {
         if let Some(stream) = prepare_read_stream(&snapshot, statement.clone(), params)? {
             return Ok(stream);
         }
+        let sequence_id = sequence_mutation_id(&statement);
         let (candidate, events, dirty) = execute_bound_candidate(&snapshot, statement, params)?;
         if !dirty {
             return Ok(TryQueryStream::new(events));
         }
         if transaction.working.is_some() {
+            if let Some(sequence_id) = sequence_id {
+                self.sequence_currvals.insert(
+                    sequence_id,
+                    candidate_sequence_value(&candidate, sequence_id)?,
+                );
+            }
             transaction.working = Some(candidate);
             return Ok(TryQueryStream::new(events));
         }
 
         let lease = self.writer.try_acquire(transaction.transaction_id)?;
-        let committed = committed_snapshot(&self.state)?;
+        let mut committed = committed_snapshot(&self.state)?;
+        committed.cancellation = snapshot.cancellation.clone();
         let (candidate, events, dirty) = execute_candidate(&committed, sql, params)?;
         if dirty {
+            if let Some(sequence_id) = sequence_id {
+                self.sequence_currvals.insert(
+                    sequence_id,
+                    candidate_sequence_value(&candidate, sequence_id)?,
+                );
+            }
             transaction.working = Some(candidate);
             transaction.lease = Some(lease);
         }
@@ -483,20 +541,77 @@ impl Session {
     }
 }
 
+fn resolve_sequence_currval(
+    statement: BoundStatement,
+    currvals: &BTreeMap<SequenceId, i64>,
+) -> Result<BoundStatement> {
+    match statement {
+        BoundStatement::SequenceValue {
+            sequence_id,
+            operation: BoundSequenceOperation::CurrentValue { .. },
+            schema,
+        } => Ok(BoundStatement::SequenceValue {
+            sequence_id,
+            operation: BoundSequenceOperation::CurrentValue {
+                value: currvals.get(&sequence_id).copied(),
+            },
+            schema,
+        }),
+        statement => Ok(statement),
+    }
+}
+
+fn sequence_mutation_id(statement: &BoundStatement) -> Option<SequenceId> {
+    match statement {
+        BoundStatement::SequenceValue {
+            sequence_id,
+            operation: BoundSequenceOperation::NextValue | BoundSequenceOperation::SetValue { .. },
+            ..
+        } => Some(*sequence_id),
+        _ => None,
+    }
+}
+
+fn candidate_sequence_value(state: &DatabaseState, sequence_id: SequenceId) -> Result<i64> {
+    state
+        .catalog
+        .sequence_by_id(sequence_id)
+        .map(|sequence| sequence.last_value)
+        .ok_or_else(|| internal_error("mutated sequence disappeared from the candidate catalog"))
+}
+
 fn bound_statement_schema(statement: &BoundStatement) -> Schema {
     match statement {
-        BoundStatement::Select { schema, .. } | BoundStatement::AdvancedSelect { schema, .. } => {
-            schema.clone()
-        }
+        BoundStatement::Select { schema, .. }
+        | BoundStatement::AdvancedSelect { schema, .. }
+        | BoundStatement::ViewSelect { schema, .. }
+        | BoundStatement::RoutineSelect { schema, .. }
+        | BoundStatement::SequenceValue { schema, .. } => schema.clone(),
         BoundStatement::Explain { .. } => {
             Schema::new(vec![Field::new("QUERY PLAN", ScalarType::Text, false)])
         }
         BoundStatement::Begin
         | BoundStatement::Commit
         | BoundStatement::Rollback
+        | BoundStatement::NoOp { .. }
         | BoundStatement::CreateSchema { .. }
+        | BoundStatement::AlterSchemaRename { .. }
+        | BoundStatement::DropObjects { .. }
         | BoundStatement::CreateTable { .. }
+        | BoundStatement::AlterTable { .. }
         | BoundStatement::CreateIndex { .. }
+        | BoundStatement::AlterIndexRename { .. }
+        | BoundStatement::CreateSequence { .. }
+        | BoundStatement::AlterSequenceRename { .. }
+        | BoundStatement::AlterSequence { .. }
+        | BoundStatement::CreateView { .. }
+        | BoundStatement::AlterViewRename { .. }
+        | BoundStatement::RefreshMaterializedView { .. }
+        | BoundStatement::CreateRoutine { .. }
+        | BoundStatement::DropRoutine { .. }
+        | BoundStatement::Call { .. }
+        | BoundStatement::CreateTrigger { .. }
+        | BoundStatement::DropTrigger { .. }
         | BoundStatement::Insert { .. }
         | BoundStatement::Update { .. }
         | BoundStatement::Delete { .. } => Schema::empty(),
@@ -510,6 +625,7 @@ pub struct Transaction<'session> {
     wal: &'session Arc<WalManager>,
     writer: &'session Arc<WriterCoordinator>,
     commits_since_checkpoint: &'session Arc<AtomicU64>,
+    sequence_currvals: &'session mut BTreeMap<SequenceId, i64>,
     transaction_id: TransactionId,
     working: Option<DatabaseState>,
     lease: Option<WriterLease>,
@@ -570,7 +686,10 @@ impl Transaction<'_> {
             Some(working) => working.clone(),
             None => committed_snapshot(self.state)?,
         };
-        let statement = bind(parse(sql)?, &snapshot.catalog)?;
+        let statement = resolve_sequence_currval(
+            bind(parse(sql)?, &snapshot.catalog)?,
+            self.sequence_currvals,
+        )?;
         if matches!(
             &statement,
             BoundStatement::Begin | BoundStatement::Commit | BoundStatement::Rollback
@@ -584,11 +703,18 @@ impl Transaction<'_> {
         if let Some(stream) = prepare_read_stream(&snapshot, statement.clone(), params)? {
             return stream.collect::<Result<Vec<_>>>().map(QueryStream::new);
         }
+        let sequence_id = sequence_mutation_id(&statement);
         let (candidate, events, dirty) = execute_bound_candidate(&snapshot, statement, params)?;
         if !dirty {
             return Ok(QueryStream::new(events));
         }
         if self.working.is_some() {
+            if let Some(sequence_id) = sequence_id {
+                self.sequence_currvals.insert(
+                    sequence_id,
+                    candidate_sequence_value(&candidate, sequence_id)?,
+                );
+            }
             self.working = Some(candidate);
             return Ok(QueryStream::new(events));
         }
@@ -597,6 +723,12 @@ impl Transaction<'_> {
         let committed = committed_snapshot(self.state)?;
         let (candidate, events, dirty) = execute_candidate(&committed, sql, params)?;
         if dirty {
+            if let Some(sequence_id) = sequence_id {
+                self.sequence_currvals.insert(
+                    sequence_id,
+                    candidate_sequence_value(&candidate, sequence_id)?,
+                );
+            }
             self.working = Some(candidate);
             self.lease = Some(lease);
         }
@@ -793,6 +925,10 @@ struct DatabaseState {
     rows: BTreeMap<TableId, Arc<Vec<Row>>>,
     indexes: BTreeMap<IndexId, Arc<BPlusTree>>,
     generation: u64,
+    trigger_depth: usize,
+    triggers_fired: usize,
+    routine_depth: usize,
+    cancellation: Option<Arc<AtomicBool>>,
 }
 
 struct SelectExecution {
@@ -802,6 +938,32 @@ struct SelectExecution {
     filter: Option<BoundExpr>,
     order_by: Vec<BoundOrder>,
     limit: Option<BoundExpr>,
+}
+
+struct CreateViewExecution {
+    schema: Identifier,
+    name: Identifier,
+    kind: ViewKind,
+    query: BoundStatement,
+    query_sql: String,
+    output: Schema,
+    references: Vec<CatalogObjectRef>,
+    replace: bool,
+    if_not_exists: bool,
+    with_data: bool,
+    existing: Option<ViewId>,
+}
+
+enum ReferentialChange {
+    Delete {
+        table_id: TableId,
+        old: Row,
+    },
+    Update {
+        table_id: TableId,
+        old: Row,
+        new: Row,
+    },
 }
 
 struct AdvancedExecution {
@@ -840,6 +1002,10 @@ impl DatabaseState {
                 .collect(),
             indexes,
             generation: state.generation,
+            trigger_depth: 0,
+            triggers_fired: 0,
+            routine_depth: 0,
+            cancellation: None,
         })
     }
 }
@@ -944,7 +1110,11 @@ fn execute_bound_candidate(
     params: &[Value],
 ) -> Result<(DatabaseState, Vec<QueryEvent>, bool)> {
     let mut candidate = state.clone();
+    candidate.trigger_depth = 0;
+    candidate.triggers_fired = 0;
+    candidate.routine_depth = 0;
     let (events, dirty) = execute_bound(&mut candidate, statement, params)?;
+    candidate.cancellation = None;
     Ok((candidate, events, dirty))
 }
 
@@ -956,7 +1126,11 @@ fn execute_candidate(
     let parsed = parse(sql)?;
     let statement = bind(parsed, &state.catalog)?;
     let mut candidate = state.clone();
+    candidate.trigger_depth = 0;
+    candidate.triggers_fired = 0;
+    candidate.routine_depth = 0;
     let (events, dirty) = execute_bound(&mut candidate, statement, params)?;
+    candidate.cancellation = None;
     Ok((candidate, events, dirty))
 }
 
@@ -1067,20 +1241,56 @@ fn execute_bound(
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
     match statement {
-        BoundStatement::CreateSchema { name } => {
+        BoundStatement::NoOp { tag } => Ok((command_events(Schema::empty(), tag, 0, None), false)),
+        BoundStatement::CreateSchema {
+            name,
+            if_not_exists,
+        } => {
+            if state.catalog.schema(&name).is_some() && if_not_exists {
+                return Ok((
+                    command_events(Schema::empty(), "CREATE SCHEMA", 0, None),
+                    false,
+                ));
+            }
             Arc::make_mut(&mut state.catalog).create_schema(name)?;
             Ok((
                 command_events(Schema::empty(), "CREATE SCHEMA", 0, None),
                 true,
             ))
         }
+        BoundStatement::AlterSchemaRename {
+            schema_id,
+            new_name,
+        } => {
+            Arc::make_mut(&mut state.catalog).rename_schema(schema_id, new_name)?;
+            Ok((
+                command_events(Schema::empty(), "ALTER SCHEMA", 0, None),
+                true,
+            ))
+        }
+        BoundStatement::DropObjects {
+            kind,
+            objects,
+            behavior,
+        } => execute_drop_objects(state, kind, objects, behavior),
         BoundStatement::CreateTable {
             schema,
             name,
             columns,
+            constraints,
+            if_not_exists,
         } => {
+            if state.catalog.table(&schema, &name).is_some() && if_not_exists {
+                return Ok((
+                    command_events(Schema::empty(), "CREATE TABLE", 0, None),
+                    false,
+                ));
+            }
             let table_id =
                 Arc::make_mut(&mut state.catalog).create_table(&schema, name, columns)?;
+            for constraint in constraints {
+                Arc::make_mut(&mut state.catalog).create_constraint(table_id, constraint)?;
+            }
             state.rows.insert(table_id, Arc::new(Vec::new()));
             rebuild_table_derived(state, table_id)?;
             Ok((
@@ -1088,11 +1298,324 @@ fn execute_bound(
                 true,
             ))
         }
-        BoundStatement::CreateIndex { table_id, index } => {
+        BoundStatement::AlterTable {
+            table_id,
+            operations,
+        } => execute_alter_table(state, table_id, operations),
+        BoundStatement::CreateIndex {
+            table_id,
+            index,
+            if_not_exists,
+        } => {
+            if table_definition(state, table_id)?
+                .index(&index.name)
+                .is_some()
+                && if_not_exists
+            {
+                return Ok((
+                    command_events(Schema::empty(), "CREATE INDEX", 0, None),
+                    false,
+                ));
+            }
             Arc::make_mut(&mut state.catalog).create_index(table_id, index)?;
             rebuild_table_derived(state, table_id)?;
             Ok((
                 command_events(Schema::empty(), "CREATE INDEX", 0, None),
+                true,
+            ))
+        }
+        BoundStatement::AlterIndexRename { index_id, new_name } => {
+            Arc::make_mut(&mut state.catalog).rename_index(index_id, new_name)?;
+            Ok((
+                command_events(Schema::empty(), "ALTER INDEX", 0, None),
+                true,
+            ))
+        }
+        BoundStatement::CreateSequence {
+            schema,
+            sequence,
+            if_not_exists,
+        } => {
+            if state.catalog.sequence(&schema, &sequence.name).is_some() && if_not_exists {
+                return Ok((
+                    command_events(Schema::empty(), "CREATE SEQUENCE", 0, None),
+                    false,
+                ));
+            }
+            Arc::make_mut(&mut state.catalog).create_sequence(&schema, sequence)?;
+            Ok((
+                command_events(Schema::empty(), "CREATE SEQUENCE", 0, None),
+                true,
+            ))
+        }
+        BoundStatement::AlterSequenceRename {
+            sequence_id,
+            new_name,
+        } => {
+            Arc::make_mut(&mut state.catalog).rename_sequence(sequence_id, new_name)?;
+            Ok((
+                command_events(Schema::empty(), "ALTER SEQUENCE", 0, None),
+                true,
+            ))
+        }
+        BoundStatement::AlterSequence {
+            sequence_id,
+            increment,
+            min_value,
+            max_value,
+            restart,
+            cycle,
+            owner,
+        } => {
+            Arc::make_mut(&mut state.catalog).alter_sequence(
+                sequence_id,
+                SequenceAlteration {
+                    increment,
+                    min_value,
+                    max_value,
+                    restart,
+                    cycle,
+                    owner,
+                },
+            )?;
+            Ok((
+                command_events(Schema::empty(), "ALTER SEQUENCE", 0, None),
+                true,
+            ))
+        }
+        BoundStatement::CreateView {
+            schema,
+            name,
+            kind,
+            query,
+            query_sql,
+            output,
+            references,
+            replace,
+            if_not_exists,
+            with_data,
+            existing,
+        } => execute_create_view(
+            state,
+            CreateViewExecution {
+                schema,
+                name,
+                kind,
+                query: *query,
+                query_sql,
+                output,
+                references,
+                replace,
+                if_not_exists,
+                with_data,
+                existing,
+            },
+            params,
+        ),
+        BoundStatement::AlterViewRename { view_id, new_name } => {
+            let kind = state
+                .catalog
+                .view_by_id(view_id)
+                .map(|view| view.kind)
+                .ok_or_else(|| internal_error("view disappeared before rename"))?;
+            Arc::make_mut(&mut state.catalog).rename_view(view_id, new_name)?;
+            let tag = match kind {
+                ordadb_catalog::ViewKind::Regular => "ALTER VIEW",
+                ordadb_catalog::ViewKind::Materialized => "ALTER MATERIALIZED VIEW",
+            };
+            Ok((command_events(Schema::empty(), tag, 0, None), true))
+        }
+        BoundStatement::RefreshMaterializedView {
+            view_id,
+            table_id,
+            query,
+            with_data,
+        } => {
+            let rows = if with_data {
+                materialize_statement_rows(state, *query, params)?
+            } else {
+                Vec::new()
+            };
+            state.rows.insert(table_id, Arc::new(rows));
+            Arc::make_mut(&mut state.catalog)
+                .set_materialized_view_populated(view_id, with_data)?;
+            rebuild_table_derived(state, table_id)?;
+            Ok((
+                command_events(Schema::empty(), "REFRESH MATERIALIZED VIEW", 0, None),
+                true,
+            ))
+        }
+        BoundStatement::CreateRoutine {
+            schema,
+            name,
+            kind,
+            arguments,
+            return_type,
+            returns_set,
+            language,
+            body,
+            replace,
+        } => {
+            let argument_names = routine_argument_names(&arguments);
+            let compile_names =
+                if kind == ordadb_catalog::RoutineKind::Function && return_type.is_none() {
+                    vec!["old".to_owned(), "new".to_owned()]
+                } else {
+                    argument_names
+                };
+            compile_plpgsql(&body, &compile_names)?;
+            let tag = match kind {
+                ordadb_catalog::RoutineKind::Function => "CREATE FUNCTION",
+                ordadb_catalog::RoutineKind::Procedure => "CREATE PROCEDURE",
+            };
+            Arc::make_mut(&mut state.catalog).create_or_replace_routine(
+                &schema,
+                NewRoutine {
+                    name,
+                    kind,
+                    arguments,
+                    return_type,
+                    returns_set,
+                    language,
+                    body,
+                    replace,
+                    references: Vec::new(),
+                },
+            )?;
+            Ok((command_events(Schema::empty(), tag, 0, None), true))
+        }
+        BoundStatement::DropRoutine {
+            routine_id,
+            behavior,
+        } => {
+            let kind = state
+                .catalog
+                .routine_by_id(routine_id)
+                .map(|routine| routine.kind)
+                .ok_or_else(|| DbError::new("42883", "routine does not exist"))?;
+            let removed = Arc::make_mut(&mut state.catalog).drop_routine(routine_id, behavior)?;
+            cleanup_removed_state(state, &removed);
+            let tag = match kind {
+                ordadb_catalog::RoutineKind::Function => "DROP FUNCTION",
+                ordadb_catalog::RoutineKind::Procedure => "DROP PROCEDURE",
+            };
+            Ok((command_events(Schema::empty(), tag, 0, None), true))
+        }
+        BoundStatement::Call {
+            routine_id,
+            arguments,
+        } => {
+            execute_routine_program(state, routine_id, &arguments, params)?;
+            Ok((command_events(Schema::empty(), "CALL", 0, None), true))
+        }
+        BoundStatement::RoutineSelect {
+            routine_id,
+            arguments,
+            schema,
+            returns_set,
+        } => {
+            let output = execute_routine_program(state, routine_id, &arguments, params)?;
+            let values = if returns_set {
+                output.returned_rows
+            } else {
+                vec![output.return_value.unwrap_or(Value::Null)]
+            };
+            let row_count = values.len() as u64;
+            Ok((
+                vec![
+                    QueryEvent::Schema(schema.clone()),
+                    QueryEvent::Batch(Batch {
+                        schema,
+                        rows: values
+                            .into_iter()
+                            .map(|value| Row::new(vec![value]))
+                            .collect(),
+                    }),
+                    QueryEvent::Progress(QueryProgress {
+                        rows_processed: row_count,
+                    }),
+                    QueryEvent::Complete(CommandComplete {
+                        tag: format!("SELECT {row_count}"),
+                        rows_affected: row_count,
+                    }),
+                ],
+                false,
+            ))
+        }
+        BoundStatement::SequenceValue {
+            sequence_id,
+            operation,
+            schema,
+        } => {
+            let (value, dirty) = match operation {
+                BoundSequenceOperation::NextValue => (
+                    Arc::make_mut(&mut state.catalog).next_sequence_value(sequence_id)?,
+                    true,
+                ),
+                BoundSequenceOperation::CurrentValue { value } => (
+                    value.ok_or_else(|| {
+                        DbError::new(
+                            "55000",
+                            "currval of sequence is not yet defined in this session",
+                        )
+                    })?,
+                    false,
+                ),
+                BoundSequenceOperation::SetValue { value, is_called } => {
+                    let value = evaluate_scalar(&value, &[], params)?;
+                    let Value::Int64(value) = value else {
+                        return Err(internal_error(
+                            "bound setval expression did not produce BIGINT",
+                        ));
+                    };
+                    Arc::make_mut(&mut state.catalog).set_sequence_value(
+                        sequence_id,
+                        value,
+                        is_called,
+                    )?;
+                    (value, true)
+                }
+            };
+            Ok((
+                command_events(
+                    schema.clone(),
+                    "SELECT 1",
+                    1,
+                    Some(Batch {
+                        schema,
+                        rows: vec![Row::new(vec![Value::Int64(value)])],
+                    }),
+                ),
+                dirty,
+            ))
+        }
+        BoundStatement::CreateTrigger {
+            table_id,
+            name,
+            timing,
+            events,
+            routine_id,
+        } => {
+            Arc::make_mut(&mut state.catalog).create_trigger(
+                table_id,
+                name,
+                timing,
+                events.into_iter().collect(),
+                routine_id,
+            )?;
+            Ok((
+                command_events(Schema::empty(), "CREATE TRIGGER", 0, None),
+                true,
+            ))
+        }
+        BoundStatement::DropTrigger {
+            trigger_id,
+            behavior,
+        } => {
+            let removed = Arc::make_mut(&mut state.catalog).drop_trigger(trigger_id, behavior)?;
+            cleanup_removed_state(state, &removed);
+            Ok((
+                command_events(Schema::empty(), "DROP TRIGGER", 0, None),
                 true,
             ))
         }
@@ -1147,6 +1670,12 @@ fn execute_bound(
             },
             params,
         ),
+        BoundStatement::ViewSelect {
+            source,
+            schema,
+            projection,
+            ..
+        } => execute_view_select(state, *source, schema, projection, params),
         BoundStatement::Explain { statement } => execute_explain(state, *statement),
         BoundStatement::Update {
             table_id,
@@ -1166,6 +1695,950 @@ fn execute_bound(
     }
 }
 
+fn routine_argument_names(arguments: &[ordadb_catalog::RoutineArgument]) -> Vec<String> {
+    arguments
+        .iter()
+        .enumerate()
+        .map(|(index, argument)| {
+            argument
+                .name
+                .as_ref()
+                .map_or_else(|| format!("__arg{}", index + 1), |name| name.to_string())
+        })
+        .collect()
+}
+
+fn execute_routine_program(
+    state: &mut DatabaseState,
+    routine_id: ordadb_types::RoutineId,
+    arguments: &[BoundExpr],
+    params: &[Value],
+) -> Result<ordadb_plpgsql::VmOutput> {
+    if state.routine_depth == 0 {
+        return std::thread::scope(|scope| {
+            let worker = std::thread::Builder::new()
+                .name("ordadb-plpgsql".to_owned())
+                .stack_size(PLPGSQL_EXECUTION_STACK_BYTES)
+                .spawn_scoped(scope, || {
+                    execute_routine_program_on_stack(state, routine_id, arguments, params)
+                })
+                .map_err(|error| {
+                    DbError::new("58030", "failed to start the PL/pgSQL execution worker")
+                        .with_detail(error.to_string())
+                })?;
+            worker
+                .join()
+                .map_err(|_| internal_error("PL/pgSQL execution worker terminated unexpectedly"))?
+        });
+    }
+    execute_routine_program_on_stack(state, routine_id, arguments, params)
+}
+
+fn execute_routine_program_on_stack(
+    state: &mut DatabaseState,
+    routine_id: ordadb_types::RoutineId,
+    arguments: &[BoundExpr],
+    params: &[Value],
+) -> Result<ordadb_plpgsql::VmOutput> {
+    let routine = state
+        .catalog
+        .routine_by_id(routine_id)
+        .cloned()
+        .ok_or_else(|| DbError::new("42883", "routine does not exist"))?;
+    let program = compile_plpgsql(&routine.body, &routine_argument_names(&routine.arguments))?;
+    let values = arguments
+        .iter()
+        .map(|argument| evaluate_scalar(argument, &[], params))
+        .collect::<Result<Vec<_>>>()?;
+    if state.routine_depth >= 64 {
+        return Err(DbError::new(
+            "54001",
+            "PL/pgSQL routine-call depth exceeds the maximum of 64",
+        ));
+    }
+    state.routine_depth += 1;
+    let result = {
+        let mut host = EnginePlpgsqlHost {
+            state,
+            trigger: None,
+            exception_state: None,
+            exception_trigger: None,
+        };
+        execute_plpgsql(&program, &mut host, &values)
+    };
+    state.routine_depth = state.routine_depth.saturating_sub(1);
+    let mut output = result?;
+    if let Some(return_type) = &routine.return_type {
+        output.return_value = output
+            .return_value
+            .map(|value| coerce_execution_value(value, return_type))
+            .transpose()?;
+        output.returned_rows = output
+            .returned_rows
+            .into_iter()
+            .map(|value| coerce_execution_value(value, return_type))
+            .collect::<Result<Vec<_>>>()?;
+    }
+    Ok(output)
+}
+
+#[derive(Debug, Clone)]
+struct TriggerRowContext {
+    table: TableDefinition,
+    old: Option<Row>,
+    new: Option<Row>,
+}
+
+impl TriggerRowContext {
+    fn value_and_type(&self, slot: usize, field: &str) -> Result<(Value, ScalarType)> {
+        let row = match slot {
+            0 => self.old.as_ref(),
+            1 => self.new.as_ref(),
+            _ => {
+                return Err(DbError::new(
+                    "42P02",
+                    format!("trigger record parameter ${} does not exist", slot + 1),
+                ));
+            }
+        };
+        let field = Identifier::unquoted(field);
+        let (column_index, data_type) = self
+            .table
+            .columns()
+            .iter()
+            .enumerate()
+            .find(|(_, column)| column.name == field)
+            .map(|(index, column)| (index, column.data_type.clone()))
+            .ok_or_else(|| {
+                DbError::new(
+                    "42703",
+                    format!("trigger record field {field} does not exist"),
+                )
+            })?;
+        let value = match row {
+            Some(row) => row.values.get(column_index).cloned().ok_or_else(|| {
+                internal_error("trigger record width does not match its table definition")
+            })?,
+            None => Value::Null,
+        };
+        Ok((value, data_type))
+    }
+
+    fn value(&self, slot: usize, field: &str) -> Result<Value> {
+        self.value_and_type(slot, field).map(|(value, _)| value)
+    }
+
+    fn assign(&mut self, slot: usize, field: &str, value: Value) -> Result<()> {
+        if slot != 1 {
+            return Err(DbError::new("25006", "OLD is read-only in a row trigger"));
+        }
+        let field = Identifier::unquoted(field);
+        let (column_index, data_type) = self
+            .table
+            .columns()
+            .iter()
+            .enumerate()
+            .find(|(_, column)| column.name == field)
+            .map(|(index, column)| (index, column.data_type.clone()))
+            .ok_or_else(|| {
+                DbError::new(
+                    "42703",
+                    format!("trigger record field {field} does not exist"),
+                )
+            })?;
+        let row = self
+            .new
+            .as_mut()
+            .ok_or_else(|| DbError::new("55000", "NEW is not available for this trigger event"))?;
+        let target = row.values.get_mut(column_index).ok_or_else(|| {
+            internal_error("trigger record width does not match its table definition")
+        })?;
+        *target = coerce_execution_value(value, &data_type)?;
+        Ok(())
+    }
+}
+
+enum RowTriggerOutcome {
+    Proceed(Option<Row>),
+    Suppress,
+}
+
+fn fire_row_triggers_with_rows(
+    state: &mut DatabaseState,
+    table_id: TableId,
+    timing: TriggerTiming,
+    event: TriggerEvent,
+    old: Option<&Row>,
+    new: Option<&Row>,
+) -> Result<RowTriggerOutcome> {
+    let table = table_definition(state, table_id)?.clone();
+    let triggers = table
+        .triggers()
+        .filter(|trigger| {
+            trigger.enabled && trigger.timing == timing && trigger.events.contains(&event)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for trigger in triggers {
+        if state.trigger_depth >= 64 || state.triggers_fired >= 16_384 {
+            return Err(DbError::new(
+                "54001",
+                "trigger recursion or fired-trigger limit exceeded",
+            ));
+        }
+        let routine = state
+            .catalog
+            .routine_by_id(trigger.routine_id)
+            .cloned()
+            .ok_or_else(|| DbError::new("42883", "trigger routine does not exist"))?;
+        let program = compile_plpgsql(&routine.body, &["old".into(), "new".into()])?;
+        state.trigger_depth += 1;
+        state.triggers_fired += 1;
+        let mut trigger = TriggerRowContext {
+            table: table.clone(),
+            old: old.cloned(),
+            new: new.cloned(),
+        };
+        let result = {
+            let mut host = EnginePlpgsqlHost {
+                state,
+                trigger: Some(&mut trigger),
+                exception_state: None,
+                exception_trigger: None,
+            };
+            execute_plpgsql(&program, &mut host, &[Value::Null, Value::Null])
+        };
+        state.trigger_depth = state.trigger_depth.saturating_sub(1);
+        let output = result?;
+        if timing == TriggerTiming::After {
+            continue;
+        }
+        match output.return_parameter {
+            Some(0) => {
+                if event != TriggerEvent::Delete {
+                    return Ok(match trigger.old {
+                        Some(row) => RowTriggerOutcome::Proceed(Some(row)),
+                        None => RowTriggerOutcome::Suppress,
+                    });
+                }
+            }
+            Some(1) => {
+                if event == TriggerEvent::Delete {
+                    if trigger.new.is_none() {
+                        return Ok(RowTriggerOutcome::Suppress);
+                    }
+                } else {
+                    return Ok(match trigger.new {
+                        Some(row) => RowTriggerOutcome::Proceed(Some(row)),
+                        None => RowTriggerOutcome::Suppress,
+                    });
+                }
+            }
+            Some(parameter) => {
+                return Err(DbError::new(
+                    "42P02",
+                    format!(
+                        "trigger function returned unknown record parameter ${}",
+                        parameter + 1
+                    ),
+                ));
+            }
+            None if output.return_value.is_none()
+                || output.return_value.as_ref().is_some_and(Value::is_null) =>
+            {
+                return Ok(RowTriggerOutcome::Suppress);
+            }
+            None => {
+                return Err(DbError::new(
+                    "42804",
+                    "row trigger functions must return OLD, NEW, or NULL",
+                ));
+            }
+        }
+    }
+    Ok(RowTriggerOutcome::Proceed(new.cloned()))
+}
+
+fn execute_view_select(
+    state: &mut DatabaseState,
+    source: BoundStatement,
+    schema: Schema,
+    projection: Vec<usize>,
+    params: &[Value],
+) -> Result<(Vec<QueryEvent>, bool)> {
+    let (mut events, dirty) = execute_bound(state, source, params)?;
+    if dirty {
+        return Err(internal_error(
+            "a stored view query attempted to mutate state",
+        ));
+    }
+    for event in &mut events {
+        match event {
+            QueryEvent::Schema(event_schema) => *event_schema = schema.clone(),
+            QueryEvent::Batch(batch) => {
+                for row in &mut batch.rows {
+                    row.values = projection
+                        .iter()
+                        .map(|position| {
+                            row.values.get(*position).cloned().ok_or_else(|| {
+                                internal_error("stored view projection is outside its row width")
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                }
+            }
+            QueryEvent::Progress(_) | QueryEvent::Notice(_) | QueryEvent::Complete(_) => {}
+        }
+    }
+    Ok((events, false))
+}
+
+fn execute_drop_objects(
+    state: &mut DatabaseState,
+    kind: DdlObjectKind,
+    objects: Vec<CatalogObjectRef>,
+    behavior: DropBehavior,
+) -> Result<(Vec<QueryEvent>, bool)> {
+    if objects.is_empty() {
+        return Ok((
+            command_events(Schema::empty(), drop_command_tag(kind), 0, None),
+            false,
+        ));
+    }
+    let catalog_before = Arc::clone(&state.catalog);
+    let mut removed = Vec::new();
+    for object in objects {
+        let dropped = drop_catalog_root(Arc::make_mut(&mut state.catalog), object, behavior)?;
+        for object in dropped {
+            if !removed.contains(&object) {
+                removed.push(object);
+            }
+        }
+    }
+
+    let backing_tables = removed
+        .iter()
+        .filter_map(|object| match object {
+            CatalogObjectRef::View(view_id) => catalog_before
+                .view_by_id(*view_id)
+                .and_then(|view| view.materialized_table_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for table_id in backing_tables {
+        if state.catalog.table_by_id(table_id).is_some() {
+            for object in
+                Arc::make_mut(&mut state.catalog).drop_table(table_id, DropBehavior::Cascade)?
+            {
+                if !removed.contains(&object) {
+                    removed.push(object);
+                }
+            }
+        }
+    }
+    cleanup_removed_state(state, &removed);
+    Ok((
+        command_events(Schema::empty(), drop_command_tag(kind), 0, None),
+        true,
+    ))
+}
+
+fn drop_catalog_root(
+    catalog: &mut Catalog,
+    object: CatalogObjectRef,
+    behavior: DropBehavior,
+) -> Result<Vec<CatalogObjectRef>> {
+    match object {
+        CatalogObjectRef::Schema(id) if catalog.schema_by_id(id).is_some() => {
+            catalog.drop_schema(id, behavior)
+        }
+        CatalogObjectRef::Table(id) if catalog.table_by_id(id).is_some() => {
+            catalog.drop_table(id, behavior)
+        }
+        CatalogObjectRef::Index(id) if catalog.index_by_id(id).is_some() => {
+            catalog.drop_index(id, behavior)
+        }
+        CatalogObjectRef::Sequence(id) if catalog.sequence_by_id(id).is_some() => {
+            catalog.drop_sequence(id, behavior)
+        }
+        CatalogObjectRef::View(id) if catalog.view_by_id(id).is_some() => {
+            catalog.drop_view(id, behavior)
+        }
+        CatalogObjectRef::Constraint(id) if catalog.constraint_by_id(id).is_some() => {
+            catalog.drop_constraint(id, behavior)
+        }
+        CatalogObjectRef::Routine(id) if catalog.routine_by_id(id).is_some() => {
+            catalog.drop_routine(id, behavior)
+        }
+        CatalogObjectRef::Trigger(id) if catalog.trigger_by_id(id).is_some() => {
+            catalog.drop_trigger(id, behavior)
+        }
+        CatalogObjectRef::Column(_, _) => Err(internal_error(
+            "column drops must be routed through ALTER TABLE",
+        )),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn cleanup_removed_state(state: &mut DatabaseState, removed: &[CatalogObjectRef]) {
+    for object in removed {
+        match object {
+            CatalogObjectRef::Table(table_id) => {
+                state.rows.remove(table_id);
+            }
+            CatalogObjectRef::Index(index_id) => {
+                state.indexes.remove(index_id);
+            }
+            _ => {}
+        }
+    }
+    state
+        .rows
+        .retain(|table_id, _| state.catalog.table_by_id(*table_id).is_some());
+    state
+        .indexes
+        .retain(|index_id, _| state.catalog.index_by_id(*index_id).is_some());
+}
+
+fn drop_command_tag(kind: DdlObjectKind) -> &'static str {
+    match kind {
+        DdlObjectKind::Schema => "DROP SCHEMA",
+        DdlObjectKind::Table => "DROP TABLE",
+        DdlObjectKind::Index => "DROP INDEX",
+        DdlObjectKind::Sequence => "DROP SEQUENCE",
+        DdlObjectKind::View => "DROP VIEW",
+        DdlObjectKind::MaterializedView => "DROP MATERIALIZED VIEW",
+    }
+}
+
+fn execute_alter_table(
+    state: &mut DatabaseState,
+    table_id: TableId,
+    operations: Vec<BoundAlterTableOperation>,
+) -> Result<(Vec<QueryEvent>, bool)> {
+    for operation in operations {
+        match operation {
+            BoundAlterTableOperation::RenameTable { new_name } => {
+                Arc::make_mut(&mut state.catalog).rename_table(table_id, new_name)?;
+            }
+            BoundAlterTableOperation::RenameColumn {
+                column_id,
+                new_name,
+            } => {
+                Arc::make_mut(&mut state.catalog).rename_column(table_id, column_id, new_name)?;
+            }
+            BoundAlterTableOperation::AddColumn {
+                column,
+                if_not_exists,
+            } => {
+                if table_definition(state, table_id)?
+                    .column(&column.name)
+                    .is_some()
+                    && if_not_exists
+                {
+                    continue;
+                }
+                let value = catalog_default_value(column.default.as_ref(), &column.data_type)?;
+                Arc::make_mut(&mut state.catalog).add_column(table_id, column)?;
+                for row in Arc::make_mut(
+                    state
+                        .rows
+                        .entry(table_id)
+                        .or_insert_with(|| Arc::new(Vec::new())),
+                ) {
+                    row.values.push(value.clone());
+                }
+            }
+            BoundAlterTableOperation::DropColumns {
+                column_ids,
+                if_exists: _,
+                behavior,
+            } => {
+                let table = table_definition(state, table_id)?.clone();
+                let mut positions = column_ids
+                    .iter()
+                    .filter_map(|column_id| table.column_index_by_id(*column_id))
+                    .collect::<Vec<_>>();
+                for column_id in column_ids {
+                    if state
+                        .catalog
+                        .table_by_id(table_id)
+                        .is_some_and(|table| table.column_index_by_id(column_id).is_some())
+                    {
+                        Arc::make_mut(&mut state.catalog)
+                            .drop_column(table_id, column_id, behavior)?;
+                    }
+                }
+                positions.sort_unstable_by(|left, right| right.cmp(left));
+                for row in Arc::make_mut(
+                    state
+                        .rows
+                        .entry(table_id)
+                        .or_insert_with(|| Arc::new(Vec::new())),
+                ) {
+                    for position in &positions {
+                        row.values.remove(*position);
+                    }
+                }
+            }
+            BoundAlterTableOperation::SetNotNull { column_id } => {
+                Arc::make_mut(&mut state.catalog).alter_column(
+                    table_id,
+                    column_id,
+                    None,
+                    Some(false),
+                    None,
+                )?;
+            }
+            BoundAlterTableOperation::DropNotNull { column_id } => {
+                Arc::make_mut(&mut state.catalog).alter_column(
+                    table_id,
+                    column_id,
+                    None,
+                    Some(true),
+                    None,
+                )?;
+            }
+            BoundAlterTableOperation::SetDefault { column_id, default } => {
+                Arc::make_mut(&mut state.catalog).alter_column(
+                    table_id,
+                    column_id,
+                    None,
+                    None,
+                    Some(Some(default)),
+                )?;
+            }
+            BoundAlterTableOperation::DropDefault { column_id } => {
+                Arc::make_mut(&mut state.catalog).alter_column(
+                    table_id,
+                    column_id,
+                    None,
+                    None,
+                    Some(None),
+                )?;
+            }
+            BoundAlterTableOperation::SetDataType {
+                column_id,
+                data_type,
+            } => {
+                let position = table_definition(state, table_id)?
+                    .column_index_by_id(column_id)
+                    .ok_or_else(|| DbError::new("42703", "column does not exist"))?;
+                for row in Arc::make_mut(
+                    state
+                        .rows
+                        .entry(table_id)
+                        .or_insert_with(|| Arc::new(Vec::new())),
+                ) {
+                    row.values[position] =
+                        coerce_execution_value(row.values[position].clone(), &data_type)?;
+                }
+                Arc::make_mut(&mut state.catalog).alter_column(
+                    table_id,
+                    column_id,
+                    Some(data_type),
+                    None,
+                    None,
+                )?;
+            }
+            BoundAlterTableOperation::AddConstraint { constraint } => {
+                Arc::make_mut(&mut state.catalog).create_constraint(table_id, constraint)?;
+            }
+            BoundAlterTableOperation::DropConstraint {
+                constraint_id,
+                if_exists: _,
+                behavior,
+            } => {
+                if let Some(constraint_id) = constraint_id {
+                    let removed = Arc::make_mut(&mut state.catalog)
+                        .drop_constraint(constraint_id, behavior)?;
+                    cleanup_removed_state(state, &removed);
+                }
+            }
+            BoundAlterTableOperation::SetTriggerEnabled {
+                trigger_id,
+                name,
+                enabled,
+            } => {
+                let trigger_id = trigger_id.ok_or_else(|| {
+                    DbError::new("42704", format!("trigger {name} does not exist"))
+                })?;
+                Arc::make_mut(&mut state.catalog).set_trigger_enabled(trigger_id, enabled)?;
+            }
+        }
+    }
+    validate_database_rows(state)?;
+    rebuild_table_derived(state, table_id)?;
+    Ok((
+        command_events(Schema::empty(), "ALTER TABLE", 0, None),
+        true,
+    ))
+}
+
+fn catalog_default_value(
+    expression: Option<&CatalogExpression>,
+    data_type: &ScalarType,
+) -> Result<Value> {
+    let Some(expression) = expression else {
+        return Ok(Value::Null);
+    };
+    let bound = bind_catalog_expression(expression, None, Some(data_type))?;
+    evaluate_scalar(&bound, &[], &[])
+}
+
+fn execute_create_view(
+    state: &mut DatabaseState,
+    view: CreateViewExecution,
+    params: &[Value],
+) -> Result<(Vec<QueryEvent>, bool)> {
+    let tag = match view.kind {
+        ViewKind::Regular => "CREATE VIEW",
+        ViewKind::Materialized => "CREATE MATERIALIZED VIEW",
+    };
+    if view.existing.is_some() && view.if_not_exists && !view.replace {
+        return Ok((command_events(Schema::empty(), tag, 0, None), false));
+    }
+    let materialized_rows = if view.kind == ViewKind::Materialized && view.with_data {
+        Some(materialize_statement_rows(
+            state,
+            view.query.clone(),
+            params,
+        )?)
+    } else {
+        None
+    };
+
+    if let Some(view_id) = view.existing {
+        let current = state
+            .catalog
+            .view_by_id(view_id)
+            .cloned()
+            .ok_or_else(|| DbError::new("42P01", "view does not exist"))?;
+        if current.kind != view.kind {
+            return Err(DbError::new(
+                "42809",
+                "cannot replace a view with a different relation kind",
+            ));
+        }
+        Arc::make_mut(&mut state.catalog).replace_view(
+            view_id,
+            view.query_sql,
+            view.output,
+            view.kind == ViewKind::Regular || view.with_data,
+            view.references,
+        )?;
+        if let Some(table_id) = current.materialized_table_id {
+            state
+                .rows
+                .insert(table_id, Arc::new(materialized_rows.unwrap_or_default()));
+            rebuild_table_derived(state, table_id)?;
+        }
+        return Ok((command_events(Schema::empty(), tag, 0, None), true));
+    }
+
+    let materialized_table_id = if view.kind == ViewKind::Materialized {
+        let backing_name = Identifier::unquoted(format!("__ordadb_mv_{}", view.name.as_str()));
+        let columns = view
+            .output
+            .fields
+            .iter()
+            .map(|field| NewColumn {
+                name: Identifier::unquoted(field.name.clone()),
+                data_type: field.data_type.clone(),
+                nullable: field.nullable,
+                primary_key: false,
+                unique: false,
+                default: None,
+            })
+            .collect();
+        let table_id =
+            Arc::make_mut(&mut state.catalog).create_table(&view.schema, backing_name, columns)?;
+        state
+            .rows
+            .insert(table_id, Arc::new(materialized_rows.unwrap_or_default()));
+        rebuild_table_derived(state, table_id)?;
+        Some(table_id)
+    } else {
+        None
+    };
+    Arc::make_mut(&mut state.catalog).create_view(
+        &view.schema,
+        NewView {
+            name: view.name,
+            kind: view.kind,
+            query: view.query_sql,
+            output: view.output,
+            materialized_table_id,
+            populated: view.kind == ViewKind::Regular || view.with_data,
+            references: view.references,
+        },
+    )?;
+    Ok((command_events(Schema::empty(), tag, 0, None), true))
+}
+
+fn materialize_statement_rows(
+    state: &mut DatabaseState,
+    statement: BoundStatement,
+    params: &[Value],
+) -> Result<Vec<Row>> {
+    let (events, dirty) = execute_bound(state, statement, params)?;
+    if dirty {
+        return Err(internal_error(
+            "a materialized query attempted to mutate database state",
+        ));
+    }
+    Ok(events
+        .into_iter()
+        .filter_map(|event| match event {
+            QueryEvent::Batch(batch) => Some(batch.rows),
+            _ => None,
+        })
+        .flatten()
+        .collect())
+}
+
+struct EnginePlpgsqlHost<'a> {
+    state: &'a mut DatabaseState,
+    trigger: Option<&'a mut TriggerRowContext>,
+    exception_state: Option<DatabaseState>,
+    exception_trigger: Option<TriggerRowContext>,
+}
+
+impl PlpgsqlHost for EnginePlpgsqlHost<'_> {
+    fn execute_sql(
+        &mut self,
+        sql: &str,
+        parameters: &[Value],
+    ) -> Result<Box<dyn Iterator<Item = Result<QueryEvent>> + '_>> {
+        let (sql, parameters, _) =
+            expand_trigger_record_fields(sql, parameters, self.trigger.as_deref())?;
+        let statement = bind(parse(&sql)?, &self.state.catalog)?;
+        if matches!(
+            statement,
+            BoundStatement::Begin | BoundStatement::Commit | BoundStatement::Rollback
+        ) {
+            return Err(DbError::new(
+                "0A000",
+                "transaction control is not allowed inside PL/pgSQL routines",
+            ));
+        }
+        let (events, _) = execute_bound(self.state, statement, &parameters)?;
+        Ok(Box::new(events.into_iter().map(Ok)))
+    }
+
+    fn evaluate_expression(&mut self, sql: &str, parameters: &[Value]) -> Result<Value> {
+        if let Some(trigger) = self.trigger.as_deref()
+            && let Some((slot, field)) = trigger_field_reference(sql)
+        {
+            return trigger.value(slot, field);
+        }
+        if let Some(index) = sql
+            .trim()
+            .strip_prefix('$')
+            .and_then(|index| index.parse::<usize>().ok())
+        {
+            return parameters
+                .get(index.saturating_sub(1))
+                .cloned()
+                .ok_or_else(|| DbError::new("42P02", format!("there is no parameter ${index}")));
+        }
+        let (sql, parameters, mut parameter_types) =
+            expand_trigger_record_fields(sql, parameters, self.trigger.as_deref())?;
+        for (index, value) in parameters.iter().enumerate() {
+            if let Some(data_type) = scalar_type_of_value(value) {
+                parameter_types.entry(index + 1).or_insert(data_type);
+            }
+        }
+        let expression = CatalogExpression::new(sql);
+        let bound = bind_catalog_expression_with_parameter_types(
+            &expression,
+            None,
+            None,
+            &parameter_types,
+        )?;
+        evaluate_scalar(&bound, &[], &parameters)
+    }
+
+    fn assign_composite_field(&mut self, slot: usize, field: &str, value: Value) -> Result<()> {
+        self.trigger
+            .as_deref_mut()
+            .ok_or_else(|| {
+                DbError::new(
+                    "0A000",
+                    "composite assignment is only available in row triggers",
+                )
+            })?
+            .assign(slot, field, value)
+    }
+
+    fn begin_exception_block(&mut self) -> Result<()> {
+        if self.exception_state.is_some() {
+            return Err(internal_error(
+                "PL/pgSQL exception savepoint is already active",
+            ));
+        }
+        self.exception_state = Some(self.state.clone());
+        self.exception_trigger = self.trigger.as_deref().cloned();
+        Ok(())
+    }
+
+    fn commit_exception_block(&mut self) -> Result<()> {
+        self.exception_state = None;
+        self.exception_trigger = None;
+        Ok(())
+    }
+
+    fn rollback_exception_block(&mut self) -> Result<()> {
+        let saved = self
+            .exception_state
+            .take()
+            .ok_or_else(|| internal_error("PL/pgSQL exception savepoint is not active"))?;
+        *self.state = saved;
+        if let Some(trigger) = self.trigger.as_deref_mut()
+            && let Some(saved) = self.exception_trigger.take()
+        {
+            *trigger = saved;
+        }
+        Ok(())
+    }
+
+    fn check_cancelled(&self) -> Result<()> {
+        if self
+            .state
+            .cancellation
+            .as_ref()
+            .is_some_and(|cancellation| cancellation.load(Ordering::Acquire))
+        {
+            Err(DbError::new("57014", "query was cancelled"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn scalar_type_of_value(value: &Value) -> Option<ScalarType> {
+    match value {
+        Value::Null => None,
+        Value::Boolean(_) => Some(ScalarType::Boolean),
+        Value::Int16(_) => Some(ScalarType::Int16),
+        Value::Int32(_) => Some(ScalarType::Int32),
+        Value::Int64(_) => Some(ScalarType::Int64),
+        Value::Float32(_) => Some(ScalarType::Float32),
+        Value::Float64(_) => Some(ScalarType::Float64),
+        Value::Decimal(_) => Some(ScalarType::Decimal {
+            precision: None,
+            scale: None,
+        }),
+        Value::Text(_) => Some(ScalarType::Text),
+        Value::Binary(_) => Some(ScalarType::Binary),
+        Value::Date(_) => Some(ScalarType::Date),
+        Value::Time(_) => Some(ScalarType::Time),
+        Value::Timestamp(_) => Some(ScalarType::Timestamp {
+            with_timezone: false,
+        }),
+        Value::Json(_) => Some(ScalarType::Json),
+        Value::Jsonb(_) => Some(ScalarType::Jsonb),
+        Value::Uuid(_) => Some(ScalarType::Uuid),
+        Value::Vector(values) => Some(ScalarType::Vector {
+            dimensions: Some(values.len()),
+        }),
+    }
+}
+
+fn trigger_field_reference(expression: &str) -> Option<(usize, &str)> {
+    let (parameter, field) = expression.trim().strip_prefix('$')?.split_once('.')?;
+    if field.is_empty()
+        || !field
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || value == '_')
+    {
+        return None;
+    }
+    Some((parameter.parse::<usize>().ok()?.checked_sub(1)?, field))
+}
+
+fn expand_trigger_record_fields(
+    sql: &str,
+    parameters: &[Value],
+    trigger: Option<&TriggerRowContext>,
+) -> Result<(String, Vec<Value>, BTreeMap<usize, ScalarType>)> {
+    let Some(trigger) = trigger else {
+        return Ok((sql.to_owned(), parameters.to_vec(), BTreeMap::new()));
+    };
+    let characters = sql.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(sql.len());
+    let mut expanded = parameters.to_vec();
+    let mut parameter_types = BTreeMap::new();
+    let mut quote = None;
+    let mut index = 0usize;
+    while index < characters.len() {
+        let character = characters[index];
+        if let Some(delimiter) = quote {
+            output.push(character);
+            if character == delimiter {
+                if characters.get(index + 1) == Some(&delimiter) {
+                    output.push(delimiter);
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            output.push(character);
+            index += 1;
+            continue;
+        }
+        if character != '$' {
+            output.push(character);
+            index += 1;
+            continue;
+        }
+        let digits_start = index + 1;
+        let mut cursor = digits_start;
+        while characters.get(cursor).is_some_and(char::is_ascii_digit) {
+            cursor += 1;
+        }
+        if cursor == digits_start || characters.get(cursor) != Some(&'.') {
+            output.push(character);
+            index += 1;
+            continue;
+        }
+        let field_start = cursor + 1;
+        cursor = field_start;
+        while characters
+            .get(cursor)
+            .is_some_and(|value| value.is_ascii_alphanumeric() || *value == '_')
+        {
+            cursor += 1;
+        }
+        if cursor == field_start {
+            return Err(DbError::new(
+                "42601",
+                "trigger record access requires an unquoted field name",
+            ));
+        }
+        let parameter = characters[digits_start..field_start - 1]
+            .iter()
+            .collect::<String>()
+            .parse::<usize>()
+            .map_err(|_| DbError::new("42P02", "invalid trigger record parameter"))?
+            .checked_sub(1)
+            .ok_or_else(|| DbError::new("42P02", "trigger parameters are one-based"))?;
+        let field = characters[field_start..cursor].iter().collect::<String>();
+        let (value, data_type) = trigger.value_and_type(parameter, &field)?;
+        expanded.push(value);
+        parameter_types.insert(expanded.len(), data_type);
+        output.push('$');
+        output.push_str(&expanded.len().to_string());
+        index = cursor;
+    }
+    Ok((output, expanded, parameter_types))
+}
+
 fn execute_insert(
     state: &mut DatabaseState,
     table_id: TableId,
@@ -1174,22 +2647,49 @@ fn execute_insert(
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
     let table = table_definition(state, table_id)?.clone();
-    let mut candidate_rows = state
-        .rows
-        .get(&table_id)
-        .map(|rows| (**rows).clone())
-        .unwrap_or_default();
-    let inserted = expressions.len() as u64;
+    let mut inserted = 0u64;
     for expressions in expressions {
-        let mut values = vec![Value::Null; table.columns().len()];
+        let mut values = table
+            .columns()
+            .iter()
+            .map(|column| catalog_default_value(column.default.as_ref(), &column.data_type))
+            .collect::<Result<Vec<_>>>()?;
         for (expression, column_index) in expressions.into_iter().zip(&column_indexes) {
             values[*column_index] = evaluate_scalar(&expression, &[], params)?;
         }
-        candidate_rows.push(Row::new(values));
+        let proposed = Row::new(values);
+        let inserted_row = match fire_row_triggers_with_rows(
+            state,
+            table_id,
+            TriggerTiming::Before,
+            TriggerEvent::Insert,
+            None,
+            Some(&proposed),
+        )? {
+            RowTriggerOutcome::Proceed(Some(row)) => row,
+            RowTriggerOutcome::Proceed(None) | RowTriggerOutcome::Suppress => continue,
+        };
+        Arc::make_mut(
+            state
+                .rows
+                .entry(table_id)
+                .or_insert_with(|| Arc::new(Vec::new())),
+        )
+        .push(inserted_row.clone());
+        validate_database_rows(state)?;
+        rebuild_table_derived(state, table_id)?;
+        let _ = fire_row_triggers_with_rows(
+            state,
+            table_id,
+            TriggerTiming::After,
+            TriggerEvent::Insert,
+            None,
+            Some(&inserted_row),
+        )?;
+        validate_database_rows(state)?;
+        rebuild_table_derived(state, table_id)?;
+        inserted = inserted.saturating_add(1);
     }
-    validate_rows(&table, &candidate_rows)?;
-    state.rows.insert(table_id, Arc::new(candidate_rows));
-    rebuild_table_derived(state, table_id)?;
     Ok((
         command_events(
             Schema::empty(),
@@ -1468,21 +2968,21 @@ fn execute_update(
     filter: Option<BoundExpr>,
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
-    let table = table_definition(state, table_id)?.clone();
-    let mut candidate_rows = state
+    table_definition(state, table_id)?;
+    let source_rows = state
         .rows
         .get(&table_id)
         .map(|rows| (**rows).clone())
         .unwrap_or_default();
     let mut updated = 0u64;
-    for row in &mut candidate_rows {
+    for old_row in source_rows {
         if filter
             .as_ref()
-            .map(|filter| execution_predicate_matches(filter, row, params))
+            .map(|filter| execution_predicate_matches(filter, &old_row, params))
             .transpose()?
             .unwrap_or(true)
         {
-            let original = row.values.clone();
+            let original = old_row.values.clone();
             let mut replacements = Vec::with_capacity(assignments.len());
             for (column_index, expression) in &assignments {
                 replacements.push((
@@ -1490,15 +2990,65 @@ fn execute_update(
                     evaluate_scalar(expression, &original, params)?,
                 ));
             }
+            let mut proposed = old_row.clone();
             for (column_index, value) in replacements {
-                row.values[column_index] = value;
+                proposed.values[column_index] = value;
             }
-            updated += 1;
+            let replacement = match fire_row_triggers_with_rows(
+                state,
+                table_id,
+                TriggerTiming::Before,
+                TriggerEvent::Update,
+                Some(&old_row),
+                Some(&proposed),
+            )? {
+                RowTriggerOutcome::Proceed(Some(row)) => row,
+                RowTriggerOutcome::Proceed(None) | RowTriggerOutcome::Suppress => continue,
+            };
+            let position = state
+                .rows
+                .get(&table_id)
+                .and_then(|rows| rows.iter().position(|row| row == &old_row))
+                .ok_or_else(|| {
+                    DbError::new(
+                        "55000",
+                        "BEFORE trigger changed the row targeted by the outer UPDATE",
+                    )
+                    .with_hint(
+                        "Return a replacement NEW row instead of updating the same row recursively.",
+                    )
+                })?;
+            Arc::make_mut(
+                state
+                    .rows
+                    .get_mut(&table_id)
+                    .ok_or_else(|| internal_error("updated table rows disappeared"))?,
+            )[position] = replacement.clone();
+            if replacement != old_row {
+                apply_referential_actions(
+                    state,
+                    vec![ReferentialChange::Update {
+                        table_id,
+                        old: old_row.clone(),
+                        new: replacement.clone(),
+                    }],
+                )?;
+            }
+            validate_database_rows(state)?;
+            rebuild_table_derived(state, table_id)?;
+            let _ = fire_row_triggers_with_rows(
+                state,
+                table_id,
+                TriggerTiming::After,
+                TriggerEvent::Update,
+                Some(&old_row),
+                Some(&replacement),
+            )?;
+            validate_database_rows(state)?;
+            rebuild_table_derived(state, table_id)?;
+            updated = updated.saturating_add(1);
         }
     }
-    validate_rows(&table, &candidate_rows)?;
-    state.rows.insert(table_id, Arc::new(candidate_rows));
-    rebuild_table_derived(state, table_id)?;
     Ok((
         command_events(Schema::empty(), format!("UPDATE {updated}"), updated, None),
         true,
@@ -1512,36 +3062,259 @@ fn execute_delete(
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
     table_definition(state, table_id)?;
-    let rows = Arc::make_mut(
-        state
-            .rows
-            .entry(table_id)
-            .or_insert_with(|| Arc::new(Vec::new())),
-    );
-    let original_len = rows.len();
-    if let Some(filter) = &filter {
-        let mut error = None;
-        rows.retain(
-            |row| match execution_predicate_matches(filter, row, params) {
-                Ok(matches) => !matches,
-                Err(predicate_error) => {
-                    error = Some(predicate_error);
-                    true
-                }
-            },
-        );
-        if let Some(error) = error {
-            return Err(error);
+    let source_rows = state
+        .rows
+        .get(&table_id)
+        .map(|rows| (**rows).clone())
+        .unwrap_or_default();
+    let mut deleted = 0u64;
+    for old_row in source_rows {
+        let matches = filter
+            .as_ref()
+            .map(|filter| execution_predicate_matches(filter, &old_row, params))
+            .transpose()?
+            .unwrap_or(true);
+        if !matches {
+            continue;
         }
-    } else {
-        rows.clear();
+        if matches!(
+            fire_row_triggers_with_rows(
+                state,
+                table_id,
+                TriggerTiming::Before,
+                TriggerEvent::Delete,
+                Some(&old_row),
+                None,
+            )?,
+            RowTriggerOutcome::Suppress
+        ) {
+            continue;
+        }
+        let position = state
+            .rows
+            .get(&table_id)
+            .and_then(|rows| rows.iter().position(|row| row == &old_row))
+            .ok_or_else(|| {
+                DbError::new(
+                    "55000",
+                    "BEFORE trigger changed the row targeted by the outer DELETE",
+                )
+                .with_hint("Return OLD instead of deleting the same row recursively.")
+            })?;
+        Arc::make_mut(
+            state
+                .rows
+                .get_mut(&table_id)
+                .ok_or_else(|| internal_error("deleted table rows disappeared"))?,
+        )
+        .remove(position);
+        apply_referential_actions(
+            state,
+            vec![ReferentialChange::Delete {
+                table_id,
+                old: old_row.clone(),
+            }],
+        )?;
+        validate_database_rows(state)?;
+        rebuild_table_derived(state, table_id)?;
+        let _ = fire_row_triggers_with_rows(
+            state,
+            table_id,
+            TriggerTiming::After,
+            TriggerEvent::Delete,
+            Some(&old_row),
+            None,
+        )?;
+        validate_database_rows(state)?;
+        rebuild_table_derived(state, table_id)?;
+        deleted = deleted.saturating_add(1);
     }
-    let deleted = (original_len - rows.len()) as u64;
-    rebuild_table_derived(state, table_id)?;
     Ok((
         command_events(Schema::empty(), format!("DELETE {deleted}"), deleted, None),
         true,
     ))
+}
+
+fn removed_rows(before: &[Row], after: &[Row]) -> Vec<Row> {
+    let mut matched = vec![false; after.len()];
+    let mut removed = Vec::new();
+    for row in before {
+        if let Some((index, _)) = after
+            .iter()
+            .enumerate()
+            .find(|(index, candidate)| !matched[*index] && *candidate == row)
+        {
+            matched[index] = true;
+        } else {
+            removed.push(row.clone());
+        }
+    }
+    removed
+}
+
+fn apply_referential_actions(
+    state: &mut DatabaseState,
+    changes: Vec<ReferentialChange>,
+) -> Result<()> {
+    let mut queue = VecDeque::from(changes);
+    let mut applied = 0usize;
+    while let Some(change) = queue.pop_front() {
+        applied = applied.saturating_add(1);
+        if applied > MAX_REFERENTIAL_ACTIONS {
+            return Err(DbError::new(
+                "54001",
+                "referential action work exceeds the configured limit",
+            ));
+        }
+        let (referenced_table_id, old_row, new_row) = match &change {
+            ReferentialChange::Delete { table_id, old } => (*table_id, old, None),
+            ReferentialChange::Update { table_id, old, new } => (*table_id, old, Some(new)),
+        };
+        let referenced_table = table_definition(state, referenced_table_id)?.clone();
+        let referencing = state
+            .catalog
+            .database()
+            .schemas()
+            .flat_map(|schema| schema.tables())
+            .flat_map(|table| {
+                table.constraints().filter_map(|constraint| {
+                    let ConstraintKind::ForeignKey {
+                        columns,
+                        referenced_table,
+                        referenced_columns,
+                        on_delete,
+                        on_update,
+                    } = &constraint.kind
+                    else {
+                        return None;
+                    };
+                    (*referenced_table == referenced_table_id).then(|| {
+                        (
+                            table.id,
+                            constraint.name.clone(),
+                            columns.clone(),
+                            referenced_columns.clone(),
+                            *on_delete,
+                            *on_update,
+                        )
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for (
+            child_table_id,
+            constraint_name,
+            local_columns,
+            referenced_columns,
+            on_delete,
+            on_update,
+        ) in referencing
+        {
+            let child_table = table_definition(state, child_table_id)?.clone();
+            let parent_positions = referenced_columns
+                .iter()
+                .map(|column_id| {
+                    referenced_table
+                        .column_index_by_id(*column_id)
+                        .ok_or_else(|| {
+                            internal_error("foreign-key parent column is absent during action")
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let child_positions = local_columns
+                .iter()
+                .map(|column_id| {
+                    child_table.column_index_by_id(*column_id).ok_or_else(|| {
+                        internal_error("foreign-key child column is absent during action")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(new_row) = new_row
+                && parent_positions
+                    .iter()
+                    .all(|position| old_row.values[*position] == new_row.values[*position])
+            {
+                continue;
+            }
+            let action = if new_row.is_some() {
+                on_update
+            } else {
+                on_delete
+            };
+            let child_rows = Arc::make_mut(
+                state
+                    .rows
+                    .entry(child_table_id)
+                    .or_insert_with(|| Arc::new(Vec::new())),
+            );
+            let matches_parent = |row: &Row| {
+                child_positions
+                    .iter()
+                    .zip(&parent_positions)
+                    .all(|(child, parent)| row.values[*child] == old_row.values[*parent])
+            };
+            if matches!(
+                action,
+                ReferentialAction::NoAction | ReferentialAction::Restrict
+            ) && child_rows.iter().any(matches_parent)
+            {
+                return Err(DbError::new(
+                    "23503",
+                    format!("update or delete violates foreign-key constraint {constraint_name}"),
+                ));
+            }
+            match action {
+                ReferentialAction::NoAction | ReferentialAction::Restrict => {}
+                ReferentialAction::Cascade if new_row.is_none() => {
+                    let before = child_rows.clone();
+                    child_rows.retain(|row| !matches_parent(row));
+                    queue.extend(removed_rows(&before, child_rows).into_iter().map(|old| {
+                        ReferentialChange::Delete {
+                            table_id: child_table_id,
+                            old,
+                        }
+                    }));
+                }
+                ReferentialAction::Cascade => {
+                    let new_row = new_row.ok_or_else(|| {
+                        internal_error("update cascade has no replacement parent row")
+                    })?;
+                    for child_row in child_rows.iter_mut().filter(|row| matches_parent(row)) {
+                        let old = child_row.clone();
+                        for (child, parent) in child_positions.iter().zip(&parent_positions) {
+                            child_row.values[*child] = new_row.values[*parent].clone();
+                        }
+                        queue.push_back(ReferentialChange::Update {
+                            table_id: child_table_id,
+                            old,
+                            new: child_row.clone(),
+                        });
+                    }
+                }
+                ReferentialAction::SetNull | ReferentialAction::SetDefault => {
+                    for child_row in child_rows.iter_mut().filter(|row| matches_parent(row)) {
+                        let old = child_row.clone();
+                        for child in &child_positions {
+                            child_row.values[*child] = if action == ReferentialAction::SetNull {
+                                Value::Null
+                            } else {
+                                let column = &child_table.columns()[*child];
+                                catalog_default_value(column.default.as_ref(), &column.data_type)?
+                            };
+                        }
+                        queue.push_back(ReferentialChange::Update {
+                            table_id: child_table_id,
+                            old,
+                            new: child_row.clone(),
+                        });
+                    }
+                }
+            }
+            rebuild_table_derived(state, child_table_id)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_rows(table: &TableDefinition, rows: &[Row]) -> Result<()> {
@@ -1580,6 +3353,133 @@ fn validate_rows(table: &TableDefinition, rows: &[Row]) -> Result<()> {
                             column.name
                         ),
                     ));
+                }
+            }
+        }
+    }
+    for constraint in table.constraints() {
+        match &constraint.kind {
+            ConstraintKind::PrimaryKey { columns } | ConstraintKind::Unique { columns } => {
+                let positions = columns
+                    .iter()
+                    .map(|column_id| {
+                        table.column_index_by_id(*column_id).ok_or_else(|| {
+                            internal_error("constraint column is absent from its table")
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for (left, left_row) in rows.iter().enumerate() {
+                    let left_key = positions
+                        .iter()
+                        .map(|position| &left_row.values[*position])
+                        .collect::<Vec<_>>();
+                    if matches!(constraint.kind, ConstraintKind::PrimaryKey { .. })
+                        && left_key.iter().any(|value| value.is_null())
+                    {
+                        return Err(DbError::new(
+                            "23502",
+                            format!(
+                                "null value violates primary-key constraint {}",
+                                constraint.name
+                            ),
+                        ));
+                    }
+                    if left_key.iter().any(|value| value.is_null()) {
+                        continue;
+                    }
+                    for right_row in rows.iter().skip(left + 1) {
+                        if positions.iter().all(|position| {
+                            left_row.values[*position] == right_row.values[*position]
+                        }) {
+                            return Err(DbError::new(
+                                "23505",
+                                format!(
+                                    "duplicate value violates unique constraint {}",
+                                    constraint.name
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            ConstraintKind::Check { expression } => {
+                let bound =
+                    bind_catalog_expression(expression, Some(table), Some(&ScalarType::Boolean))?;
+                for row in rows {
+                    if evaluate_scalar(&bound, &row.values, &[])? == Value::Boolean(false) {
+                        return Err(DbError::new(
+                            "23514",
+                            format!("row violates check constraint {}", constraint.name),
+                        ));
+                    }
+                }
+            }
+            ConstraintKind::ForeignKey { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_database_rows(state: &DatabaseState) -> Result<()> {
+    for schema in state.catalog.database().schemas() {
+        for table in schema.tables() {
+            let rows = state
+                .rows
+                .get(&table.id)
+                .map_or(&[][..], |rows| rows.as_slice());
+            validate_rows(table, rows)?;
+            for constraint in table.constraints() {
+                let ConstraintKind::ForeignKey {
+                    columns,
+                    referenced_table,
+                    referenced_columns,
+                    ..
+                } = &constraint.kind
+                else {
+                    continue;
+                };
+                let local_positions = columns
+                    .iter()
+                    .map(|column_id| {
+                        table.column_index_by_id(*column_id).ok_or_else(|| {
+                            internal_error("foreign-key column is absent from its table")
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let referenced = table_definition(state, *referenced_table)?;
+                let referenced_positions = referenced_columns
+                    .iter()
+                    .map(|column_id| {
+                        referenced.column_index_by_id(*column_id).ok_or_else(|| {
+                            internal_error("foreign-key referenced column is absent from its table")
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let referenced_rows = state
+                    .rows
+                    .get(referenced_table)
+                    .map_or(&[][..], |rows| rows.as_slice());
+                for row in rows {
+                    if local_positions
+                        .iter()
+                        .any(|position| row.values[*position].is_null())
+                    {
+                        continue;
+                    }
+                    if !referenced_rows.iter().any(|candidate| {
+                        local_positions
+                            .iter()
+                            .zip(&referenced_positions)
+                            .all(|(local, remote)| row.values[*local] == candidate.values[*remote])
+                    }) {
+                        return Err(DbError::new(
+                            "23503",
+                            format!(
+                                "insert or update violates foreign-key constraint {}",
+                                constraint.name
+                            ),
+                        ));
+                    }
                 }
             }
         }

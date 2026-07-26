@@ -3,6 +3,7 @@
 mod client;
 mod codec;
 mod scram;
+mod security;
 mod server;
 mod value;
 

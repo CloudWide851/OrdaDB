@@ -13,9 +13,13 @@ const ADMIN_PASSWORD: &str = "correct horse battery staple";
 const OID_INT8: u32 = 20;
 
 fn client(address: SocketAddr, password: &str) -> ordadb_types::Result<PgClient> {
+    client_as(address, ADMIN_USER, password)
+}
+
+fn client_as(address: SocketAddr, user: &str, password: &str) -> ordadb_types::Result<PgClient> {
     PgClient::connect(ClientConfig {
         address,
-        user: ADMIN_USER.into(),
+        user: user.into(),
         database: "ordadb".into(),
         password: Zeroizing::new(password.into()),
         application_name: "ordadb-service-e2e".into(),
@@ -269,4 +273,227 @@ async fn pgwire_management_copy_and_restart_are_end_to_end() {
         .expect("closed connection task")
         .expect_err("stopped listener must refuse new connections");
     assert!(closed.sql_state.starts_with("08"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pgwire_security_ddl_is_autocommit_redacted_and_persistent() {
+    const USER_PASSWORD: &str = "reader initial password";
+    const REPLACEMENT_PASSWORD: &str = "reader replacement password";
+
+    let directory = tempdir().expect("tempdir");
+    let mut config = ServerConfig::new(directory.path());
+    config.pg_bind = "127.0.0.1:0".parse().expect("PG bind");
+    config.admin_bind = "127.0.0.1:0".parse().expect("admin bind");
+    let first = start_server(config.clone()).await.expect("first server");
+    request_bootstrap(
+        first.bootstrap_pipe.as_deref().expect("bootstrap pipe"),
+        ADMIN_USER.into(),
+        Zeroizing::new(ADMIN_PASSWORD.into()),
+    )
+    .await
+    .expect("bootstrap");
+
+    let address = first.pg_address;
+    tokio::task::spawn_blocking(move || {
+        let mut admin = client(address, ADMIN_PASSWORD)?;
+        admin.query("CREATE SCHEMA app")?;
+        admin.query("CREATE TABLE app.secure_items (id BIGINT PRIMARY KEY)")?;
+        admin.query("INSERT INTO app.secure_items VALUES (1)")?;
+        admin.query(
+            "CREATE FUNCTION app.echo_value(value BIGINT)
+             RETURNS BIGINT
+             LANGUAGE plpgsql
+             AS $$
+             BEGIN
+             RETURN value;
+             END;
+             $$",
+        )?;
+        admin.query(
+            "CREATE PROCEDURE app.record_secure_item(value BIGINT)
+             LANGUAGE plpgsql
+             AS $$
+             BEGIN
+             INSERT INTO app.secure_items VALUES (value);
+             END;
+             $$",
+        )?;
+        admin.query(
+            "CREATE FUNCTION app.audit_secure_item()
+             RETURNS trigger
+             LANGUAGE plpgsql
+             AS $$
+             BEGIN
+             RETURN NEW;
+             END;
+             $$",
+        )?;
+        admin.query(
+            "CREATE TRIGGER secure_items_audit
+             AFTER INSERT ON app.secure_items
+             FOR EACH ROW
+             EXECUTE FUNCTION app.audit_secure_item()",
+        )?;
+        let function = admin.query_prepared(
+            "SELECT app.echo_value($1) AS answer",
+            &[OID_INT8],
+            &[Some(b"41".to_vec())],
+            0,
+        )?;
+        assert_eq!(function.columns, ["answer"]);
+        assert_eq!(function.rows, vec![vec![Some("41".into())]]);
+        assert_eq!(function.command_tags, ["SELECT 1"]);
+        let procedure = admin.query_prepared(
+            "CALL app.record_secure_item($1)",
+            &[OID_INT8],
+            &[Some(b"2".to_vec())],
+            0,
+        )?;
+        assert!(procedure.columns.is_empty());
+        assert!(procedure.rows.is_empty());
+        assert_eq!(procedure.command_tags, ["CALL"]);
+        admin.query(
+            "CREATE MATERIALIZED VIEW app.secure_snapshot
+             AS SELECT id FROM app.secure_items
+             WITH DATA",
+        )?;
+        let namespaces = admin.query("SELECT * FROM pg_catalog.pg_namespace")?;
+        assert_eq!(namespaces.columns, ["oid", "nspname"]);
+        assert!(
+            namespaces
+                .rows
+                .iter()
+                .any(|row| row.get(1) == Some(&Some("app".into())))
+        );
+        let classes = admin.query("SELECT * FROM pg_catalog.pg_class")?;
+        assert!(classes.rows.iter().any(|row| {
+            row.get(1) == Some(&Some("secure_items".into()))
+                && row.get(3) == Some(&Some("r".into()))
+        }));
+        assert!(classes.rows.iter().any(|row| {
+            row.get(1) == Some(&Some("secure_snapshot".into()))
+                && row.get(3) == Some(&Some("m".into()))
+        }));
+        let procedures = admin.query_prepared("SELECT * FROM pg_catalog.pg_proc", &[], &[], 0)?;
+        assert!(procedures.rows.iter().any(|row| {
+            row.get(1) == Some(&Some("echo_value".into())) && row.get(3) == Some(&Some("f".into()))
+        }));
+        assert!(procedures.rows.iter().any(|row| {
+            row.get(1) == Some(&Some("record_secure_item".into()))
+                && row.get(3) == Some(&Some("p".into()))
+        }));
+        let triggers = admin.query("SELECT * FROM pg_catalog.pg_trigger")?;
+        assert!(
+            triggers
+                .rows
+                .iter()
+                .any(|row| row.get(1) == Some(&Some("secure_items_audit".into())))
+        );
+        let information_schema = admin.query("SELECT * FROM information_schema.tables")?;
+        assert!(information_schema.rows.iter().any(|row| {
+            row.get(1) == Some(&Some("app".into()))
+                && row.get(2) == Some(&Some("secure_items".into()))
+                && row.get(3) == Some(&Some("BASE TABLE".into()))
+        }));
+        admin.query("CREATE ROLE reader")?;
+        admin.query(&format!("CREATE USER alice PASSWORD '{USER_PASSWORD}'"))?;
+        admin.query("GRANT reader TO alice")?;
+        admin.query("GRANT CONNECT ON DATABASE ordadb TO reader")?;
+        admin.query("GRANT SELECT ON TABLE app.secure_items TO reader")?;
+
+        admin.query("BEGIN")?;
+        let transactional = admin
+            .query("CREATE ROLE forbidden_in_transaction")
+            .expect_err("security DDL is autocommit only");
+        assert_eq!(transactional.sql_state, "25001");
+        admin.query("ROLLBACK")?;
+        admin.query(&format!(
+            "ALTER USER alice PASSWORD '{REPLACEMENT_PASSWORD}'"
+        ))?;
+        Ok::<(), ordadb_types::DbError>(())
+    })
+    .await
+    .expect("admin task")
+    .expect("admin DDL");
+
+    let old_address = first.pg_address;
+    let old_password =
+        tokio::task::spawn_blocking(move || client_as(old_address, "alice", USER_PASSWORD))
+            .await
+            .expect("old password task")
+            .expect_err("old password must be invalid");
+    assert_eq!(old_password.sql_state, "28P01");
+
+    let user_address = first.pg_address;
+    tokio::task::spawn_blocking(move || {
+        let mut user = client_as(user_address, "alice", REPLACEMENT_PASSWORD)?;
+        let selected = user.query("SELECT id FROM app.secure_items")?;
+        assert_eq!(
+            selected.rows,
+            vec![vec![Some("1".into())], vec![Some("2".into())]]
+        );
+        let denied = user
+            .query("INSERT INTO app.secure_items VALUES (2)")
+            .expect_err("read-only role");
+        assert_eq!(denied.sql_state, "42501");
+        let denied = user
+            .query("CREATE ROLE unauthorized")
+            .expect_err("server manage required");
+        assert_eq!(denied.sql_state, "42501");
+        Ok::<(), ordadb_types::DbError>(())
+    })
+    .await
+    .expect("user task")
+    .expect("user checks");
+
+    let token = management_token(first.admin_address).await;
+    let catalog: Value = reqwest::Client::new()
+        .get(format!("http://{}/v1/catalog", first.admin_address))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("catalog request")
+        .error_for_status()
+        .expect("catalog status")
+        .json()
+        .await
+        .expect("catalog JSON");
+    let app = catalog["data"]["database"]["schemas"]
+        .as_array()
+        .and_then(|schemas| schemas.iter().find(|schema| schema["name"] == "u:app"))
+        .expect("app schema projection");
+    assert_eq!(app["tables"].as_array().map(Vec::len), Some(1));
+    assert_eq!(app["views"].as_array().map(Vec::len), Some(1));
+    assert_eq!(app["routines"].as_array().map(Vec::len), Some(3));
+    let encoded_catalog = serde_json::to_string(&catalog).expect("catalog encoding");
+    assert!(!encoded_catalog.contains("\"body\""));
+    assert!(!encoded_catalog.contains("RETURN value"));
+    assert!(!encoded_catalog.contains("INSERT INTO app.secure_items"));
+
+    tokio::time::timeout(Duration::from_secs(5), first.shutdown())
+        .await
+        .expect("first shutdown timeout")
+        .expect("first shutdown");
+    let second = start_server(config).await.expect("second server");
+    let restart_address = second.pg_address;
+    tokio::task::spawn_blocking(move || {
+        let mut user = client_as(restart_address, "alice", REPLACEMENT_PASSWORD)?;
+        assert_eq!(
+            user.query("SELECT id FROM app.secure_items")?.rows,
+            vec![vec![Some("1".into())], vec![Some("2".into())]]
+        );
+        Ok::<(), ordadb_types::DbError>(())
+    })
+    .await
+    .expect("restart user task")
+    .expect("restart user");
+    tokio::time::timeout(Duration::from_secs(5), second.shutdown())
+        .await
+        .expect("second shutdown timeout")
+        .expect("second shutdown");
+
+    let auth = std::fs::read_to_string(directory.path().join("ordadb.auth.json"))
+        .expect("persisted auth catalog");
+    assert!(!auth.contains(USER_PASSWORD));
+    assert!(!auth.contains(REPLACEMENT_PASSWORD));
 }

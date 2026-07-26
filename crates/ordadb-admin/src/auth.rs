@@ -33,6 +33,7 @@ const SCRAM_ITERATIONS: u32 = 4096;
 const SCRAM_KEY_BYTES: usize = 32;
 const TOKEN_BYTES: usize = 32;
 const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(15 * 60);
+const MAX_ROLE_DEPTH: usize = 64;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -205,6 +206,216 @@ impl AuthStore {
         Ok(!self.read_document()?.users.is_empty())
     }
 
+    pub fn create_role(&self, name: &str, if_not_exists: bool) -> Result<bool> {
+        let name = normalize_name(name, "role")?;
+        self.mutate_document(|document| {
+            if document.roles.contains_key(&name) || document.users.contains_key(&name) {
+                if if_not_exists {
+                    return Ok(false);
+                }
+                return Err(DbError::new("42710", format!("role {name} already exists")));
+            }
+            document.roles.insert(
+                name.clone(),
+                Role {
+                    name,
+                    inherits: BTreeSet::new(),
+                },
+            );
+            Ok(true)
+        })
+    }
+
+    pub fn create_user(&self, name: &str, password: &[u8], if_not_exists: bool) -> Result<bool> {
+        let name = normalize_name(name, "user")?;
+        validate_password(password)?;
+        let scram = ScramVerifier::derive(password)?;
+        let argon2id = hash_argon2(password)?;
+        self.mutate_document(|document| {
+            if document.users.contains_key(&name) || document.roles.contains_key(&name) {
+                if if_not_exists {
+                    return Ok(false);
+                }
+                return Err(DbError::new("42710", format!("user {name} already exists")));
+            }
+            document.users.insert(
+                name.clone(),
+                UserRecord {
+                    name,
+                    enabled: true,
+                    scram,
+                    argon2id,
+                    roles: BTreeSet::new(),
+                },
+            );
+            Ok(true)
+        })
+    }
+
+    pub fn alter_user_password(&self, name: &str, password: &[u8]) -> Result<()> {
+        let name = normalize_name(name, "user")?;
+        validate_password(password)?;
+        let scram = ScramVerifier::derive(password)?;
+        let argon2id = hash_argon2(password)?;
+        self.mutate_document(|document| {
+            let user = document
+                .users
+                .get_mut(&name)
+                .ok_or_else(|| DbError::new("42704", format!("user {name} does not exist")))?;
+            user.scram = scram;
+            user.argon2id = argon2id;
+            Ok(())
+        })
+    }
+
+    pub fn set_user_enabled(&self, name: &str, enabled: bool) -> Result<()> {
+        let name = normalize_name(name, "user")?;
+        self.mutate_document(|document| {
+            let user = document
+                .users
+                .get_mut(&name)
+                .ok_or_else(|| DbError::new("42704", format!("user {name} does not exist")))?;
+            user.enabled = enabled;
+            Ok(())
+        })
+    }
+
+    pub fn drop_user(&self, name: &str, if_exists: bool) -> Result<bool> {
+        let name = normalize_name(name, "user")?;
+        self.mutate_document(|document| {
+            if document.users.remove(&name).is_some() {
+                return Ok(true);
+            }
+            if if_exists {
+                Ok(false)
+            } else {
+                Err(DbError::new("42704", format!("user {name} does not exist")))
+            }
+        })
+    }
+
+    pub fn drop_role(&self, name: &str, if_exists: bool) -> Result<bool> {
+        let name = normalize_name(name, "role")?;
+        self.mutate_document(|document| {
+            if !document.roles.contains_key(&name) {
+                return if if_exists {
+                    Ok(false)
+                } else {
+                    Err(DbError::new("42704", format!("role {name} does not exist")))
+                };
+            }
+            let referenced_by_user = document
+                .users
+                .values()
+                .any(|user| user.roles.contains(&name));
+            let referenced_by_role = document
+                .roles
+                .values()
+                .any(|role| role.inherits.contains(&name));
+            let has_grants = document.grants.iter().any(|grant| grant.role == name);
+            if referenced_by_user || referenced_by_role || has_grants {
+                return Err(DbError::new(
+                    "2BP01",
+                    format!("role {name} has dependent memberships or grants"),
+                )
+                .with_hint("revoke memberships and privileges before dropping the role"));
+            }
+            document.roles.remove(&name);
+            Ok(true)
+        })
+    }
+
+    pub fn grant_role(&self, role: &str, member: &str) -> Result<bool> {
+        let role = normalize_name(role, "role")?;
+        let member = normalize_name(member, "member")?;
+        self.mutate_document(|document| {
+            if !document.roles.contains_key(&role) {
+                return Err(DbError::new("42704", format!("role {role} does not exist")));
+            }
+            if let Some(user) = document.users.get_mut(&member) {
+                return Ok(user.roles.insert(role));
+            }
+            if !document.roles.contains_key(&member) {
+                return Err(DbError::new(
+                    "42704",
+                    format!("member {member} does not exist"),
+                ));
+            }
+            if role == member || role_reaches(&document.roles, &role, &member)? {
+                return Err(DbError::new(
+                    "0LP01",
+                    "role membership would create a cycle",
+                ));
+            }
+            Ok(document
+                .roles
+                .get_mut(&member)
+                .ok_or_else(|| DbError::internal("role member disappeared"))?
+                .inherits
+                .insert(role))
+        })
+    }
+
+    pub fn revoke_role(&self, role: &str, member: &str) -> Result<bool> {
+        let role = normalize_name(role, "role")?;
+        let member = normalize_name(member, "member")?;
+        self.mutate_document(|document| {
+            if let Some(user) = document.users.get_mut(&member) {
+                return Ok(user.roles.remove(&role));
+            }
+            if let Some(member_role) = document.roles.get_mut(&member) {
+                return Ok(member_role.inherits.remove(&role));
+            }
+            Err(DbError::new(
+                "42704",
+                format!("member {member} does not exist"),
+            ))
+        })
+    }
+
+    pub fn grant_privilege(&self, role: &str, action: Action, object: DbObject) -> Result<bool> {
+        let role = normalize_name(role, "role")?;
+        self.mutate_document(|document| {
+            if !document.roles.contains_key(&role) {
+                return Err(DbError::new("42704", format!("role {role} does not exist")));
+            }
+            let grant = Grant {
+                role,
+                action,
+                object,
+            };
+            if document.grants.contains(&grant) {
+                return Ok(false);
+            }
+            document.grants.push(grant);
+            Ok(true)
+        })
+    }
+
+    pub fn revoke_privilege(&self, role: &str, action: Action, object: &DbObject) -> Result<bool> {
+        let role = normalize_name(role, "role")?;
+        self.mutate_document(|document| {
+            let before = document.grants.len();
+            document.grants.retain(|grant| {
+                grant.role != role || grant.action != action || &grant.object != object
+            });
+            Ok(document.grants.len() != before)
+        })
+    }
+
+    pub fn principal(&self, username: &str) -> Result<Principal> {
+        let username = normalize_name(username, "user")?;
+        let document = self.read_document()?;
+        let user = document
+            .users
+            .get(&username)
+            .ok_or_else(authentication_failed)?;
+        Ok(Principal {
+            user: user.name.clone(),
+            roles: user.roles.clone(),
+        })
+    }
+
     pub fn bootstrap_admin(&self, username: &str, password: &[u8]) -> Result<Principal> {
         let username = normalize_name(username, "user")?;
         validate_password(password)?;
@@ -300,6 +511,22 @@ impl AuthStore {
     pub fn authorization_snapshot(&self) -> Result<(BTreeMap<String, Role>, Vec<Grant>)> {
         let document = self.read_document()?;
         Ok((document.roles.clone(), document.grants.clone()))
+    }
+
+    fn mutate_document<T>(
+        &self,
+        mutation: impl FnOnce(&mut AuthDocument) -> Result<T>,
+    ) -> Result<T> {
+        let _write = self
+            .write_lock
+            .lock()
+            .map_err(|_| internal("authentication write lock is poisoned"))?;
+        let mut candidate = self.read_document()?.clone();
+        let output = mutation(&mut candidate)?;
+        validate_document(&candidate)?;
+        persist_document(&self.path, &candidate)?;
+        *self.write_document()? = candidate;
+        Ok(output)
     }
 
     fn read_document(&self) -> Result<std::sync::RwLockReadGuard<'_, AuthDocument>> {
@@ -460,6 +687,35 @@ fn normalize_name(value: &str, kind: &str) -> Result<String> {
         ));
     }
     Ok(value)
+}
+
+fn role_reaches(roles: &BTreeMap<String, Role>, start: &str, target: &str) -> Result<bool> {
+    let mut visited = BTreeSet::new();
+    let mut stack = vec![(start.to_owned(), 0usize)];
+    while let Some((role, depth)) = stack.pop() {
+        if depth > MAX_ROLE_DEPTH {
+            return Err(DbError::new(
+                "54001",
+                "role membership depth exceeds the configured limit",
+            ));
+        }
+        if role == target {
+            return Ok(true);
+        }
+        if !visited.insert(role.clone()) {
+            continue;
+        }
+        if let Some(definition) = roles.get(&role) {
+            stack.extend(
+                definition
+                    .inherits
+                    .iter()
+                    .cloned()
+                    .map(|parent| (parent, depth + 1)),
+            );
+        }
+    }
+    Ok(false)
 }
 
 fn validate_document(document: &AuthDocument) -> Result<()> {
@@ -710,6 +966,64 @@ mod tests {
                 .expect("authenticate")
                 .user,
             "dba"
+        );
+    }
+
+    #[test]
+    fn role_user_membership_and_grants_mutate_atomically_without_plaintext() {
+        let directory = tempdir().expect("tempdir");
+        let auth = AuthStore::open(directory.path()).expect("open");
+        auth.create_role("analyst", false).expect("create role");
+        auth.create_role("reader", false).expect("create reader");
+        auth.create_user("alice", b"initial password value", false)
+            .expect("create user");
+        auth.grant_role("analyst", "alice").expect("grant role");
+        auth.grant_role("reader", "analyst")
+            .expect("grant inherited role");
+        assert_eq!(
+            auth.grant_role("analyst", "reader")
+                .expect_err("cycle")
+                .sql_state,
+            "0LP01"
+        );
+        auth.grant_privilege("reader", Action::Read, DbObject::Table("app.items".into()))
+            .expect("grant privilege");
+        assert!(
+            auth.principal("alice")
+                .expect("principal")
+                .roles
+                .contains("analyst")
+        );
+        auth.alter_user_password("alice", b"replacement password value")
+            .expect("alter password");
+        assert!(
+            auth.authenticate_password("alice", b"initial password value")
+                .is_err()
+        );
+        assert!(
+            auth.authenticate_password("alice", b"replacement password value")
+                .is_ok()
+        );
+        assert_eq!(
+            auth.drop_role("reader", false)
+                .expect_err("dependent role")
+                .sql_state,
+            "2BP01"
+        );
+        auth.revoke_privilege("reader", Action::Read, &DbObject::Table("app.items".into()))
+            .expect("revoke privilege");
+        auth.revoke_role("reader", "analyst")
+            .expect("revoke inheritance");
+        auth.drop_role("reader", false).expect("drop reader");
+
+        let contents = fs::read_to_string(auth.path()).expect("read auth");
+        assert!(!contents.contains("initial password value"));
+        assert!(!contents.contains("replacement password value"));
+        let reopened = AuthStore::open(directory.path()).expect("reopen");
+        assert!(
+            reopened
+                .authenticate_password("alice", b"replacement password value")
+                .is_ok()
         );
     }
 }
