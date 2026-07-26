@@ -18,5 +18,8 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+ordadb-connectors = { path = "../../../crates/ordadb-connectors" }
+ordadb-types = { path = "../../../crates/ordadb-types" }
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = [] }
+tokio.workspace = true

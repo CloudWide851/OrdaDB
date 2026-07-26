@@ -1,5 +1,5 @@
 [package]
-name = "ordadb-server"
+name = "ordadb-connectors"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,24 +7,22 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-axum.workspace = true
-axum-server.workspace = true
-ordadb-admin = { path = "../ordadb-admin" }
-ordadb-engine = { path = "../ordadb-engine" }
-ordadb-protocol = { path = "../ordadb-protocol" }
+async-trait.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+futures-util.workspace = true
 ordadb-types = { path = "../ordadb-types" }
 ordadb-windows = { path = "../ordadb-windows" }
-rand.workspace = true
-rustls.workspace = true
+reqwest.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-windows-service.workspace = true
+uuid.workspace = true
 windows-sys.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-reqwest.workspace = true
 tempfile.workspace = true

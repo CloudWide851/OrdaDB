@@ -18,6 +18,7 @@ interface WorkbenchState {
   activeInspectorTab: InspectorTab;
   selectedObject: string;
   commandPaletteOpen: boolean;
+  pluginManagerOpen: boolean;
   notice: string;
   queryState: QueryState;
   rows: QueryRow[];
@@ -31,6 +32,7 @@ interface WorkbenchState {
   setActiveInspectorTab: (tab: InspectorTab) => void;
   setSelectedObject: (objectName: string) => void;
   setCommandPaletteOpen: (open: boolean) => void;
+  setPluginManagerOpen: (open: boolean) => void;
   setNotice: (notice: string) => void;
   runPreviewQuery: () => Promise<void>;
 }
@@ -49,6 +51,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   activeInspectorTab: "properties",
   selectedObject: "documents",
   commandPaletteOpen: false,
+  pluginManagerOpen: false,
   notice: "准备就绪",
   queryState: "idle",
   rows: [],
@@ -67,6 +70,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   setActiveInspectorTab: (activeInspectorTab) => set({ activeInspectorTab }),
   setSelectedObject: (selectedObject) => set({ selectedObject }),
   setCommandPaletteOpen: (commandPaletteOpen) => set({ commandPaletteOpen }),
+  setPluginManagerOpen: (pluginManagerOpen) => set({ pluginManagerOpen }),
   setNotice: (notice) => set({ notice }),
   runPreviewQuery: async () => {
     const sql = get().sql.trim();

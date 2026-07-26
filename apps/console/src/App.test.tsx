@@ -12,6 +12,10 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { initialSql } from "./data/preview";
+import {
+  resetPreviewPluginManagerForTests,
+  setPreviewRegistryAvailabilityForTests,
+} from "./lib/pluginManager";
 import { useWorkbenchStore } from "./store/workbench";
 
 vi.mock("@monaco-editor/react", () => ({
@@ -31,6 +35,7 @@ vi.mock("@monaco-editor/react", () => ({
 }));
 
 vi.mock("./lib/tauri", () => ({
+  isTauriRuntime: vi.fn().mockReturnValue(false),
   getAppStatus: vi.fn().mockResolvedValue({
     name: "OrdaDB Console",
     version: "0.1.0",
@@ -60,6 +65,7 @@ describe("OrdaDB workbench", () => {
   });
 
   beforeEach(() => {
+    resetPreviewPluginManagerForTests();
     useWorkbenchStore.setState({
       sql: initialSql,
       dialect: "postgresql",
@@ -69,6 +75,7 @@ describe("OrdaDB workbench", () => {
       activeInspectorTab: "properties",
       selectedObject: "documents",
       commandPaletteOpen: false,
+      pluginManagerOpen: false,
       notice: "准备就绪",
       queryState: "idle",
       rows: [],
@@ -242,5 +249,88 @@ describe("OrdaDB workbench", () => {
     ).not.toBeInTheDocument();
     expect(dialectSelector).toHaveValue("sqlServer");
     expect(screen.getByText("SQL · SQL Server", { exact: true })).toBeVisible();
+  });
+
+  it("manages the four signed connector fixtures with accessible lifecycle actions", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(screen.getByRole("button", { name: "管理连接插件" }));
+    const dialog = await screen.findByRole("dialog", { name: "连接插件" });
+    const pluginView = within(dialog);
+
+    for (const connector of [
+      "OrdaDB / PostgreSQL",
+      "MySQL",
+      "SQLite",
+      "SQL Server",
+    ]) {
+      expect(pluginView.getByText(connector)).toBeVisible();
+    }
+    expect(pluginView.getByText("Preview 目录")).toBeVisible();
+    expect(
+      pluginView.getByText("Preview 不执行网络下载或文件写入"),
+    ).toBeVisible();
+
+    const download = pluginView.getByRole("button", {
+      name: "下载 MySQL 连接插件",
+    });
+    await user.hover(download);
+    expect(
+      await screen.findByRole("tooltip", {
+        name: "下载 MySQL 连接插件",
+      }),
+    ).toHaveTextContent("下载 MySQL 连接插件");
+    await user.click(download);
+    const cancel = await pluginView.findByRole("button", {
+      name: "取消 MySQL 插件操作",
+    });
+    await user.click(cancel);
+    expect(
+      await pluginView.findByRole("button", {
+        name: "下载 MySQL 连接插件",
+      }),
+    ).toBeVisible();
+
+    expect(
+      pluginView.getByRole("button", {
+        name: "重试 SQLite 连接插件",
+      }),
+    ).toBeVisible();
+    expect(
+      pluginView.getByRole("button", {
+        name: "更新 SQL Server 连接插件",
+      }),
+    ).toBeVisible();
+    await user.click(
+      pluginView.getByRole("button", {
+        name: "回滚 SQL Server 连接插件",
+      }),
+    );
+    expect(await pluginView.findByText(/已安装 v0\.9\.0/)).toBeVisible();
+
+    await user.keyboard("{Escape}");
+    expect(
+      screen.queryByRole("dialog", { name: "连接插件" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("fails closed when the official plugin registry is not configured", async () => {
+    const user = userEvent.setup();
+    setPreviewRegistryAvailabilityForTests("notConfigured");
+    renderApp();
+
+    await user.keyboard(
+      "{Control>}{Alt>}{Shift>}s{/Shift}{/Alt}{/Control}",
+    );
+    const dialog = await screen.findByRole("dialog", { name: "连接插件" });
+    expect(
+      within(dialog).getByRole("status"),
+    ).toHaveTextContent("插件仓库未配置");
+    expect(
+      within(dialog).getByRole("button", {
+        name: "下载 MySQL 连接插件",
+      }),
+    ).toBeDisabled();
   });
 });

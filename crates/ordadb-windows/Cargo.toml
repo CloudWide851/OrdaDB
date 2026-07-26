@@ -1,0 +1,15 @@
+[package]
+name = "ordadb-windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ordadb-types = { path = "../ordadb-types" }
+windows-sys.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

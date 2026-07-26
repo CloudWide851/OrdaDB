@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { Route, Routes } from "react-router-dom";
 import { CommandPalette } from "./components/CommandPalette";
+import { ConnectorManager } from "./components/ConnectorManager";
 import { EditorPane } from "./components/EditorPane";
 import { ObjectInspector } from "./components/ObjectInspector";
 import { ResultsPane } from "./components/ResultsPane";
@@ -79,10 +80,16 @@ function Workbench() {
   const commandPaletteOpen = useWorkbenchStore(
     (state) => state.commandPaletteOpen,
   );
+  const pluginManagerOpen = useWorkbenchStore(
+    (state) => state.pluginManagerOpen,
+  );
   const toggleSchema = useWorkbenchStore((state) => state.toggleSchema);
   const toggleInspector = useWorkbenchStore((state) => state.toggleInspector);
   const setCommandPaletteOpen = useWorkbenchStore(
     (state) => state.setCommandPaletteOpen,
+  );
+  const setPluginManagerOpen = useWorkbenchStore(
+    (state) => state.setPluginManagerOpen,
   );
   const setActiveResultTab = useWorkbenchStore(
     (state) => state.setActiveResultTab,
@@ -115,6 +122,10 @@ function Workbench() {
         setCommandPaletteOpen(true);
         return;
       }
+      if (commandId === "data-sources") {
+        setPluginManagerOpen(true);
+        return;
+      }
       if (commandId === "run-query") {
         void runPreviewQuery();
         return;
@@ -137,6 +148,7 @@ function Workbench() {
       runPreviewQuery,
       setActiveResultTab,
       setCommandPaletteOpen,
+      setPluginManagerOpen,
       setNotice,
       setSql,
       toggleInspector,
@@ -156,6 +168,14 @@ function Workbench() {
       ) {
         event.preventDefault();
         setCommandPaletteOpen(true);
+      } else if (
+        (event.metaKey || event.ctrlKey) &&
+        event.altKey &&
+        event.shiftKey &&
+        event.key.toLowerCase() === "s"
+      ) {
+        event.preventDefault();
+        setPluginManagerOpen(true);
       } else if (event.altKey && event.key === "1") {
         event.preventDefault();
         toggleSchema();
@@ -170,6 +190,7 @@ function Workbench() {
   }, [
     runPreviewQuery,
     setCommandPaletteOpen,
+    setPluginManagerOpen,
     toggleInspector,
     toggleSchema,
   ]);
@@ -212,6 +233,10 @@ function Workbench() {
         open={commandPaletteOpen}
         onClose={() => setCommandPaletteOpen(false)}
         onCommand={handleCommand}
+      />
+      <ConnectorManager
+        open={pluginManagerOpen}
+        onClose={() => setPluginManagerOpen(false)}
       />
     </div>
   );

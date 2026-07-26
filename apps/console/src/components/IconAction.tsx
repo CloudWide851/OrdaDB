@@ -1,5 +1,9 @@
 import { Tooltip } from "antd";
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import {
+  forwardRef,
+  type ButtonHTMLAttributes,
+  type ReactNode,
+} from "react";
 
 interface IconActionProps
   extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, "children"> {
@@ -8,23 +12,29 @@ interface IconActionProps
   tone?: "plain" | "brand" | "danger";
 }
 
-export function IconAction({
-  label,
-  icon,
-  tone = "plain",
-  className = "",
-  ...buttonProps
-}: IconActionProps) {
-  return (
-    <Tooltip title={label} mouseEnterDelay={0.35}>
-      <button
-        type="button"
-        className={`icon-action icon-action--${tone} ${className}`}
-        aria-label={label}
-        {...buttonProps}
-      >
-        {icon}
-      </button>
-    </Tooltip>
-  );
-}
+export const IconAction = forwardRef<HTMLButtonElement, IconActionProps>(
+  function IconAction(
+    {
+      label,
+      icon,
+      tone = "plain",
+      className = "",
+      ...buttonProps
+    },
+    ref,
+  ) {
+    return (
+      <Tooltip title={label} mouseEnterDelay={0.35}>
+        <button
+          ref={ref}
+          type="button"
+          className={`icon-action icon-action--${tone} ${className}`}
+          aria-label={label}
+          {...buttonProps}
+        >
+          {icon}
+        </button>
+      </Tooltip>
+    );
+  },
+);

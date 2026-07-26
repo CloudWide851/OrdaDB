@@ -90,6 +90,55 @@ test.describe("OrdaDB SQL workbench", () => {
     await expect(page.getByRole("option", { name: /服务管理/ })).toBeVisible();
     await page.keyboard.press("Escape");
 
+    await page.keyboard.press("Control+Alt+Shift+S");
+    const connectorManager = page.getByRole("dialog", { name: "连接插件" });
+    await expect(connectorManager).toBeVisible();
+    await expect(connectorManager.getByText("Preview 目录")).toBeVisible();
+    await expect(
+      connectorManager.getByText("Preview 不执行网络下载或文件写入"),
+    ).toBeVisible();
+    for (const connector of [
+      "OrdaDB / PostgreSQL",
+      "MySQL",
+      "SQLite",
+      "SQL Server",
+    ]) {
+      await expect(connectorManager.getByText(connector)).toBeVisible();
+    }
+    await page.screenshot({
+      path: "test-results/ordadb-connectors.png",
+      fullPage: true,
+    });
+    const downloadConnector = connectorManager.getByRole("button", {
+      name: "下载 MySQL 连接插件",
+    });
+    await downloadConnector.hover();
+    await expect(
+      page.getByRole("tooltip", { name: "下载 MySQL 连接插件" }),
+    ).toBeVisible();
+    await downloadConnector.click();
+    await connectorManager
+      .getByRole("button", { name: "取消 MySQL 插件操作" })
+      .click();
+    await expect(
+      connectorManager.getByRole("button", {
+        name: "重试 SQLite 连接插件",
+      }),
+    ).toBeVisible();
+    await expect(
+      connectorManager.getByRole("button", {
+        name: "更新 SQL Server 连接插件",
+      }),
+    ).toBeVisible();
+    await connectorManager
+      .getByRole("button", {
+        name: "回滚 SQL Server 连接插件",
+      })
+      .click();
+    await expect(connectorManager.getByText(/已安装 v0\.9\.0/)).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(connectorManager).toHaveCount(0);
+
     const schemaToggle = page.getByRole("button", {
       name: "隐藏数据库浏览器",
     });
@@ -177,6 +226,17 @@ test.describe("OrdaDB SQL workbench", () => {
       "transform",
       "none",
     );
+
+    await page.keyboard.press("Control+Alt+Shift+S");
+    await expect(page.getByRole("dialog", { name: "连接插件" })).toHaveCSS(
+      "animation-duration",
+      "0.001s",
+    );
+    await expect(page.getByRole("dialog", { name: "连接插件" })).toHaveCSS(
+      "transform",
+      "none",
+    );
+    await page.keyboard.press("Escape");
 
     await page.getByRole("button", { name: /^运行/ }).click();
     await expect(page.locator(".loading-orbit")).toBeVisible();

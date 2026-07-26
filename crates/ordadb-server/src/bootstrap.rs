@@ -274,58 +274,10 @@ async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, bytes: &[u8]) -> Res
 
 #[cfg(windows)]
 fn restrict_pipe_acl(pipe: &NamedPipeServer) -> Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use std::ptr;
-
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-    };
-    use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetKernelObjectSecurity,
-    };
-
-    let user_sid = current_process_user_sid()?;
-    let sddl = bootstrap_pipe_sddl(&user_sid);
-    let mut wide: Vec<u16> = sddl.encode_utf16().collect();
-    wide.push(0);
-    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: `wide` is a valid NUL-terminated SDDL string and `descriptor`
-    // points to writable storage owned until LocalFree below.
-    let converted = unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            wide.as_ptr(),
-            SDDL_REVISION_1,
-            &mut descriptor,
-            ptr::null_mut(),
-        )
-    };
-    if converted == 0 {
-        return Err(io_error(
-            "failed to build bootstrap pipe security descriptor",
-            std::io::Error::last_os_error(),
-        ));
-    }
-    // SAFETY: the pipe was opened with WRITE_DAC and descriptor is the valid
-    // allocation returned by ConvertStringSecurityDescriptor... above.
-    let applied = unsafe {
-        SetKernelObjectSecurity(pipe.as_raw_handle(), DACL_SECURITY_INFORMATION, descriptor)
-    };
-    // SAFETY: descriptor is the LocalAlloc allocation returned by the Win32
-    // conversion function and is released exactly once.
-    unsafe {
-        LocalFree(descriptor.cast());
-    }
-    if applied == 0 {
-        return Err(io_error(
-            "failed to apply bootstrap pipe security descriptor",
-            std::io::Error::last_os_error(),
-        ));
-    }
-    Ok(())
+    ordadb_windows::restrict_named_pipe_acl(pipe)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn current_process_user_sid() -> Result<String> {
     use std::ffi::c_void;
     use std::mem::size_of;
@@ -444,7 +396,7 @@ fn current_process_user_sid() -> Result<String> {
     })
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn bootstrap_pipe_sddl(user_sid: &str) -> String {
     format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GA;;;OW)(A;;GA;;;{user_sid})")
 }
