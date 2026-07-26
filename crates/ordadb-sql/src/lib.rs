@@ -1,14 +1,16 @@
-//! PostgreSQL-dialect parsing and catalog-aware binding for OrdaDB.
+//! Multi-dialect parsing and catalog-aware binding for OrdaDB.
 //!
 //! The public syntax tree in this crate is owned by OrdaDB. `sqlparser` is an
-//! implementation detail so parser upgrades cannot leak into the engine,
-//! storage, or protocol crates.
+//! implementation detail. Every accepted source dialect is normalized into
+//! OrdaDB's PostgreSQL-compatible semantics before binding.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::str::FromStr;
 
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use ordadb_catalog::{
     Catalog, CatalogExpression, CatalogObjectRef, DropBehavior, NewColumn, NewConstraint,
     NewConstraintKind, NewIndex, NewSequence, ReferentialAction, RoutineArgument, RoutineKind,
@@ -20,6 +22,7 @@ use ordadb_types::{
     Schema, SchemaId, SequenceId, TableId, TriggerId, Value, ViewId,
 };
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
     AlterColumnOperation as SqlAlterColumnOperation, AlterIndexOperation,
     AlterSchemaOperation as SqlAlterSchemaOperation, AlterTable,
@@ -32,13 +35,13 @@ use sqlparser::ast::{
     JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByKind, Query,
     ReferentialAction as SqlReferentialAction, RenameTableNameKind, SchemaName, Select, SelectItem,
     SequenceOptions, SetExpr, Spanned, Statement as SqlStatement, TableAlias, TableConstraint,
-    TableFactor, TableObject, TableWithJoins, TimezoneInfo, TriggerEvent as SqlTriggerEvent,
-    TriggerExecBodyType, TriggerObject, TriggerObjectKind, TriggerPeriod,
-    UnaryOperator as SqlUnaryOperator, Value as SqlValue,
+    TableFactor, TableObject, TableWithJoins, TimezoneInfo, TopQuantity,
+    TriggerEvent as SqlTriggerEvent, TriggerExecBodyType, TriggerObject, TriggerObjectKind,
+    TriggerPeriod, UnaryOperator as SqlUnaryOperator, Value as SqlValue,
 };
-use sqlparser::dialect::PostgreSqlDialect;
-use sqlparser::parser::Parser;
-use sqlparser::tokenizer::{Location, Span, Token, Tokenizer};
+use sqlparser::dialect::{Dialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::parser::{Parser, ParserError};
+use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer};
 
 const FEATURE_NOT_SUPPORTED: &str = "0A000";
 const SYNTAX_ERROR: &str = "42601";
@@ -47,6 +50,54 @@ const UNDEFINED_TABLE: &str = "42P01";
 const UNDEFINED_COLUMN: &str = "42703";
 const DATATYPE_MISMATCH: &str = "42804";
 const INDETERMINATE_DATATYPE: &str = "42P18";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SqlDialect {
+    #[default]
+    #[serde(rename = "postgresql")]
+    PostgreSql,
+    #[serde(rename = "mysql")]
+    MySql,
+    #[serde(rename = "sqlite")]
+    Sqlite,
+    #[serde(rename = "sqlServer")]
+    SqlServer,
+}
+
+impl SqlDialect {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PostgreSql => "PostgreSQL",
+            Self::MySql => "MySQL",
+            Self::Sqlite => "SQLite",
+            Self::SqlServer => "SQL Server",
+        }
+    }
+}
+
+impl fmt::Display for SqlDialect {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+impl FromStr for SqlDialect {
+    type Err = DbError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "postgres" | "postgresql" => Ok(Self::PostgreSql),
+            "mysql" => Ok(Self::MySql),
+            "sqlite" | "sqlite3" => Ok(Self::Sqlite),
+            "mssql" | "sqlserver" | "sql-server" => Ok(Self::SqlServer),
+            _ => Err(
+                DbError::new("22023", format!("unknown SQL dialect {value}"))
+                    .with_hint("Use postgresql, mysql, sqlite, or sqlserver."),
+            ),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedIdentifier {
@@ -710,24 +761,30 @@ pub enum BoundSequenceOperation {
 
 /// Parse exactly one statement using PostgreSQL dialect rules.
 pub fn parse(sql: &str) -> Result<ParsedStatement> {
-    if let Some(statement) = parse_create_procedure(sql)? {
-        return Ok(statement);
+    parse_with_dialect(sql, SqlDialect::PostgreSql)
+}
+
+/// Parse exactly one statement using the selected source dialect and lower it
+/// into OrdaDB's PostgreSQL-compatible syntax tree.
+pub fn parse_with_dialect(sql: &str, dialect: SqlDialect) -> Result<ParsedStatement> {
+    if dialect == SqlDialect::PostgreSql {
+        if let Some(statement) = parse_create_procedure(sql)? {
+            return Ok(statement);
+        }
+        if let Some(statement) = parse_alter_view(sql)? {
+            return Ok(statement);
+        }
+        if let Some(statement) = parse_alter_sequence(sql)? {
+            return Ok(statement);
+        }
+        if let Some(statement) = parse_refresh_materialized_view(sql)? {
+            return Ok(statement);
+        }
     }
-    if let Some(statement) = parse_alter_view(sql)? {
-        return Ok(statement);
-    }
-    if let Some(statement) = parse_alter_sequence(sql)? {
-        return Ok(statement);
-    }
-    if let Some(statement) = parse_refresh_materialized_view(sql)? {
-        return Ok(statement);
-    }
-    let dialect = PostgreSqlDialect {};
-    let parser_sql = materialized_view_parser_sql(sql);
-    let mut statements = match Parser::parse_sql(&dialect, &parser_sql) {
+    let mut statements = match parse_source_statements(sql, dialect) {
         Ok(statements) => statements,
         Err(error) => {
-            if has_unrepresented_transaction_option(sql) {
+            if dialect == SqlDialect::PostgreSql && has_unrepresented_transaction_option(sql) {
                 return unsupported("transaction modes and options are not supported yet");
             }
             let message = error.to_string();
@@ -751,6 +808,73 @@ pub fn parse(sql: &str) -> Result<ParsedStatement> {
             .ok_or_else(|| DbError::new(SYNTAX_ERROR, "SQL statement is empty"))?,
         sql,
     )
+    .map_err(|error| dialect_error(error, dialect))
+}
+
+fn parse_source_statements(
+    sql: &str,
+    dialect: SqlDialect,
+) -> std::result::Result<Vec<SqlStatement>, ParserError> {
+    match dialect {
+        SqlDialect::PostgreSql => {
+            let parser_sql = materialized_view_parser_sql(sql);
+            Parser::parse_sql(&PostgreSqlDialect {}, &parser_sql)
+        }
+        SqlDialect::MySql => {
+            parse_tokenized_source(sql, &MySqlDialect {}, ParameterStyle::QuestionMark)
+        }
+        SqlDialect::Sqlite => {
+            parse_tokenized_source(sql, &SQLiteDialect {}, ParameterStyle::QuestionMark)
+        }
+        SqlDialect::SqlServer => {
+            parse_tokenized_source(sql, &MsSqlDialect {}, ParameterStyle::NamedAtP)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParameterStyle {
+    QuestionMark,
+    NamedAtP,
+}
+
+fn parse_tokenized_source(
+    sql: &str,
+    dialect: &dyn Dialect,
+    parameter_style: ParameterStyle,
+) -> std::result::Result<Vec<SqlStatement>, ParserError> {
+    let mut parameter_index = 1usize;
+    let mut tokens = Vec::<TokenWithSpan>::new();
+    Tokenizer::new(dialect, sql).tokenize_with_location_into_buf_with_mapper(
+        &mut tokens,
+        |mut token| {
+            if parameter_style == ParameterStyle::QuestionMark
+                && matches!(&token.token, Token::Placeholder(value) if value == "?")
+            {
+                token.token = Token::Placeholder(format!("${parameter_index}"));
+                parameter_index = parameter_index.saturating_add(1);
+            }
+            token
+        },
+    )?;
+    Parser::new(dialect)
+        .with_tokens_with_locations(tokens)
+        .parse_statements()
+}
+
+fn dialect_error(mut error: DbError, dialect: SqlDialect) -> DbError {
+    if dialect != SqlDialect::PostgreSql && error.sql_state == FEATURE_NOT_SUPPORTED {
+        error.message = format!(
+            "{} feature is not supported: {}",
+            dialect.label(),
+            error.message
+        );
+        if error.hint.is_none() {
+            error.hint =
+                Some("Rewrite the statement using the OrdaDB/PostgreSQL-compatible subset.".into());
+        }
+    }
+    error
 }
 
 fn parse_create_procedure(sql: &str) -> Result<Option<ParsedStatement>> {
@@ -2420,11 +2544,20 @@ fn convert_create_table(table: CreateTable, sql: &str) -> Result<ParsedStatement
         || table.volatile
         || table.iceberg
         || table.snapshot
+        || !matches!(
+            table.hive_distribution,
+            sqlparser::ast::HiveDistributionStyle::NONE
+        )
+        || table.hive_formats.is_some()
+        || !matches!(table.table_options, CreateTableOptions::None)
+        || table.file_format.is_some()
+        || table.location.is_some()
         || table.query.is_some()
         || table.without_rowid
         || table.like.is_some()
         || table.clone.is_some()
         || table.version.is_some()
+        || table.comment.is_some()
         || table.on_commit.is_some()
         || table.on_cluster.is_some()
         || table.primary_key.is_some()
@@ -2436,6 +2569,30 @@ fn convert_create_table(table: CreateTable, sql: &str) -> Result<ParsedStatement
         || table.partition_of.is_some()
         || table.for_values.is_some()
         || table.strict
+        || table.copy_grants
+        || table.enable_schema_evolution.is_some()
+        || table.change_tracking.is_some()
+        || table.data_retention_time_in_days.is_some()
+        || table.max_data_extension_time_in_days.is_some()
+        || table.default_ddl_collation.is_some()
+        || table.with_aggregation_policy.is_some()
+        || table.with_row_access_policy.is_some()
+        || table.with_storage_lifecycle_policy.is_some()
+        || table.with_tags.is_some()
+        || table.external_volume.is_some()
+        || table.base_location.is_some()
+        || table.catalog.is_some()
+        || table.catalog_sync.is_some()
+        || table.storage_serialization_policy.is_some()
+        || table.target_lag.is_some()
+        || table.warehouse.is_some()
+        || table.refresh_mode.is_some()
+        || table.initialize.is_some()
+        || table.require_user
+        || table.diststyle.is_some()
+        || table.distkey.is_some()
+        || table.sortkey.is_some()
+        || table.backup.is_some()
     {
         return unsupported("this CREATE TABLE form is not supported yet");
     }
@@ -3170,7 +3327,6 @@ fn convert_routine_invocation(
 
 fn convert_select_query(query: Query, sql: &str) -> Result<ParsedStatement> {
     if query.with.is_some()
-        || query.fetch.is_some()
         || !query.locks.is_empty()
         || query.for_clause.is_some()
         || query.settings.is_some()
@@ -3183,6 +3339,25 @@ fn convert_select_query(query: Query, sql: &str) -> Result<ParsedStatement> {
         return unsupported(
             "set operations, subqueries, and VALUES queries are not supported here",
         );
+    };
+    let mut select = *select;
+    let top_limit = match select.top.take() {
+        None => None,
+        Some(top) if top.with_ties || top.percent => {
+            return unsupported("TOP PERCENT and TOP WITH TIES are not supported");
+        }
+        Some(top) => match top.quantity {
+            Some(TopQuantity::Expr(expression)) => Some(convert_expr(expression, sql)?),
+            Some(TopQuantity::Constant(value)) => {
+                let value = i64::try_from(value)
+                    .map_err(|_| DbError::new("22003", "TOP value is out of range"))?;
+                Some(ParsedExpr {
+                    kind: ParsedExprKind::Literal(Value::Int64(value)),
+                    position: None,
+                })
+            }
+            None => return unsupported("TOP requires an explicit row count"),
+        },
     };
 
     let order_by = match query.order_by {
@@ -3210,6 +3385,22 @@ fn convert_select_query(query: Query, sql: &str) -> Result<ParsedStatement> {
         }
     };
 
+    let fetch_limit = match query.fetch {
+        None => None,
+        Some(fetch) if fetch.with_ties || fetch.percent => {
+            return unsupported("FETCH PERCENT and FETCH WITH TIES are not supported");
+        }
+        Some(fetch) => Some(
+            fetch
+                .quantity
+                .map(|expression| convert_expr(expression, sql))
+                .transpose()?
+                .unwrap_or(ParsedExpr {
+                    kind: ParsedExprKind::Literal(Value::Int64(1)),
+                    position: None,
+                }),
+        ),
+    };
     let limit = match query.limit_clause {
         None => None,
         Some(LimitClause::LimitOffset {
@@ -3219,12 +3410,40 @@ fn convert_select_query(query: Query, sql: &str) -> Result<ParsedStatement> {
         }) if offset.is_none() && limit_by.is_empty() => {
             limit.map(|expr| convert_expr(expr, sql)).transpose()?
         }
+        Some(LimitClause::LimitOffset {
+            limit,
+            offset: Some(offset),
+            limit_by,
+        }) if limit_by.is_empty() && sql_expr_is_integer_zero(&offset.value) => {
+            limit.map(|expr| convert_expr(expr, sql)).transpose()?
+        }
+        Some(LimitClause::OffsetCommaLimit { offset, limit })
+            if sql_expr_is_integer_zero(&offset) =>
+        {
+            Some(convert_expr(limit, sql)?)
+        }
         Some(_) => {
-            return unsupported("OFFSET and dialect-specific LIMIT forms are not supported yet");
+            return unsupported(
+                "non-zero OFFSET and unrepresentable dialect-specific LIMIT forms are not supported",
+            );
         }
     };
+    let limit = match (top_limit, limit, fetch_limit) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
+            return unsupported("a query may specify only one row-limit form");
+        }
+        (top, limit, fetch) => top.or(limit).or(fetch),
+    };
 
-    convert_select(*select, order_by, limit, sql)
+    convert_select(select, order_by, limit, sql)
+}
+
+fn sql_expr_is_integer_zero(expression: &SqlExpr) -> bool {
+    matches!(
+        expression,
+        SqlExpr::Value(value)
+            if matches!(&value.value, SqlValue::Number(number, _) if number == "0")
+    )
 }
 
 fn convert_select(
@@ -3634,9 +3853,17 @@ fn convert_table_with_joins(table: TableWithJoins, sql: &str) -> Result<ParsedOb
 fn convert_expr(expr: SqlExpr, sql: &str) -> Result<ParsedExpr> {
     let position = span_position(sql, expr.span());
     let kind = match expr {
-        SqlExpr::Identifier(ident) => ParsedExprKind::Column(ParsedObjectName {
-            parts: vec![convert_ident(ident, sql)],
-        }),
+        SqlExpr::Identifier(ident) => {
+            if ident.quote_style.is_none()
+                && let Some(index) = named_at_parameter_index(&ident.value)
+            {
+                ParsedExprKind::Parameter(index)
+            } else {
+                ParsedExprKind::Column(ParsedObjectName {
+                    parts: vec![convert_ident(ident, sql)],
+                })
+            }
+        }
         SqlExpr::CompoundIdentifier(parts) => ParsedExprKind::Column(ParsedObjectName {
             parts: parts
                 .into_iter()
@@ -3645,6 +3872,13 @@ fn convert_expr(expr: SqlExpr, sql: &str) -> Result<ParsedExpr> {
         }),
         SqlExpr::Nested(expr) => return convert_expr(*expr, sql),
         SqlExpr::Value(value) => convert_sql_value(value.value, position)?,
+        SqlExpr::TypedString(typed) => {
+            let value = typed.value.into_string().ok_or_else(|| {
+                DbError::new(SYNTAX_ERROR, "typed literal requires a string value")
+                    .with_position_opt(position)
+            })?;
+            ParsedExprKind::Literal(parse_temporal_literal(typed.data_type, &value, position)?)
+        }
         SqlExpr::UnaryOp { op, expr } => {
             let op = match op {
                 SqlUnaryOperator::Not => UnaryOperator::Not,
@@ -3768,6 +4002,7 @@ fn convert_sql_value(value: SqlValue, position: Option<usize>) -> Result<ParsedE
                 .strip_prefix('$')
                 .and_then(|index| index.parse::<usize>().ok())
                 .filter(|index| *index > 0)
+                .or_else(|| named_at_parameter_index(&parameter))
                 .ok_or_else(|| {
                     DbError::new("42P02", format!("invalid parameter reference {parameter}"))
                         .with_position_opt(position)
@@ -3778,11 +4013,53 @@ fn convert_sql_value(value: SqlValue, position: Option<usize>) -> Result<ParsedE
     }
 }
 
+fn named_at_parameter_index(value: &str) -> Option<usize> {
+    value
+        .get(..2)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("@p"))
+        .and_then(|_| value.get(2..))
+        .and_then(|index| index.parse::<usize>().ok())
+        .filter(|index| *index > 0)
+}
+
+fn parse_temporal_literal(
+    data_type: DataType,
+    value: &str,
+    position: Option<usize>,
+) -> Result<Value> {
+    let data_type_label = data_type.to_string();
+    let invalid = || {
+        DbError::new(
+            "22007",
+            format!("invalid {data_type_label} literal {value:?}"),
+        )
+        .with_position_opt(position)
+    };
+    match data_type {
+        DataType::Date => NaiveDate::parse_from_str(value, "%Y-%m-%d")
+            .map(Value::Date)
+            .map_err(|_| invalid()),
+        DataType::Time(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
+            NaiveTime::parse_from_str(value, "%H:%M:%S%.f")
+                .map(Value::Time)
+                .map_err(|_| invalid())
+        }
+        DataType::Timestamp(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone)
+        | DataType::Datetime(_) => NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+            .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f"))
+            .map(Value::Timestamp)
+            .map_err(|_| invalid()),
+        _ => unsupported_at("this typed literal is not supported yet", position),
+    }
+}
+
 fn convert_data_type(data_type: DataType) -> Result<ScalarType> {
     match data_type {
         DataType::Bool | DataType::Boolean => Ok(ScalarType::Boolean),
-        DataType::Int2(_) | DataType::SmallInt(_) => Ok(ScalarType::Int16),
-        DataType::Int(_) | DataType::Int4(_) | DataType::Integer(_) => Ok(ScalarType::Int32),
+        DataType::Int2(_) | DataType::SmallInt(_) | DataType::TinyInt(_) => Ok(ScalarType::Int16),
+        DataType::Int(_) | DataType::Int4(_) | DataType::Integer(_) | DataType::MediumInt(_) => {
+            Ok(ScalarType::Int32)
+        }
         DataType::Int8(_) | DataType::BigInt(_) => Ok(ScalarType::Int64),
         DataType::Float4 | DataType::Real => Ok(ScalarType::Float32),
         DataType::Float8 | DataType::Double(_) | DataType::DoublePrecision => {
@@ -3795,17 +4072,28 @@ fn convert_data_type(data_type: DataType) -> Result<ScalarType> {
         DataType::Character(length) | DataType::Char(length) => Ok(ScalarType::Char {
             length: character_length(length)?,
         }),
-        DataType::CharacterVarying(length) | DataType::Varchar(length) => Ok(ScalarType::Varchar {
+        DataType::CharacterVarying(length)
+        | DataType::Varchar(length)
+        | DataType::Nvarchar(length) => Ok(ScalarType::Varchar {
             length: character_length(length)?,
         }),
         DataType::Text => Ok(ScalarType::Text),
-        DataType::Bytea | DataType::Binary(_) => Ok(ScalarType::Binary),
+        DataType::Bytea
+        | DataType::Binary(_)
+        | DataType::Varbinary(_)
+        | DataType::Blob(_)
+        | DataType::TinyBlob
+        | DataType::MediumBlob
+        | DataType::LongBlob => Ok(ScalarType::Binary),
         DataType::Date => Ok(ScalarType::Date),
         DataType::Time(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
             Ok(ScalarType::Time)
         }
         DataType::Timestamp(_, timezone) => Ok(ScalarType::Timestamp {
             with_timezone: matches!(timezone, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz),
+        }),
+        DataType::Datetime(_) => Ok(ScalarType::Timestamp {
+            with_timezone: false,
         }),
         DataType::JSON => Ok(ScalarType::Json),
         DataType::JSONB => Ok(ScalarType::Jsonb),
@@ -3819,6 +4107,12 @@ fn convert_data_type(data_type: DataType) -> Result<ScalarType> {
                 _ => return unsupported("VECTOR accepts at most one dimension"),
             };
             Ok(ScalarType::Vector { dimensions })
+        }
+        DataType::Custom(name, modifiers)
+            if modifiers.is_empty()
+                && name.to_string().eq_ignore_ascii_case("uniqueidentifier") =>
+        {
+            Ok(ScalarType::Uuid)
         }
         _ => unsupported("this SQL data type is not supported yet"),
     }
@@ -6375,5 +6669,294 @@ mod tests {
         let error = bind(parse("SELECT $1 FROM documents").expect("parse"), &catalog)
             .expect_err("unknown parameter type");
         assert_eq!(error.sql_state, INDETERMINATE_DATATYPE);
+    }
+
+    #[test]
+    fn defaults_to_postgresql_and_parses_dialect_names() {
+        assert_eq!(
+            parse("SELECT id FROM documents").expect("default parse"),
+            parse_with_dialect("SELECT id FROM documents", SqlDialect::PostgreSql)
+                .expect("explicit parse")
+        );
+        for (source, expected) in [
+            ("postgres", SqlDialect::PostgreSql),
+            ("mysql", SqlDialect::MySql),
+            ("sqlite3", SqlDialect::Sqlite),
+            ("sql-server", SqlDialect::SqlServer),
+        ] {
+            assert_eq!(source.parse::<SqlDialect>().expect("dialect"), expected);
+        }
+    }
+
+    #[test]
+    fn normalizes_question_mark_and_named_parameters_without_touching_literals() {
+        let mysql = parse_with_dialect(
+            "SELECT `id` FROM `documents` \
+             WHERE `title` = '?' AND `id` >= ? AND `id` <> ? /* ? */ LIMIT 5",
+            SqlDialect::MySql,
+        )
+        .expect("mysql");
+        let ParsedStatement::Select {
+            table,
+            filter: Some(filter),
+            limit: Some(limit),
+            ..
+        } = mysql
+        else {
+            panic!("mysql select");
+        };
+        assert_eq!(table.parts[0].name.as_str(), "documents");
+        assert_eq!(parameter_indices(&filter), vec![1, 2]);
+        assert!(matches!(
+            limit.kind,
+            ParsedExprKind::Literal(Value::Int32(5))
+        ));
+
+        let sql_server = parse_with_dialect(
+            "SELECT TOP 7 [id] FROM [documents] WHERE [id] = @p1",
+            SqlDialect::SqlServer,
+        )
+        .expect("sql server");
+        let ParsedStatement::Select {
+            filter: Some(filter),
+            limit: Some(limit),
+            ..
+        } = sql_server
+        else {
+            panic!("sql server select");
+        };
+        assert_eq!(parameter_indices(&filter), vec![1], "{filter:?}");
+        assert!(matches!(
+            limit.kind,
+            ParsedExprKind::Literal(Value::Int64(7))
+        ));
+    }
+
+    #[test]
+    fn accepts_verified_dialect_type_aliases_and_temporal_literals() {
+        let mysql = parse_with_dialect(
+            "CREATE TABLE dialect_types (\
+                tiny TINYINT,\
+                medium MEDIUMINT,\
+                payload BLOB,\
+                created DATETIME\
+            )",
+            SqlDialect::MySql,
+        )
+        .expect("mysql types");
+        let ParsedStatement::CreateTable { columns, .. } = mysql else {
+            panic!("create table");
+        };
+        assert_eq!(columns[0].data_type, ScalarType::Int16);
+        assert_eq!(columns[1].data_type, ScalarType::Int32);
+        assert_eq!(columns[2].data_type, ScalarType::Binary);
+        assert_eq!(
+            columns[3].data_type,
+            ScalarType::Timestamp {
+                with_timezone: false
+            }
+        );
+
+        let sql_server = parse_with_dialect(
+            "CREATE TABLE [dialect_types] (\
+                [token] UNIQUEIDENTIFIER,\
+                [title] NVARCHAR(32)\
+            )",
+            SqlDialect::SqlServer,
+        )
+        .expect("sql server types");
+        let ParsedStatement::CreateTable { columns, .. } = sql_server else {
+            panic!("create table");
+        };
+        assert_eq!(columns[0].data_type, ScalarType::Uuid);
+        assert_eq!(
+            columns[1].data_type,
+            ScalarType::Varchar { length: Some(32) }
+        );
+
+        let temporal = parse_with_dialect(
+            "INSERT INTO events (created_on, created_at) VALUES (\
+                DATE '2026-07-25',\
+                TIMESTAMP '2026-07-25 09:30:00.125'\
+            )",
+            SqlDialect::PostgreSql,
+        )
+        .expect("temporal literals");
+        let ParsedStatement::Insert { rows, .. } = temporal else {
+            panic!("insert");
+        };
+        assert!(matches!(
+            rows[0][0].kind,
+            ParsedExprKind::Literal(Value::Date(_))
+        ));
+        assert!(matches!(
+            rows[0][1].kind,
+            ParsedExprKind::Literal(Value::Timestamp(_))
+        ));
+    }
+
+    #[test]
+    fn normalizes_sqlite_types_quotes_parameters_and_zero_offset() {
+        let statement = parse_with_dialect(
+            "CREATE TABLE \"sqlite_types\" (\
+                \"id\" INTEGER,\
+                \"payload\" BLOB,\
+                \"created\" DATETIME\
+            )",
+            SqlDialect::Sqlite,
+        )
+        .expect("sqlite types");
+        let ParsedStatement::CreateTable { name, columns, .. } = statement else {
+            panic!("create table");
+        };
+        assert!(name.parts[0].name.is_quoted());
+        assert_eq!(columns[0].data_type, ScalarType::Int32);
+        assert_eq!(columns[1].data_type, ScalarType::Binary);
+        assert_eq!(
+            columns[2].data_type,
+            ScalarType::Timestamp {
+                with_timezone: false
+            }
+        );
+
+        let statement = parse_with_dialect(
+            "SELECT \"id\" FROM \"sqlite_types\" WHERE \"id\" = ? LIMIT 5 OFFSET 0",
+            SqlDialect::Sqlite,
+        )
+        .expect("sqlite select");
+        let ParsedStatement::Select {
+            table,
+            filter: Some(filter),
+            limit: Some(limit),
+            ..
+        } = statement
+        else {
+            panic!("sqlite select");
+        };
+        assert!(table.parts[0].name.is_quoted());
+        assert_eq!(parameter_indices(&filter), vec![1]);
+        assert!(matches!(
+            limit.kind,
+            ParsedExprKind::Literal(Value::Int32(5))
+        ));
+    }
+
+    #[test]
+    fn normalizes_verified_zero_offset_row_limit_forms() {
+        for (dialect, sql, expected_limit) in [
+            (
+                SqlDialect::PostgreSql,
+                "SELECT id FROM documents OFFSET 0 ROWS FETCH FIRST 4 ROWS ONLY",
+                4,
+            ),
+            (SqlDialect::MySql, "SELECT id FROM documents LIMIT 0, 5", 5),
+            (
+                SqlDialect::Sqlite,
+                "SELECT id FROM documents LIMIT 6 OFFSET 0",
+                6,
+            ),
+            (
+                SqlDialect::SqlServer,
+                "SELECT [id] FROM [documents] ORDER BY [id] \
+                 OFFSET 0 ROWS FETCH NEXT 7 ROWS ONLY",
+                7,
+            ),
+        ] {
+            let statement = parse_with_dialect(sql, dialect)
+                .unwrap_or_else(|error| panic!("{dialect}: {error:?}"));
+            let ParsedStatement::Select {
+                limit: Some(limit), ..
+            } = statement
+            else {
+                panic!("select with limit");
+            };
+            assert!(
+                matches!(
+                    limit.kind,
+                    ParsedExprKind::Literal(Value::Int32(value))
+                        if value == expected_limit
+                ) || matches!(
+                    limit.kind,
+                    ParsedExprKind::Literal(Value::Int64(value))
+                        if value == i64::from(expected_limit)
+                ),
+                "{dialect}: {limit:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_zero_offset_with_the_selected_dialect() {
+        for (dialect, sql) in [
+            (
+                SqlDialect::PostgreSql,
+                "SELECT id FROM documents LIMIT 5 OFFSET 1",
+            ),
+            (SqlDialect::MySql, "SELECT id FROM documents LIMIT 1, 5"),
+            (
+                SqlDialect::Sqlite,
+                "SELECT id FROM documents LIMIT 5 OFFSET 1",
+            ),
+            (
+                SqlDialect::SqlServer,
+                "SELECT [id] FROM [documents] ORDER BY [id] \
+                 OFFSET 1 ROWS FETCH NEXT 5 ROWS ONLY",
+            ),
+        ] {
+            let error = parse_with_dialect(sql, dialect).expect_err("non-zero offset");
+            assert_eq!(
+                error.sql_state, FEATURE_NOT_SUPPORTED,
+                "{dialect}: {error:?}"
+            );
+            if dialect != SqlDialect::PostgreSql {
+                assert!(
+                    error.message.contains(dialect.label()),
+                    "{dialect}: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reports_unsupported_vendor_features_with_the_selected_dialect() {
+        let error = parse_with_dialect(
+            "INSERT IGNORE INTO documents (id, title) VALUES (1, 'ignored')",
+            SqlDialect::MySql,
+        )
+        .expect_err("insert ignore");
+        assert_eq!(error.sql_state, FEATURE_NOT_SUPPORTED);
+        assert!(error.message.contains("MySQL"), "{error:?}");
+        assert!(error.hint.is_some());
+
+        let error = parse_with_dialect(
+            "SELECT TOP 10 PERCENT [id] FROM [documents]",
+            SqlDialect::SqlServer,
+        )
+        .expect_err("top percent");
+        assert_eq!(error.sql_state, FEATURE_NOT_SUPPORTED);
+        assert!(error.message.contains("SQL Server"), "{error:?}");
+    }
+
+    fn parameter_indices(expression: &ParsedExpr) -> Vec<usize> {
+        let mut parameters = Vec::new();
+        let mut stack = vec![expression];
+        while let Some(expression) = stack.pop() {
+            match &expression.kind {
+                ParsedExprKind::Parameter(index) => parameters.push(*index),
+                ParsedExprKind::Unary { expr, .. } => stack.push(expr),
+                ParsedExprKind::Binary { left, right, .. } => {
+                    stack.push(right);
+                    stack.push(left);
+                }
+                ParsedExprKind::Aggregate {
+                    argument: Some(argument),
+                    ..
+                } => stack.push(argument),
+                ParsedExprKind::Column(_)
+                | ParsedExprKind::Literal(_)
+                | ParsedExprKind::Aggregate { argument: None, .. } => {}
+            }
+        }
+        parameters
     }
 }

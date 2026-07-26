@@ -663,7 +663,8 @@ button.tree-row:hover {
   flex: 0 0 auto;
 }
 
-.connection-selector {
+.dialect-selector {
+  position: relative;
   height: var(--control-sm);
   align-self: center;
   margin-left: auto;
@@ -680,9 +681,67 @@ button.tree-row:hover {
   cursor: pointer;
 }
 
-.connection-selector:hover {
+.dialect-selector:hover,
+.dialect-selector:focus-within {
   color: var(--ink);
   background: oklch(0.92 0.018 232);
+}
+
+.dialect-selector select {
+  min-width: 92px;
+  height: 100%;
+  padding: 0 17px 0 0;
+  border: 0;
+  outline: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  appearance: none;
+  cursor: pointer;
+}
+
+.dialect-selector select:focus-visible {
+  border-radius: 5px;
+  box-shadow: 0 0 0 2px var(--focus);
+}
+
+.dialect-chevron {
+  position: absolute;
+  right: 6px;
+  pointer-events: none;
+}
+
+.dialect-tooltip {
+  position: absolute;
+  z-index: 120;
+  top: calc(100% + 6px);
+  right: 0;
+  width: max-content;
+  max-width: 240px;
+  padding: 5px 8px;
+  visibility: hidden;
+  border: 1px solid oklch(0.79 0.022 231);
+  border-radius: 6px;
+  color: var(--ink);
+  background: oklch(0.99 0.004 225 / 0.98);
+  box-shadow: 0 6px 16px oklch(0.31 0.03 235 / 0.14);
+  font-size: var(--font-ui);
+  line-height: 1.35;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition:
+    opacity 130ms ease,
+    transform 130ms ease,
+    visibility 0s linear 130ms;
+  pointer-events: none;
+}
+
+.dialect-selector:hover .dialect-tooltip,
+.dialect-selector:focus-within .dialect-tooltip {
+  visibility: visible;
+  opacity: 1;
+  transform: translateY(0);
+  transition-delay: 0s;
 }
 
 .connection-dot {
@@ -763,6 +822,13 @@ button.tree-row:hover {
   background: var(--brand-soft);
   font-size: var(--font-ui);
   font-weight: 710;
+}
+
+.dialect-parameter {
+  color: var(--ink-muted);
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: var(--font-ui);
+  white-space: nowrap;
 }
 
 .monaco-shell {

@@ -2667,9 +2667,11 @@ dependencies = [
 name = "ordadb-sql"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "ordadb-catalog",
  "ordadb-types",
  "rust_decimal",
+ "serde",
  "sqlparser",
 ]
 

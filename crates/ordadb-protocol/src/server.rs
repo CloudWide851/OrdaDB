@@ -251,7 +251,7 @@ fn serve_tcp_connection_inner(
     let _guard = SessionGuard::new(Arc::clone(&registry), handle.process_id());
     write_startup_responses(&mut stream, &config, &principal.user, &handle)?;
 
-    let session = engine.connect()?;
+    let session = connect_postgresql_session(&engine)?;
     let mut connection = Connection {
         stream,
         session,
@@ -1076,6 +1076,10 @@ fn transaction_status(session: &Session) -> u8 {
     }
 }
 
+fn connect_postgresql_session(engine: &Engine) -> Result<Session> {
+    engine.connect()
+}
+
 fn command_tag(complete: &CommandComplete) -> String {
     let upper = complete.tag.to_ascii_uppercase();
     if upper == "INSERT" {
@@ -1812,5 +1816,18 @@ mod tests {
             .expect("virtual");
         assert!(matches!(events.first(), Some(QueryEvent::Schema(_))));
         assert!(matches!(events.last(), Some(QueryEvent::Complete(_))));
+    }
+
+    #[test]
+    fn pgwire_sessions_keep_the_default_postgresql_dialect() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine =
+            Engine::open(ordadb_engine::EngineConfig::new(directory.path())).expect("open engine");
+        let session = connect_postgresql_session(&engine).expect("connect session");
+        assert_eq!(
+            session.options(),
+            ordadb_engine::SessionOptions::default(),
+            "PostgreSQL Wire must not negotiate a non-PostgreSQL dialect"
+        );
     }
 }
