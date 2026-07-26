@@ -12,10 +12,11 @@ use std::str::FromStr;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use ordadb_catalog::{
-    Catalog, CatalogExpression, CatalogObjectRef, DropBehavior, NewColumn, NewConstraint,
-    NewConstraintKind, NewIndex, NewSequence, ReferentialAction, RoutineArgument, RoutineKind,
-    TableDefinition, TriggerEvent as CatalogTriggerEvent, TriggerTiming, ViewDefinition, ViewKind,
-    indexable_type,
+    Catalog, CatalogExpression, CatalogObjectRef, DropBehavior, FullTextAnalyzer, IndexMethod,
+    IndexOptions, NewColumn, NewConstraint, NewConstraintKind, NewIndex, NewSequence,
+    ReferentialAction, RoutineArgument, RoutineKind, TableDefinition,
+    TriggerEvent as CatalogTriggerEvent, TriggerTiming, VectorDistanceMetric, ViewDefinition,
+    ViewKind, indexable_type, text_search_type,
 };
 use ordadb_types::{
     ColumnId, ConstraintId, DbError, Field, Identifier, IndexId, Result, RoutineId, ScalarType,
@@ -31,11 +32,11 @@ use sqlparser::ast::{
     CreateFunction as SqlCreateFunction, CreateFunctionBody, CreateTable, CreateTableOptions,
     CreateTrigger as SqlCreateTrigger, CreateView, DataType, DropBehavior as SqlDropBehavior,
     ExactNumberInfo, Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, FunctionReturnType, FunctionSecurity, GroupByExpr, Ident, JoinConstraint,
-    JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByKind, Query,
-    ReferentialAction as SqlReferentialAction, RenameTableNameKind, SchemaName, Select, SelectItem,
-    SequenceOptions, SetExpr, Spanned, Statement as SqlStatement, TableAlias, TableConstraint,
-    TableFactor, TableObject, TableWithJoins, TimezoneInfo, TopQuantity,
+    FunctionArguments, FunctionReturnType, FunctionSecurity, GroupByExpr, Ident, IndexType,
+    JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByKind,
+    Query, ReferentialAction as SqlReferentialAction, RenameTableNameKind, SchemaName, Select,
+    SelectItem, SequenceOptions, SetExpr, Spanned, Statement as SqlStatement, TableAlias,
+    TableConstraint, TableFactor, TableObject, TableWithJoins, TimezoneInfo, TopQuantity,
     TriggerEvent as SqlTriggerEvent, TriggerExecBodyType, TriggerObject, TriggerObjectKind,
     TriggerPeriod, UnaryOperator as SqlUnaryOperator, Value as SqlValue,
 };
@@ -108,6 +109,30 @@ pub struct ParsedIdentifier {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedObjectName {
     pub parts: Vec<ParsedIdentifier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedIndexOption {
+    pub name: ParsedIdentifier,
+    pub value: ParsedIndexOptionValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedIndexOptionValue {
+    Text(String),
+    Integer(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCreateIndex {
+    pub name: ParsedIdentifier,
+    pub table: ParsedObjectName,
+    pub key_columns: Vec<ParsedIdentifier>,
+    pub include_columns: Vec<ParsedIdentifier>,
+    pub unique: bool,
+    pub method: IndexMethod,
+    pub options: Vec<ParsedIndexOption>,
+    pub if_not_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -379,14 +404,7 @@ pub enum ParsedStatement {
         if_exists: bool,
         operations: Vec<ParsedAlterTableOperation>,
     },
-    CreateIndex {
-        name: ParsedIdentifier,
-        table: ParsedObjectName,
-        key_columns: Vec<ParsedIdentifier>,
-        include_columns: Vec<ParsedIdentifier>,
-        unique: bool,
-        if_not_exists: bool,
-    },
+    CreateIndex(ParsedCreateIndex),
     AlterIndexRename {
         name: ParsedObjectName,
         new_name: ParsedIdentifier,
@@ -1555,22 +1573,7 @@ fn bind_with_view_depth(
             if_exists,
             operations,
         } => bind_alter_table(name, if_exists, operations, catalog),
-        ParsedStatement::CreateIndex {
-            name,
-            table,
-            key_columns,
-            include_columns,
-            unique,
-            if_not_exists,
-        } => bind_create_index(
-            name,
-            table,
-            key_columns,
-            include_columns,
-            unique,
-            if_not_exists,
-            catalog,
-        ),
+        ParsedStatement::CreateIndex(index) => bind_create_index(index, catalog),
         ParsedStatement::AlterIndexRename { name, new_name } => {
             let (schema, index, position) = split_table_name(&name)?;
             let index = catalog.index(&schema, &index).ok_or_else(|| {
@@ -2297,16 +2300,16 @@ fn convert_statement(statement: SqlStatement, sql: &str) -> Result<ParsedStateme
         SqlStatement::CreateTable(table) => convert_create_table(table, sql),
         SqlStatement::AlterTable(alter) => convert_alter_table(alter, sql),
         SqlStatement::CreateIndex(index) => {
-            if index.using.is_some()
-                || index.concurrently
+            if index.concurrently
                 || index.nulls_distinct.is_some()
-                || !index.with.is_empty()
                 || index.predicate.is_some()
                 || !index.index_options.is_empty()
                 || !index.alter_options.is_empty()
             {
                 return unsupported("this CREATE INDEX form is not supported yet");
             }
+            let method = convert_index_method(index.using)?;
+            let options = convert_index_options(index.with, sql)?;
             let name = index
                 .name
                 .ok_or_else(|| DbError::new(SYNTAX_ERROR, "CREATE INDEX requires a name"))?;
@@ -2321,14 +2324,16 @@ fn convert_statement(statement: SqlStatement, sql: &str) -> Result<ParsedStateme
                 .into_iter()
                 .map(|column| convert_ident(column, sql))
                 .collect();
-            Ok(ParsedStatement::CreateIndex {
+            Ok(ParsedStatement::CreateIndex(ParsedCreateIndex {
                 name,
                 table: convert_object_name(index.table_name, sql)?,
                 key_columns,
                 include_columns,
                 unique: index.unique,
+                method,
+                options,
                 if_not_exists: index.if_not_exists,
-            })
+            }))
         }
         SqlStatement::AlterIndex { name, operation } => {
             let AlterIndexOperation::RenameIndex { index_name } = operation;
@@ -4159,6 +4164,76 @@ fn character_length(length: Option<CharacterLength>) -> Result<Option<u32>> {
     }
 }
 
+fn convert_index_method(method: Option<IndexType>) -> Result<IndexMethod> {
+    match method {
+        None | Some(IndexType::BTree) => Ok(IndexMethod::BTree),
+        Some(IndexType::Custom(name))
+            if name.quote_style.is_none() && name.value.eq_ignore_ascii_case("fulltext") =>
+        {
+            Ok(IndexMethod::FullText)
+        }
+        Some(IndexType::Custom(name))
+            if name.quote_style.is_none() && name.value.eq_ignore_ascii_case("hnsw") =>
+        {
+            Ok(IndexMethod::Hnsw)
+        }
+        Some(method) => unsupported(format!("index method {method} is not supported")),
+    }
+}
+
+fn convert_index_options(options: Vec<SqlExpr>, sql: &str) -> Result<Vec<ParsedIndexOption>> {
+    options
+        .into_iter()
+        .map(|option| {
+            let position = span_position(sql, option.span());
+            let SqlExpr::BinaryOp { left, op, right } = option else {
+                return unsupported_at("index options must use name = value", position);
+            };
+            if op != SqlBinaryOperator::Eq {
+                return unsupported_at("index options must use name = value", position);
+            }
+            let SqlExpr::Identifier(name) = *left else {
+                return unsupported_at("index option names must be identifiers", position);
+            };
+            let parsed_name = convert_ident(name, sql);
+            if parsed_name.name.is_quoted() {
+                return unsupported_at(
+                    "quoted index option names are not supported",
+                    parsed_name.position,
+                );
+            }
+            let SqlExpr::Value(value) = *right else {
+                return unsupported_at(
+                    "index option values must be strings or non-negative integers",
+                    position,
+                );
+            };
+            let value = match value.value {
+                SqlValue::SingleQuotedString(value)
+                | SqlValue::EscapedStringLiteral(value)
+                | SqlValue::UnicodeStringLiteral(value)
+                | SqlValue::NationalStringLiteral(value) => ParsedIndexOptionValue::Text(value),
+                SqlValue::Number(value, _) => {
+                    ParsedIndexOptionValue::Integer(value.parse::<usize>().map_err(|_| {
+                        DbError::new("22023", "index option integer is out of range")
+                            .with_position_opt(position)
+                    })?)
+                }
+                _ => {
+                    return unsupported_at(
+                        "index option values must be strings or non-negative integers",
+                        position,
+                    );
+                }
+            };
+            Ok(ParsedIndexOption {
+                name: parsed_name,
+                value,
+            })
+        })
+        .collect()
+}
+
 fn convert_index_column(
     column: &sqlparser::ast::IndexColumn,
     sql: &str,
@@ -4503,15 +4578,17 @@ fn bind_insert(
     })
 }
 
-fn bind_create_index(
-    name: ParsedIdentifier,
-    table_name: ParsedObjectName,
-    key_columns: Vec<ParsedIdentifier>,
-    include_columns: Vec<ParsedIdentifier>,
-    unique: bool,
-    if_not_exists: bool,
-    catalog: &Catalog,
-) -> Result<BoundStatement> {
+fn bind_create_index(index: ParsedCreateIndex, catalog: &Catalog) -> Result<BoundStatement> {
+    let ParsedCreateIndex {
+        name,
+        table: table_name,
+        key_columns,
+        include_columns,
+        unique,
+        method,
+        options,
+        if_not_exists,
+    } = index;
     let table = resolve_index_relation(&table_name, catalog)?;
     let schema = catalog
         .schema_by_id(table.schema_id)
@@ -4553,18 +4630,14 @@ fn bind_create_index(
             .with_position_opt(column.position));
         }
     }
-    for column in &key_columns {
-        let definition = table
-            .column(&column.name)
-            .ok_or_else(|| DbError::internal("validated index column disappeared"))?;
-        if !indexable_type(&definition.data_type) {
-            return Err(DbError::new(
-                DATATYPE_MISMATCH,
-                format!("column {} has no B+Tree ordering", column.name),
-            )
-            .with_position_opt(column.position));
-        }
-    }
+    let options = bind_index_options(
+        method,
+        table,
+        &key_columns,
+        &include_columns,
+        unique,
+        options,
+    )?;
     Ok(BoundStatement::CreateIndex {
         table_id: table.id,
         index: NewIndex {
@@ -4575,9 +4648,220 @@ fn bind_create_index(
                 .map(|column| column.name)
                 .collect(),
             unique,
+            method,
+            options,
         },
         if_not_exists,
     })
+}
+
+fn bind_index_options(
+    method: IndexMethod,
+    table: &TableDefinition,
+    key_columns: &[ParsedIdentifier],
+    include_columns: &[ParsedIdentifier],
+    unique: bool,
+    options: Vec<ParsedIndexOption>,
+) -> Result<IndexOptions> {
+    let mut options = collect_index_options(options)?;
+    let bound = match method {
+        IndexMethod::BTree => {
+            reject_remaining_index_options(&options, "B-Tree")?;
+            for column in key_columns {
+                let definition = table
+                    .column(&column.name)
+                    .ok_or_else(|| DbError::internal("validated index column disappeared"))?;
+                if !indexable_type(&definition.data_type) {
+                    return Err(DbError::new(
+                        DATATYPE_MISMATCH,
+                        format!("column {} has no B+Tree ordering", column.name),
+                    )
+                    .with_position_opt(column.position));
+                }
+            }
+            IndexOptions::BTree
+        }
+        IndexMethod::FullText => {
+            if unique || !include_columns.is_empty() {
+                return unsupported("full-text indexes do not support UNIQUE or INCLUDE");
+            }
+            for column in key_columns {
+                let definition = table
+                    .column(&column.name)
+                    .ok_or_else(|| DbError::internal("validated index column disappeared"))?;
+                if !text_search_type(&definition.data_type) {
+                    return Err(DbError::new(
+                        DATATYPE_MISMATCH,
+                        format!(
+                            "full-text index column {} must be character or text",
+                            column.name
+                        ),
+                    )
+                    .with_position_opt(column.position));
+                }
+            }
+            let analyzer = match take_text_index_option(&mut options, "analyzer")? {
+                None => FullTextAnalyzer::Standard,
+                Some((value, _)) if value.eq_ignore_ascii_case("standard") => {
+                    FullTextAnalyzer::Standard
+                }
+                Some((value, _)) if value.eq_ignore_ascii_case("whitespace") => {
+                    FullTextAnalyzer::Whitespace
+                }
+                Some((value, position)) => {
+                    return Err(DbError::new(
+                        "22023",
+                        format!("unsupported full-text analyzer {value}"),
+                    )
+                    .with_position_opt(position));
+                }
+            };
+            reject_remaining_index_options(&options, "full-text")?;
+            IndexOptions::FullText { analyzer }
+        }
+        IndexMethod::Hnsw => {
+            if unique || !include_columns.is_empty() || key_columns.len() != 1 {
+                return unsupported(
+                    "HNSW indexes require one VECTOR column and do not support UNIQUE or INCLUDE",
+                );
+            }
+            let column = key_columns
+                .first()
+                .ok_or_else(|| DbError::internal("validated HNSW column disappeared"))?;
+            let definition = table
+                .column(&column.name)
+                .ok_or_else(|| DbError::internal("validated HNSW column disappeared"))?;
+            let dimensions = match definition.data_type {
+                ScalarType::Vector {
+                    dimensions: Some(dimensions),
+                } if dimensions > 0 => dimensions,
+                ScalarType::Vector { dimensions: None } => {
+                    return Err(DbError::new(
+                        DATATYPE_MISMATCH,
+                        format!(
+                            "HNSW index column {} requires a fixed VECTOR dimension",
+                            column.name
+                        ),
+                    )
+                    .with_position_opt(column.position));
+                }
+                _ => {
+                    return Err(DbError::new(
+                        DATATYPE_MISMATCH,
+                        format!("HNSW index column {} must be VECTOR", column.name),
+                    )
+                    .with_position_opt(column.position));
+                }
+            };
+            let metric = match take_text_index_option(&mut options, "metric")? {
+                None => VectorDistanceMetric::Cosine,
+                Some((value, _)) if value.eq_ignore_ascii_case("cosine") => {
+                    VectorDistanceMetric::Cosine
+                }
+                Some((value, _))
+                    if value.eq_ignore_ascii_case("l2")
+                        || value.eq_ignore_ascii_case("euclidean") =>
+                {
+                    VectorDistanceMetric::L2
+                }
+                Some((value, _)) if value.eq_ignore_ascii_case("dot") => VectorDistanceMetric::Dot,
+                Some((value, position)) => {
+                    return Err(DbError::new(
+                        "22023",
+                        format!("unsupported HNSW distance metric {value}"),
+                    )
+                    .with_position_opt(position));
+                }
+            };
+            let m = take_integer_index_option(&mut options, "m")?.unwrap_or(16);
+            let ef_construction =
+                take_integer_index_option(&mut options, "ef_construction")?.unwrap_or(64);
+            let ef_search = take_integer_index_option(&mut options, "ef_search")?.unwrap_or(40);
+            reject_remaining_index_options(&options, "HNSW")?;
+            if !(2..=64).contains(&m)
+                || ef_construction < m
+                || ef_construction > 4_096
+                || !(1..=4_096).contains(&ef_search)
+            {
+                return Err(DbError::new(
+                    "22023",
+                    "HNSW options require m 2..64, ef_construction m..4096, and ef_search 1..4096",
+                ));
+            }
+            IndexOptions::Hnsw {
+                metric,
+                dimensions,
+                m,
+                ef_construction,
+                ef_search,
+            }
+        }
+    };
+    Ok(bound)
+}
+
+fn collect_index_options(
+    options: Vec<ParsedIndexOption>,
+) -> Result<BTreeMap<String, ParsedIndexOption>> {
+    let mut collected = BTreeMap::new();
+    for option in options {
+        let name = option.name.name.as_str().to_owned();
+        if collected.insert(name.clone(), option).is_some() {
+            return Err(DbError::new(
+                "42701",
+                format!("index option {name} specified more than once"),
+            ));
+        }
+    }
+    Ok(collected)
+}
+
+fn take_text_index_option(
+    options: &mut BTreeMap<String, ParsedIndexOption>,
+    name: &str,
+) -> Result<Option<(String, Option<usize>)>> {
+    let Some(option) = options.remove(name) else {
+        return Ok(None);
+    };
+    let position = option.name.position;
+    match option.value {
+        ParsedIndexOptionValue::Text(value) => Ok(Some((value, position))),
+        ParsedIndexOptionValue::Integer(_) => Err(DbError::new(
+            "22023",
+            format!("index option {name} requires a string value"),
+        )
+        .with_position_opt(position)),
+    }
+}
+
+fn take_integer_index_option(
+    options: &mut BTreeMap<String, ParsedIndexOption>,
+    name: &str,
+) -> Result<Option<usize>> {
+    let Some(option) = options.remove(name) else {
+        return Ok(None);
+    };
+    match option.value {
+        ParsedIndexOptionValue::Integer(value) => Ok(Some(value)),
+        ParsedIndexOptionValue::Text(_) => Err(DbError::new(
+            "22023",
+            format!("index option {name} requires a non-negative integer"),
+        )
+        .with_position_opt(option.name.position)),
+    }
+}
+
+fn reject_remaining_index_options(
+    options: &BTreeMap<String, ParsedIndexOption>,
+    method: &str,
+) -> Result<()> {
+    let Some((name, option)) = options.first_key_value() else {
+        return Ok(());
+    };
+    unsupported_at(
+        format!("{method} index option {name} is not supported"),
+        option.name.position,
+    )
 }
 
 fn resolve_index_relation<'a>(
@@ -6502,6 +6786,85 @@ mod tests {
         )
         .expect("bind explain");
         assert!(matches!(explain, BoundStatement::Explain { .. }));
+    }
+
+    #[test]
+    fn binds_full_text_and_hnsw_index_methods_with_bounded_options() {
+        let catalog = catalog_with_documents();
+        let full_text = bind(
+            parse(
+                "CREATE INDEX documents_fts ON documents USING fulltext (title) \
+                 WITH (analyzer = 'whitespace')",
+            )
+            .expect("parse full-text index"),
+            &catalog,
+        )
+        .expect("bind full-text index");
+        let BoundStatement::CreateIndex { index, .. } = full_text else {
+            panic!("full-text CREATE INDEX");
+        };
+        assert_eq!(index.method, IndexMethod::FullText);
+        assert_eq!(
+            index.options,
+            IndexOptions::FullText {
+                analyzer: FullTextAnalyzer::Whitespace
+            }
+        );
+
+        let mut vector_catalog = Catalog::default();
+        vector_catalog
+            .create_table(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("embeddings"),
+                vec![NewColumn::new(
+                    Identifier::unquoted("value"),
+                    ScalarType::Vector {
+                        dimensions: Some(3),
+                    },
+                )],
+            )
+            .expect("vector table");
+        let hnsw = bind(
+            parse(
+                "CREATE INDEX embeddings_hnsw ON embeddings USING hnsw (value) \
+                 WITH (metric = 'l2', m = 8, ef_construction = 32, ef_search = 24)",
+            )
+            .expect("parse HNSW index"),
+            &vector_catalog,
+        )
+        .expect("bind HNSW index");
+        let BoundStatement::CreateIndex { index, .. } = hnsw else {
+            panic!("HNSW CREATE INDEX");
+        };
+        assert_eq!(index.method, IndexMethod::Hnsw);
+        assert_eq!(
+            index.options,
+            IndexOptions::Hnsw {
+                metric: VectorDistanceMetric::L2,
+                dimensions: 3,
+                m: 8,
+                ef_construction: 32,
+                ef_search: 24,
+            }
+        );
+
+        let wrong_type = bind(
+            parse("CREATE INDEX documents_hnsw ON documents USING hnsw (title)")
+                .expect("parse wrong HNSW"),
+            &catalog,
+        )
+        .expect_err("HNSW requires VECTOR");
+        assert_eq!(wrong_type.sql_state, DATATYPE_MISMATCH);
+        let unsupported_option = bind(
+            parse(
+                "CREATE INDEX documents_bad_fts ON documents USING fulltext (title) \
+                 WITH (language = 'english')",
+            )
+            .expect("parse unsupported option"),
+            &catalog,
+        )
+        .expect_err("unsupported option");
+        assert_eq!(unsupported_option.sql_state, FEATURE_NOT_SUPPORTED);
     }
 
     #[test]

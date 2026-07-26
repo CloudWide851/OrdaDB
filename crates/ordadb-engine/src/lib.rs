@@ -4,7 +4,7 @@
 //! encoding belongs to `ordadb-storage`; WAL and crash recovery belong to
 //! `ordadb-transaction`.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use ordadb_catalog::{
     Catalog, CatalogExpression, CatalogObjectRef, ColumnStatistics, ConstraintKind, DropBehavior,
-    NewColumn, NewRoutine, NewView, ReferentialAction, SequenceAlteration, TableDefinition,
-    TableStatistics, TriggerEvent, TriggerTiming, ViewKind, indexable_type,
+    IndexMethod, NewColumn, NewRoutine, NewView, ReferentialAction, SequenceAlteration,
+    TableDefinition, TableStatistics, TriggerEvent, TriggerTiming, ViewKind, indexable_type,
 };
 use ordadb_execution::{
     AdvancedExecutionCursor, AdvancedExecutionPlan, ExecutionContext, ExecutionCursor,
@@ -27,6 +27,10 @@ use ordadb_optimizer::{
 use ordadb_plpgsql::{
     PlpgsqlHost, compile_with_arguments as compile_plpgsql, execute as execute_plpgsql,
 };
+pub use ordadb_search::{
+    AllowedRows, HybridSearchRequest, SearchRowId, TextSearchRequest, VectorSearchRequest,
+};
+use ordadb_search::{SearchCatalog, SearchLimits};
 use ordadb_sql::{
     BinaryOperator, BoundAlterTableOperation, BoundExpr, BoundExprKind, BoundJoin, BoundOrder,
     BoundProjection, BoundSequenceOperation, BoundStatement, BoundTable, DdlObjectKind, JoinKind,
@@ -55,6 +59,29 @@ pub struct EngineConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionOptions {
     pub dialect: SqlDialect,
+}
+
+#[derive(Debug, Clone)]
+pub enum SearchRequest {
+    Text(TextSearchRequest),
+    Vector(VectorSearchRequest),
+    Hybrid(HybridSearchRequest),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalarSearchFilter {
+    pub expression: String,
+    pub parameters: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchResult {
+    pub row_id: SearchRowId,
+    pub row: Row,
+    pub text_score: Option<f32>,
+    pub vector_score: Option<f32>,
+    pub distance: Option<f32>,
+    pub combined_score: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,11 +195,18 @@ impl Engine {
         })?;
         let durable_lsn = self.wal.durable_lsn()?.map(|lsn| lsn.get());
         let dirty_page_count = self.wal.dirty_pages()?.len();
+        let index_count = state
+            .catalog
+            .database()
+            .schemas()
+            .flat_map(|schema| schema.tables())
+            .flat_map(|table| table.indexes())
+            .count();
         Ok(EngineStatusSnapshot {
             generation: state.generation,
             table_count,
             row_count,
-            index_count: state.indexes.len(),
+            index_count,
             durable_lsn,
             dirty_page_count,
             commits_since_checkpoint: self.commits_since_checkpoint.load(Ordering::Acquire),
@@ -363,6 +397,99 @@ impl Session {
             }
             SqlTransactionState::Active(_) => TransactionStatus::Active,
             SqlTransactionState::Failed => TransactionStatus::Failed,
+        }
+    }
+
+    pub fn search(&self, request: SearchRequest) -> Result<Vec<SearchResult>> {
+        self.search_with_filter(request, None)
+    }
+
+    pub fn search_with_filter(
+        &self,
+        request: SearchRequest,
+        filter: Option<&ScalarSearchFilter>,
+    ) -> Result<Vec<SearchResult>> {
+        let snapshot = self.statement_snapshot()?;
+        match request {
+            SearchRequest::Text(mut request) => {
+                let table_id =
+                    search_index_table(&snapshot, request.index_id, IndexMethod::FullText)?;
+                if let Some(filter) = filter {
+                    let allowed = evaluate_search_filter(&snapshot, table_id, filter)?;
+                    request.allowed_rows = intersect_allowed_rows(request.allowed_rows, allowed);
+                }
+                snapshot
+                    .searches
+                    .text_search(&request)?
+                    .into_iter()
+                    .map(|hit| {
+                        Ok(SearchResult {
+                            row_id: hit.row_id,
+                            row: search_result_row(&snapshot, table_id, hit.row_id)?,
+                            text_score: Some(hit.score),
+                            vector_score: None,
+                            distance: None,
+                            combined_score: None,
+                        })
+                    })
+                    .collect()
+            }
+            SearchRequest::Vector(mut request) => {
+                let table_id = search_index_table(&snapshot, request.index_id, IndexMethod::Hnsw)?;
+                if let Some(filter) = filter {
+                    let allowed = evaluate_search_filter(&snapshot, table_id, filter)?;
+                    request.allowed_rows = intersect_allowed_rows(request.allowed_rows, allowed);
+                }
+                snapshot
+                    .searches
+                    .vector_search(&request)?
+                    .into_iter()
+                    .map(|hit| {
+                        Ok(SearchResult {
+                            row_id: hit.row_id,
+                            row: search_result_row(&snapshot, table_id, hit.row_id)?,
+                            text_score: None,
+                            vector_score: Some(hit.score),
+                            distance: Some(hit.distance),
+                            combined_score: None,
+                        })
+                    })
+                    .collect()
+            }
+            SearchRequest::Hybrid(mut request) => {
+                let text_table =
+                    search_index_table(&snapshot, request.text.index_id, IndexMethod::FullText)?;
+                let vector_table =
+                    search_index_table(&snapshot, request.vector.index_id, IndexMethod::Hnsw)?;
+                if text_table != vector_table {
+                    return Err(DbError::new(
+                        "22023",
+                        "hybrid search indexes must belong to the same table",
+                    ));
+                }
+                if let Some(filter) = filter {
+                    let allowed = evaluate_search_filter(&snapshot, text_table, filter)?;
+                    request.text.allowed_rows =
+                        intersect_allowed_rows(request.text.allowed_rows, Arc::clone(&allowed));
+                    request.vector.allowed_rows =
+                        intersect_allowed_rows(request.vector.allowed_rows, allowed);
+                }
+                snapshot
+                    .searches
+                    .hybrid_search(&request)?
+                    .into_iter()
+                    .map(|hit| {
+                        Ok(SearchResult {
+                            row_id: hit.row_id,
+                            row: search_result_row(&snapshot, text_table, hit.row_id)?,
+                            text_score: Some(hit.text_score),
+                            vector_score: Some(hit.vector_score),
+                            distance: None,
+                            combined_score: Some(hit.combined_score),
+                        })
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -944,6 +1071,7 @@ struct DatabaseState {
     catalog: Arc<Catalog>,
     rows: BTreeMap<TableId, Arc<Vec<Row>>>,
     indexes: BTreeMap<IndexId, Arc<BPlusTree>>,
+    searches: Arc<SearchCatalog>,
     generation: u64,
     trigger_depth: usize,
     triggers_fired: usize,
@@ -1001,27 +1129,33 @@ struct AdvancedExecution {
 
 impl DatabaseState {
     fn from_persistent(state: PersistentState) -> Result<Self> {
-        let indexes = state
-            .indexes
+        let PersistentState {
+            generation,
+            catalog,
+            tables,
+            indexes,
+        } = state;
+        let indexes = indexes
             .into_iter()
             .map(|(index_id, entries)| {
-                let definition = state
-                    .catalog
+                let definition = catalog
                     .index_by_id(index_id)
                     .ok_or_else(|| internal_error("persistent index is absent from the catalog"))?;
                 BPlusTree::from_entries(definition.unique, entries)
                     .map(|tree| (index_id, Arc::new(tree)))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
+        let rows = tables
+            .into_iter()
+            .map(|(table_id, rows)| (table_id, Arc::new(rows)))
+            .collect::<BTreeMap<_, _>>();
+        let searches = SearchCatalog::build(&catalog, &rows, SearchLimits::default())?;
         Ok(Self {
-            catalog: Arc::new(state.catalog),
-            rows: state
-                .tables
-                .into_iter()
-                .map(|(table_id, rows)| (table_id, Arc::new(rows)))
-                .collect(),
+            catalog: Arc::new(catalog),
+            rows,
             indexes,
-            generation: state.generation,
+            searches: Arc::new(searches),
+            generation,
             trigger_depth: 0,
             triggers_fired: 0,
             routine_depth: 0,
@@ -2058,6 +2192,7 @@ fn execute_drop_objects(
         }
     }
     cleanup_removed_state(state, &removed);
+    reconcile_search_catalog(state)?;
     Ok((
         command_events(Schema::empty(), drop_command_tag(kind), 0, None),
         true,
@@ -3513,6 +3648,9 @@ fn rebuild_table_derived(state: &mut DatabaseState, table_id: TableId) -> Result
     let rows = state.rows.get(&table_id).cloned().unwrap_or_default();
     let mut rebuilt = Vec::new();
     for definition in table.indexes() {
+        if definition.method != IndexMethod::BTree {
+            continue;
+        }
         let key_positions = definition
             .key_columns
             .iter()
@@ -3552,14 +3690,32 @@ fn rebuild_table_derived(state: &mut DatabaseState, table_id: TableId) -> Result
         let tree = BPlusTree::from_entries(definition.unique, entries)?;
         rebuilt.push((definition.id, tree));
     }
-    state
-        .indexes
-        .retain(|index_id, _| state.catalog.index_by_id(*index_id).is_some());
+    let catalog = Arc::clone(&state.catalog);
+    state.indexes.retain(|index_id, _| {
+        catalog
+            .index_by_id(*index_id)
+            .is_some_and(|definition| definition.method == IndexMethod::BTree)
+    });
     for (index_id, tree) in rebuilt {
         state.indexes.insert(index_id, Arc::new(tree));
     }
     Arc::make_mut(&mut state.catalog)
         .set_table_statistics(table_id, compute_statistics(&table, &rows)?)?;
+    rebuild_search_catalog_for_table(state, table_id)?;
+    Ok(())
+}
+
+fn rebuild_search_catalog_for_table(state: &mut DatabaseState, table_id: TableId) -> Result<()> {
+    let searches = state
+        .searches
+        .rebuild_table(&state.catalog, &state.rows, table_id)?;
+    state.searches = Arc::new(searches);
+    Ok(())
+}
+
+fn reconcile_search_catalog(state: &mut DatabaseState) -> Result<()> {
+    let searches = state.searches.reconcile(&state.catalog, &state.rows)?;
+    state.searches = Arc::new(searches);
     Ok(())
 }
 
@@ -3615,6 +3771,76 @@ fn table_definition(state: &DatabaseState, table_id: TableId) -> Result<&TableDe
         .catalog
         .table_by_id(table_id)
         .ok_or_else(|| internal_error(format!("bound table ID {table_id:?} does not exist")))
+}
+
+fn search_index_table(
+    state: &DatabaseState,
+    index_id: IndexId,
+    expected_method: IndexMethod,
+) -> Result<TableId> {
+    let definition = state
+        .catalog
+        .index_by_id(index_id)
+        .ok_or_else(|| DbError::new("42704", format!("index {} does not exist", index_id.get())))?;
+    if definition.method != expected_method {
+        return Err(DbError::new(
+            "42809",
+            format!(
+                "index {} uses {:?}, expected {expected_method:?}",
+                definition.name, definition.method
+            ),
+        ));
+    }
+    Ok(definition.table_id)
+}
+
+fn search_result_row(state: &DatabaseState, table_id: TableId, row_id: SearchRowId) -> Result<Row> {
+    let row_index = usize::try_from(row_id.get())
+        .map_err(|_| internal_error("search Row ID exceeds the platform limit"))?;
+    state
+        .rows
+        .get(&table_id)
+        .and_then(|rows| rows.get(row_index))
+        .cloned()
+        .ok_or_else(|| internal_error("search index returned a Row ID outside its table snapshot"))
+}
+
+fn evaluate_search_filter(
+    state: &DatabaseState,
+    table_id: TableId,
+    filter: &ScalarSearchFilter,
+) -> Result<AllowedRows> {
+    let table = table_definition(state, table_id)?;
+    let expression = bind_catalog_expression(
+        &CatalogExpression::new(&filter.expression),
+        Some(table),
+        Some(&ScalarType::Boolean),
+    )?;
+    let rows = state
+        .rows
+        .get(&table_id)
+        .map_or(&[][..], |rows| rows.as_slice());
+    let mut allowed = BTreeSet::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        if execution_predicate_matches(&expression, row, &filter.parameters)? {
+            allowed.insert(
+                u64::try_from(row_index)
+                    .map(SearchRowId::new)
+                    .map_err(|_| DbError::new("54000", "table row count exceeds search limits"))?,
+            );
+        }
+    }
+    Ok(Arc::new(allowed))
+}
+
+fn intersect_allowed_rows(
+    current: Option<AllowedRows>,
+    filter: AllowedRows,
+) -> Option<AllowedRows> {
+    match current {
+        Some(current) => Some(Arc::new(current.intersection(&filter).copied().collect())),
+        None => Some(filter),
+    }
 }
 
 fn command_events(

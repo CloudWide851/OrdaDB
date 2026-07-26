@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use ordadb_catalog::TableDefinition;
+use ordadb_catalog::{IndexMethod, TableDefinition};
 use ordadb_sql::{BinaryOperator, BoundExpr, BoundExprKind, BoundOrder, BoundProjection};
 use ordadb_types::{IndexId, TableId};
 
@@ -223,7 +223,7 @@ fn index_candidate(table: &TableDefinition, predicate: &BoundExpr) -> Option<(Ac
     let column = table.columns().get(column_index)?;
     let index = table
         .indexes()
-        .filter(|index| index.key_columns.len() == 1)
+        .filter(|index| index.method == IndexMethod::BTree && index.key_columns.len() == 1)
         .find(|index| index.key_columns[0] == column.id)?;
     let stats = table.statistics().columns.get(&column.id);
     let selectivity = if operator == BinaryOperator::Eq {
