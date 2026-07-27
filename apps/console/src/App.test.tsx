@@ -59,6 +59,8 @@ const renderApp = () => {
   );
 };
 
+const initialWorkbenchState = useWorkbenchStore.getState();
+
 describe("OrdaDB workbench", () => {
   afterEach(() => {
     cleanup();
@@ -66,21 +68,10 @@ describe("OrdaDB workbench", () => {
 
   beforeEach(() => {
     resetPreviewPluginManagerForTests();
+    useWorkbenchStore.setState(initialWorkbenchState, true);
     useWorkbenchStore.setState({
       sql: initialSql,
-      dialect: "postgresql",
-      schemaVisible: true,
-      inspectorVisible: true,
-      activeResultTab: "data",
-      activeInspectorTab: "properties",
-      selectedObject: "documents",
-      commandPaletteOpen: false,
-      pluginManagerOpen: false,
       notice: "准备就绪",
-      queryState: "idle",
-      rows: [],
-      errorMessage: null,
-      durationMs: null,
     });
   });
 
@@ -128,9 +119,9 @@ describe("OrdaDB workbench", () => {
 
     await user.click(screen.getByRole("button", { name: /^运行/ }));
 
-    expect(screen.getByText("正在生成预览结果")).toBeVisible();
+    expect(screen.getByText("正在接收结果")).toBeVisible();
     await waitFor(() => {
-      expect(screen.getByText("向量检索在事务系统中的边界")).toBeVisible();
+      expect(screen.getByText("WAL checkpoint overview")).toBeVisible();
     });
     expect(screen.getByText("5 行 · 36 ms")).toBeVisible();
   });
@@ -199,9 +190,7 @@ describe("OrdaDB workbench", () => {
     expect(screen.getByText(/CREATE TABLE public\.documents/)).toBeVisible();
 
     await user.click(screen.getByRole("tab", { name: "日志" }));
-    expect(
-      screen.getByText(/不会连接真实数据库/),
-    ).toBeVisible();
+    expect(screen.getByText(/不连接真实数据库/)).toBeVisible();
 
     await user.keyboard("{Control>}{Enter}{/Control}");
     await waitFor(() => {
@@ -212,12 +201,17 @@ describe("OrdaDB workbench", () => {
   it("switches SQL dialect hints without losing the workbench state", async () => {
     const user = userEvent.setup();
     renderApp();
+    await waitFor(() => {
+      expect(useWorkbenchStore.getState().catalog.length).toBeGreaterThan(0);
+    });
 
     const dialectSelector = screen.getByRole("combobox", { name: "SQL 方言" });
     expect(dialectSelector).toHaveValue("postgresql");
     expect(screen.getByText("参数 $1", { exact: true })).toBeVisible();
     expect(screen.getByText("SQL · PostgreSQL", { exact: true })).toBeVisible();
-    expect(screen.getByText("预览", { exact: true })).toBeVisible();
+    expect(screen.getAllByText("PREVIEW", { exact: true }).length).toBeGreaterThan(
+      0,
+    );
 
     for (const [value, label, parameter] of [
       ["mysql", "MySQL", "?"],
@@ -249,6 +243,47 @@ describe("OrdaDB workbench", () => {
     ).not.toBeInTheDocument();
     expect(dialectSelector).toHaveValue("sqlServer");
     expect(screen.getByText("SQL · SQL Server", { exact: true })).toBeVisible();
+  });
+
+  it("opens credential-safe data sources and live-capability operations", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(screen.getByRole("button", { name: "管理数据源" }));
+    const dataSource = screen.getByRole("dialog", { name: "数据源" });
+    expect(dataSource).toBeVisible();
+    expect(
+      within(dataSource).getByText("密码仅提交到桌面凭据库"),
+    ).toBeVisible();
+    expect(within(dataSource).getByText("PREVIEW fixture")).toBeVisible();
+    await user.click(
+      within(dataSource).getByRole("button", { name: "关闭数据源" }),
+    );
+
+    await user.click(screen.getByRole("menuitem", { name: "工具" }));
+    await user.click(screen.getByRole("menuitem", { name: "会话" }));
+    const operations = await screen.findByRole("dialog", {
+      name: "数据库运维",
+    });
+    expect(within(operations).getByText("当前没有活动会话")).toBeVisible();
+    await user.click(
+      within(operations).getByRole("button", {
+        name: "关闭数据库运维",
+      }),
+    );
+  });
+
+  it("renders structured DBMS errors from the query stream", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    fireEvent.change(screen.getByRole("textbox", { name: "SQL 编辑器" }), {
+      target: { value: "error" },
+    });
+    await user.click(screen.getByRole("button", { name: /^运行/ }));
+
+    expect(await screen.findByText(/42601 · Preview/)).toBeVisible();
+    expect(screen.getByText("Fixture 数据，不连接真实数据库。")).toBeVisible();
   });
 
   it("manages the four signed connector fixtures with accessible lifecycle actions", async () => {

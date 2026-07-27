@@ -2833,11 +2833,17 @@ name = "ordadb-desktop"
 version = "0.1.0"
 dependencies = [
  "ordadb-connectors",
+ "ordadb-protocol",
  "ordadb-types",
+ "reqwest",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tokio",
+ "tokio-util",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]

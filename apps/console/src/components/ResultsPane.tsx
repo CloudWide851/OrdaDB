@@ -7,8 +7,12 @@ import {
   Rows3,
   Search,
 } from "lucide-react";
+import type {
+  DbmsError,
+  DbmsQueryColumn,
+} from "../lib/dbmsClient";
 import { useWorkbenchStore } from "../store/workbench";
-import type { ResultTab } from "../types";
+import type { QueryState, ResultTab } from "../types";
 import { IconAction } from "./IconAction";
 
 const tabs: Array<{ id: ResultTab; label: string; icon: typeof Rows3 }> = [
@@ -21,9 +25,13 @@ export function ResultsPane() {
   const activeTab = useWorkbenchStore((state) => state.activeResultTab);
   const setActiveTab = useWorkbenchStore((state) => state.setActiveResultTab);
   const queryState = useWorkbenchStore((state) => state.queryState);
+  const columns = useWorkbenchStore((state) => state.columns);
   const rows = useWorkbenchStore((state) => state.rows);
+  const logs = useWorkbenchStore((state) => state.logs);
+  const error = useWorkbenchStore((state) => state.error);
   const durationMs = useWorkbenchStore((state) => state.durationMs);
-  const errorMessage = useWorkbenchStore((state) => state.errorMessage);
+  const rowsProcessed = useWorkbenchStore((state) => state.rowsProcessed);
+  const connection = useWorkbenchStore((state) => state.connection);
 
   return (
     <section className="results-pane" aria-label="查询结果">
@@ -52,7 +60,7 @@ export function ResultsPane() {
           {queryState === "success" && (
             <span className="query-summary" aria-live="polite">
               <CheckCircle2 size={15} aria-hidden="true" />
-              {rows.length} 行 · {durationMs} ms
+              {rows.length} 行 · {durationMs ?? 0} ms
             </span>
           )}
           <IconAction
@@ -61,6 +69,7 @@ export function ResultsPane() {
           />
           <IconAction
             label="导出结果"
+            disabled={rows.length === 0}
             icon={<Download size={16} aria-hidden="true" />}
           />
         </div>
@@ -70,13 +79,20 @@ export function ResultsPane() {
         {activeTab === "logs" ? (
           <LogView
             queryState={queryState}
-            errorMessage={errorMessage}
+            logs={logs}
+            error={error}
             durationMs={durationMs}
+            rowsProcessed={rowsProcessed}
+            preview={connection?.mode === "preview"}
           />
         ) : activeTab === "plan" ? (
-          <PlanView />
+          <PlanView
+            queryState={queryState}
+            columns={columns}
+            rows={rows}
+          />
         ) : (
-          <DataView queryState={queryState} rows={rows} />
+          <DataView queryState={queryState} columns={columns} rows={rows} />
         )}
       </div>
     </section>
@@ -85,16 +101,18 @@ export function ResultsPane() {
 
 function DataView({
   queryState,
+  columns,
   rows,
 }: {
-  queryState: ReturnType<typeof useWorkbenchStore.getState>["queryState"];
-  rows: ReturnType<typeof useWorkbenchStore.getState>["rows"];
+  queryState: QueryState;
+  columns: DbmsQueryColumn[];
+  rows: Array<Array<string | null>>;
 }) {
   if (queryState === "running") {
     return (
       <div className="result-empty result-empty--loading" aria-live="polite">
         <span className="loading-orbit" aria-hidden="true" />
-        <strong>正在生成预览结果</strong>
+        <strong>正在接收结果</strong>
       </div>
     );
   }
@@ -114,85 +132,126 @@ function DataView({
       <table className="result-table">
         <thead>
           <tr>
-            <th>ID</th>
-            <th>TITLE</th>
-            <th>CATEGORY</th>
-            <th>SCORE</th>
-            <th>UPDATED_AT</th>
+            {columns.map((column, index) => (
+              <th title={column.dataType} key={`${column.name}:${index}`}>
+                {column.name}
+              </th>
+            ))}
           </tr>
         </thead>
         <tbody>
-          {rows.map((row) => (
-            <tr key={row.id}>
-              <td className="cell-id">{row.id}</td>
-              <td className="cell-title">{row.title}</td>
-              <td>
-                <span className="category-chip">{row.category}</span>
-              </td>
-              <td className="cell-score">{row.score.toFixed(3)}</td>
-              <td>{row.updatedAt}</td>
+          {rows.map((row, rowIndex) => (
+            <tr key={rowIndex}>
+              {columns.map((column, columnIndex) => (
+                <td
+                  className={columnIndex === 0 ? "cell-id" : undefined}
+                  key={`${column.name}:${columnIndex}`}
+                >
+                  {row[columnIndex] ?? <span className="null-value">NULL</span>}
+                </td>
+              ))}
             </tr>
           ))}
         </tbody>
       </table>
+      {rows.length === 0 && <div className="inline-empty">查询未返回行</div>}
     </div>
   );
 }
 
 function LogView({
   queryState,
-  errorMessage,
+  logs,
+  error,
   durationMs,
+  rowsProcessed,
+  preview,
 }: {
-  queryState: ReturnType<typeof useWorkbenchStore.getState>["queryState"];
-  errorMessage: string | null;
+  queryState: QueryState;
+  logs: string[];
+  error: DbmsError | null;
   durationMs: number | null;
+  rowsProcessed: number;
+  preview: boolean;
 }) {
   return (
     <div className="log-view" aria-live="polite">
       <div className="log-line">
-        <span className="log-time">15:42:08</span>
-        <span className="log-level">PREVIEW</span>
-        <span>查询将在本地示例数据上执行，不会连接真实数据库。</span>
+        <span className="log-level">{preview ? "PREVIEW" : "DBMS"}</span>
+        <span>
+          {preview
+            ? "Fixture 数据，不连接真实数据库。"
+            : "事件由当前数据库连接流式返回。"}
+        </span>
       </div>
+      {logs.map((message, index) => (
+        <div className="log-line" key={`${message}:${index}`}>
+          <span className="log-level log-level--success">INFO</span>
+          <span>{message}</span>
+        </div>
+      ))}
       {queryState === "success" && (
         <div className="log-line">
-          <span className="log-time">15:42:09</span>
           <span className="log-level log-level--success">OK</span>
-          <span>返回 5 行，耗时 {durationMs} ms。</span>
+          <span>
+            处理 {rowsProcessed} 行，耗时 {durationMs ?? 0} ms。
+          </span>
         </div>
       )}
-      {queryState === "error" && (
-        <div className="log-line log-line--error">
-          <span className="log-time">15:42:09</span>
-          <span className="log-level log-level--error">ERROR</span>
-          <span>{errorMessage}</span>
+      {error && (
+        <div className="structured-error structured-error--query" role="alert">
+          <strong>
+            {error.sqlState} · {error.message}
+          </strong>
+          {error.detail && <span>{error.detail}</span>}
+          {error.hint && <span>{error.hint}</span>}
+          {error.position !== null && <span>位置 {error.position}</span>}
+          <code>{error.queryId}</code>
         </div>
       )}
     </div>
   );
 }
 
-function PlanView() {
+function PlanView({
+  queryState,
+  columns,
+  rows,
+}: {
+  queryState: QueryState;
+  columns: DbmsQueryColumn[];
+  rows: Array<Array<string | null>>;
+}) {
+  if (queryState === "running") {
+    return (
+      <div className="result-empty result-empty--loading">
+        <span className="loading-orbit" aria-hidden="true" />
+        <strong>正在读取执行计划</strong>
+      </div>
+    );
+  }
+  if (queryState !== "success" || rows.length === 0) {
+    return (
+      <div className="result-empty">
+        <ListTree size={24} aria-hidden="true" />
+        <strong>运行 Explain</strong>
+      </div>
+    );
+  }
   return (
-    <div className="execution-plan" aria-label="预览执行计划">
-      <div className="plan-node plan-node--root">
-        <ListTree size={16} aria-hidden="true" />
-        <span>Limit</span>
-        <span>rows=5</span>
-      </div>
-      <div className="plan-node plan-node--level-1">
-        <span>Sort</span>
-        <span>hybrid_score DESC</span>
-      </div>
-      <div className="plan-node plan-node--level-2">
-        <span>Filter</span>
-        <span>category = 'database'</span>
-      </div>
-      <div className="plan-node plan-node--level-3">
-        <span>Hybrid Scan</span>
-        <span>documents</span>
-      </div>
+    <div className="execution-plan" aria-label="执行计划">
+      {rows.map((row, index) => (
+        <div
+          className={`plan-node ${
+            index === 0 ? "plan-node--root" : "plan-node--level-1"
+          }`}
+          key={index}
+        >
+          {index === 0 && <ListTree size={16} aria-hidden="true" />}
+          <span>{row.filter((value) => value !== null).join(" · ")}</span>
+          {columns[index] && <span>{columns[index].dataType}</span>}
+        </div>
+      ))}
     </div>
   );
 }

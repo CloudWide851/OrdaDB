@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ordadb_connectors::{
     OperationStarted, PluginCatalogItem, PluginCatalogSnapshot, PluginManager,
@@ -7,8 +8,11 @@ use ordadb_connectors::{
 };
 use ordadb_types::DbError;
 use serde::Serialize;
-use tauri::{Emitter, Manager, State};
+use tauri::{Emitter, Manager, Runtime, State, webview::PageLoadEvent};
 
+mod dbms;
+
+const MAIN_WINDOW_LABEL: &str = "main";
 const PLUGIN_PROGRESS_EVENT: &str = "plugin://progress";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -94,8 +98,34 @@ fn build_plugin_manager_options(plugin_root: PathBuf) -> PluginManagerOptions {
     options
 }
 
+fn show_main_window<R: Runtime, M: Manager<R>>(manager: &M) -> Result<(), String> {
+    let title = manager
+        .config()
+        .product_name
+        .as_deref()
+        .ok_or_else(|| "OrdaDB product name is not configured".to_owned())?;
+    let window = manager
+        .get_webview_window(MAIN_WINDOW_LABEL)
+        .ok_or_else(|| "failed to resolve OrdaDB main window".to_owned())?;
+    window
+        .set_title(title)
+        .map_err(|error| format!("failed to set OrdaDB main window title: {error}"))?;
+    window
+        .show()
+        .map_err(|error| format!("failed to show OrdaDB main window: {error}"))
+}
+
 pub fn run() {
     tauri::Builder::default()
+        .on_page_load(|webview, payload| {
+            if webview.label() == MAIN_WINDOW_LABEL
+                && payload.event() == PageLoadEvent::Finished
+                && let Err(error) = show_main_window(webview)
+            {
+                eprintln!("{error}");
+                webview.app_handle().exit(1);
+            }
+        })
         .setup(|app| {
             let plugin_root = app
                 .path()
@@ -117,7 +147,19 @@ pub fn run() {
                     }
                 }
             });
+            let dbms = dbms::DbmsRuntime::new(Arc::clone(&manager))
+                .map_err(|error| format!("failed to initialize DBMS runtime: {error}"))?;
             app.manage(manager);
+            app.manage(dbms);
+            show_main_window(app)?;
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                if let Err(error) = show_main_window(&handle) {
+                    eprintln!("{error}");
+                    handle.exit(1);
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -128,7 +170,19 @@ pub fn run() {
             plugin_cancel,
             plugin_retry,
             plugin_update,
-            plugin_rollback
+            plugin_rollback,
+            dbms::dbms_save_credential,
+            dbms::dbms_delete_credential,
+            dbms::dbms_connect,
+            dbms::dbms_disconnect,
+            dbms::dbms_catalog,
+            dbms::dbms_execute,
+            dbms::dbms_cancel,
+            dbms::dbms_begin,
+            dbms::dbms_commit,
+            dbms::dbms_rollback,
+            dbms::dbms_monitor,
+            dbms::dbms_checkpoint
         ])
         .run(tauri::generate_context!())
         .expect("failed to run OrdaDB desktop application");
