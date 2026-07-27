@@ -19,7 +19,13 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 ordadb-connectors = { path = "../../../crates/ordadb-connectors" }
+ordadb-protocol = { path = "../../../crates/ordadb-protocol" }
 ordadb-types = { path = "../../../crates/ordadb-types" }
+reqwest.workspace = true
 serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
 tauri = { version = "2", features = [] }
 tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+zeroize.workspace = true

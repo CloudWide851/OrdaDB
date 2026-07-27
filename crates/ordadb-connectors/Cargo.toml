@@ -26,3 +26,8 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[test]]
+name = "connector_host_e2e"
+path = "tests/connector_host_e2e.rs"
+harness = false

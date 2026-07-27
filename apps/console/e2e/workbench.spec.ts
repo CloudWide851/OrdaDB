@@ -139,6 +139,26 @@ test.describe("OrdaDB SQL workbench", () => {
     await page.keyboard.press("Escape");
     await expect(connectorManager).toHaveCount(0);
 
+    await page.getByRole("button", { name: "管理数据源" }).click();
+    const dataSource = page.getByRole("dialog", { name: "数据源" });
+    await expect(dataSource).toBeVisible();
+    await expect(
+      dataSource.getByText("PREVIEW fixture", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      dataSource.getByText("密码仅提交到桌面凭据库"),
+    ).toBeVisible();
+    await dataSource.getByRole("button", { name: "关闭数据源" }).click();
+
+    await page.getByRole("menuitem", { name: "工具" }).click();
+    await page.getByRole("menuitem", { name: "会话" }).click();
+    const operations = page.getByRole("dialog", { name: "数据库运维" });
+    await expect(operations).toBeVisible();
+    await expect(operations.getByText("当前没有活动会话")).toBeVisible();
+    await operations
+      .getByRole("button", { name: "关闭数据库运维" })
+      .click();
+
     const schemaToggle = page.getByRole("button", {
       name: "隐藏数据库浏览器",
     });
@@ -147,13 +167,11 @@ test.describe("OrdaDB SQL workbench", () => {
 
     await page.getByRole("button", { name: /^运行/ }).click();
     await expect(page.getByText("5 行 · 36 ms")).toBeVisible();
-    await expect(
-      page.getByText("向量检索在事务系统中的边界"),
-    ).toBeVisible();
+    await expect(page.getByText("WAL checkpoint overview")).toBeVisible();
     await expect(page.locator(".result-table")).toHaveCSS("font-size", "14px");
 
     await page.getByRole("button", { name: "执行计划" }).click();
-    await expect(page.getByText("Hybrid Scan")).toBeVisible();
+    await expect(page.getByText(/Preview Plan · Seq Scan/)).toBeVisible();
     await expect(page.locator(".result-content")).toHaveCSS(
       "animation-duration",
       "0.13s",

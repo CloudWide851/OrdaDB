@@ -11,6 +11,11 @@ interface StatusBarProps {
 export function StatusBar({ status, loading }: StatusBarProps) {
   const notice = useWorkbenchStore((state) => state.notice);
   const dialect = useWorkbenchStore((state) => state.dialect);
+  const connection = useWorkbenchStore((state) => state.connection);
+  const connectionState = useWorkbenchStore((state) => state.connectionState);
+  const transactionActive = useWorkbenchStore(
+    (state) => state.transactionActive,
+  );
   const dialectLabel = getSqlDialect(dialect).label;
   const modeLabel = loading
     ? "状态检查中"
@@ -22,22 +27,21 @@ export function StatusBar({ status, loading }: StatusBarProps) {
     <footer className="status-bar" aria-label="工作台状态">
       <div className="status-primary" aria-live="polite">
         <Circle size={8} fill="currentColor" strokeWidth={0} aria-hidden="true" />
-        <span>OrdaDB Local</span>
+        <span>{connection?.database ?? "未连接"}</span>
         <span className="status-separator" aria-hidden="true" />
         <span>{notice}</span>
       </div>
       <div className="status-details">
         <span>
           <ShieldCheck size={14} aria-hidden="true" />
-          事务预览
+          {connection?.mode === "preview" ? "PREVIEW" : connectionState}
         </span>
         <span>
           <GitBranch size={14} aria-hidden="true" />
-          自动提交 · 预览
+          {transactionActive ? "事务进行中" : "自动提交"}
         </span>
         <span>UTF-8</span>
         <span>SQL · {dialectLabel}</span>
-        <span>Ln 5, Col 12</span>
         <span>{modeLabel}</span>
         <span>v{status?.version ?? "0.1.0"}</span>
       </div>

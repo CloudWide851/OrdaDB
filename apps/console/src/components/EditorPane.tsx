@@ -5,12 +5,15 @@ import Editor, {
 } from "@monaco-editor/react";
 import {
   AlignLeft,
+  Check,
   ChevronDown,
+  GitBranch,
   History,
   ListTree,
   MoreHorizontal,
   Play,
   Plus,
+  RotateCcw,
   Square,
 } from "lucide-react";
 import { useCallback, useEffect, useRef } from "react";
@@ -120,10 +123,22 @@ export function EditorPane() {
   const dialect = useWorkbenchStore((state) => state.dialect);
   const setDialect = useWorkbenchStore((state) => state.setDialect);
   const queryState = useWorkbenchStore((state) => state.queryState);
-  const runPreviewQuery = useWorkbenchStore((state) => state.runPreviewQuery);
-  const setActiveResultTab = useWorkbenchStore(
-    (state) => state.setActiveResultTab,
+  const runQuery = useWorkbenchStore((state) => state.runQuery);
+  const cancelQuery = useWorkbenchStore((state) => state.cancelQuery);
+  const runExplain = useWorkbenchStore((state) => state.runExplain);
+  const beginTransaction = useWorkbenchStore(
+    (state) => state.beginTransaction,
   );
+  const commitTransaction = useWorkbenchStore(
+    (state) => state.commitTransaction,
+  );
+  const rollbackTransaction = useWorkbenchStore(
+    (state) => state.rollbackTransaction,
+  );
+  const transactionActive = useWorkbenchStore(
+    (state) => state.transactionActive,
+  );
+  const connection = useWorkbenchStore((state) => state.connection);
   const setNotice = useWorkbenchStore((state) => state.setNotice);
   const dialectDescriptor = getSqlDialect(dialect);
 
@@ -186,6 +201,7 @@ export function EditorPane() {
             aria-label="SQL 方言"
             aria-describedby="dialect-tooltip"
             value={dialect}
+            disabled={connection !== null && connection.mode !== "preview"}
             onChange={(event) => {
               const nextDialect = sqlDialects.find(
                 (candidate) => candidate.id === event.target.value,
@@ -217,7 +233,7 @@ export function EditorPane() {
           className="run-query"
           type="button"
           disabled={queryState === "running"}
-          onClick={() => void runPreviewQuery()}
+          onClick={() => void runQuery()}
         >
           <Play size={15} fill="currentColor" aria-hidden="true" />
           {queryState === "running" ? "运行中" : "运行"}
@@ -227,7 +243,7 @@ export function EditorPane() {
           label="停止查询"
           disabled={queryState !== "running"}
           icon={<Square size={14} fill="currentColor" aria-hidden="true" />}
-          onClick={() => setNotice("停止查询 · 预览入口")}
+          onClick={() => void cancelQuery()}
         />
         <span className="toolbar-divider" aria-hidden="true" />
         <IconAction
@@ -235,30 +251,47 @@ export function EditorPane() {
           icon={<AlignLeft size={17} aria-hidden="true" />}
           onClick={() => {
             setSql(formatSqlForDialect(sql, dialectDescriptor));
-            setNotice(`格式化 SQL · ${dialectDescriptor.label} · 预览入口`);
+            setNotice(`格式化 SQL · ${dialectDescriptor.label}`);
           }}
         />
         <IconAction
           label="查询历史"
           icon={<History size={17} aria-hidden="true" />}
-          onClick={() => setNotice("SQL 历史 · 预览入口")}
+          onClick={() => setNotice("SQL 历史 · 尚未提供")}
         />
         <IconAction
           label="执行计划"
           icon={<ListTree size={17} aria-hidden="true" />}
-          onClick={() => {
-            setActiveResultTab("plan");
-            setNotice("执行计划 · 预览数据");
-          }}
+          disabled={!connection?.capabilities.explain}
+          onClick={() => void runExplain()}
         />
-        <button
-          className="transaction-mode"
-          type="button"
-          onClick={() => setNotice("自动提交 · 预览模式")}
-        >
-          自动提交
-          <ChevronDown size={14} aria-hidden="true" />
-        </button>
+        {!transactionActive ? (
+          <button
+            className="transaction-mode"
+            type="button"
+            disabled={!connection?.capabilities.transactions}
+            onClick={() => void beginTransaction()}
+          >
+            <GitBranch size={14} aria-hidden="true" />
+            开始事务
+          </button>
+        ) : (
+          <div className="transaction-actions" aria-label="活动事务">
+            <button
+              className="transaction-mode transaction-mode--active"
+              type="button"
+              onClick={() => void commitTransaction()}
+            >
+              <Check size={14} aria-hidden="true" />
+              提交
+            </button>
+            <IconAction
+              label="回滚事务"
+              icon={<RotateCcw size={15} aria-hidden="true" />}
+              onClick={() => void rollbackTransaction()}
+            />
+          </div>
+        )}
         <span className="toolbar-spacer" />
         <span
           className="dialect-parameter"
@@ -266,7 +299,13 @@ export function EditorPane() {
         >
           参数 {dialectDescriptor.parameterExample}
         </span>
-        <span className="preview-badge">预览</span>
+        <span
+          className={`preview-badge ${
+            connection?.mode === "preview" ? "" : "preview-badge--desktop"
+          }`}
+        >
+          {connection?.mode === "preview" ? "PREVIEW" : connection?.database ?? "未连接"}
+        </span>
         <IconAction
           label="更多查询操作"
           icon={<MoreHorizontal size={18} aria-hidden="true" />}
