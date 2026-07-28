@@ -1,7 +1,10 @@
 import {
   Activity,
   Archive,
+  CircleStop,
   DatabaseBackup,
+  FileInput,
+  FileOutput,
   HardDrive,
   KeyRound,
   LoaderCircle,
@@ -13,6 +16,12 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import type {
+  DbmsOperationKind,
+  DbmsOperationRecord,
+  DbmsServiceStatus,
+  DbmsTransferFormat,
+} from "../lib/dbmsClient";
 import {
   useWorkbenchStore,
   type OperationView,
@@ -43,11 +52,30 @@ export function OperationsPanel({ open, onClose }: OperationsPanelProps) {
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
   const [checkpointArmed, setCheckpointArmed] = useState(false);
+  const [armedAction, setArmedAction] = useState<DbmsOperationKind | null>(null);
+  const [operationPath, setOperationPath] = useState("ordadb-backup.ordbak");
+  const [schema, setSchema] = useState("public");
+  const [table, setTable] = useState("documents");
+  const [format, setFormat] = useState<DbmsTransferFormat>("csv");
   const operationView = useWorkbenchStore((state) => state.operationView);
   const connection = useWorkbenchStore((state) => state.connection);
   const monitor = useWorkbenchStore((state) => state.monitor);
+  const operations = useWorkbenchStore((state) => state.operations);
+  const serviceStatus = useWorkbenchStore((state) => state.serviceStatus);
+  const administrationBusy = useWorkbenchStore(
+    (state) => state.administrationBusy,
+  );
   const connectionError = useWorkbenchStore((state) => state.connectionError);
   const refreshMonitor = useWorkbenchStore((state) => state.refreshMonitor);
+  const refreshAdministration = useWorkbenchStore(
+    (state) => state.refreshAdministration,
+  );
+  const startAdministrationOperation = useWorkbenchStore(
+    (state) => state.startAdministrationOperation,
+  );
+  const cancelAdministrationOperation = useWorkbenchStore(
+    (state) => state.cancelAdministrationOperation,
+  );
   const openOperations = useWorkbenchStore((state) => state.openOperations);
   const checkpoint = useWorkbenchStore((state) => state.checkpoint);
 
@@ -55,8 +83,25 @@ export function OperationsPanel({ open, onClose }: OperationsPanelProps) {
     if (!open) return;
     previousFocusRef.current = document.activeElement as HTMLElement;
     setCheckpointArmed(false);
+    setArmedAction(null);
     window.setTimeout(() => closeButtonRef.current?.focus());
   }, [open]);
+
+  useEffect(() => {
+    if (
+      !open ||
+      !operations.some(
+        (operation) =>
+          operation.state === "queued" || operation.state === "running",
+      )
+    ) {
+      return;
+    }
+    const interval = window.setInterval(() => {
+      void refreshAdministration();
+    }, 750);
+    return () => window.clearInterval(interval);
+  }, [open, operations, refreshAdministration]);
 
   if (!open) return null;
 
@@ -102,7 +147,9 @@ export function OperationsPanel({ open, onClose }: OperationsPanelProps) {
               label="刷新运维状态"
               icon={<RefreshCw size={16} aria-hidden="true" />}
               disabled={!connection}
-              onClick={() => void refreshMonitor()}
+              onClick={() => {
+                void Promise.all([refreshMonitor(), refreshAdministration()]);
+              }}
             />
             <IconAction
               ref={closeButtonRef}
@@ -149,6 +196,44 @@ export function OperationsPanel({ open, onClose }: OperationsPanelProps) {
                 connection={connection}
                 monitor={monitor}
                 checkpointArmed={checkpointArmed}
+                administrationContent={
+                  <AdministrationContent
+                    view={operationView}
+                    connectionMode={connection.mode}
+                    backupEnabled={connection.capabilities.backup}
+                    importExportEnabled={connection.capabilities.importExport}
+                    operations={operations}
+                    serviceStatus={serviceStatus}
+                    busy={administrationBusy}
+                    operationPath={operationPath}
+                    schema={schema}
+                    table={table}
+                    format={format}
+                    armedAction={armedAction}
+                    onPathChange={setOperationPath}
+                    onSchemaChange={setSchema}
+                    onTableChange={setTable}
+                    onFormatChange={setFormat}
+                    onStart={(kind) => {
+                      const destructive = kind === "restore" || kind === "import";
+                      if (destructive && armedAction !== kind) {
+                        setArmedAction(kind);
+                        return;
+                      }
+                      setArmedAction(null);
+                      void startAdministrationOperation({
+                        kind,
+                        path: operationPath,
+                        ...(kind === "import" || kind === "export"
+                          ? { schema, table, format }
+                          : {}),
+                      });
+                    }}
+                    onCancel={(operationId) =>
+                      void cancelAdministrationOperation(operationId)
+                    }
+                  />
+                }
                 onCheckpoint={() => {
                   if (!checkpointArmed) {
                     setCheckpointArmed(true);
@@ -181,6 +266,7 @@ function OperationContent({
   connection,
   monitor,
   checkpointArmed,
+  administrationContent,
   onCheckpoint,
 }: {
   view: OperationView;
@@ -191,6 +277,7 @@ function OperationContent({
     ReturnType<typeof useWorkbenchStore.getState>["monitor"]
   >;
   checkpointArmed: boolean;
+  administrationContent: ReactNode;
   onCheckpoint: () => void;
 }) {
   const capabilities = connection.capabilities;
@@ -298,44 +385,12 @@ function OperationContent({
     );
   }
 
-  if (view === "backup") {
-    if (!capabilities.backup || !monitor.backups.supported) {
-      return (
-        <CapabilityEmpty
-          title="备份写入未实现"
-          detail={monitor.backups.reason || "服务返回 0A000。"}
-        />
-      );
-    }
-  }
-
-  if (view === "importExport" && !capabilities.importExport) {
-    return (
-      <CapabilityEmpty
-        title="导入导出不可用"
-        detail="当前服务没有声明导入导出能力。"
-      />
-    );
-  }
-
-  if (view === "service") {
-    return (
-      <OperationSection title="服务">
-        <MetricGrid
-          values={[
-            ["PostgreSQL", monitor.config.pgBind || "—"],
-            ["管理 API", monitor.config.adminBind || "—"],
-            ["远程 TLS", monitor.config.remoteRequiresTls ? "必须" : "本地"],
-          ]}
-        />
-        {!capabilities.serviceControl && (
-          <CapabilityEmpty
-            title="服务控制需要 UAC"
-            detail="此连接只读展示服务配置，不会模拟启停。"
-          />
-        )}
-      </OperationSection>
-    );
+  if (
+    view === "backup" ||
+    view === "importExport" ||
+    view === "service"
+  ) {
+    return administrationContent;
   }
 
   return (
@@ -348,6 +403,281 @@ function OperationContent({
       }
     />
   );
+}
+
+function AdministrationContent({
+  view,
+  connectionMode,
+  backupEnabled,
+  importExportEnabled,
+  operations,
+  serviceStatus,
+  busy,
+  operationPath,
+  schema,
+  table,
+  format,
+  armedAction,
+  onPathChange,
+  onSchemaChange,
+  onTableChange,
+  onFormatChange,
+  onStart,
+  onCancel,
+}: {
+  view: OperationView;
+  connectionMode: "native" | "plugin" | "preview";
+  backupEnabled: boolean;
+  importExportEnabled: boolean;
+  operations: DbmsOperationRecord[];
+  serviceStatus: DbmsServiceStatus | null;
+  busy: boolean;
+  operationPath: string;
+  schema: string;
+  table: string;
+  format: DbmsTransferFormat;
+  armedAction: DbmsOperationKind | null;
+  onPathChange: (path: string) => void;
+  onSchemaChange: (schema: string) => void;
+  onTableChange: (table: string) => void;
+  onFormatChange: (format: DbmsTransferFormat) => void;
+  onStart: (kind: DbmsOperationKind) => void;
+  onCancel: (operationId: string) => void;
+}) {
+  const fixtureSuffix = connectionMode === "preview" ? " · Preview fixture" : "";
+  if (view === "backup") {
+    if (!backupEnabled) {
+      return (
+        <CapabilityEmpty
+          title="备份不可用"
+          detail="当前连接未提供 OrdaDB 逻辑归档能力。"
+        />
+      );
+    }
+    return (
+      <OperationSection title={`逻辑备份与恢复${fixtureSuffix}`}>
+        <div className="operation-form operation-form--backup">
+          <label>
+            归档文件
+            <input
+              aria-label="逻辑归档文件"
+              value={operationPath}
+              onChange={(event) => onPathChange(event.target.value)}
+            />
+          </label>
+          <div className="operation-form-actions">
+            <button
+              type="button"
+              className="primary-action"
+              disabled={busy || !operationPath.trim()}
+              onClick={() => onStart("backup")}
+            >
+              <DatabaseBackup size={15} aria-hidden="true" />
+              创建备份
+            </button>
+            <button
+              type="button"
+              className={armedAction === "restore" ? "danger-action" : "secondary-action"}
+              disabled={busy || !operationPath.trim()}
+              onClick={() => onStart("restore")}
+            >
+              <FileInput size={15} aria-hidden="true" />
+              {armedAction === "restore" ? "确认恢复并替换" : "恢复归档"}
+            </button>
+          </div>
+        </div>
+        <OperationList
+          operations={operations.filter(
+            (operation) =>
+              operation.kind === "backup" || operation.kind === "restore",
+          )}
+          onCancel={onCancel}
+        />
+      </OperationSection>
+    );
+  }
+
+  if (view === "importExport") {
+    if (!importExportEnabled) {
+      return (
+        <CapabilityEmpty
+          title="导入导出不可用"
+          detail="当前连接未提供表级文件交换能力。"
+        />
+      );
+    }
+    return (
+      <OperationSection title={`表数据交换${fixtureSuffix}`}>
+        <div className="operation-form operation-form--transfer">
+          <label>
+            Schema
+            <input
+              aria-label="导入导出 Schema"
+              value={schema}
+              onChange={(event) => onSchemaChange(event.target.value)}
+            />
+          </label>
+          <label>
+            表
+            <input
+              aria-label="导入导出表"
+              value={table}
+              onChange={(event) => onTableChange(event.target.value)}
+            />
+          </label>
+          <label>
+            格式
+            <select
+              aria-label="导入导出格式"
+              value={format}
+              onChange={(event) =>
+                onFormatChange(event.target.value as DbmsTransferFormat)
+              }
+            >
+              <option value="csv">CSV</option>
+              <option value="jsonLines">JSON Lines</option>
+            </select>
+          </label>
+          <label className="operation-form-path">
+            文件
+            <input
+              aria-label="导入导出文件"
+              value={operationPath}
+              onChange={(event) => onPathChange(event.target.value)}
+            />
+          </label>
+          <div className="operation-form-actions">
+            <button
+              type="button"
+              className={armedAction === "import" ? "danger-action" : "secondary-action"}
+              disabled={busy || !schema.trim() || !table.trim() || !operationPath.trim()}
+              onClick={() => onStart("import")}
+            >
+              <FileInput size={15} aria-hidden="true" />
+              {armedAction === "import" ? "确认导入" : "导入"}
+            </button>
+            <button
+              type="button"
+              className="primary-action"
+              disabled={busy || !schema.trim() || !table.trim() || !operationPath.trim()}
+              onClick={() => onStart("export")}
+            >
+              <FileOutput size={15} aria-hidden="true" />
+              导出
+            </button>
+          </div>
+        </div>
+        <OperationList
+          operations={operations.filter(
+            (operation) =>
+              operation.kind === "import" || operation.kind === "export",
+          )}
+          onCancel={onCancel}
+        />
+      </OperationSection>
+    );
+  }
+
+  if (view === "service") {
+    if (!serviceStatus) {
+      return <CapabilityEmpty title="服务状态不可用" detail="当前连接未返回服务状态。" />;
+    }
+    return (
+      <OperationSection title={`Windows 服务${fixtureSuffix}`}>
+        <MetricGrid
+          values={[
+            ["名称", serviceStatus.name],
+            ["进程", serviceStatus.processRunning ? "运行中" : "未运行"],
+            ["Windows SCM", serviceStatus.windowsServiceSupported ? "支持" : "不可用"],
+            ["数据目录", serviceStatus.dataDir || "—"],
+            ["操作目录", serviceStatus.operationsRoot || "—"],
+          ]}
+        />
+        <CapabilityEmpty
+          title="服务生命周期由安装器与 CLI 管理"
+          detail="Console 只读展示状态；启停与卸载需要管理员权限。"
+        />
+      </OperationSection>
+    );
+  }
+
+  return null;
+}
+
+function OperationList({
+  operations,
+  onCancel,
+}: {
+  operations: DbmsOperationRecord[];
+  onCancel: (operationId: string) => void;
+}) {
+  if (operations.length === 0) {
+    return <InlineEmpty text="暂无作业" />;
+  }
+  return (
+    <div className="operation-jobs" aria-label="数据库作业">
+      {operations.map((operation) => {
+        const active =
+          operation.state === "queued" || operation.state === "running";
+        return (
+          <div className="operation-job" key={operation.operationId}>
+            <div>
+              <strong>{operationKindLabel(operation.kind)}</strong>
+              <span>{operation.path}</span>
+            </div>
+            <span className={`operation-state operation-state--${operation.state}`}>
+              {operationStateLabel(operation.state)}
+            </span>
+            <span>{operation.rows === null ? "—" : `${operation.rows} 行`}</span>
+            {active ? (
+              <button
+                type="button"
+                className="secondary-action"
+                onClick={() => onCancel(operation.operationId)}
+              >
+                <CircleStop size={14} aria-hidden="true" />
+                取消
+              </button>
+            ) : (
+              <span>{formatBytes(operation.bytes)}</span>
+            )}
+            {operation.error && (
+              <div className="structured-error operation-job-error" role="alert">
+                <strong>
+                  {operation.error.sqlState} · {operation.error.message}
+                </strong>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function operationKindLabel(kind: DbmsOperationKind) {
+  return {
+    backup: "备份",
+    restore: "恢复",
+    import: "导入",
+    export: "导出",
+  }[kind];
+}
+
+function operationStateLabel(state: DbmsOperationRecord["state"]) {
+  return {
+    queued: "排队",
+    running: "运行中",
+    succeeded: "完成",
+    failed: "失败",
+    cancelled: "已取消",
+  }[state];
+}
+
+function formatBytes(bytes: number | null) {
+  if (bytes === null) return "—";
+  if (bytes < 1024) return `${bytes} B`;
+  return `${(bytes / 1024).toFixed(1)} KiB`;
 }
 
 function OperationSection({

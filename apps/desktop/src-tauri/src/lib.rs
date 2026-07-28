@@ -182,7 +182,12 @@ pub fn run() {
             dbms::dbms_commit,
             dbms::dbms_rollback,
             dbms::dbms_monitor,
-            dbms::dbms_checkpoint
+            dbms::dbms_checkpoint,
+            dbms::dbms_operations,
+            dbms::dbms_start_operation,
+            dbms::dbms_operation,
+            dbms::dbms_cancel_operation,
+            dbms::dbms_service
         ])
         .run(tauri::generate_context!())
         .expect("failed to run OrdaDB desktop application");

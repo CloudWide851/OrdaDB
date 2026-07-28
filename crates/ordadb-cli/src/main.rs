@@ -39,6 +39,12 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "sql" => sql(options)?,
         "health" => health(options).await?,
         "checkpoint" => checkpoint(options).await?,
+        "backup" => start_path_operation(options, "backups").await?,
+        "restore" => start_path_operation(options, "restores").await?,
+        "import" => start_transfer_operation(options, "imports").await?,
+        "export" => start_transfer_operation(options, "exports").await?,
+        "operations" => operations(options).await?,
+        "service" => service(options).await?,
         "validate-config" => validate_config(options)?,
         _ => return Err(usage()),
     };
@@ -105,10 +111,103 @@ async fn health(mut options: BTreeMap<String, Option<String>>) -> Result<Value> 
 }
 
 async fn checkpoint(mut options: BTreeMap<String, Option<String>>) -> Result<Value> {
-    require_password_stdin(&mut options)?;
     let base = take(&mut options, "--url").unwrap_or_else(|| "http://127.0.0.1:9080".into());
-    let user = take_required(&mut options, "--user")?;
+    let (client, token) = management_session(&mut options, &base).await?;
     ensure_empty(&options)?;
+    post_json(&client, &format!("{base}/v1/checkpoint"), &token, None).await
+}
+
+async fn start_path_operation(
+    mut options: BTreeMap<String, Option<String>>,
+    endpoint: &str,
+) -> Result<Value> {
+    let base = take(&mut options, "--url").unwrap_or_else(|| "http://127.0.0.1:9080".into());
+    let path = take_required(&mut options, "--path")?;
+    let (client, token) = management_session(&mut options, &base).await?;
+    ensure_empty(&options)?;
+    post_json(
+        &client,
+        &format!("{base}/v1/{endpoint}"),
+        &token,
+        Some(&json!({ "path": path })),
+    )
+    .await
+}
+
+async fn start_transfer_operation(
+    mut options: BTreeMap<String, Option<String>>,
+    endpoint: &str,
+) -> Result<Value> {
+    let base = take(&mut options, "--url").unwrap_or_else(|| "http://127.0.0.1:9080".into());
+    let schema = take(&mut options, "--schema").unwrap_or_else(|| "public".into());
+    let table = take_required(&mut options, "--table")?;
+    let path = take_required(&mut options, "--path")?;
+    let format = match take(&mut options, "--format")
+        .unwrap_or_else(|| "csv".into())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "csv" => "csv",
+        "json" | "jsonl" | "json-lines" => "jsonLines",
+        _ => return Err(invalid("--format must be csv or json-lines")),
+    };
+    let (client, token) = management_session(&mut options, &base).await?;
+    ensure_empty(&options)?;
+    post_json(
+        &client,
+        &format!("{base}/v1/{endpoint}"),
+        &token,
+        Some(&json!({
+            "schema": schema,
+            "table": table,
+            "path": path,
+            "format": format,
+        })),
+    )
+    .await
+}
+
+async fn operations(mut options: BTreeMap<String, Option<String>>) -> Result<Value> {
+    let base = take(&mut options, "--url").unwrap_or_else(|| "http://127.0.0.1:9080".into());
+    let operation_id = take(&mut options, "--id");
+    let cancel = options.remove("--cancel").is_some();
+    let (client, token) = management_session(&mut options, &base).await?;
+    ensure_empty(&options)?;
+    match (operation_id, cancel) {
+        (None, false) => get_json(&format!("{base}/v1/operations"), Some(&token)).await,
+        (Some(operation_id), false) => {
+            get_json(
+                &format!("{base}/v1/operations/{operation_id}"),
+                Some(&token),
+            )
+            .await
+        }
+        (Some(operation_id), true) => {
+            post_json(
+                &client,
+                &format!("{base}/v1/operations/{operation_id}/cancel"),
+                &token,
+                None,
+            )
+            .await
+        }
+        (None, true) => Err(invalid("--cancel requires --id")),
+    }
+}
+
+async fn service(mut options: BTreeMap<String, Option<String>>) -> Result<Value> {
+    let base = take(&mut options, "--url").unwrap_or_else(|| "http://127.0.0.1:9080".into());
+    let (_client, token) = management_session(&mut options, &base).await?;
+    ensure_empty(&options)?;
+    get_json(&format!("{base}/v1/service"), Some(&token)).await
+}
+
+async fn management_session(
+    options: &mut BTreeMap<String, Option<String>>,
+    base: &str,
+) -> Result<(reqwest::Client, Zeroizing<String>)> {
+    require_password_stdin(options)?;
+    let user = take_required(options, "--user")?;
     let password = read_secret_from_stdin()?;
     let client = reqwest::Client::new();
     let token: Value = client
@@ -128,18 +227,28 @@ async fn checkpoint(mut options: BTreeMap<String, Option<String>>) -> Result<Val
     let access_token = token["data"]["accessToken"]
         .as_str()
         .ok_or_else(|| protocol("management token response has no access token"))?;
-    let response: Value = client
-        .post(format!("{base}/v1/checkpoint"))
-        .bearer_auth(access_token)
+    Ok((client, Zeroizing::new(access_token.to_owned())))
+}
+
+async fn post_json(
+    client: &reqwest::Client,
+    url: &str,
+    bearer: &str,
+    body: Option<&Value>,
+) -> Result<Value> {
+    let mut request = client.post(url).bearer_auth(bearer);
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    request
         .send()
         .await
-        .map_err(|error| network("failed to request checkpoint", error))?
+        .map_err(|error| network("management request failed", error))?
         .error_for_status()
-        .map_err(|error| network("checkpoint request failed", error))?
+        .map_err(|error| network("management request returned an error", error))?
         .json()
         .await
-        .map_err(|error| network("checkpoint response is invalid", error))?;
-    Ok(response)
+        .map_err(|error| network("management response is invalid", error))
 }
 
 fn validate_config(mut options: BTreeMap<String, Option<String>>) -> Result<Value> {
@@ -194,9 +303,9 @@ fn parse_options(arguments: &[String]) -> Result<BTreeMap<String, Option<String>
         if !option.starts_with("--") {
             return Err(invalid(format!("unexpected positional argument {option}")));
         }
-        if option == "--password-stdin" {
+        if matches!(option.as_str(), "--password-stdin" | "--cancel") {
             if options.insert(option.clone(), None).is_some() {
-                return Err(invalid("--password-stdin was provided more than once"));
+                return Err(invalid(format!("{option} was provided more than once")));
             }
             index += 1;
             continue;
@@ -264,7 +373,9 @@ fn ensure_empty(options: &BTreeMap<String, Option<String>>) -> Result<()> {
 }
 
 fn usage() -> DbError {
-    invalid("usage: ordadb-cli <bootstrap|sql|health|checkpoint|validate-config> [options]")
+    invalid(
+        "usage: ordadb-cli <bootstrap|sql|health|checkpoint|backup|restore|import|export|operations|service|validate-config> [options]",
+    )
 }
 
 fn invalid(message: impl Into<String>) -> DbError {

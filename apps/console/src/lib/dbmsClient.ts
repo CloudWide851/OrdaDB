@@ -157,6 +157,46 @@ export interface DbmsMonitorSnapshot {
   };
 }
 
+export type DbmsOperationKind = "backup" | "restore" | "import" | "export";
+export type DbmsOperationState =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+export type DbmsTransferFormat = "csv" | "jsonLines";
+
+export interface DbmsOperationRecord {
+  operationId: string;
+  kind: DbmsOperationKind;
+  state: DbmsOperationState;
+  path: string;
+  schema: string | null;
+  table: string | null;
+  startedAt: unknown | null;
+  finishedAt: unknown | null;
+  rows: number | null;
+  bytes: number | null;
+  error: DbmsError | null;
+}
+
+export interface StartDbmsOperationRequest {
+  connectionId: string;
+  kind: DbmsOperationKind;
+  path: string;
+  schema?: string;
+  table?: string;
+  format?: DbmsTransferFormat;
+}
+
+export interface DbmsServiceStatus {
+  name: string;
+  processRunning: boolean;
+  windowsServiceSupported: boolean;
+  dataDir: string;
+  operationsRoot: string;
+}
+
 export interface DbmsClient {
   readonly mode: "desktop" | "preview";
   saveCredential(request: SaveCredentialRequest): Promise<CredentialSaved>;
@@ -175,6 +215,19 @@ export interface DbmsClient {
   rollback(connectionId: string): Promise<DbmsCommandResult>;
   monitor(connectionId: string): Promise<DbmsMonitorSnapshot>;
   checkpoint(connectionId: string): Promise<DbmsEngineStatus>;
+  operations(connectionId: string): Promise<DbmsOperationRecord[]>;
+  startOperation(
+    request: StartDbmsOperationRequest,
+  ): Promise<DbmsOperationRecord>;
+  operation(
+    connectionId: string,
+    operationId: string,
+  ): Promise<DbmsOperationRecord>;
+  cancelOperation(
+    connectionId: string,
+    operationId: string,
+  ): Promise<DbmsOperationRecord>;
+  service(connectionId: string): Promise<DbmsServiceStatus>;
 }
 
 const previewCapabilities: DbmsCapabilities = {
@@ -187,8 +240,8 @@ const previewCapabilities: DbmsCapabilities = {
   metrics: true,
   wal: false,
   checkpoint: false,
-  backup: false,
-  importExport: false,
+  backup: true,
+  importExport: true,
   serviceControl: false,
 };
 
@@ -316,10 +369,52 @@ class TauriDbmsClient implements DbmsClient {
   checkpoint(connectionId: string) {
     return invoke<DbmsEngineStatus>("dbms_checkpoint", { connectionId });
   }
+
+  operations(connectionId: string) {
+    return invoke<DbmsOperationRecord[]>("dbms_operations", { connectionId });
+  }
+
+  startOperation(request: StartDbmsOperationRequest) {
+    return invoke<DbmsOperationRecord>("dbms_start_operation", { request });
+  }
+
+  operation(connectionId: string, operationId: string) {
+    return invoke<DbmsOperationRecord>("dbms_operation", {
+      connectionId,
+      operationId,
+    });
+  }
+
+  cancelOperation(connectionId: string, operationId: string) {
+    return invoke<DbmsOperationRecord>("dbms_cancel_operation", {
+      connectionId,
+      operationId,
+    });
+  }
+
+  service(connectionId: string) {
+    return invoke<DbmsServiceStatus>("dbms_service", { connectionId });
+  }
 }
 
 export class PreviewDbmsClient implements DbmsClient {
   readonly mode = "preview";
+  private operationSequence = 1;
+  private operationRecords: DbmsOperationRecord[] = [
+    {
+      operationId: "preview-operation-0",
+      kind: "backup",
+      state: "succeeded",
+      path: "preview-demo.ordbak",
+      schema: null,
+      table: null,
+      startedAt: "preview",
+      finishedAt: "preview",
+      rows: 5,
+      bytes: 2048,
+      error: null,
+    },
+  ];
 
   saveCredential: DbmsClient["saveCredential"] = async (request) => ({
     credentialId: request.credentialId,
@@ -370,8 +465,8 @@ export class PreviewDbmsClient implements DbmsClient {
     storage: emptyEngineStatus(),
     wal: emptyEngineStatus(),
     backups: {
-      supported: false,
-      reason: "Preview 不连接真实数据库",
+      supported: true,
+      reason: "Preview fixture · 不写入文件",
     },
     config: {
       dataDir: "",
@@ -384,6 +479,75 @@ export class PreviewDbmsClient implements DbmsClient {
   checkpoint: DbmsClient["checkpoint"] = async () => {
     throw previewError("0A000", "Preview 不执行检查点");
   };
+
+  operations: DbmsClient["operations"] = async () => {
+    for (const operation of this.operationRecords) {
+      if (operation.state === "queued") {
+        operation.state = "succeeded";
+        operation.startedAt = "preview";
+        operation.finishedAt = "preview";
+        operation.rows = operation.kind === "backup" ? 5 : 0;
+        operation.bytes = operation.kind === "restore" ? 0 : 2048;
+      }
+    }
+    return this.operationRecords.map((operation) => ({ ...operation }));
+  };
+
+  startOperation: DbmsClient["startOperation"] = async (request) => {
+    const operation: DbmsOperationRecord = {
+      operationId: `preview-operation-${this.operationSequence++}`,
+      kind: request.kind,
+      state: "queued",
+      path: request.path,
+      schema: request.schema ?? null,
+      table: request.table ?? null,
+      startedAt: null,
+      finishedAt: null,
+      rows: null,
+      bytes: null,
+      error: null,
+    };
+    this.operationRecords = [operation, ...this.operationRecords];
+    return { ...operation };
+  };
+
+  operation: DbmsClient["operation"] = async (_connectionId, operationId) => {
+    const operation = this.operationRecords.find(
+      (candidate) => candidate.operationId === operationId,
+    );
+    if (!operation) throw previewError("42704", "Preview 作业不存在");
+    if (operation.state === "queued") {
+      operation.state = "succeeded";
+      operation.startedAt = "preview";
+      operation.finishedAt = "preview";
+      operation.rows = operation.kind === "backup" ? 5 : 0;
+      operation.bytes = operation.kind === "restore" ? 0 : 2048;
+    }
+    return { ...operation };
+  };
+
+  cancelOperation: DbmsClient["cancelOperation"] = async (
+    _connectionId,
+    operationId,
+  ) => {
+    const operation = this.operationRecords.find(
+      (candidate) => candidate.operationId === operationId,
+    );
+    if (!operation) throw previewError("42704", "Preview 作业不存在");
+    if (operation.state === "queued" || operation.state === "running") {
+      operation.state = "cancelled";
+      operation.finishedAt = "preview";
+    }
+    return { ...operation };
+  };
+
+  service: DbmsClient["service"] = async () => ({
+    name: "OrdaDB Preview",
+    processRunning: false,
+    windowsServiceSupported: true,
+    dataDir: "Preview fixture",
+    operationsRoot: "Preview fixture",
+  });
 }
 
 let client: DbmsClient | undefined;

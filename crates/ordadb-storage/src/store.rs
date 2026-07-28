@@ -16,6 +16,7 @@ pub(crate) const DATABASE_FILE_NAME: &str = "ordadb.data";
 const MANIFEST_MAGIC: &str = "ORDADB";
 const DEFAULT_BUFFER_CAPACITY: usize = 64;
 const INDEX_RECORD_VERSION: u16 = 1;
+const MAX_MANIFEST_PAGE_REFERENCES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PersistentState {
@@ -28,13 +29,126 @@ pub struct PersistentState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableManifest {
     pub table_id: TableId,
+    #[serde(with = "page_directory")]
     pub heap_pages: Vec<PageId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexManifest {
     pub index_id: IndexId,
+    #[serde(with = "page_directory")]
     pub index_pages: Vec<PageId>,
+}
+
+mod page_directory {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{MAX_MANIFEST_PAGE_REFERENCES, PageId};
+
+    #[derive(Serialize, Deserialize)]
+    struct PageRange {
+        first: PageId,
+        count: u64,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum Representation {
+        Legacy(Vec<PageId>),
+        Compact { ranges: Vec<PageRange> },
+    }
+
+    pub fn serialize<S>(pages: &[PageId], serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut ranges = Vec::<PageRange>::new();
+        for page in pages {
+            if let Some(previous) = ranges.last_mut() {
+                let next = previous
+                    .first
+                    .get()
+                    .checked_add(previous.count)
+                    .ok_or_else(|| serde::ser::Error::custom("page directory range overflowed"))?;
+                if next == page.get() {
+                    previous.count = previous.count.checked_add(1).ok_or_else(|| {
+                        serde::ser::Error::custom("page directory range count overflowed")
+                    })?;
+                    continue;
+                }
+            }
+            ranges.push(PageRange {
+                first: *page,
+                count: 1,
+            });
+        }
+        Representation::Compact { ranges }.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<Vec<PageId>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match Representation::deserialize(deserializer)? {
+            Representation::Legacy(pages) => {
+                validate_count(pages.len() as u64)?;
+                Ok(pages)
+            }
+            Representation::Compact { ranges } => expand_ranges(ranges),
+        }
+    }
+
+    fn expand_ranges<E>(ranges: Vec<PageRange>) -> std::result::Result<Vec<PageId>, E>
+    where
+        E: serde::de::Error,
+    {
+        let mut total = 0_u64;
+        let mut previous_end = None;
+        for range in &ranges {
+            if range.count == 0 {
+                return Err(E::custom("page directory ranges must be non-empty"));
+            }
+            let end = range
+                .first
+                .get()
+                .checked_add(range.count)
+                .ok_or_else(|| E::custom("page directory range overflowed"))?;
+            if previous_end.is_some_and(|previous| range.first.get() < previous) {
+                return Err(E::custom(
+                    "page directory ranges must be ordered and non-overlapping",
+                ));
+            }
+            previous_end = Some(end);
+            total = total
+                .checked_add(range.count)
+                .ok_or_else(|| E::custom("page directory count overflowed"))?;
+        }
+        validate_count(total)?;
+        let capacity = usize::try_from(total)
+            .map_err(|_| E::custom("page directory does not fit this platform"))?;
+        let mut pages = Vec::with_capacity(capacity);
+        for range in ranges {
+            let end = range
+                .first
+                .get()
+                .checked_add(range.count)
+                .ok_or_else(|| E::custom("page directory range overflowed"))?;
+            pages.extend((range.first.get()..end).map(PageId::new));
+        }
+        Ok(pages)
+    }
+
+    fn validate_count<E>(count: u64) -> std::result::Result<(), E>
+    where
+        E: serde::de::Error,
+    {
+        if count > MAX_MANIFEST_PAGE_REFERENCES {
+            return Err(E::custom(format!(
+                "page directory contains {count} references, exceeding {MAX_MANIFEST_PAGE_REFERENCES}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1022,6 +1136,42 @@ mod tests {
         assert_eq!(reopened.committed_state(), &state);
         assert_eq!(reopened.table_manifests(), table_manifests);
         assert_eq!(reopened.index_manifests(), index_manifests);
+    }
+
+    #[test]
+    fn page_directories_use_compact_ranges_and_accept_legacy_lists() {
+        let manifest = TableManifest {
+            table_id: TableId::new(7),
+            heap_pages: (1..=10_000).map(PageId::new).collect(),
+        };
+        let encoded = serde_json::to_string(&manifest).expect("compact manifest");
+        assert!(encoded.contains("\"ranges\""));
+        assert!(encoded.len() < 128, "{encoded}");
+        assert_eq!(
+            serde_json::from_str::<TableManifest>(&encoded).expect("compact round trip"),
+            manifest
+        );
+
+        let legacy = r#"{"table_id":7,"heap_pages":[1,2,3]}"#;
+        assert_eq!(
+            serde_json::from_str::<TableManifest>(legacy)
+                .expect("legacy page directory")
+                .heap_pages,
+            vec![PageId::new(1), PageId::new(2), PageId::new(3)]
+        );
+    }
+
+    #[test]
+    fn page_directories_reject_empty_overlapping_and_oversized_ranges() {
+        let empty = r#"{"table_id":7,"heap_pages":{"ranges":[{"first":1,"count":0}]}}"#;
+        assert!(serde_json::from_str::<TableManifest>(empty).is_err());
+        let overlapping = r#"{"table_id":7,"heap_pages":{"ranges":[{"first":1,"count":3},{"first":2,"count":1}]}}"#;
+        assert!(serde_json::from_str::<TableManifest>(overlapping).is_err());
+        let oversized = format!(
+            r#"{{"table_id":7,"heap_pages":{{"ranges":[{{"first":1,"count":{}}}]}}}}"#,
+            MAX_MANIFEST_PAGE_REFERENCES + 1
+        );
+        assert!(serde_json::from_str::<TableManifest>(&oversized).is_err());
     }
 
     #[test]

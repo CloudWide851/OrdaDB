@@ -1,5 +1,5 @@
 [package]
-name = "ordadb-admin"
+name = "ordadb-backup"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,28 +7,19 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-argon2.workspace = true
-async-stream.workspace = true
-axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
-futures-core.workspace = true
-hmac.workspace = true
-ordadb-backup = { path = "../ordadb-backup" }
+csv.workspace = true
 ordadb-catalog = { path = "../ordadb-catalog" }
 ordadb-engine = { path = "../ordadb-engine" }
 ordadb-types = { path = "../ordadb-types" }
-pbkdf2.workspace = true
-rand.workspace = true
+rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-subtle.workspace = true
-tokio.workspace = true
+tempfile.workspace = true
 uuid.workspace = true
-windows-sys.workspace = true
-zeroize.workspace = true
 
 [dev-dependencies]
+ordadb-engine = { path = "../ordadb-engine" }
 tempfile.workspace = true
-tower.workspace = true

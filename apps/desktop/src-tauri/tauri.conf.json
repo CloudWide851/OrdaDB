@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "pnpm --dir ../console dev --host 127.0.0.1",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "pnpm --dir ../console build",
+    "beforeBuildCommand": "pnpm --dir ../console build && pnpm --dir ../.. package:stage:x64",
     "frontendDist": "../../console/dist"
   },
   "app": {
@@ -32,10 +32,15 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
+    "resources": {
+      "staging/windows-x64/ordadb-server.exe": "ordadb-server.exe",
+      "staging/windows-x64/ordadb-cli.exe": "ordadb-cli.exe"
+    },
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico",
-        "installMode": "currentUser"
+        "installMode": "perMachine",
+        "installerHooks": "nsis/installer-hooks.nsh"
       }
     }
   }

@@ -68,7 +68,7 @@ pub fn authenticate<S: Read + Write>(
     let client_user = unescape_username(required(&client_attributes, 'n')?)?;
     let client_nonce = required(&client_attributes, 'r')?;
     validate_nonce(client_nonce)?;
-    if client_user != username {
+    if !scram_username_matches_startup(&client_user, username) {
         return Err(authentication_failed());
     }
 
@@ -206,6 +206,13 @@ fn unescape_username(username: &str) -> Result<String> {
     Ok(result)
 }
 
+fn scram_username_matches_startup(client_user: &str, startup_user: &str) -> bool {
+    // PostgreSQL authenticates the user from StartupMessage and ignores the
+    // SCRAM username. Its JDBC driver deliberately sends `n=*`, while the
+    // native OrdaDB client repeats the startup user.
+    client_user == "*" || client_user == startup_user
+}
+
 fn validate_nonce(nonce: &str) -> Result<()> {
     if !(MIN_NONCE_BYTES..=MAX_NONCE_BYTES).contains(&nonce.len())
         || !nonce
@@ -237,6 +244,9 @@ mod tests {
         assert_eq!(parsed.response, response);
         assert_eq!(unescape_username("a=2Cb=3Dc").expect("escape"), "a,b=c");
         assert!(unescape_username("a=4Fb").is_err());
+        assert!(scram_username_matches_startup("*", "dba"));
+        assert!(scram_username_matches_startup("dba", "dba"));
+        assert!(!scram_username_matches_startup("other", "dba"));
     }
 
     #[test]
