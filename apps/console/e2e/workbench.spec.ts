@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
 test.describe("OrdaDB SQL workbench", () => {
   test.setTimeout(60_000);
@@ -10,48 +10,83 @@ test.describe("OrdaDB SQL workbench", () => {
     await page.goto("/");
 
     await expect(page.getByText("OrdaDB", { exact: true })).toBeVisible();
+    await expect(page.getByText("界面预览", { exact: true })).toBeVisible();
     await expect(page.locator(".brand-logo")).toBeVisible();
     await expect(page.locator(".titlebar")).toHaveCSS("height", "38px");
     await expect(page.locator(".command-strip")).toHaveCount(0);
     await expect(page.getByText("OrdaDB Local / default")).toHaveCount(0);
-    await expect(page.getByText("query_01.sql", { exact: true })).toHaveCount(1);
-    await expect(
-      page.getByText("query_01.sql", { exact: true }).locator(".."),
-    ).toHaveClass(/query-tab/);
-    await expect(page.locator("body")).toHaveCSS("font-size", "13px");
-    await expect(page.locator(".tree-row").first()).toHaveCSS(
-      "min-height",
-      "26px",
-    );
+    await expect(page.getByText("query_01.sql", { exact: true })).toHaveCount(0);
+    await expect(page.locator(".query-tab")).toHaveCount(0);
+    await expect(page.locator("body")).toHaveCSS("font-size", "11px");
     await expect(page.locator(".island").first()).toHaveCSS(
       "border-radius",
-      "8px",
+      "7px",
     );
     await expect(
       page.getByRole("complementary", { name: "数据库浏览器" }),
     ).toBeVisible();
     await expect(page.getByRole("region", { name: "SQL 编辑器" })).toBeVisible();
+    await expect(page.getByText("public", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("后续能力", { exact: true })).toHaveCount(0);
+    await page.getByRole("tab", { name: "数据库" }).click();
+    const disconnectedTree = page.locator(".schema-tree--disconnected");
+    await expect(disconnectedTree.getByRole("button")).toHaveCount(1);
+    await expect(
+      disconnectedTree.getByRole("button", { name: "连接数据库" }),
+    ).toBeVisible();
+    await page.getByRole("tab", { name: "项目" }).click();
+    await openPreviewWorkspace(page);
     await expect(
       page.getByRole("textbox", { name: "SQL 编辑器" }),
     ).toBeVisible({ timeout: 45_000 });
+    await expect(page.locator(".view-lines")).toHaveCSS("font-size", "12px");
+    await page
+      .locator(".schema-pane .heading-actions")
+      .getByRole("button", { name: "新建 SQL 文件" })
+      .click();
+    await expect(page.getByRole("tab", { name: "query.sql" })).toBeVisible();
+    const sqlEditor = page.getByRole("textbox", { name: "SQL 编辑器" });
+    await sqlEditor.focus();
+    await page.keyboard.press("Control+A");
+    await page.keyboard.insertText("select 42;");
+    await page.keyboard.press("Control+S");
+    await expect(page.getByText("全部 SQL 文件已保存")).toBeVisible();
+    await page
+      .locator(".workspace-tree")
+      .getByRole("button", { name: "query.sql" })
+      .click();
+    await page.getByRole("button", { name: "重命名项目条目" }).click();
+    const renameInput = page.getByRole("textbox", { name: "重命名 query.sql" });
+    await renameInput.fill("renamed.sql");
+    await renameInput.press("Enter");
+    await expect(page.getByRole("tab", { name: "renamed.sql" })).toBeVisible();
+    await page
+      .locator(".workspace-tree")
+      .getByRole("button", { name: /renamed\.sql/ })
+      .click();
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.getByRole("button", { name: "移入回收站" }).click();
+    await expect(page.getByRole("tab", { name: "renamed.sql" })).toHaveCount(0);
+    await page
+      .locator(".workspace-tree")
+      .getByRole("button", { name: /scratch\.sql/ })
+      .click();
     await expect(
       page.getByRole("complementary", { name: "对象检查器" }),
     ).toBeVisible();
     await expect(page.locator(".island")).toHaveCount(3);
     const dialectSelector = page.getByRole("combobox", { name: "SQL 方言" });
     await expect(dialectSelector).toHaveValue("postgresql");
-    await expect(page.getByText("参数 $1", { exact: true })).toBeVisible();
     await dialectSelector.hover();
     await expect(
       page.getByRole("tooltip", { name: "SQL 方言 · 参数 $1" }),
     ).toBeVisible();
     await dialectSelector.selectOption("mysql");
-    await expect(page.getByText("参数 ?", { exact: true })).toBeVisible();
     await expect(page.getByText("SQL · MySQL", { exact: true })).toBeVisible();
     await dialectSelector.selectOption("sqlite");
     await expect(dialectSelector).toHaveValue("sqlite");
     await dialectSelector.selectOption("sqlServer");
-    await expect(page.getByText("参数 @p1", { exact: true })).toBeVisible();
+    await expect(page.getByText("SQL · SQL Server", { exact: true })).toBeVisible();
     await dialectSelector.selectOption("postgresql");
 
     const windowControls = page.locator(".window-controls button");
@@ -89,6 +124,17 @@ test.describe("OrdaDB SQL workbench", () => {
     await page.getByRole("textbox", { name: "搜索命令" }).fill("服务");
     await expect(page.getByRole("option", { name: /服务管理/ })).toBeVisible();
     await page.keyboard.press("Escape");
+
+    await page.keyboard.press("Control+Alt+S");
+    const settings = page.getByRole("dialog", { name: "设置" });
+    await expect(settings.getByLabel("界面字体")).toHaveValue("11");
+    await expect(settings.getByLabel("数据字体")).toHaveValue("12");
+    await expect(settings.getByLabel("编辑器字体")).toHaveValue("12");
+    await expect(
+      settings.getByLabel("启动时自动恢复上次 SQL 项目"),
+    ).not.toBeChecked();
+    await settings.getByRole("button", { name: "保存设置" }).click();
+    await expect(settings).toHaveCount(0);
 
     await page.keyboard.press("Control+Alt+Shift+S");
     const connectorManager = page.getByRole("dialog", { name: "连接插件" });
@@ -139,16 +185,12 @@ test.describe("OrdaDB SQL workbench", () => {
     await page.keyboard.press("Escape");
     await expect(connectorManager).toHaveCount(0);
 
-    await page.getByRole("button", { name: "管理数据源" }).click();
-    const dataSource = page.getByRole("dialog", { name: "数据源" });
-    await expect(dataSource).toBeVisible();
+    await connectPreviewDatabase(page);
+    await page.getByRole("tab", { name: "数据库" }).click();
     await expect(
-      dataSource.getByText("PREVIEW fixture", { exact: true }),
-    ).toBeVisible();
-    await expect(
-      dataSource.getByText("密码仅提交到桌面凭据库"),
-    ).toBeVisible();
-    await dataSource.getByRole("button", { name: "关闭数据源" }).click();
+      page.getByRole("button", { name: /^表/ }),
+    ).toHaveAttribute("aria-expanded", "false");
+    await expect(page.getByText("物化视图", { exact: true })).toHaveCount(0);
 
     await page.getByRole("menuitem", { name: "工具" }).click();
     await page.getByRole("menuitem", { name: "会话" }).click();
@@ -181,7 +223,7 @@ test.describe("OrdaDB SQL workbench", () => {
     await page.getByRole("button", { name: /^运行/ }).click();
     await expect(page.getByText("5 行 · 36 ms")).toBeVisible();
     await expect(page.getByText("WAL checkpoint overview")).toBeVisible();
-    await expect(page.locator(".result-table")).toHaveCSS("font-size", "14px");
+    await expect(page.locator(".result-table")).toHaveCSS("font-size", "12px");
 
     await page.getByRole("button", { name: "执行计划" }).click();
     await expect(page.getByText(/Preview Plan · Seq Scan/)).toBeVisible();
@@ -226,6 +268,8 @@ test.describe("OrdaDB SQL workbench", () => {
       expect(hasHorizontalOverflow).toBe(false);
     }
 
+    await openPreviewWorkspace(page);
+    await connectPreviewDatabase(page);
     const sqlEditor = page.getByRole("textbox", { name: "SQL 编辑器" });
     await sqlEditor.focus();
     await expect(sqlEditor).toBeFocused();
@@ -239,6 +283,8 @@ test.describe("OrdaDB SQL workbench", () => {
     await page.emulateMedia({ reducedMotion: "reduce" });
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto("/");
+    await openPreviewWorkspace(page);
+    await connectPreviewDatabase(page);
 
     await page
       .getByRole("button", { name: "隐藏数据库浏览器" })
@@ -274,3 +320,39 @@ test.describe("OrdaDB SQL workbench", () => {
     await expect(page.getByText("5 行 · 36 ms")).toBeVisible();
   });
 });
+
+async function openPreviewWorkspace(page: Page) {
+  await page.getByRole("tab", { name: "项目" }).click();
+  const workspaceTree = page.locator(".workspace-tree");
+  const openProject = workspaceTree.getByRole("button", {
+    name: "打开 SQL 项目",
+  });
+  if (await openProject.isVisible()) {
+    await openProject.click();
+  }
+  await workspaceTree
+    .getByRole("button", { name: /customers\.sql/ })
+    .click();
+  await expect(page.getByRole("tab", { name: "customers.sql" })).toBeVisible();
+}
+
+async function connectPreviewDatabase(page: Page) {
+  await page.getByRole("tab", { name: "数据库" }).click();
+  const disconnected = page.locator(".schema-tree--disconnected");
+  if (await disconnected.isVisible()) {
+    await disconnected
+      .getByRole("button", { name: "连接数据库" })
+      .click();
+    const dialog = page.getByRole("dialog", { name: "数据源" });
+    await expect(dialog.getByText("密码仅提交到桌面凭据库")).toBeVisible();
+    await dialog.getByLabel("密码").fill("preview-only");
+    await dialog
+      .getByRole("button", { name: "连接", exact: true })
+      .click();
+    await expect(page.getByLabel("连接状态：connected")).toBeVisible();
+    if (await dialog.isVisible()) {
+      await dialog.getByRole("button", { name: "关闭数据源" }).click();
+    }
+  }
+  await page.getByRole("tab", { name: "项目" }).click();
+}

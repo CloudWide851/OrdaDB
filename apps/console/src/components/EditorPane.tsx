@@ -8,13 +8,13 @@ import {
   Check,
   ChevronDown,
   GitBranch,
-  History,
   ListTree,
-  MoreHorizontal,
   Play,
   Plus,
   RotateCcw,
+  Save,
   Square,
+  X,
 } from "lucide-react";
 import { useCallback, useEffect, useRef } from "react";
 import {
@@ -120,6 +120,27 @@ export function EditorPane() {
   const completionRef = useRef<{ dispose: () => void } | null>(null);
   const sql = useWorkbenchStore((state) => state.sql);
   const setSql = useWorkbenchStore((state) => state.setSql);
+  const settings = useWorkbenchStore((state) => state.settings);
+  const workspace = useWorkbenchStore((state) => state.workspace);
+  const documents = useWorkbenchStore((state) => state.documents);
+  const activeDocumentPath = useWorkbenchStore(
+    (state) => state.activeDocumentPath,
+  );
+  const openWorkspace = useWorkbenchStore((state) => state.openWorkspace);
+  const createDocument = useWorkbenchStore((state) => state.createDocument);
+  const activateDocument = useWorkbenchStore(
+    (state) => state.activateDocument,
+  );
+  const closeDocument = useWorkbenchStore((state) => state.closeDocument);
+  const reloadActiveDocument = useWorkbenchStore(
+    (state) => state.reloadActiveDocument,
+  );
+  const saveActiveDocument = useWorkbenchStore(
+    (state) => state.saveActiveDocument,
+  );
+  const activeDocument = documents.find(
+    (document) => document.path === activeDocumentPath,
+  );
   const dialect = useWorkbenchStore((state) => state.dialect);
   const setDialect = useWorkbenchStore((state) => state.setDialect);
   const queryState = useWorkbenchStore((state) => state.queryState);
@@ -172,27 +193,53 @@ export function EditorPane() {
   return (
     <section className="editor-pane" aria-label="SQL 编辑器">
       <div className="query-tabs" role="tablist" aria-label="查询标签">
-        <button
-          type="button"
-          className="query-tab query-tab--active"
-          role="tab"
-          aria-selected="true"
-        >
-          <span className="query-dot" aria-hidden="true" />
-          query_01.sql
-        </button>
-        <button
-          type="button"
-          className="query-tab"
-          role="tab"
-          aria-selected="false"
-        >
-          scratch_02.sql
-        </button>
+        {documents.map((document) => {
+          const active = document.path === activeDocumentPath;
+          return (
+            <div
+              className={`query-tab-wrap ${active ? "query-tab-wrap--active" : ""}`}
+              key={document.path}
+            >
+              <button
+                type="button"
+                className={`query-tab ${active ? "query-tab--active" : ""}`}
+                role="tab"
+                aria-selected={active}
+                onClick={() => activateDocument(document.path)}
+              >
+                {(document.dirty || document.conflict) && (
+                  <span
+                    className={`query-dot ${
+                      document.conflict ? "query-dot--conflict" : ""
+                    }`}
+                    aria-label={document.conflict ? "外部冲突" : "未保存"}
+                  />
+                )}
+                {document.name}
+              </button>
+              <IconAction
+                label={`关闭 ${document.name}`}
+                className="query-close"
+                icon={<X size={12} aria-hidden="true" />}
+                onClick={() => {
+                  if (
+                    !document.dirty ||
+                    window.confirm(`${document.name} 尚未保存，仍要关闭吗？`)
+                  ) {
+                    void closeDocument(document.path);
+                  }
+                }}
+              />
+            </div>
+          );
+        })}
         <IconAction
-          label="新建查询"
+          label={workspace ? "新建 SQL 文件" : "打开 SQL 项目"}
           className="query-add"
           icon={<Plus size={17} aria-hidden="true" />}
+          onClick={() =>
+            workspace ? void createDocument() : void openWorkspace()
+          }
         />
         <span className="query-tabs-spacer" />
         <label className="dialect-selector">
@@ -232,7 +279,7 @@ export function EditorPane() {
         <button
           className="run-query"
           type="button"
-          disabled={queryState === "running"}
+          disabled={queryState === "running" || !connection || !activeDocumentPath}
           onClick={() => void runQuery()}
         >
           <Play size={15} fill="currentColor" aria-hidden="true" />
@@ -248,6 +295,7 @@ export function EditorPane() {
         <span className="toolbar-divider" aria-hidden="true" />
         <IconAction
           label="格式化 SQL"
+          disabled={!activeDocumentPath}
           icon={<AlignLeft size={17} aria-hidden="true" />}
           onClick={() => {
             setSql(formatSqlForDialect(sql, dialectDescriptor));
@@ -255,10 +303,28 @@ export function EditorPane() {
           }}
         />
         <IconAction
-          label="查询历史"
-          icon={<History size={17} aria-hidden="true" />}
-          onClick={() => setNotice("SQL 历史 · 尚未提供")}
+          label="保存 SQL 文件"
+          disabled={!activeDocumentPath}
+          icon={<Save size={16} aria-hidden="true" />}
+          onClick={() => void saveActiveDocument()}
         />
+        {activeDocument?.conflict && (
+          <div className="conflict-actions" role="alert">
+            <span>文件已在外部修改</span>
+            <button
+              type="button"
+              onClick={() => void reloadActiveDocument()}
+            >
+              重新加载
+            </button>
+            <button
+              type="button"
+              onClick={() => void saveActiveDocument(true)}
+            >
+              覆盖保存
+            </button>
+          </div>
+        )}
         <IconAction
           label="执行计划"
           icon={<ListTree size={17} aria-hidden="true" />}
@@ -292,57 +358,51 @@ export function EditorPane() {
             />
           </div>
         )}
-        <span className="toolbar-spacer" />
-        <span
-          className="dialect-parameter"
-          title={`${dialectDescriptor.label} 位置参数`}
-        >
-          参数 {dialectDescriptor.parameterExample}
-        </span>
-        <span
-          className={`preview-badge ${
-            connection?.mode === "preview" ? "" : "preview-badge--desktop"
-          }`}
-        >
-          {connection?.mode === "preview" ? "PREVIEW" : connection?.database ?? "未连接"}
-        </span>
-        <IconAction
-          label="更多查询操作"
-          icon={<MoreHorizontal size={18} aria-hidden="true" />}
-        />
       </div>
 
       <div className="monaco-shell">
-        <Editor
-          beforeMount={configureMonaco}
-          onMount={handleEditorMount}
-          height="100%"
-          language="sql"
-          path={`query_01.${dialect}.sql`}
-          theme="ordadb-light"
-          value={sql}
-          onChange={(value) => setSql(value ?? "")}
-          loading={<span className="editor-loading">正在加载 SQL 编辑器</span>}
-          options={{
-            ariaLabel: "SQL 编辑器",
-            fontFamily:
-              '"Cascadia Code", "SFMono-Regular", Consolas, monospace',
-            fontSize: 14,
-            lineHeight: 22,
-            minimap: { enabled: false },
-            padding: { top: 16, bottom: 16 },
-            scrollBeyondLastLine: false,
-            smoothScrolling: true,
-            renderLineHighlight: "all",
-            wordWrap: "on",
-            automaticLayout: true,
-            tabSize: 2,
-            cursorBlinking: "smooth",
-            overviewRulerBorder: false,
-            hideCursorInOverviewRuler: true,
-            stickyScroll: { enabled: false },
-          }}
-        />
+        {activeDocumentPath ? (
+          <Editor
+            beforeMount={configureMonaco}
+            onMount={handleEditorMount}
+            height="100%"
+            language="sql"
+            path={`${activeDocumentPath}.${dialect}`}
+            theme="ordadb-light"
+            value={sql}
+            onChange={(value) => setSql(value ?? "")}
+            loading={<span className="editor-loading">正在加载 SQL 编辑器</span>}
+            options={{
+              ariaLabel: "SQL 编辑器",
+              fontFamily:
+                '"Cascadia Code", "SFMono-Regular", Consolas, monospace',
+              fontSize: settings.editorFontSize,
+              lineHeight: settings.editorFontSize + 7,
+              minimap: { enabled: false },
+              padding: { top: 12, bottom: 12 },
+              scrollBeyondLastLine: false,
+              smoothScrolling: true,
+              renderLineHighlight: "all",
+              wordWrap: "on",
+              automaticLayout: true,
+              tabSize: 2,
+              cursorBlinking: "smooth",
+              overviewRulerBorder: false,
+              hideCursorInOverviewRuler: true,
+              stickyScroll: { enabled: false },
+            }}
+          />
+        ) : (
+          <div className="editor-empty-state">
+            <button type="button" onClick={() => void openWorkspace()}>
+              打开 SQL 项目
+            </button>
+            <span>或</span>
+            <button type="button" onClick={() => void createDocument()}>
+              新建 SQL 文件
+            </button>
+          </div>
+        )}
       </div>
     </section>
   );

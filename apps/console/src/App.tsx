@@ -8,9 +8,11 @@ import { EditorPane } from "./components/EditorPane";
 import { ObjectInspector } from "./components/ObjectInspector";
 import { OperationsPanel } from "./components/OperationsPanel";
 import { ResultsPane } from "./components/ResultsPane";
+import { SettingsDialog } from "./components/SettingsDialog";
 import { SchemaPane } from "./components/SchemaPane";
 import { StatusBar } from "./components/StatusBar";
 import { TitleBar } from "./components/TitleBar";
+import { WorkspaceRecovery } from "./components/WorkspaceRecovery";
 import {
   commandById,
   type WorkbenchCommandId,
@@ -99,6 +101,8 @@ function Workbench() {
     (state) => state.pluginManagerOpen,
   );
   const dataSourceOpen = useWorkbenchStore((state) => state.dataSourceOpen);
+  const settingsOpen = useWorkbenchStore((state) => state.settingsOpen);
+  const recovery = useWorkbenchStore((state) => state.recovery);
   const operationsOpen = useWorkbenchStore((state) => state.operationsOpen);
   const initialize = useWorkbenchStore((state) => state.initialize);
   const toggleSchema = useWorkbenchStore((state) => state.toggleSchema);
@@ -112,14 +116,18 @@ function Workbench() {
   const setDataSourceOpen = useWorkbenchStore(
     (state) => state.setDataSourceOpen,
   );
+  const setSettingsOpen = useWorkbenchStore((state) => state.setSettingsOpen);
   const setOperationsOpen = useWorkbenchStore(
     (state) => state.setOperationsOpen,
   );
-  const setActiveResultTab = useWorkbenchStore(
-    (state) => state.setActiveResultTab,
-  );
-  const setSql = useWorkbenchStore((state) => state.setSql);
   const setNotice = useWorkbenchStore((state) => state.setNotice);
+  const openWorkspace = useWorkbenchStore((state) => state.openWorkspace);
+  const createDocument = useWorkbenchStore((state) => state.createDocument);
+  const saveAllDocuments = useWorkbenchStore(
+    (state) => state.saveAllDocuments,
+  );
+  const restoreRecovery = useWorkbenchStore((state) => state.restoreRecovery);
+  const discardRecovery = useWorkbenchStore((state) => state.discardRecovery);
   const runQuery = useWorkbenchStore((state) => state.runQuery);
   const runExplain = useWorkbenchStore((state) => state.runExplain);
   const cancelQuery = useWorkbenchStore((state) => state.cancelQuery);
@@ -170,8 +178,19 @@ function Workbench() {
         return;
       }
       if (commandId === "new-query") {
-        setSql("SELECT *\nFROM public.documents\nORDER BY updated_at DESC\nLIMIT 100;");
-        setNotice("新查询已创建 · 本地草稿");
+        void createDocument();
+        return;
+      }
+      if (commandId === "open-project") {
+        void openWorkspace();
+        return;
+      }
+      if (commandId === "save-all") {
+        void saveAllDocuments();
+        return;
+      }
+      if (commandId === "settings") {
+        setSettingsOpen(true);
         return;
       }
       const operation = operationCommands.get(commandId);
@@ -185,15 +204,17 @@ function Workbench() {
     },
     [
       cancelQuery,
+      createDocument,
+      openWorkspace,
       openOperations,
       runExplain,
       runQuery,
-      setActiveResultTab,
+      saveAllDocuments,
       setCommandPaletteOpen,
       setDataSourceOpen,
+      setSettingsOpen,
       setPluginManagerOpen,
       setNotice,
-      setSql,
       toggleInspector,
       toggleSchema,
     ],
@@ -219,6 +240,31 @@ function Workbench() {
       ) {
         event.preventDefault();
         setPluginManagerOpen(true);
+      } else if (
+        (event.metaKey || event.ctrlKey) &&
+        event.key.toLowerCase() === "o"
+      ) {
+        event.preventDefault();
+        void openWorkspace();
+      } else if (
+        (event.metaKey || event.ctrlKey) &&
+        event.altKey &&
+        event.key.toLowerCase() === "s"
+      ) {
+        event.preventDefault();
+        setSettingsOpen(true);
+      } else if (
+        (event.metaKey || event.ctrlKey) &&
+        event.key.toLowerCase() === "s"
+      ) {
+        event.preventDefault();
+        void saveAllDocuments();
+      } else if (
+        (event.metaKey || event.ctrlKey) &&
+        event.key.toLowerCase() === "n"
+      ) {
+        event.preventDefault();
+        void createDocument();
       } else if (event.altKey && event.key === "1") {
         event.preventDefault();
         toggleSchema();
@@ -232,8 +278,12 @@ function Workbench() {
     return () => window.removeEventListener("keydown", handleKeyDown, true);
   }, [
     runQuery,
+    createDocument,
+    openWorkspace,
+    saveAllDocuments,
     setCommandPaletteOpen,
     setPluginManagerOpen,
+    setSettingsOpen,
     toggleInspector,
     toggleSchema,
   ]);
@@ -289,6 +339,15 @@ function Workbench() {
       <OperationsPanel
         open={operationsOpen}
         onClose={() => setOperationsOpen(false)}
+      />
+      <SettingsDialog
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+      />
+      <WorkspaceRecovery
+        open={recovery !== null}
+        onRestore={() => void restoreRecovery()}
+        onDiscard={() => void discardRecovery()}
       />
     </div>
   );

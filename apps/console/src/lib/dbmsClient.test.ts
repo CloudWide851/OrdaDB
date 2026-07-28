@@ -4,6 +4,12 @@ import { PreviewDbmsClient, type DbmsClient } from "./dbmsClient";
 describe("PreviewDbmsClient", () => {
   it("keeps the browser adapter explicit and streams ordered query events", async () => {
     const client: DbmsClient = new PreviewDbmsClient();
+    const probe = await client.probe({
+      connectorId: "ordadb-postgresql",
+      dialect: "postgresql",
+      endpoint: "preview",
+      credentialId: "preview-test",
+    });
     const connectionId = await client.connect({
       connectorId: "ordadb-postgresql",
       dialect: "postgresql",
@@ -20,6 +26,9 @@ describe("PreviewDbmsClient", () => {
       events.push(event);
     }
 
+    expect(probe.ready).toBe(true);
+    expect(probe.stages).toHaveLength(6);
+    expect(probe.stages.every((stage) => stage.status === "skipped")).toBe(true);
     expect(connectionId.connectionId).toBe("preview-connection");
     expect(operation.requestId).toMatch(/^preview-/);
     expect(events.map((event) => event.kind)).toEqual([

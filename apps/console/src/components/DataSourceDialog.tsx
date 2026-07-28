@@ -1,16 +1,21 @@
 import {
   Cable,
+  CheckCircle2,
+  Circle,
   DatabaseZap,
   PlugZap,
   ShieldCheck,
   Unplug,
+  UserPlus,
   X,
+  XCircle,
 } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   connectorDefinitions,
   getConnectorDefinition,
 } from "../data/connectors";
+import type { ConnectionProbeStageName } from "../lib/dbmsClient";
 import {
   useWorkbenchStore,
   type DataSourceValues,
@@ -49,6 +54,7 @@ export function DataSourceDialog({
   );
   const connectionState = useWorkbenchStore((state) => state.connectionState);
   const connectionError = useWorkbenchStore((state) => state.connectionError);
+  const connectionProbe = useWorkbenchStore((state) => state.connectionProbe);
   const connectDataSource = useWorkbenchStore(
     (state) => state.connectDataSource,
   );
@@ -57,6 +63,9 @@ export function DataSourceDialog({
   );
   const deleteStoredCredential = useWorkbenchStore(
     (state) => state.deleteStoredCredential,
+  );
+  const bootstrapAdministrator = useWorkbenchStore(
+    (state) => state.bootstrapAdministrator,
   );
 
   useEffect(() => {
@@ -70,6 +79,12 @@ export function DataSourceDialog({
   const selectedConnector = getConnectorDefinition(values.connectorId);
   const native = selectedConnector.id === "ordadb-postgresql";
   const preview = connection?.mode === "preview";
+  const needsBootstrap = connectionProbe?.stages.some(
+    (stage) =>
+      stage.stage === "initialization" &&
+      stage.status === "failed" &&
+      stage.error?.sqlState === "55000",
+  );
 
   const close = () => {
     setValues((current) => ({ ...current, password: "" }));
@@ -81,6 +96,23 @@ export function DataSourceDialog({
     event.preventDefault();
     setSubmitting(true);
     try {
+      await connectDataSource(values);
+      setValues((current) => ({ ...current, password: "" }));
+      close();
+    } catch {
+      // The store owns the structured error rendered below.
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const bootstrap = async () => {
+    setSubmitting(true);
+    try {
+      await bootstrapAdministrator({
+        username: values.username,
+        password: values.password,
+      });
       await connectDataSource(values);
       setValues((current) => ({ ...current, password: "" }));
       close();
@@ -148,6 +180,45 @@ export function DataSourceDialog({
                 断开
               </button>
             )}
+          </div>
+        )}
+
+        {connectionProbe && (
+          <ol className="connection-probe" aria-label="连接诊断">
+            {connectionProbe.stages.map((stage) => (
+              <li
+                className={`connection-probe--${stage.status}`}
+                key={stage.stage}
+              >
+                {stage.status === "passed" ? (
+                  <CheckCircle2 size={14} aria-hidden="true" />
+                ) : stage.status === "failed" ? (
+                  <XCircle size={14} aria-hidden="true" />
+                ) : (
+                  <Circle size={14} aria-hidden="true" />
+                )}
+                <span>{probeStageLabel(stage.stage)}</span>
+                {stage.error && <small>{stage.error.message}</small>}
+              </li>
+            ))}
+          </ol>
+        )}
+
+        {needsBootstrap && (
+          <div className="bootstrap-guide" role="alert">
+            <UserPlus size={17} aria-hidden="true" />
+            <div>
+              <strong>创建首位管理员</strong>
+              <span>使用下方用户名和密码完成一次本机初始化。</span>
+            </div>
+            <button
+              className="secondary-action"
+              type="button"
+              disabled={submitting || !values.password}
+              onClick={() => void bootstrap()}
+            >
+              初始化并连接
+            </button>
           </div>
         )}
 
@@ -318,4 +389,21 @@ export function DataSourceDialog({
       </section>
     </div>
   );
+}
+
+function probeStageLabel(stage: ConnectionProbeStageName) {
+  switch (stage) {
+    case "service":
+      return "Windows 服务";
+    case "pgPort":
+      return "PostgreSQL 端口";
+    case "adminApi":
+      return "Admin API";
+    case "initialization":
+      return "初始化";
+    case "authentication":
+      return "认证";
+    case "catalog":
+      return "Catalog";
+  }
 }

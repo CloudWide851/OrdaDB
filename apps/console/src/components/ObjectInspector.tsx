@@ -1,5 +1,4 @@
 import {
-  Bot,
   ChevronRight,
   Copy,
   MoreHorizontal,
@@ -94,12 +93,6 @@ export function ObjectInspector() {
         )}
       </div>
 
-      <button className="future-ai-entry" type="button" disabled>
-        <Bot size={17} aria-hidden="true" />
-        <span>AI 助手</span>
-        <span className="future-label">后续能力</span>
-        <ChevronRight size={15} aria-hidden="true" />
-      </button>
     </aside>
   );
 }

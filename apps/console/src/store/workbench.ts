@@ -1,10 +1,20 @@
 import { create } from "zustand";
 import { getSqlDialect } from "../data/dialects";
-import { initialSql } from "../data/preview";
+import {
+  defaultConsoleSettings,
+  getConsoleClient,
+  type ConnectionProfileV1,
+  type ConsoleClient,
+  type ConsoleSettingsV1,
+  type OpenSqlDocument,
+  type WorkspaceSessionV1,
+  type WorkspaceSnapshot,
+} from "../lib/consoleClient";
 import {
   getDbmsClient,
   normalizeDbmsError,
-  previewConnection,
+  type BootstrapAdminRequest,
+  type ConnectionProbe,
   type DbmsCatalogObject,
   type DbmsClient,
   type DbmsConnectionRequest,
@@ -45,6 +55,14 @@ interface RunQueryOptions {
 
 export interface WorkbenchState {
   sql: string;
+  settings: ConsoleSettingsV1;
+  settingsOpen: boolean;
+  workspace: WorkspaceSnapshot | null;
+  documents: OpenSqlDocument[];
+  activeDocumentPath: string | null;
+  recovery: WorkspaceSessionV1 | null;
+  connectionProfiles: ConnectionProfileV1[];
+  connectionProbe: ConnectionProbe | null;
   dialect: SqlDialect;
   schemaVisible: boolean;
   inspectorVisible: boolean;
@@ -79,6 +97,21 @@ export interface WorkbenchState {
   transactionActive: boolean;
   initialize: () => Promise<void>;
   setSql: (sql: string) => void;
+  setSettingsOpen: (open: boolean) => void;
+  saveSettings: (settings: ConsoleSettingsV1) => Promise<void>;
+  openWorkspace: () => Promise<void>;
+  openWorkspacePath: (rootPath: string) => Promise<void>;
+  restoreRecovery: () => Promise<void>;
+  discardRecovery: () => Promise<void>;
+  openDocument: (path: string) => Promise<void>;
+  createDocument: (parentPath?: string) => Promise<void>;
+  activateDocument: (path: string) => void;
+  closeDocument: (path: string) => Promise<void>;
+  reloadActiveDocument: () => Promise<void>;
+  saveActiveDocument: (force?: boolean) => Promise<void>;
+  saveAllDocuments: () => Promise<void>;
+  renameWorkspaceEntry: (path: string, newName: string) => Promise<void>;
+  trashWorkspaceEntry: (path: string) => Promise<void>;
   setDialect: (dialect: SqlDialect) => void;
   toggleSchema: () => void;
   toggleInspector: () => void;
@@ -91,6 +124,7 @@ export interface WorkbenchState {
   openOperations: (view: OperationView) => Promise<void>;
   setOperationsOpen: (open: boolean) => void;
   setNotice: (notice: string) => void;
+  bootstrapAdministrator: (request: BootstrapAdminRequest) => Promise<void>;
   connectDataSource: (values: DataSourceValues) => Promise<void>;
   disconnectDataSource: () => Promise<void>;
   deleteStoredCredential: () => Promise<void>;
@@ -112,25 +146,32 @@ export interface WorkbenchState {
 
 export function createWorkbenchStore(
   dbms: DbmsClient = getDbmsClient(),
+  consoleClient: ConsoleClient = getConsoleClient(),
 ) {
+  const sessionSaveController: SessionSaveController = {};
   return create<WorkbenchState>((set, get) => ({
-  sql: initialSql,
+  sql: "",
+  settings: { ...defaultConsoleSettings },
+  settingsOpen: false,
+  workspace: null,
+  documents: [],
+  activeDocumentPath: null,
+  recovery: null,
+  connectionProfiles: [],
+  connectionProbe: null,
   dialect: "postgresql",
   schemaVisible: true,
   inspectorVisible: true,
   activeResultTab: "data",
   activeInspectorTab: "properties",
-  selectedObject: "documents",
+  selectedObject: "",
   selectedCatalogObject: null,
   commandPaletteOpen: false,
   pluginManagerOpen: false,
   dataSourceOpen: false,
   operationsOpen: false,
   operationView: "sessions",
-  notice:
-    dbms.mode === "preview"
-      ? "Preview fixture · 不连接真实数据库"
-      : "请选择数据源",
+  notice: dbms.mode === "preview" ? "Preview · 未连接" : "未连接",
   queryState: "idle",
   columns: [],
   rows: [],
@@ -140,39 +181,373 @@ export function createWorkbenchStore(
   durationMs: null,
   rowsProcessed: 0,
   activeRequestId: null,
-  connection: dbms.mode === "preview" ? previewConnection : null,
+  connection: null,
   activeCredentialId: null,
   catalog: [],
   monitor: null,
   operations: [],
   serviceStatus: null,
   administrationBusy: false,
-  connectionState: dbms.mode === "preview" ? "connected" : "idle",
+  connectionState: "idle",
   connectionError: null,
   transactionActive: false,
 
   initialize: async () => {
-    const connection = get().connection;
-    if (!connection || get().catalog.length > 0) return;
     try {
-      const [catalog, monitor] = await Promise.all([
-        dbms.catalog(connection.connectionId),
-        dbms.monitor(connection.connectionId),
-      ]);
-      setCatalog(set, get, catalog.objects);
-      set({ monitor });
-      await get().refreshAdministration();
+      const bootstrap = await consoleClient.bootstrap();
+      set({
+        settings: bootstrap.settings,
+        recovery: bootstrap.recovery,
+        connectionProfiles: bootstrap.connectionProfiles,
+      });
+      applyConsoleSettings(bootstrap.settings);
+      if (bootstrap.settings.reopenLastProject && bootstrap.recovery) {
+        await get().restoreRecovery();
+      }
+      const reconnect = bootstrap.connectionProfiles.find(
+        (profile) => profile.autoReconnect,
+      );
+      if (reconnect && dbms.mode === "desktop") {
+        await connectProfile(reconnect, dbms, consoleClient, set, get);
+      }
     } catch (error) {
       const normalized = normalizeDbmsError(error);
       set({
-        connectionState: "error",
-        connectionError: normalized,
         notice: normalized.message,
       });
     }
   },
 
-  setSql: (sql) => set({ sql }),
+  setSql: (sql) => {
+    set((state) => ({
+      sql,
+      documents: state.documents.map((document) =>
+        document.path === state.activeDocumentPath
+          ? {
+              ...document,
+              content: sql,
+              dirty: sql !== document.savedContent,
+            }
+          : document,
+      ),
+    }));
+    scheduleSessionSave(sessionSaveController, consoleClient, get);
+  },
+  setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
+  saveSettings: async (settings) => {
+    try {
+      const saved = await consoleClient.saveSettings(settings);
+      applyConsoleSettings(saved);
+      set({
+        settings: saved,
+        settingsOpen: false,
+        notice: "设置已保存",
+      });
+    } catch (error) {
+      const normalized = normalizeDbmsError(error);
+      set({ notice: normalized.message });
+      throw normalized;
+    }
+  },
+  openWorkspace: async () => {
+    try {
+      const snapshot = await consoleClient.pickWorkspace();
+      if (!snapshot) return;
+      await activateWorkspace(snapshot, consoleClient, set, get);
+    } catch (error) {
+      const normalized = normalizeDbmsError(error);
+      set({ notice: normalized.message });
+    }
+  },
+  openWorkspacePath: async (rootPath) => {
+    try {
+      const snapshot = await consoleClient.openWorkspace(rootPath);
+      await activateWorkspace(snapshot, consoleClient, set, get);
+    } catch (error) {
+      const normalized = normalizeDbmsError(error);
+      set({ notice: normalized.message });
+      throw normalized;
+    }
+  },
+  restoreRecovery: async () => {
+    const recovery = get().recovery;
+    if (!recovery?.rootPath) return;
+    try {
+      const snapshot = await consoleClient.openWorkspace(recovery.rootPath);
+      const documents: OpenSqlDocument[] = [];
+      for (const draft of recovery.openDocuments) {
+        const current = await consoleClient.openDocument(
+          snapshot.rootPath,
+          draft.path,
+        );
+        documents.push({
+          ...current,
+          content: draft.content,
+          savedContent: current.content,
+          dirty: draft.content !== current.content,
+          conflict:
+            draft.baseRevision !== null &&
+            !sameRevision(draft.baseRevision, current.revision),
+        });
+      }
+      const activePath =
+        recovery.activePath &&
+        documents.some((document) => document.path === recovery.activePath)
+          ? recovery.activePath
+          : documents[0]?.path ?? null;
+      set({
+        workspace: snapshot,
+        documents,
+        activeDocumentPath: activePath,
+        sql:
+          documents.find((document) => document.path === activePath)?.content ??
+          "",
+        recovery: null,
+        notice: `已恢复 ${documents.length} 个 SQL 草稿`,
+      });
+      scheduleSessionSave(sessionSaveController, consoleClient, get);
+    } catch (error) {
+      const normalized = normalizeDbmsError(error);
+      set({ notice: normalized.message });
+    }
+  },
+  discardRecovery: async () => {
+    set({ recovery: null });
+    await consoleClient.saveSession(emptyWorkspaceSession());
+    set({ notice: "已丢弃上次草稿" });
+  },
+  openDocument: async (path) => {
+    const workspace = get().workspace;
+    if (!workspace) return;
+    const existing = get().documents.find((document) => document.path === path);
+    if (existing) {
+      get().activateDocument(path);
+      return;
+    }
+    try {
+      const document = await consoleClient.openDocument(workspace.rootPath, path);
+      const openDocument = toOpenDocument(document);
+      set((state) => ({
+        documents: [...state.documents, openDocument],
+        activeDocumentPath: openDocument.path,
+        sql: openDocument.content,
+        notice: `${openDocument.name} · 已打开`,
+      }));
+      scheduleSessionSave(sessionSaveController, consoleClient, get);
+    } catch (error) {
+      const normalized = normalizeDbmsError(error);
+      set({ notice: normalized.message });
+    }
+  },
+  createDocument: async (parentPath = "") => {
+    let workspace = get().workspace;
+    if (!workspace) {
+      await get().openWorkspace();
+      workspace = get().workspace;
+    }
+    if (!workspace) return;
+    const fileName = nextQueryFileName(workspace);
+    try {
+      const document = await consoleClient.newDocument(
+        workspace.rootPath,
+        parentPath,
+        fileName,
+      );
+      const snapshot = await consoleClient.openWorkspace(workspace.rootPath);
+      const openDocument = toOpenDocument(document);
+      set((state) => ({
+        workspace: snapshot,
+        documents: [...state.documents, openDocument],
+        activeDocumentPath: openDocument.path,
+        sql: "",
+        notice: `${openDocument.name} · 已创建`,
+      }));
+      scheduleSessionSave(sessionSaveController, consoleClient, get);
+    } catch (error) {
+      const normalized = normalizeDbmsError(error);
+      set({ notice: normalized.message });
+    }
+  },
+  activateDocument: (path) => {
+    const document = get().documents.find((candidate) => candidate.path === path);
+    if (!document) return;
+    set({
+      activeDocumentPath: path,
+      sql: document.content,
+      notice: document.dirty ? `${document.name} · 未保存` : document.name,
+    });
+    scheduleSessionSave(sessionSaveController, consoleClient, get);
+  },
+  closeDocument: async (path) => {
+    const documents = get().documents.filter(
+      (document) => document.path !== path,
+    );
+    const activePath =
+      get().activeDocumentPath === path
+        ? documents.at(-1)?.path ?? null
+        : get().activeDocumentPath;
+    set({
+      documents,
+      activeDocumentPath: activePath,
+      sql:
+        documents.find((document) => document.path === activePath)?.content ?? "",
+      notice: "SQL 文件已关闭",
+    });
+    await persistSession(consoleClient, get);
+  },
+  reloadActiveDocument: async () => {
+    const workspace = get().workspace;
+    const activePath = get().activeDocumentPath;
+    if (!workspace || !activePath) return;
+    try {
+      const document = await consoleClient.openDocument(
+        workspace.rootPath,
+        activePath,
+      );
+      const reloaded = toOpenDocument(document);
+      set((state) => ({
+        documents: state.documents.map((candidate) =>
+          candidate.path === activePath ? reloaded : candidate,
+        ),
+        sql: reloaded.content,
+        notice: `${reloaded.name} · 已从磁盘重新加载`,
+      }));
+      await persistSession(consoleClient, get);
+    } catch (error) {
+      const normalized = normalizeDbmsError(error);
+      set({ notice: normalized.message });
+    }
+  },
+  saveActiveDocument: async (force = false) => {
+    const workspace = get().workspace;
+    const activePath = get().activeDocumentPath;
+    const document = get().documents.find(
+      (candidate) => candidate.path === activePath,
+    );
+    if (!workspace || !document) return;
+    try {
+      const saved = await consoleClient.saveDocument(
+        workspace.rootPath,
+        document,
+        force,
+      );
+      set((state) => ({
+        documents: state.documents.map((candidate) =>
+          candidate.path === saved.path ? toOpenDocument(saved) : candidate,
+        ),
+        sql: saved.content,
+        notice: `${saved.name} · 已保存`,
+      }));
+      await persistSession(consoleClient, get);
+    } catch (error) {
+      const normalized = normalizeDbmsError(error);
+      set((state) => ({
+        documents: state.documents.map((candidate) =>
+          candidate.path === document.path
+            ? { ...candidate, conflict: normalized.sqlState === "40001" }
+            : candidate,
+        ),
+        notice: normalized.message,
+      }));
+      throw normalized;
+    }
+  },
+  saveAllDocuments: async () => {
+    const workspace = get().workspace;
+    if (!workspace) return;
+    for (const document of get().documents.filter((candidate) => candidate.dirty)) {
+      try {
+        const saved = await consoleClient.saveDocument(
+          workspace.rootPath,
+          document,
+        );
+        set((state) => ({
+          documents: state.documents.map((candidate) =>
+            candidate.path === saved.path ? toOpenDocument(saved) : candidate,
+          ),
+        }));
+      } catch (error) {
+        const normalized = normalizeDbmsError(error);
+        set((state) => ({
+          documents: state.documents.map((candidate) =>
+            candidate.path === document.path
+              ? { ...candidate, conflict: normalized.sqlState === "40001" }
+              : candidate,
+          ),
+          notice: normalized.message,
+        }));
+        return;
+      }
+    }
+    const active = get().documents.find(
+      (document) => document.path === get().activeDocumentPath,
+    );
+    set({ sql: active?.content ?? "", notice: "全部 SQL 文件已保存" });
+    await persistSession(consoleClient, get);
+  },
+  renameWorkspaceEntry: async (path, newName) => {
+    const workspace = get().workspace;
+    if (!workspace) return;
+    try {
+      const snapshot = await consoleClient.renameEntry(
+        workspace.rootPath,
+        path,
+        newName,
+      );
+      const nextPath = renamedPath(path, newName);
+      const documents = get().documents.map((document) => {
+        const pathAfterRename = replacePathPrefix(document.path, path, nextPath);
+        return {
+          ...document,
+          path: pathAfterRename,
+          name: pathAfterRename.split("/").at(-1) ?? document.name,
+        };
+      });
+      const activeDocumentPath = get().activeDocumentPath
+        ? replacePathPrefix(get().activeDocumentPath!, path, nextPath)
+        : null;
+      set({
+        workspace: snapshot,
+        documents,
+        activeDocumentPath,
+        notice: "项目条目已重命名",
+      });
+      await persistSession(consoleClient, get);
+    } catch (error) {
+      const normalized = normalizeDbmsError(error);
+      set({ notice: normalized.message });
+    }
+  },
+  trashWorkspaceEntry: async (path) => {
+    const workspace = get().workspace;
+    if (!workspace) return;
+    try {
+      const snapshot = await consoleClient.trashEntry(workspace.rootPath, path);
+      const documents = get().documents.filter(
+        (document) =>
+          document.path !== path && !document.path.startsWith(`${path}/`),
+      );
+      const activeDocumentPath = documents.some(
+        (document) => document.path === get().activeDocumentPath,
+      )
+        ? get().activeDocumentPath
+        : documents.at(-1)?.path ?? null;
+      set({
+        workspace: snapshot,
+        documents,
+        activeDocumentPath,
+        sql:
+          documents.find(
+            (document) => document.path === activeDocumentPath,
+          )?.content ?? "",
+        notice: "项目条目已移入回收站",
+      });
+      await persistSession(consoleClient, get);
+    } catch (error) {
+      const normalized = normalizeDbmsError(error);
+      set({ notice: normalized.message });
+    }
+  },
   setDialect: (dialect) =>
     set({
       dialect,
@@ -197,6 +572,23 @@ export function createWorkbenchStore(
   setOperationsOpen: (operationsOpen) => set({ operationsOpen }),
   setNotice: (notice) => set({ notice }),
 
+  bootstrapAdministrator: async (request) => {
+    try {
+      const result = await dbms.bootstrapAdmin(request);
+      if (!result.success || result.error) {
+        throw result.error ?? localError("55000", "管理员初始化未完成");
+      }
+      set({
+        notice: `${result.user ?? request.username} · 管理员初始化完成`,
+        connectionProbe: null,
+      });
+    } catch (error) {
+      const normalized = normalizeDbmsError(error);
+      set({ connectionError: normalized, notice: normalized.message });
+      throw normalized;
+    }
+  },
+
   openOperations: async (operationView) => {
     set({ operationView, operationsOpen: true });
     await Promise.all([get().refreshMonitor(), get().refreshAdministration()]);
@@ -215,14 +607,26 @@ export function createWorkbenchStore(
         password: values.password,
       });
       set({ activeCredentialId: values.credentialId });
-      const connection = await dbms.connect({
+      const request = {
         connectorId: values.connectorId,
         dialect: values.dialect,
         endpoint: values.endpoint,
         adminEndpoint: values.adminEndpoint,
         database: values.database,
         credentialId: values.credentialId,
-      });
+      };
+      const probe = await dbms.probe(request);
+      set({ connectionProbe: probe });
+      const failed = probe.stages.find(
+        (stage) => stage.status === "failed" && stage.stage !== "service",
+      );
+      if (!probe.ready) {
+        throw (
+          failed?.error ??
+          localError("08001", "本地数据库连接诊断未通过")
+        );
+      }
+      const connection = await dbms.connect(request);
       const [catalog, monitor] = await Promise.all([
         dbms.catalog(connection.connectionId),
         dbms.monitor(connection.connectionId),
@@ -240,6 +644,19 @@ export function createWorkbenchStore(
         notice: `${connection.database} · 已连接`,
       });
       setCatalog(set, get, catalog.objects);
+      const profiles = await consoleClient.saveConnectionProfile({
+        formatVersion: 1,
+        profileId: values.credentialId,
+        label: values.database || values.endpoint,
+        connectorId: values.connectorId,
+        dialect: values.dialect,
+        endpoint: values.endpoint,
+        adminEndpoint: values.adminEndpoint,
+        database: values.database,
+        credentialId: values.credentialId,
+        autoReconnect: values.connectorId === "ordadb-postgresql",
+      });
+      set({ connectionProfiles: profiles });
       await get().refreshAdministration();
     } catch (error) {
       const normalized = normalizeDbmsError(error);
@@ -282,8 +699,11 @@ export function createWorkbenchStore(
     }
     try {
       await dbms.deleteCredential(credentialId);
+      const profiles =
+        await consoleClient.deleteConnectionProfile(credentialId);
       set({
         activeCredentialId: null,
+        connectionProfiles: profiles,
         notice: "已删除 Windows 凭据",
       });
     } catch (error) {
@@ -591,6 +1011,184 @@ function replaceOperation(
       (operation) => operation.operationId !== incoming.operationId,
     ),
   ];
+}
+
+interface SessionSaveController {
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+function applyConsoleSettings(settings: ConsoleSettingsV1) {
+  if (typeof document === "undefined") return;
+  const root = document.documentElement;
+  root.style.setProperty("--font-ui", `${settings.uiFontSize}px`);
+  root.style.setProperty("--font-data", `${settings.dataFontSize}px`);
+  root.style.setProperty("--font-editor", `${settings.editorFontSize}px`);
+  root.dataset.density = settings.density;
+}
+
+function toOpenDocument(
+  document: Omit<OpenSqlDocument, "savedContent" | "dirty" | "conflict">,
+): OpenSqlDocument {
+  return {
+    ...document,
+    savedContent: document.content,
+    dirty: false,
+    conflict: false,
+  };
+}
+
+function sameRevision(
+  left: OpenSqlDocument["revision"],
+  right: OpenSqlDocument["revision"],
+) {
+  return (
+    left.sizeBytes === right.sizeBytes &&
+    left.modifiedAtMs === right.modifiedAtMs &&
+    left.sha256 === right.sha256
+  );
+}
+
+async function activateWorkspace(
+  snapshot: WorkspaceSnapshot,
+  consoleClient: ConsoleClient,
+  set: StoreSet,
+  get: StoreGet,
+) {
+  set({
+    workspace: snapshot,
+    documents: [],
+    activeDocumentPath: null,
+    sql: "",
+    recovery: null,
+    notice: `${snapshot.rootPath} · 项目已打开`,
+  });
+  await persistSession(consoleClient, get);
+}
+
+function emptyWorkspaceSession(): WorkspaceSessionV1 {
+  return {
+    formatVersion: 1,
+    rootPath: null,
+    activePath: null,
+    openDocuments: [],
+  };
+}
+
+function workspaceSession(state: WorkbenchState): WorkspaceSessionV1 {
+  if (!state.workspace) return emptyWorkspaceSession();
+  return {
+    formatVersion: 1,
+    rootPath: state.workspace.rootPath,
+    activePath: state.activeDocumentPath,
+    openDocuments: state.documents.map((document) => ({
+      path: document.path,
+      content: document.content,
+      baseRevision: document.revision,
+    })),
+  };
+}
+
+function scheduleSessionSave(
+  controller: SessionSaveController,
+  consoleClient: ConsoleClient,
+  get: StoreGet,
+) {
+  if (controller.timer) clearTimeout(controller.timer);
+  controller.timer = setTimeout(() => {
+    controller.timer = undefined;
+    void persistSession(consoleClient, get);
+  }, 500);
+}
+
+async function persistSession(consoleClient: ConsoleClient, get: StoreGet) {
+  try {
+    await consoleClient.saveSession(workspaceSession(get()));
+  } catch (error) {
+    const normalized = normalizeDbmsError(error);
+    get().setNotice(`草稿恢复状态保存失败 · ${normalized.message}`);
+  }
+}
+
+function nextQueryFileName(workspace: WorkspaceSnapshot) {
+  const names = new Set(
+    workspace.entries
+      .filter((entry) => entry.kind === "sqlFile")
+      .map((entry) => entry.name.toLowerCase()),
+  );
+  if (!names.has("query.sql")) return "query.sql";
+  for (let index = 2; index <= 9_999; index += 1) {
+    const name = `query_${String(index).padStart(2, "0")}.sql`;
+    if (!names.has(name.toLowerCase())) return name;
+  }
+  return `query_${Date.now()}.sql`;
+}
+
+function renamedPath(path: string, newName: string) {
+  const separator = path.lastIndexOf("/");
+  return separator < 0 ? newName : `${path.slice(0, separator + 1)}${newName}`;
+}
+
+function replacePathPrefix(path: string, before: string, after: string) {
+  if (path === before) return after;
+  return path.startsWith(`${before}/`)
+    ? `${after}${path.slice(before.length)}`
+    : path;
+}
+
+async function connectProfile(
+  profile: ConnectionProfileV1,
+  dbms: DbmsClient,
+  _consoleClient: ConsoleClient,
+  set: StoreSet,
+  get: StoreGet,
+) {
+  set({
+    connectionState: "connecting",
+    connectionError: null,
+    activeCredentialId: profile.credentialId,
+    notice: `正在重连 ${profile.label}`,
+  });
+  const request = {
+    connectorId: profile.connectorId,
+    dialect: profile.dialect,
+    endpoint: profile.endpoint,
+    adminEndpoint: profile.adminEndpoint,
+    database: profile.database,
+    credentialId: profile.credentialId,
+  };
+  try {
+    const probe = await dbms.probe(request);
+    set({ connectionProbe: probe });
+    if (!probe.ready) {
+      throw (
+        probe.stages.find(
+          (stage) => stage.status === "failed" && stage.stage !== "service",
+        )?.error ?? localError("08001", "本地数据库自动重连诊断未通过")
+      );
+    }
+    const connection = await dbms.connect(request);
+    const [catalog, monitor] = await Promise.all([
+      dbms.catalog(connection.connectionId),
+      dbms.monitor(connection.connectionId),
+    ]);
+    set({
+      connection,
+      monitor,
+      dialect: connection.dialect,
+      connectionState: "connected",
+      connectionError: null,
+      notice: `${connection.database} · 已自动重连`,
+    });
+    setCatalog(set, get, catalog.objects);
+    await get().refreshAdministration();
+  } catch (error) {
+    const normalized = normalizeDbmsError(error);
+    set({
+      connectionState: "error",
+      connectionError: normalized,
+      notice: `自动重连失败 · ${normalized.sqlState}`,
+    });
+  }
 }
 
 function operationLabel(kind: DbmsOperationRecord["kind"]) {
