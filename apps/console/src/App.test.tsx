@@ -61,6 +61,51 @@ const renderApp = () => {
 
 const initialWorkbenchState = useWorkbenchStore.getState();
 
+async function seedPreviewWorkspace() {
+  await useWorkbenchStore.getState().connectDataSource({
+    connectorId: "ordadb-postgresql",
+    dialect: "postgresql",
+    endpoint: "preview",
+    database: "ordadb_preview",
+    credentialId: "preview-ui",
+    username: "dba",
+    password: "disposable-secret",
+  });
+  const revision = {
+    sizeBytes: initialSql.length,
+    modifiedAtMs: 1,
+    sha256: "a".repeat(64),
+  };
+  useWorkbenchStore.setState({
+    workspace: {
+      formatVersion: 1,
+      rootPath: "C:\\Preview\\project",
+      entries: [
+        {
+          path: "query.sql",
+          name: "query.sql",
+          kind: "sqlFile",
+          depth: 1,
+        },
+      ],
+    },
+    documents: [
+      {
+        path: "query.sql",
+        name: "query.sql",
+        content: initialSql,
+        savedContent: initialSql,
+        revision,
+        dirty: false,
+        conflict: false,
+      },
+    ],
+    activeDocumentPath: "query.sql",
+    sql: initialSql,
+    notice: "准备就绪",
+  });
+}
+
 describe("OrdaDB workbench", () => {
   afterEach(() => {
     cleanup();
@@ -69,10 +114,6 @@ describe("OrdaDB workbench", () => {
   beforeEach(() => {
     resetPreviewPluginManagerForTests();
     useWorkbenchStore.setState(initialWorkbenchState, true);
-    useWorkbenchStore.setState({
-      sql: initialSql,
-      notice: "准备就绪",
-    });
   });
 
   it("renders the Windows shell and professional database islands", async () => {
@@ -80,7 +121,8 @@ describe("OrdaDB workbench", () => {
 
     expect(screen.getByText("OrdaDB")).toBeInTheDocument();
     expect(screen.queryByText("OrdaDB Local / default")).not.toBeInTheDocument();
-    expect(screen.getAllByText("query_01.sql")).toHaveLength(1);
+    expect(screen.queryByText("query_01.sql")).not.toBeInTheDocument();
+    expect(screen.getAllByText("打开 SQL 项目").length).toBeGreaterThan(0);
     expect(
       screen.getByRole("complementary", { name: "数据库浏览器" }),
     ).toBeVisible();
@@ -95,7 +137,8 @@ describe("OrdaDB workbench", () => {
       screen.getByLabelText("快捷工具").closest(".titlebar"),
     ).not.toBeNull();
     expect(document.querySelector(".command-strip")).toBeNull();
-    expect(screen.getByText("物化视图")).toBeVisible();
+    expect(screen.queryByText("public")).not.toBeInTheDocument();
+    expect(screen.queryByText("后续能力")).not.toBeInTheDocument();
     expect(await screen.findByText("界面预览")).toBeVisible();
 
     const controls = screen
@@ -115,15 +158,39 @@ describe("OrdaDB workbench", () => {
 
   it("runs a preview query from the primary action", async () => {
     const user = userEvent.setup();
+    await seedPreviewWorkspace();
     renderApp();
 
     await user.click(screen.getByRole("button", { name: /^运行/ }));
 
-    expect(screen.getByText("正在接收结果")).toBeVisible();
     await waitFor(() => {
       expect(screen.getByText("WAL checkpoint overview")).toBeVisible();
     });
     expect(screen.getByText("5 行 · 36 ms")).toBeVisible();
+  });
+
+  it("opens compact settings with 11px UI and 12px data/editor defaults", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(screen.getByRole("menuitem", { name: "文件" }));
+    await user.click(screen.getByRole("menuitem", { name: /^设置/ }));
+    const dialog = screen.getByRole("dialog", { name: "设置" });
+    expect(within(dialog).getByLabelText("界面字体")).toHaveValue(11);
+    expect(within(dialog).getByLabelText("数据字体")).toHaveValue(12);
+    expect(within(dialog).getByLabelText("编辑器字体")).toHaveValue(12);
+    expect(
+      within(dialog).getByLabelText("启动时自动恢复上次 SQL 项目"),
+    ).not.toBeChecked();
+    expect(
+      within(dialog).getByLabelText("隐藏空的 Catalog 分类"),
+    ).toBeChecked();
+    await user.click(
+      within(dialog).getByRole("button", { name: "保存设置" }),
+    );
+    expect(document.documentElement.style.getPropertyValue("--font-ui")).toBe(
+      "11px",
+    );
   });
 
   it("supports menus, command palette, and keyboard navigation", async () => {
@@ -168,6 +235,7 @@ describe("OrdaDB workbench", () => {
 
   it("supports keyboard execution and accessible pane controls", async () => {
     const user = userEvent.setup();
+    await seedPreviewWorkspace();
     renderApp();
 
     const schemaToggle = screen.getByRole("button", {
@@ -190,7 +258,7 @@ describe("OrdaDB workbench", () => {
     expect(screen.getByText(/CREATE TABLE public\.documents/)).toBeVisible();
 
     await user.click(screen.getByRole("tab", { name: "日志" }));
-    expect(screen.getByText(/不连接真实数据库/)).toBeVisible();
+    expect(screen.queryByText(/不连接真实数据库/)).not.toBeInTheDocument();
 
     await user.keyboard("{Control>}{Enter}{/Control}");
     await waitFor(() => {
@@ -200,6 +268,7 @@ describe("OrdaDB workbench", () => {
 
   it("switches SQL dialect hints without losing the workbench state", async () => {
     const user = userEvent.setup();
+    await seedPreviewWorkspace();
     renderApp();
     await waitFor(() => {
       expect(useWorkbenchStore.getState().catalog.length).toBeGreaterThan(0);
@@ -207,21 +276,16 @@ describe("OrdaDB workbench", () => {
 
     const dialectSelector = screen.getByRole("combobox", { name: "SQL 方言" });
     expect(dialectSelector).toHaveValue("postgresql");
-    expect(screen.getByText("参数 $1", { exact: true })).toBeVisible();
     expect(screen.getByText("SQL · PostgreSQL", { exact: true })).toBeVisible();
-    expect(screen.getAllByText("PREVIEW", { exact: true }).length).toBeGreaterThan(
-      0,
-    );
 
-    for (const [value, label, parameter] of [
-      ["mysql", "MySQL", "?"],
-      ["sqlite", "SQLite", "?"],
-      ["sqlServer", "SQL Server", "@p1"],
-      ["postgresql", "PostgreSQL", "$1"],
+    for (const [value, label] of [
+      ["mysql", "MySQL"],
+      ["sqlite", "SQLite"],
+      ["sqlServer", "SQL Server"],
+      ["postgresql", "PostgreSQL"],
     ] as const) {
       await user.selectOptions(dialectSelector, value);
       expect(dialectSelector).toHaveValue(value);
-      expect(screen.getByText(`参数 ${parameter}`, { exact: true })).toBeVisible();
       expect(screen.getByText(`SQL · ${label}`, { exact: true })).toBeVisible();
     }
 
@@ -247,9 +311,11 @@ describe("OrdaDB workbench", () => {
 
   it("opens credential-safe data sources and live-capability operations", async () => {
     const user = userEvent.setup();
+    await seedPreviewWorkspace();
     renderApp();
 
-    await user.click(screen.getByRole("button", { name: "管理数据源" }));
+    await user.click(screen.getByRole("tab", { name: "数据库" }));
+    await user.click(screen.getByRole("button", { name: "连接数据库" }));
     const dataSource = screen.getByRole("dialog", { name: "数据源" });
     expect(dataSource).toBeVisible();
     expect(
@@ -295,6 +361,7 @@ describe("OrdaDB workbench", () => {
 
   it("renders structured DBMS errors from the query stream", async () => {
     const user = userEvent.setup();
+    await seedPreviewWorkspace();
     renderApp();
 
     fireEvent.change(screen.getByRole("textbox", { name: "SQL 编辑器" }), {
@@ -303,14 +370,18 @@ describe("OrdaDB workbench", () => {
     await user.click(screen.getByRole("button", { name: /^运行/ }));
 
     expect(await screen.findByText(/42601 · Preview/)).toBeVisible();
-    expect(screen.getByText("Fixture 数据，不连接真实数据库。")).toBeVisible();
+    expect(
+      screen.queryByText("Fixture 数据，不连接真实数据库。"),
+    ).not.toBeInTheDocument();
   });
 
   it("manages the four signed connector fixtures with accessible lifecycle actions", async () => {
     const user = userEvent.setup();
     renderApp();
 
-    await user.click(screen.getByRole("button", { name: "管理连接插件" }));
+    await user.keyboard(
+      "{Control>}{Alt>}{Shift>}s{/Shift}{/Alt}{/Control}",
+    );
     const dialog = await screen.findByRole("dialog", { name: "连接插件" });
     const pluginView = within(dialog);
 

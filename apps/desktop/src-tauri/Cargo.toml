@@ -20,12 +20,21 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 ordadb-connectors = { path = "../../../crates/ordadb-connectors" }
 ordadb-protocol = { path = "../../../crates/ordadb-protocol" }
+ordadb-server = { path = "../../../crates/ordadb-server" }
 ordadb-types = { path = "../../../crates/ordadb-types" }
 reqwest.workspace = true
+rfd = { version = "0.15.4", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+sha2.workspace = true
 tauri = { version = "2", features = [] }
 tokio.workspace = true
 tokio-util.workspace = true
+trash = { version = "5.2.5", default-features = false, features = ["coinit_apartmentthreaded"] }
 uuid.workspace = true
+windows-service.workspace = true
+windows-sys.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

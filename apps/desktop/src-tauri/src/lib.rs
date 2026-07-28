@@ -11,6 +11,7 @@ use serde::Serialize;
 use tauri::{Emitter, Manager, Runtime, State, webview::PageLoadEvent};
 
 mod dbms;
+mod workspace;
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const PLUGIN_PROGRESS_EVENT: &str = "plugin://progress";
@@ -149,8 +150,16 @@ pub fn run() {
             });
             let dbms = dbms::DbmsRuntime::new(Arc::clone(&manager))
                 .map_err(|error| format!("failed to initialize DBMS runtime: {error}"))?;
+            let console = workspace::ConsoleRuntime::open(
+                app.path()
+                    .app_local_data_dir()
+                    .map_err(|error| format!("failed to resolve OrdaDB local data path: {error}"))?
+                    .join("console"),
+            )
+            .map_err(|error| format!("failed to initialize Console runtime: {error}"))?;
             app.manage(manager);
             app.manage(dbms);
+            app.manage(console);
             show_main_window(app)?;
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -187,7 +196,21 @@ pub fn run() {
             dbms::dbms_start_operation,
             dbms::dbms_operation,
             dbms::dbms_cancel_operation,
-            dbms::dbms_service
+            dbms::dbms_service,
+            dbms::dbms_probe_connection,
+            dbms::dbms_bootstrap_admin,
+            workspace::console_bootstrap,
+            workspace::console_save_settings,
+            workspace::workspace_open,
+            workspace::workspace_pick_folder,
+            workspace::workspace_open_document,
+            workspace::workspace_new_document,
+            workspace::workspace_save_document,
+            workspace::workspace_rename_entry,
+            workspace::workspace_trash_entry,
+            workspace::workspace_save_session,
+            workspace::console_save_connection_profile,
+            workspace::console_delete_connection_profile
         ])
         .run(tauri::generate_context!())
         .expect("failed to run OrdaDB desktop application");

@@ -4,7 +4,6 @@ import {
   PanelLeftOpen,
   PanelRightClose,
   PanelRightOpen,
-  Search,
 } from "lucide-react";
 import type { WorkbenchCommandId } from "../data/commands";
 import { IconAction } from "./IconAction";
@@ -45,14 +44,6 @@ export function CommandToolbar({
         onClick={() => onCommand("toggle-inspector")}
       />
       <span className="command-divider" aria-hidden="true" />
-      <button
-        className="context-path"
-        type="button"
-        onClick={() => onCommand("go-to-object")}
-      >
-        <Search size={15} aria-hidden="true" />
-        public.documents
-      </button>
       <IconAction
         label="打开命令面板"
         icon={<Command size={17} aria-hidden="true" />}

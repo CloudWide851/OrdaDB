@@ -31,7 +31,6 @@ export function ResultsPane() {
   const error = useWorkbenchStore((state) => state.error);
   const durationMs = useWorkbenchStore((state) => state.durationMs);
   const rowsProcessed = useWorkbenchStore((state) => state.rowsProcessed);
-  const connection = useWorkbenchStore((state) => state.connection);
 
   return (
     <section className="results-pane" aria-label="查询结果">
@@ -83,7 +82,6 @@ export function ResultsPane() {
             error={error}
             durationMs={durationMs}
             rowsProcessed={rowsProcessed}
-            preview={connection?.mode === "preview"}
           />
         ) : activeTab === "plan" ? (
           <PlanView
@@ -165,25 +163,15 @@ function LogView({
   error,
   durationMs,
   rowsProcessed,
-  preview,
 }: {
   queryState: QueryState;
   logs: string[];
   error: DbmsError | null;
   durationMs: number | null;
   rowsProcessed: number;
-  preview: boolean;
 }) {
   return (
     <div className="log-view" aria-live="polite">
-      <div className="log-line">
-        <span className="log-level">{preview ? "PREVIEW" : "DBMS"}</span>
-        <span>
-          {preview
-            ? "Fixture 数据，不连接真实数据库。"
-            : "事件由当前数据库连接流式返回。"}
-        </span>
-      </div>
       {logs.map((message, index) => (
         <div className="log-line" key={`${message}:${index}`}>
           <span className="log-level log-level--success">INFO</span>

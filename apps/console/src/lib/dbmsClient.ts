@@ -32,6 +32,36 @@ export interface DbmsConnectionRequest {
   credentialId: string;
 }
 
+export type ConnectionProbeStageName =
+  | "service"
+  | "pgPort"
+  | "adminApi"
+  | "initialization"
+  | "authentication"
+  | "catalog";
+
+export interface ConnectionProbeStage {
+  stage: ConnectionProbeStageName;
+  status: "passed" | "failed" | "skipped";
+  error: DbmsError | null;
+}
+
+export interface ConnectionProbe {
+  ready: boolean;
+  stages: ConnectionProbeStage[];
+}
+
+export interface BootstrapAdminRequest {
+  username: string;
+  password: string;
+}
+
+export interface BootstrapAdminResult {
+  success: boolean;
+  user: string | null;
+  error: DbmsError | null;
+}
+
 export interface DbmsCapabilities {
   catalog: boolean;
   transactions: boolean;
@@ -201,6 +231,8 @@ export interface DbmsClient {
   readonly mode: "desktop" | "preview";
   saveCredential(request: SaveCredentialRequest): Promise<CredentialSaved>;
   deleteCredential(credentialId: string): Promise<void>;
+  probe(request: DbmsConnectionRequest): Promise<ConnectionProbe>;
+  bootstrapAdmin(request: BootstrapAdminRequest): Promise<BootstrapAdminResult>;
   connect(request: DbmsConnectionRequest): Promise<DbmsConnectionSnapshot>;
   disconnect(connectionId: string): Promise<void>;
   catalog(connectionId: string): Promise<DbmsCatalogSnapshot>;
@@ -310,6 +342,14 @@ class TauriDbmsClient implements DbmsClient {
 
   deleteCredential(credentialId: string) {
     return invoke<void>("dbms_delete_credential", { credentialId });
+  }
+
+  probe(request: DbmsConnectionRequest) {
+    return invoke<ConnectionProbe>("dbms_probe_connection", { request });
+  }
+
+  bootstrapAdmin(request: BootstrapAdminRequest) {
+    return invoke<BootstrapAdminResult>("dbms_bootstrap_admin", { request });
   }
 
   connect(request: DbmsConnectionRequest) {
@@ -422,6 +462,28 @@ export class PreviewDbmsClient implements DbmsClient {
   });
 
   deleteCredential: DbmsClient["deleteCredential"] = async () => {};
+
+  probe: DbmsClient["probe"] = async () => ({
+    ready: true,
+    stages: [
+      "service",
+      "pgPort",
+      "adminApi",
+      "initialization",
+      "authentication",
+      "catalog",
+    ].map((stage) => ({
+      stage: stage as ConnectionProbeStageName,
+      status: "skipped" as const,
+      error: null,
+    })),
+  });
+
+  bootstrapAdmin: DbmsClient["bootstrapAdmin"] = async (request) => ({
+    success: true,
+    user: request.username,
+    error: null,
+  });
 
   connect: DbmsClient["connect"] = async (request) => ({
     ...previewConnection,

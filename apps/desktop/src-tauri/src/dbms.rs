@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::{Component, Path};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
@@ -18,6 +18,8 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use windows_service::service::{ServiceAccess, ServiceState};
+use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use zeroize::Zeroizing;
 
 pub const DBMS_QUERY_EVENT: &str = "dbms://query";
@@ -67,6 +69,105 @@ pub struct ConnectRequest {
     admin_endpoint: Option<String>,
     database: Option<String>,
     credential_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConnectionProbeStageName {
+    Service,
+    PgPort,
+    AdminApi,
+    Initialization,
+    Authentication,
+    Catalog,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConnectionProbeStageStatus {
+    Passed,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionProbeStage {
+    stage: ConnectionProbeStageName,
+    status: ConnectionProbeStageStatus,
+    error: Option<DbmsError>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionProbe {
+    ready: bool,
+    stages: Vec<ConnectionProbeStage>,
+}
+
+impl ConnectionProbe {
+    fn new() -> Self {
+        Self {
+            ready: false,
+            stages: Vec::with_capacity(6),
+        }
+    }
+
+    fn passed(&mut self, stage: ConnectionProbeStageName) {
+        self.stages.push(ConnectionProbeStage {
+            stage,
+            status: ConnectionProbeStageStatus::Passed,
+            error: None,
+        });
+    }
+
+    fn failed(&mut self, stage: ConnectionProbeStageName, error: DbError) {
+        self.stages.push(ConnectionProbeStage {
+            stage,
+            status: ConnectionProbeStageStatus::Failed,
+            error: Some(error.into()),
+        });
+    }
+
+    fn skipped(&mut self, stage: ConnectionProbeStageName) {
+        self.stages.push(ConnectionProbeStage {
+            stage,
+            status: ConnectionProbeStageStatus::Skipped,
+            error: None,
+        });
+    }
+
+    fn finish(&mut self) {
+        self.ready = self.stages.iter().all(|stage| {
+            stage.stage == ConnectionProbeStageName::Service
+                || stage.status == ConnectionProbeStageStatus::Passed
+        });
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BootstrapAdminRequest {
+    username: String,
+    password: String,
+}
+
+impl std::fmt::Debug for BootstrapAdminRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BootstrapAdminRequest")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BootstrapAdminResult {
+    success: bool,
+    user: Option<String>,
+    error: Option<DbmsError>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -621,6 +722,215 @@ impl DbmsRuntime {
         let handle = Arc::new(ConnectionHandle { transport });
         write_lock(&self.connections)?.insert(connection_id, handle);
         Ok(snapshot)
+    }
+
+    async fn probe_connection(&self, request: ConnectRequest) -> ConnectionProbe {
+        let mut probe = ConnectionProbe::new();
+        if let Err(error) = validate_connect_request(&request) {
+            probe.failed(ConnectionProbeStageName::Service, error);
+            for stage in [
+                ConnectionProbeStageName::PgPort,
+                ConnectionProbeStageName::AdminApi,
+                ConnectionProbeStageName::Initialization,
+                ConnectionProbeStageName::Authentication,
+                ConnectionProbeStageName::Catalog,
+            ] {
+                probe.skipped(stage);
+            }
+            probe.finish();
+            return probe;
+        }
+        if request.connector_id != NATIVE_CONNECTOR_ID {
+            for stage in [
+                ConnectionProbeStageName::Service,
+                ConnectionProbeStageName::PgPort,
+                ConnectionProbeStageName::AdminApi,
+                ConnectionProbeStageName::Initialization,
+                ConnectionProbeStageName::Authentication,
+                ConnectionProbeStageName::Catalog,
+            ] {
+                probe.skipped(stage);
+            }
+            probe.ready = true;
+            return probe;
+        }
+
+        match tauri::async_runtime::spawn_blocking(probe_windows_service).await {
+            Ok(Ok(())) => probe.passed(ConnectionProbeStageName::Service),
+            Ok(Err(error)) => probe.failed(ConnectionProbeStageName::Service, error),
+            Err(error) => probe.failed(
+                ConnectionProbeStageName::Service,
+                task_error("Windows service probe task failed", error),
+            ),
+        }
+
+        let address = match request.endpoint.parse::<SocketAddr>() {
+            Ok(address) => {
+                let socket_address = address;
+                let reachable = match tauri::async_runtime::spawn_blocking(move || {
+                    TcpStream::connect_timeout(&socket_address, Duration::from_secs(2))
+                })
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        probe.passed(ConnectionProbeStageName::PgPort);
+                        true
+                    }
+                    Ok(Err(error)) => {
+                        probe.failed(
+                            ConnectionProbeStageName::PgPort,
+                            network_error("PostgreSQL port is not reachable", error),
+                        );
+                        false
+                    }
+                    Err(error) => {
+                        probe.failed(
+                            ConnectionProbeStageName::PgPort,
+                            task_error("PostgreSQL port probe task failed", error),
+                        );
+                        false
+                    }
+                };
+                reachable.then_some(address)
+            }
+            Err(_) => {
+                probe.failed(
+                    ConnectionProbeStageName::PgPort,
+                    invalid("native OrdaDB endpoint must be an IP socket address"),
+                );
+                None
+            }
+        };
+
+        let admin_endpoint = match request
+            .admin_endpoint
+            .as_deref()
+            .ok_or_else(|| invalid("native OrdaDB connection requires an administration endpoint"))
+            .and_then(validate_admin_endpoint)
+        {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) => {
+                probe.failed(ConnectionProbeStageName::AdminApi, error);
+                probe.skipped(ConnectionProbeStageName::Initialization);
+                None
+            }
+        };
+
+        if let Some(endpoint) = &admin_endpoint {
+            let public = AdminSession {
+                base_url: endpoint.clone(),
+                bearer: Zeroizing::new(String::new()),
+            };
+            match admin_get::<Health>(&self.http, &public, "/v1/health/live", false).await {
+                Ok(health) if !health.status.is_empty() => {
+                    probe.passed(ConnectionProbeStageName::AdminApi)
+                }
+                Ok(_) => probe.failed(
+                    ConnectionProbeStageName::AdminApi,
+                    DbError::new("08P01", "OrdaDB live health response is invalid"),
+                ),
+                Err(error) => probe.failed(ConnectionProbeStageName::AdminApi, error),
+            }
+
+            match admin_get::<Health>(&self.http, &public, "/v1/health/ready", false).await {
+                Ok(health) if health.bootstrap_required => probe.failed(
+                    ConnectionProbeStageName::Initialization,
+                    DbError::new("55000", "OrdaDB requires its first administrator")
+                        .with_hint("complete the local administrator setup, then retry"),
+                ),
+                Ok(health) if health.status == "ready" && !health.version.is_empty() => {
+                    probe.passed(ConnectionProbeStageName::Initialization)
+                }
+                Ok(_) => probe.failed(
+                    ConnectionProbeStageName::Initialization,
+                    DbError::new("55000", "OrdaDB service is not ready"),
+                ),
+                Err(error) => probe.failed(ConnectionProbeStageName::Initialization, error),
+            }
+        }
+
+        let can_authenticate = address.is_some()
+            && admin_endpoint.is_some()
+            && probe.stages.iter().any(|stage| {
+                stage.stage == ConnectionProbeStageName::AdminApi
+                    && stage.status == ConnectionProbeStageStatus::Passed
+            })
+            && probe.stages.iter().any(|stage| {
+                stage.stage == ConnectionProbeStageName::Initialization
+                    && stage.status == ConnectionProbeStageStatus::Passed
+            });
+        let stored = if can_authenticate {
+            match self.credentials.load(&request.credential_id) {
+                Ok(stored) => Some(stored),
+                Err(error) => {
+                    probe.failed(ConnectionProbeStageName::Authentication, error);
+                    None
+                }
+            }
+        } else {
+            probe.skipped(ConnectionProbeStageName::Authentication);
+            None
+        };
+        let mut bearer = None;
+        if let (Some(address), Some(endpoint), Some(stored)) =
+            (address, admin_endpoint.as_deref(), stored)
+        {
+            let username = stored.username.clone();
+            let password = Zeroizing::new(stored.password.to_string());
+            let database = request
+                .database
+                .clone()
+                .unwrap_or_else(|| "ordadb".to_owned());
+            let pg_password = Zeroizing::new(stored.password.to_string());
+            let pg_result = tauri::async_runtime::spawn_blocking(move || {
+                PgClient::connect(ClientConfig {
+                    address,
+                    user: username,
+                    database,
+                    password: pg_password,
+                    application_name: "OrdaDB Console Probe".into(),
+                })
+            })
+            .await;
+            match pg_result {
+                Ok(Ok(_)) => {
+                    match issue_admin_token(&self.http, endpoint, &stored.username, &password).await
+                    {
+                        Ok(token) => {
+                            bearer = Some(token);
+                            probe.passed(ConnectionProbeStageName::Authentication);
+                        }
+                        Err(error) => probe.failed(ConnectionProbeStageName::Authentication, error),
+                    }
+                }
+                Ok(Err(error)) => probe.failed(ConnectionProbeStageName::Authentication, error),
+                Err(error) => probe.failed(
+                    ConnectionProbeStageName::Authentication,
+                    task_error("database authentication probe task failed", error),
+                ),
+            }
+        } else if !probe
+            .stages
+            .iter()
+            .any(|stage| stage.stage == ConnectionProbeStageName::Authentication)
+        {
+            probe.skipped(ConnectionProbeStageName::Authentication);
+        }
+
+        if let (Some(endpoint), Some(bearer)) = (admin_endpoint, bearer) {
+            let session = AdminSession {
+                base_url: endpoint,
+                bearer,
+            };
+            match admin_get::<JsonValue>(&self.http, &session, "/v1/catalog", true).await {
+                Ok(_) => probe.passed(ConnectionProbeStageName::Catalog),
+                Err(error) => probe.failed(ConnectionProbeStageName::Catalog, error),
+            }
+        } else {
+            probe.skipped(ConnectionProbeStageName::Catalog);
+        }
+        probe.finish();
+        probe
     }
 
     async fn disconnect(&self, connection_id: &str) -> Result<(), DbError> {
@@ -1213,6 +1523,32 @@ pub async fn dbms_connect(
     request: ConnectRequest,
 ) -> DesktopResult<ConnectionSnapshot> {
     runtime.connect(request).await.map_err(Into::into)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn dbms_probe_connection(
+    runtime: State<'_, Arc<DbmsRuntime>>,
+    request: ConnectRequest,
+) -> DesktopResult<ConnectionProbe> {
+    Ok(runtime.probe_connection(request).await)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn dbms_bootstrap_admin(
+    request: BootstrapAdminRequest,
+) -> DesktopResult<BootstrapAdminResult> {
+    validate_text(&request.username, 1, 128, "administrator username")?;
+    validate_text(&request.password, 8, 1_024, "administrator password")?;
+    let data_dir = ordadb_server::default_data_dir();
+    let pipe = ordadb_server::bootstrap_pipe_name(&data_dir);
+    let response =
+        ordadb_server::request_bootstrap(&pipe, request.username, Zeroizing::new(request.password))
+            .await?;
+    Ok(BootstrapAdminResult {
+        success: response.success,
+        user: response.user,
+        error: response.error.map(Into::into),
+    })
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1962,6 +2298,10 @@ fn join_error(error: tokio::task::JoinError) -> DbError {
     DbError::new("XX000", "database worker task failed").with_detail(error.to_string())
 }
 
+fn task_error(context: &str, error: impl std::fmt::Display) -> DbError {
+    DbError::new("XX000", context).with_detail(error.to_string())
+}
+
 fn mutex_lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, DbError> {
     mutex
         .lock()
@@ -1978,6 +2318,37 @@ fn write_lock<T>(lock: &RwLock<T>) -> Result<RwLockWriteGuard<'_, T>, DbError> {
         .map_err(|_| DbError::internal("desktop DBMS state lock was poisoned"))
 }
 
+fn probe_windows_service() -> Result<(), DbError> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|error| {
+            DbError::new("58030", "failed to open Windows Service Control Manager")
+                .with_detail(error.to_string())
+        })?;
+    let service = manager
+        .open_service(ordadb_server::SERVICE_NAME, ServiceAccess::QUERY_STATUS)
+        .map_err(|error| {
+            DbError::new("55000", "OrdaDB Windows service is not installed")
+                .with_detail(error.to_string())
+                .with_hint("install or repair OrdaDB, then retry the local connection")
+        })?;
+    let status = service.query_status().map_err(|error| {
+        DbError::new("58030", "failed to query OrdaDB Windows service")
+            .with_detail(error.to_string())
+    })?;
+    if status.current_state != ServiceState::Running {
+        return Err(
+            DbError::new("55000", "OrdaDB Windows service is not running")
+                .with_detail(format!("current service state: {:?}", status.current_state))
+                .with_hint("start the OrdaDB service, then retry"),
+        );
+    }
+    Ok(())
+}
+
+fn invalid(message: impl Into<String>) -> DbError {
+    DbError::new("22023", message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1992,6 +2363,34 @@ mod tests {
         let debug = format!("{request:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("never-print-this"));
+    }
+
+    #[test]
+    fn bootstrap_request_debug_is_redacted_and_probe_stages_are_structured() {
+        let request = BootstrapAdminRequest {
+            username: "ordadb_admin".into(),
+            password: "never-print-bootstrap".into(),
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("never-print-bootstrap"));
+
+        let mut probe = ConnectionProbe::new();
+        probe.passed(ConnectionProbeStageName::Service);
+        probe.passed(ConnectionProbeStageName::PgPort);
+        probe.passed(ConnectionProbeStageName::AdminApi);
+        probe.failed(
+            ConnectionProbeStageName::Initialization,
+            DbError::new("55000", "administrator bootstrap required"),
+        );
+        probe.skipped(ConnectionProbeStageName::Authentication);
+        probe.skipped(ConnectionProbeStageName::Catalog);
+        probe.finish();
+        let value = serde_json::to_value(probe).expect("serialize probe");
+        assert_eq!(value["ready"], false);
+        assert_eq!(value["stages"][1]["stage"], "pgPort");
+        assert_eq!(value["stages"][3]["status"], "failed");
+        assert_eq!(value["stages"][3]["error"]["sqlState"], "55000");
     }
 
     #[test]
