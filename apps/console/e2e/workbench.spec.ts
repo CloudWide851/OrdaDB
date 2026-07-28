@@ -155,6 +155,19 @@ test.describe("OrdaDB SQL workbench", () => {
     const operations = page.getByRole("dialog", { name: "数据库运维" });
     await expect(operations).toBeVisible();
     await expect(operations.getByText("当前没有活动会话")).toBeVisible();
+    await operations.getByRole("button", { name: "备份" }).click();
+    await expect(
+      operations.getByText("逻辑备份与恢复 · Preview fixture"),
+    ).toBeVisible();
+    await operations
+      .getByRole("textbox", { name: "逻辑归档文件" })
+      .fill("playwright.ordbak");
+    await operations.getByRole("button", { name: "创建备份" }).click();
+    await expect(operations.getByText("playwright.ordbak")).toBeVisible();
+    await operations.getByRole("button", { name: "恢复归档" }).click();
+    await expect(
+      operations.getByRole("button", { name: "确认恢复并替换" }),
+    ).toBeVisible();
     await operations
       .getByRole("button", { name: "关闭数据库运维" })
       .click();

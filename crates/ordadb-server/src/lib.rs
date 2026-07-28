@@ -31,7 +31,8 @@ pub use ordadb_protocol::TlsPaths;
 #[cfg(windows)]
 pub use windows_service::{
     SERVICE_ACCOUNT, SERVICE_DISPLAY_NAME, SERVICE_FAILURE_ACTIONS, SERVICE_NAME,
-    SERVICE_START_MODE, dispatch_windows_service,
+    SERVICE_START_MODE, ServiceCommand, WindowsServiceStatus, dispatch_windows_service,
+    manage_windows_service,
 };
 
 pub const DEFAULT_PG_PORT: u16 = 54_329;

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_stream::stream;
-use axum::extract::State;
+use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Response, Sse};
@@ -13,8 +13,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use ordadb_backup::{TableTransferRequest, TransferFormat};
 use ordadb_catalog::{
     Catalog, ColumnDefinition, ConstraintDefinition, IndexDefinition, RoutineArgument, RoutineKind,
     SequenceDefinition, TriggerDefinition, ViewKind,
@@ -24,7 +26,10 @@ use ordadb_types::{
     DatabaseId, DbError, Identifier, RoutineId, ScalarType, Schema, SchemaId, TableId, ViewId,
 };
 
-use crate::{Action, AuthStore, Authorizer, DbObject, Principal, SessionRegistry, TokenStore};
+use crate::{
+    Action, AuthStore, Authorizer, DbObject, OperationManager, Principal, SessionRegistry,
+    StartOperation, TokenStore,
+};
 
 const API_VERSION: &str = "v1";
 
@@ -50,6 +55,7 @@ pub struct AdminState {
     pub auth: Arc<AuthStore>,
     pub tokens: Arc<TokenStore>,
     pub registry: Arc<SessionRegistry>,
+    pub operations: Arc<OperationManager>,
     started_at: Instant,
 }
 
@@ -60,6 +66,7 @@ impl std::fmt::Debug for AdminState {
             .field("engine", &self.engine)
             .field("auth", &"<redacted>")
             .field("registry", &self.registry)
+            .field("operations", &self.operations)
             .finish_non_exhaustive()
     }
 }
@@ -67,7 +74,14 @@ impl std::fmt::Debug for AdminState {
 impl AdminState {
     #[must_use]
     pub fn new(engine: Arc<Engine>, auth: Arc<AuthStore>, registry: Arc<SessionRegistry>) -> Self {
+        let operations_root = engine
+            .config()
+            .data_dir
+            .parent()
+            .unwrap_or(&engine.config().data_dir)
+            .join("operations");
         Self {
+            operations: OperationManager::new(Arc::clone(&engine), operations_root),
             engine,
             auth,
             tokens: Arc::new(TokenStore::default()),
@@ -90,7 +104,17 @@ pub fn api_router(state: AdminState) -> Router {
         .route("/v1/storage", get(storage))
         .route("/v1/wal", get(wal))
         .route("/v1/checkpoint", post(checkpoint))
-        .route("/v1/backups", get(backups).post(backups_unsupported))
+        .route("/v1/backups", get(backups).post(start_backup))
+        .route("/v1/restores", post(start_restore))
+        .route("/v1/imports", post(start_import))
+        .route("/v1/exports", post(start_export))
+        .route("/v1/operations", get(operations))
+        .route("/v1/operations/{operation_id}", get(operation))
+        .route(
+            "/v1/operations/{operation_id}/cancel",
+            post(cancel_operation),
+        )
+        .route("/v1/service", get(service))
         .route("/v1/config", get(config).post(config_unsupported))
         .route("/v1/logs/stream", get(log_stream))
         .with_state(state)
@@ -417,32 +441,171 @@ async fn checkpoint(
     Ok(Json(ApiEnvelope::new(CheckpointResult { completed: true })))
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CapabilityStatus {
-    supported: bool,
-    reason: &'static str,
-}
-
 async fn backups(
     State(state): State<AdminState>,
     headers: HeaderMap,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
     require(&state, &headers, Action::Backup, DbObject::Server)?;
-    Ok(Json(ApiEnvelope::new(CapabilityStatus {
-        supported: false,
-        reason: "logical backup jobs are implemented in the packaging milestone",
-    })))
+    Ok(Json(ApiEnvelope::new(
+        state.operations.backups().map_err(ApiError::from)?,
+    )))
 }
 
-async fn backups_unsupported(
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PathOperationRequest {
+    path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferOperationRequest {
+    schema: String,
+    table: String,
+    path: PathBuf,
+    format: TransferFormat,
+}
+
+async fn start_backup(
     State(state): State<AdminState>,
     headers: HeaderMap,
-) -> std::result::Result<Response, ApiError> {
+    Json(request): Json<PathOperationRequest>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
     require(&state, &headers, Action::Backup, DbObject::Server)?;
-    Err(ApiError::unsupported(
-        "backup job creation is not implemented in this milestone",
-    ))
+    let operation = state
+        .operations
+        .start(StartOperation::Backup { path: request.path })
+        .map_err(ApiError::from)?;
+    state
+        .registry
+        .notice(format!("logical backup {} queued", operation.operation_id));
+    Ok((StatusCode::ACCEPTED, Json(ApiEnvelope::new(operation))))
+}
+
+async fn start_restore(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(request): Json<PathOperationRequest>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    require(&state, &headers, Action::Manage, DbObject::Server)?;
+    let operation = state
+        .operations
+        .start(StartOperation::Restore { path: request.path })
+        .map_err(ApiError::from)?;
+    state
+        .registry
+        .notice(format!("logical restore {} queued", operation.operation_id));
+    Ok((StatusCode::ACCEPTED, Json(ApiEnvelope::new(operation))))
+}
+
+async fn start_import(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(request): Json<TransferOperationRequest>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    require(
+        &state,
+        &headers,
+        Action::Write,
+        DbObject::Table(format!("{}.{}", request.schema, request.table)),
+    )?;
+    let operation = state
+        .operations
+        .start(StartOperation::Import {
+            request: TableTransferRequest {
+                schema: request.schema,
+                table: request.table,
+                path: request.path,
+                format: request.format,
+            },
+        })
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::ACCEPTED, Json(ApiEnvelope::new(operation))))
+}
+
+async fn start_export(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(request): Json<TransferOperationRequest>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let object = DbObject::Table(format!("{}.{}", request.schema, request.table));
+    let principal = authenticate(&state, &headers)?;
+    Authorizer::from_store(&state.auth)
+        .and_then(|authorizer| {
+            authorizer.authorize_all(&principal, &[Action::Read, Action::Backup], &object)
+        })
+        .map_err(ApiError::from)?;
+    let operation = state
+        .operations
+        .start(StartOperation::Export {
+            request: TableTransferRequest {
+                schema: request.schema,
+                table: request.table,
+                path: request.path,
+                format: request.format,
+            },
+        })
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::ACCEPTED, Json(ApiEnvelope::new(operation))))
+}
+
+async fn operations(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    require(&state, &headers, Action::Monitor, DbObject::Server)?;
+    Ok(Json(ApiEnvelope::new(
+        state.operations.list().map_err(ApiError::from)?,
+    )))
+}
+
+async fn operation(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    AxumPath(operation_id): AxumPath<Uuid>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    require(&state, &headers, Action::Monitor, DbObject::Server)?;
+    Ok(Json(ApiEnvelope::new(
+        state.operations.get(operation_id).map_err(ApiError::from)?,
+    )))
+}
+
+async fn cancel_operation(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    AxumPath(operation_id): AxumPath<Uuid>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    require(&state, &headers, Action::Manage, DbObject::Server)?;
+    Ok(Json(ApiEnvelope::new(
+        state
+            .operations
+            .cancel(operation_id)
+            .map_err(ApiError::from)?,
+    )))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceStatus {
+    name: &'static str,
+    process_running: bool,
+    windows_service_supported: bool,
+    data_dir: PathBuf,
+    operations_root: PathBuf,
+}
+
+async fn service(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    require(&state, &headers, Action::Monitor, DbObject::Server)?;
+    Ok(Json(ApiEnvelope::new(ServiceStatus {
+        name: "OrdaDB",
+        process_running: true,
+        windows_service_supported: cfg!(windows),
+        data_dir: state.engine.config().data_dir.clone(),
+        operations_root: state.operations.operations_root().to_path_buf(),
+    })))
 }
 
 #[derive(Serialize)]
@@ -517,16 +680,23 @@ fn require(
     action: Action,
     object: DbObject,
 ) -> std::result::Result<Principal, ApiError> {
+    let principal = authenticate(state, headers)?;
+    Authorizer::from_store(&state.auth)
+        .and_then(|authorizer| authorizer.authorize(&principal, action, &object))
+        .map_err(ApiError::from)?;
+    Ok(principal)
+}
+
+fn authenticate(
+    state: &AdminState,
+    headers: &HeaderMap,
+) -> std::result::Result<Principal, ApiError> {
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(|| ApiError::from(DbError::new("28000", "authentication required")))?;
-    let principal = state.tokens.authenticate(token).map_err(ApiError::from)?;
-    Authorizer::from_store(&state.auth)
-        .and_then(|authorizer| authorizer.authorize(&principal, action, &object))
-        .map_err(ApiError::from)?;
-    Ok(principal)
+    state.tokens.authenticate(token).map_err(ApiError::from)
 }
 
 struct ApiError {
@@ -733,6 +903,8 @@ mod tests {
             "/v1/storage",
             "/v1/wal",
             "/v1/backups",
+            "/v1/operations",
+            "/v1/service",
             "/v1/config",
             "/v1/logs/stream",
         ] {
@@ -764,20 +936,62 @@ mod tests {
             .expect("checkpoint");
         assert_eq!(checkpoint.status(), StatusCode::OK);
 
-        for path in ["/v1/backups", "/v1/config"] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri(path)
-                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                        .body(Body::empty())
-                        .expect("unsupported request"),
-                )
-                .await
-                .expect("unsupported response");
-            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/config")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("unsupported request"),
+            )
+            .await
+            .expect("unsupported response");
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn backup_route_starts_a_real_bounded_operation() {
+        let (_directory, state) = state();
+        let token = state
+            .tokens
+            .issue(&state.auth, "dba", b"correct horse battery staple")
+            .expect("token")
+            .access_token;
+        let app = api_router(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/backups")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"path":"api-backup.orda"}"#))
+                    .expect("backup request"),
+            )
+            .await
+            .expect("backup response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json");
+        let operation_id =
+            Uuid::parse_str(body["data"]["operationId"].as_str().expect("operation ID"))
+                .expect("UUID");
+        for _ in 0..100 {
+            let operation = state.operations.get(operation_id).expect("operation");
+            if !matches!(
+                operation.state,
+                crate::OperationState::Queued | crate::OperationState::Running
+            ) {
+                assert_eq!(operation.state, crate::OperationState::Succeeded);
+                assert_eq!(operation.path, PathBuf::from("api-backup.orda"));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        panic!("backup operation did not finish");
     }
 }

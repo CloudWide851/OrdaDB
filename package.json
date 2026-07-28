@@ -10,6 +10,9 @@
     "test": "pnpm --filter @ordadb/console test",
     "test:e2e": "pnpm --filter @ordadb/console test:e2e",
     "build": "pnpm --filter @ordadb/console build",
+    "package:stage:x64": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stage-windows-x64.ps1",
+    "scale:smoke:x64": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-final-scale.ps1 -Profile Smoke",
+    "scale:full:x64": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-final-scale.ps1 -Profile Full -ConfirmFullScale -RetainData",
     "desktop:dev": "pnpm --filter @ordadb/desktop dev",
     "desktop:build:x64": "pnpm --filter @ordadb/desktop build:x64"
   },

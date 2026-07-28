@@ -46,10 +46,12 @@ use ordadb_types::{
     Batch, CommandComplete, DbError, Field, Identifier, IndexId, QueryEvent, QueryProgress, Result,
     Row, ScalarType, Schema, SequenceId, TableId, Value, ViewId,
 };
+use serde::{Deserialize, Serialize};
 
 const AUTOMATIC_CHECKPOINT_INTERVAL: u64 = 64;
 const MAX_REFERENTIAL_ACTIONS: usize = 16_384;
 const PLPGSQL_EXECUTION_STACK_BYTES: usize = 8 * 1024 * 1024;
+pub const LOGICAL_SNAPSHOT_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
@@ -93,6 +95,15 @@ pub struct EngineStatusSnapshot {
     pub durable_lsn: Option<u64>,
     pub dirty_page_count: usize,
     pub commits_since_checkpoint: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogicalDatabaseSnapshot {
+    pub format_version: u16,
+    pub source_generation: u64,
+    pub catalog: Arc<Catalog>,
+    pub tables: BTreeMap<TableId, Arc<Vec<Row>>>,
 }
 
 impl EngineConfig {
@@ -173,6 +184,92 @@ impl Engine {
             .read()
             .map(|state| Arc::clone(&state.catalog))
             .map_err(|_| internal_error("engine state lock is poisoned"))
+    }
+
+    pub fn logical_snapshot(&self) -> Result<LogicalDatabaseSnapshot> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| internal_error("engine state lock is poisoned"))?;
+        let tables = state
+            .catalog
+            .database()
+            .schemas()
+            .flat_map(|schema| schema.tables())
+            .map(|table| {
+                (
+                    table.id,
+                    state
+                        .rows
+                        .get(&table.id)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(Vec::new())),
+                )
+            })
+            .collect();
+        Ok(LogicalDatabaseSnapshot {
+            format_version: LOGICAL_SNAPSHOT_VERSION,
+            source_generation: state.generation,
+            catalog: Arc::clone(&state.catalog),
+            tables,
+        })
+    }
+
+    pub fn replace_logical_snapshot(&self, snapshot: LogicalDatabaseSnapshot) -> Result<()> {
+        let candidate = DatabaseState::from_logical_snapshot(snapshot)?;
+        let transaction_id = self.writer.next_transaction_id()?;
+        let mut lease = self.writer.try_acquire(transaction_id)?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| internal_error("engine state lock is poisoned"))?;
+        persist_candidate(
+            &mut state,
+            &self.store,
+            &self.wal,
+            transaction_id,
+            candidate,
+        )?;
+        drop(state);
+        lease.release();
+        record_commit_and_maybe_checkpoint(
+            &self.state,
+            &self.store,
+            &self.wal,
+            &self.writer,
+            &self.commits_since_checkpoint,
+        )
+    }
+
+    pub fn restore_logical_snapshot(
+        config: EngineConfig,
+        snapshot: LogicalDatabaseSnapshot,
+    ) -> Result<Self> {
+        if config.data_dir.exists() {
+            let mut entries = std::fs::read_dir(&config.data_dir).map_err(|error| {
+                DbError::new("58030", "failed to inspect logical restore target")
+                    .with_detail(error.to_string())
+            })?;
+            if entries
+                .next()
+                .transpose()
+                .map_err(|error| {
+                    DbError::new("58030", "failed to inspect logical restore target")
+                        .with_detail(error.to_string())
+                })?
+                .is_some()
+            {
+                return Err(DbError::new(
+                    "55000",
+                    "logical restore target must be absent or empty",
+                )
+                .with_hint("restore into a new candidate directory before replacing active data"));
+            }
+        }
+        let engine = Self::open(config)?;
+        engine.replace_logical_snapshot(snapshot)?;
+        engine.checkpoint()?;
+        Ok(engine)
     }
 
     pub fn status_snapshot(&self) -> Result<EngineStatusSnapshot> {
@@ -892,6 +989,7 @@ pub struct TryQueryStream {
     state: TryQueryStreamState,
     failed: bool,
     failure_flag: Option<Arc<AtomicBool>>,
+    execution_memory_peak_bytes: Option<usize>,
 }
 
 enum TryQueryStreamState {
@@ -930,6 +1028,13 @@ impl StreamBatchCursor {
             Self::Advanced(cursor) => cursor.next_batch(),
         }
     }
+
+    fn memory_peak_bytes(&self) -> usize {
+        match self {
+            Self::Simple(cursor) => cursor.memory().peak_bytes(),
+            Self::Advanced(cursor) => cursor.memory().peak_bytes(),
+        }
+    }
 }
 
 impl std::fmt::Debug for TryQueryStream {
@@ -949,6 +1054,7 @@ impl TryQueryStream {
             ),
             failed: false,
             failure_flag: None,
+            execution_memory_peak_bytes: None,
         }
     }
 
@@ -963,12 +1069,20 @@ impl TryQueryStream {
             })),
             failed: false,
             failure_flag: None,
+            execution_memory_peak_bytes: Some(0),
         }
     }
 
     fn with_failure_flag(mut self, failure_flag: Arc<AtomicBool>) -> Self {
         self.failure_flag = Some(failure_flag);
         self
+    }
+
+    /// Returns the highest number of query-accounted bytes observed by this
+    /// SELECT stream. Non-SELECT statements do not own an execution cursor.
+    #[must_use]
+    pub const fn execution_memory_peak_bytes(&self) -> Option<usize> {
+        self.execution_memory_peak_bytes
     }
 }
 
@@ -984,6 +1098,9 @@ impl Iterator for TryQueryStream {
             TryQueryStreamState::Select(stream) => stream.next_event(),
             TryQueryStreamState::Done => Ok(None),
         };
+        if let TryQueryStreamState::Select(stream) = &self.state {
+            self.execution_memory_peak_bytes = Some(stream.cursor.memory_peak_bytes());
+        }
         match event {
             Ok(Some(event)) => Some(Ok(event)),
             Ok(None) => {
@@ -1161,6 +1278,65 @@ impl DatabaseState {
             routine_depth: 0,
             cancellation: None,
         })
+    }
+
+    fn from_logical_snapshot(snapshot: LogicalDatabaseSnapshot) -> Result<Self> {
+        if snapshot.format_version != LOGICAL_SNAPSHOT_VERSION {
+            return Err(DbError::new(
+                "0A000",
+                format!(
+                    "logical snapshot version {} is not supported",
+                    snapshot.format_version
+                ),
+            )
+            .with_hint("use a compatible OrdaDB version or perform an explicit migration"));
+        }
+        let catalog_table_ids = snapshot
+            .catalog
+            .database()
+            .schemas()
+            .flat_map(|schema| schema.tables())
+            .map(|table| table.id)
+            .collect::<BTreeSet<_>>();
+        if snapshot
+            .tables
+            .keys()
+            .any(|table_id| !catalog_table_ids.contains(table_id))
+        {
+            return Err(DbError::new(
+                "XX001",
+                "logical snapshot contains rows for a table absent from its catalog",
+            ));
+        }
+        let rows = catalog_table_ids
+            .iter()
+            .map(|table_id| {
+                (
+                    *table_id,
+                    snapshot
+                        .tables
+                        .get(table_id)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(Vec::new())),
+                )
+            })
+            .collect();
+        let mut state = Self {
+            catalog: snapshot.catalog,
+            rows,
+            indexes: BTreeMap::new(),
+            searches: Arc::new(SearchCatalog::default()),
+            generation: snapshot.source_generation,
+            trigger_depth: 0,
+            triggers_fired: 0,
+            routine_depth: 0,
+            cancellation: None,
+        };
+        validate_database_rows(&state)?;
+        for table_id in catalog_table_ids {
+            rebuild_table_derived(&mut state, table_id)?;
+        }
+        Ok(state)
     }
 }
 
@@ -4315,6 +4491,33 @@ mod tests {
     }
 
     #[test]
+    fn fallible_stream_retains_query_accounted_peak_after_completion() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE memory_items (id BIGINT, payload TEXT)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO memory_items VALUES (1, 'alpha'), (2, 'beta')",
+            &[],
+        );
+
+        let mut stream = session
+            .execute_stream("SELECT id, payload FROM memory_items", &[])
+            .expect("stream");
+        assert_eq!(stream.execution_memory_peak_bytes(), Some(0));
+        while stream.next().is_some() {}
+        assert!(
+            stream
+                .execution_memory_peak_bytes()
+                .is_some_and(|peak| peak > 0 && peak <= 256 * 1024 * 1024)
+        );
+    }
+
+    #[test]
     fn read_snapshots_share_arcs_and_writes_copy_only_the_affected_table() {
         let (_directory, engine) = engine();
         let mut session = engine.connect().expect("connect");
@@ -4385,6 +4588,7 @@ mod tests {
             ),
             failed: false,
             failure_flag: Some(failure_flag),
+            execution_memory_peak_bytes: None,
         };
 
         assert_eq!(

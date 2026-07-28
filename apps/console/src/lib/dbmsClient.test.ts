@@ -53,4 +53,32 @@ describe("PreviewDbmsClient", () => {
       },
     });
   });
+
+  it("projects administration jobs and service status as explicit Preview fixtures", async () => {
+    const client: DbmsClient = new PreviewDbmsClient();
+    const started = await client.startOperation({
+      connectionId: "preview-connection",
+      kind: "backup",
+      path: "fixture.ordbak",
+    });
+
+    expect(started).toMatchObject({
+      kind: "backup",
+      state: "queued",
+      path: "fixture.ordbak",
+    });
+    await expect(client.operations("preview-connection")).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          operationId: started.operationId,
+          state: "succeeded",
+        }),
+      ]),
+    );
+    await expect(client.service("preview-connection")).resolves.toMatchObject({
+      name: "OrdaDB Preview",
+      processRunning: false,
+      dataDir: "Preview fixture",
+    });
+  });
 });

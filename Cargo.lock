@@ -2763,8 +2763,10 @@ dependencies = [
  "async-stream",
  "axum",
  "base64 0.22.1",
+ "chrono",
  "futures-core",
  "hmac",
+ "ordadb-backup",
  "ordadb-catalog",
  "ordadb-engine",
  "ordadb-types",
@@ -2780,6 +2782,24 @@ dependencies = [
  "uuid",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "ordadb-backup"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "csv",
+ "ordadb-catalog",
+ "ordadb-engine",
+ "ordadb-types",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -2860,6 +2880,7 @@ dependencies = [
  "ordadb-storage",
  "ordadb-transaction",
  "ordadb-types",
+ "serde",
  "serde_json",
  "tempfile",
 ]

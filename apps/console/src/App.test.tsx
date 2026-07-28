@@ -266,6 +266,26 @@ describe("OrdaDB workbench", () => {
       name: "数据库运维",
     });
     expect(within(operations).getByText("当前没有活动会话")).toBeVisible();
+    await user.click(within(operations).getByRole("button", { name: "备份" }));
+    expect(
+      within(operations).getByText(/逻辑备份与恢复 · Preview fixture/),
+    ).toBeVisible();
+    const archive = within(operations).getByRole("textbox", {
+      name: "逻辑归档文件",
+    });
+    await user.clear(archive);
+    await user.type(archive, "ui-fixture.ordbak");
+    await user.click(
+      within(operations).getByRole("button", { name: "创建备份" }),
+    );
+    expect(await within(operations).findByText("ui-fixture.ordbak")).toBeVisible();
+    const restore = within(operations).getByRole("button", {
+      name: "恢复归档",
+    });
+    await user.click(restore);
+    expect(
+      within(operations).getByRole("button", { name: "确认恢复并替换" }),
+    ).toBeVisible();
     await user.click(
       within(operations).getByRole("button", {
         name: "关闭数据库运维",

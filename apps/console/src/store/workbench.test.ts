@@ -75,4 +75,32 @@ describe("workbench store", () => {
     expect(store.getState()).not.toHaveProperty("password");
     expect(JSON.stringify(store.getState())).not.toContain("disposable-secret");
   });
+
+  it("tracks administration operations without exposing native paths", async () => {
+    const store = createWorkbenchStore(new PreviewDbmsClient());
+
+    await store.getState().initialize();
+    await store.getState().startAdministrationOperation({
+      kind: "export",
+      path: "documents.csv",
+      schema: "public",
+      table: "documents",
+      format: "csv",
+    });
+
+    expect(store.getState().operations[0]).toMatchObject({
+      kind: "export",
+      state: "queued",
+      path: "documents.csv",
+    });
+    await store.getState().refreshAdministration();
+    expect(store.getState().operations[0]).toMatchObject({
+      kind: "export",
+      state: "succeeded",
+    });
+    expect(store.getState().serviceStatus).toMatchObject({
+      name: "OrdaDB Preview",
+      dataDir: "Preview fixture",
+    });
+  });
 });

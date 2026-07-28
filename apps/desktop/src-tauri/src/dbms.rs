@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Component, Path};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
@@ -97,7 +98,7 @@ impl DbmsCapabilities {
             metrics: true,
             wal: true,
             checkpoint: true,
-            backup: false,
+            backup: true,
             import_export: true,
             service_control: false,
         }
@@ -317,6 +318,108 @@ pub struct MonitorSnapshot {
     wal: EngineStatus,
     backups: CapabilityStatus,
     config: PublicConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdministrationOperationKind {
+    Backup,
+    Restore,
+    Import,
+    Export,
+}
+
+impl AdministrationOperationKind {
+    const fn endpoint(self) -> &'static str {
+        match self {
+            Self::Backup => "/v1/backups",
+            Self::Restore => "/v1/restores",
+            Self::Import => "/v1/imports",
+            Self::Export => "/v1/exports",
+        }
+    }
+
+    const fn requires_table(self) -> bool {
+        matches!(self, Self::Import | Self::Export)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AdministrationTransferFormat {
+    Csv,
+    JsonLines,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StartAdministrationOperationRequest {
+    connection_id: String,
+    kind: AdministrationOperationKind,
+    path: String,
+    schema: Option<String>,
+    table: Option<String>,
+    format: Option<AdministrationTransferFormat>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdministrationOperationResponse {
+    operation_id: Uuid,
+    kind: AdministrationOperationKind,
+    state: String,
+    path: String,
+    schema: Option<String>,
+    table: Option<String>,
+    started_at: Option<JsonValue>,
+    finished_at: Option<JsonValue>,
+    rows: Option<u64>,
+    bytes: Option<u64>,
+    error: Option<DbError>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdministrationOperation {
+    operation_id: Uuid,
+    kind: AdministrationOperationKind,
+    state: String,
+    path: String,
+    schema: Option<String>,
+    table: Option<String>,
+    started_at: Option<JsonValue>,
+    finished_at: Option<JsonValue>,
+    rows: Option<u64>,
+    bytes: Option<u64>,
+    error: Option<DbmsError>,
+}
+
+impl From<AdministrationOperationResponse> for AdministrationOperation {
+    fn from(operation: AdministrationOperationResponse) -> Self {
+        Self {
+            operation_id: operation.operation_id,
+            kind: operation.kind,
+            state: operation.state,
+            path: operation.path,
+            schema: operation.schema,
+            table: operation.table,
+            started_at: operation.started_at,
+            finished_at: operation.finished_at,
+            rows: operation.rows,
+            bytes: operation.bytes,
+            error: operation.error.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdministrationServiceStatus {
+    name: String,
+    process_running: bool,
+    windows_service_supported: bool,
+    data_dir: String,
+    operations_root: String,
 }
 
 #[derive(Debug)]
@@ -801,11 +904,9 @@ impl DbmsRuntime {
                 let metrics = admin_get(&self.http, &native.admin, "/v1/metrics", true);
                 let storage = admin_get(&self.http, &native.admin, "/v1/storage", true);
                 let wal = admin_get(&self.http, &native.admin, "/v1/wal", true);
-                let backups = admin_get(&self.http, &native.admin, "/v1/backups", true);
                 let config = admin_get(&self.http, &native.admin, "/v1/config", true);
-                let (sessions, queries, locks, metrics, storage, wal, backups, config) = tokio::try_join!(
-                    sessions, queries, locks, metrics, storage, wal, backups, config
-                )?;
+                let (sessions, queries, locks, metrics, storage, wal, config) =
+                    tokio::try_join!(sessions, queries, locks, metrics, storage, wal, config)?;
                 Ok(MonitorSnapshot {
                     connection_id: connection_id.to_owned(),
                     sessions,
@@ -814,7 +915,10 @@ impl DbmsRuntime {
                     metrics,
                     storage,
                     wal,
-                    backups,
+                    backups: CapabilityStatus {
+                        supported: true,
+                        reason: String::new(),
+                    },
                     config,
                 })
             }
@@ -886,6 +990,108 @@ impl DbmsRuntime {
             ));
         }
         admin_get(&self.http, &native.admin, "/v1/storage", true).await
+    }
+
+    async fn administration_operations(
+        &self,
+        connection_id: &str,
+    ) -> Result<Vec<AdministrationOperation>, DbError> {
+        let connection = self.connection(connection_id)?;
+        let ConnectionTransport::Native(native) = &connection.transport else {
+            return Err(DbError::new(
+                "0A000",
+                "administration operations are available only for native OrdaDB connections",
+            ));
+        };
+        let operations: Vec<AdministrationOperationResponse> =
+            admin_get(&self.http, &native.admin, "/v1/operations", true).await?;
+        Ok(operations.into_iter().map(Into::into).collect())
+    }
+
+    async fn start_administration_operation(
+        &self,
+        request: StartAdministrationOperationRequest,
+    ) -> Result<AdministrationOperation, DbError> {
+        validate_administration_operation_request(&request)?;
+        let connection = self.connection(&request.connection_id)?;
+        let ConnectionTransport::Native(native) = &connection.transport else {
+            return Err(DbError::new(
+                "0A000",
+                "administration operations are available only for native OrdaDB connections",
+            ));
+        };
+        let body = if request.kind.requires_table() {
+            serde_json::json!({
+                "path": request.path,
+                "schema": request.schema,
+                "table": request.table,
+                "format": request.format,
+            })
+        } else {
+            serde_json::json!({ "path": request.path })
+        };
+        let operation: AdministrationOperationResponse =
+            admin_post_json(&self.http, &native.admin, request.kind.endpoint(), &body).await?;
+        Ok(operation.into())
+    }
+
+    async fn administration_operation(
+        &self,
+        connection_id: &str,
+        operation_id: &str,
+    ) -> Result<AdministrationOperation, DbError> {
+        let operation_id = validate_operation_id(operation_id)?;
+        let connection = self.connection(connection_id)?;
+        let ConnectionTransport::Native(native) = &connection.transport else {
+            return Err(DbError::new(
+                "0A000",
+                "administration operations are available only for native OrdaDB connections",
+            ));
+        };
+        let operation: AdministrationOperationResponse = admin_get(
+            &self.http,
+            &native.admin,
+            &format!("/v1/operations/{operation_id}"),
+            true,
+        )
+        .await?;
+        Ok(operation.into())
+    }
+
+    async fn cancel_administration_operation(
+        &self,
+        connection_id: &str,
+        operation_id: &str,
+    ) -> Result<AdministrationOperation, DbError> {
+        let operation_id = validate_operation_id(operation_id)?;
+        let connection = self.connection(connection_id)?;
+        let ConnectionTransport::Native(native) = &connection.transport else {
+            return Err(DbError::new(
+                "0A000",
+                "administration operations are available only for native OrdaDB connections",
+            ));
+        };
+        let operation: AdministrationOperationResponse = admin_post(
+            &self.http,
+            &native.admin,
+            &format!("/v1/operations/{operation_id}/cancel"),
+        )
+        .await?;
+        Ok(operation.into())
+    }
+
+    async fn administration_service(
+        &self,
+        connection_id: &str,
+    ) -> Result<AdministrationServiceStatus, DbError> {
+        let connection = self.connection(connection_id)?;
+        let ConnectionTransport::Native(native) = &connection.transport else {
+            return Err(DbError::new(
+                "0A000",
+                "service status is available only for native OrdaDB connections",
+            ));
+        };
+        admin_get(&self.http, &native.admin, "/v1/service", true).await
     }
 }
 
@@ -1094,6 +1300,63 @@ pub async fn dbms_checkpoint(
     runtime.checkpoint(&connection_id).await.map_err(Into::into)
 }
 
+#[tauri::command(rename_all = "camelCase")]
+pub async fn dbms_operations(
+    runtime: State<'_, Arc<DbmsRuntime>>,
+    connection_id: String,
+) -> DesktopResult<Vec<AdministrationOperation>> {
+    runtime
+        .administration_operations(&connection_id)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn dbms_start_operation(
+    runtime: State<'_, Arc<DbmsRuntime>>,
+    request: StartAdministrationOperationRequest,
+) -> DesktopResult<AdministrationOperation> {
+    runtime
+        .start_administration_operation(request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn dbms_operation(
+    runtime: State<'_, Arc<DbmsRuntime>>,
+    connection_id: String,
+    operation_id: String,
+) -> DesktopResult<AdministrationOperation> {
+    runtime
+        .administration_operation(&connection_id, &operation_id)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn dbms_cancel_operation(
+    runtime: State<'_, Arc<DbmsRuntime>>,
+    connection_id: String,
+    operation_id: String,
+) -> DesktopResult<AdministrationOperation> {
+    runtime
+        .cancel_administration_operation(&connection_id, &operation_id)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn dbms_service(
+    runtime: State<'_, Arc<DbmsRuntime>>,
+    connection_id: String,
+) -> DesktopResult<AdministrationServiceStatus> {
+    runtime
+        .administration_service(&connection_id)
+        .await
+        .map_err(Into::into)
+}
+
 fn validate_connect_request(request: &ConnectRequest) -> Result<(), DbError> {
     if !VALID_CONNECTOR_IDS.contains(&request.connector_id.as_str()) {
         return Err(DbError::new("22023", "unknown connector ID"));
@@ -1116,6 +1379,59 @@ fn validate_connect_request(request: &ConnectRequest) -> Result<(), DbError> {
         ));
     }
     Ok(())
+}
+
+fn validate_administration_operation_request(
+    request: &StartAdministrationOperationRequest,
+) -> Result<(), DbError> {
+    validate_id(&request.connection_id, "connection ID")?;
+    validate_operation_path(&request.path)?;
+    if request.kind.requires_table() {
+        let schema = request
+            .schema
+            .as_deref()
+            .ok_or_else(|| DbError::new("22023", "table operation requires a schema"))?;
+        let table = request
+            .table
+            .as_deref()
+            .ok_or_else(|| DbError::new("22023", "table operation requires a table"))?;
+        validate_text(schema, 1, 256, "schema name")?;
+        validate_text(table, 1, 256, "table name")?;
+        if request.format.is_none() {
+            return Err(DbError::new(
+                "22023",
+                "table operation requires CSV or JSON Lines format",
+            ));
+        }
+    } else if request.schema.is_some() || request.table.is_some() || request.format.is_some() {
+        return Err(DbError::new(
+            "22023",
+            "backup and restore requests do not accept table fields",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_operation_path(value: &str) -> Result<(), DbError> {
+    validate_text(value, 1, 512, "operation path")?;
+    let path = Path::new(value);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(DbError::new(
+            "22023",
+            "operation path must be relative to the server operations root",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_operation_id(value: &str) -> Result<Uuid, DbError> {
+    value
+        .parse()
+        .map_err(|_| DbError::new("22023", "operation ID must be a UUID"))
 }
 
 fn validate_execute_request(request: &ExecuteRequest) -> Result<(), DbError> {
@@ -1244,6 +1560,24 @@ async fn admin_post<T: DeserializeOwned>(
     path: &str,
 ) -> Result<T, DbError> {
     admin_request(client, session, Method::POST, path, true).await
+}
+
+async fn admin_post_json<T: DeserializeOwned>(
+    client: &Client,
+    session: &AdminSession,
+    path: &str,
+    body: &JsonValue,
+) -> Result<T, DbError> {
+    let response = client
+        .post(format!("{}{}", session.base_url, path))
+        .bearer_auth(session.bearer.as_str())
+        .json(body)
+        .send()
+        .await
+        .map_err(|error| network_error("administration request failed", error))?;
+    let envelope: ApiEnvelope<T> = decode_admin_response(response).await?;
+    validate_api_version(&envelope.api_version)?;
+    Ok(envelope.data)
 }
 
 async fn admin_request<T: DeserializeOwned>(
@@ -1788,5 +2122,58 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn administration_requests_are_relative_and_shape_checked() {
+        let backup = StartAdministrationOperationRequest {
+            connection_id: "connection-1".into(),
+            kind: AdministrationOperationKind::Backup,
+            path: "nightly/ordadb.ordbak".into(),
+            schema: None,
+            table: None,
+            format: None,
+        };
+        assert!(validate_administration_operation_request(&backup).is_ok());
+
+        let mut absolute = backup.clone();
+        absolute.path = r"C:\ProgramData\ordadb.ordbak".into();
+        assert_eq!(
+            validate_administration_operation_request(&absolute)
+                .expect_err("absolute path")
+                .sql_state,
+            "22023"
+        );
+        let mut traversal = backup.clone();
+        traversal.path = "../escape.ordbak".into();
+        assert!(validate_administration_operation_request(&traversal).is_err());
+
+        let mut missing_table = backup;
+        missing_table.kind = AdministrationOperationKind::Import;
+        missing_table.format = Some(AdministrationTransferFormat::Csv);
+        assert!(validate_administration_operation_request(&missing_table).is_err());
+    }
+
+    #[test]
+    fn administration_operation_errors_serialize_recursively_in_camel_case() {
+        let operation = AdministrationOperation::from(AdministrationOperationResponse {
+            operation_id: Uuid::nil(),
+            kind: AdministrationOperationKind::Restore,
+            state: "failed".into(),
+            path: "broken.ordbak".into(),
+            schema: None,
+            table: None,
+            started_at: None,
+            finished_at: None,
+            rows: None,
+            bytes: None,
+            error: Some(DbError::new("XX001", "archive checksum mismatch")),
+        });
+        let value = serde_json::to_value(operation).expect("serialize operation");
+        assert_eq!(value["operationId"], Uuid::nil().to_string());
+        assert_eq!(value["kind"], "restore");
+        assert_eq!(value["error"]["sqlState"], "XX001");
+        assert!(value["error"].get("sql_state").is_none());
+        assert!(value["error"].get("queryId").is_some());
     }
 }

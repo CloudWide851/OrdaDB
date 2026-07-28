@@ -24,11 +24,14 @@ node_modules/
 dist/
 .vite/
 *.tsbuildinfo
+/apps/desktop/src-tauri/staging/
 
 # Tests and reports
 playwright-report/
 test-results/
 coverage/
+*.profraw
+*.profdata
 
 # Local state
 .env

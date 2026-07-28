@@ -11,7 +11,10 @@ import {
   type DbmsConnectionSnapshot,
   type DbmsError,
   type DbmsMonitorSnapshot,
+  type DbmsOperationRecord,
   type DbmsQueryColumn,
+  type DbmsServiceStatus,
+  type StartDbmsOperationRequest,
 } from "../lib/dbmsClient";
 import type {
   InspectorTab,
@@ -68,6 +71,9 @@ export interface WorkbenchState {
   activeCredentialId: string | null;
   catalog: DbmsCatalogObject[];
   monitor: DbmsMonitorSnapshot | null;
+  operations: DbmsOperationRecord[];
+  serviceStatus: DbmsServiceStatus | null;
+  administrationBusy: boolean;
   connectionState: "idle" | "connecting" | "connected" | "error";
   connectionError: DbmsError | null;
   transactionActive: boolean;
@@ -90,6 +96,11 @@ export interface WorkbenchState {
   deleteStoredCredential: () => Promise<void>;
   refreshCatalog: () => Promise<void>;
   refreshMonitor: () => Promise<void>;
+  refreshAdministration: () => Promise<void>;
+  startAdministrationOperation: (
+    request: Omit<StartDbmsOperationRequest, "connectionId">,
+  ) => Promise<void>;
+  cancelAdministrationOperation: (operationId: string) => Promise<void>;
   runQuery: (options?: RunQueryOptions) => Promise<void>;
   runExplain: () => Promise<void>;
   cancelQuery: () => Promise<void>;
@@ -133,6 +144,9 @@ export function createWorkbenchStore(
   activeCredentialId: null,
   catalog: [],
   monitor: null,
+  operations: [],
+  serviceStatus: null,
+  administrationBusy: false,
   connectionState: dbms.mode === "preview" ? "connected" : "idle",
   connectionError: null,
   transactionActive: false,
@@ -147,6 +161,7 @@ export function createWorkbenchStore(
       ]);
       setCatalog(set, get, catalog.objects);
       set({ monitor });
+      await get().refreshAdministration();
     } catch (error) {
       const normalized = normalizeDbmsError(error);
       set({
@@ -184,7 +199,7 @@ export function createWorkbenchStore(
 
   openOperations: async (operationView) => {
     set({ operationView, operationsOpen: true });
-    await get().refreshMonitor();
+    await Promise.all([get().refreshMonitor(), get().refreshAdministration()]);
   },
 
   connectDataSource: async (values) => {
@@ -215,6 +230,8 @@ export function createWorkbenchStore(
       set({
         connection,
         monitor,
+        operations: [],
+        serviceStatus: null,
         dialect: connection.dialect,
         dataSourceOpen: false,
         connectionState: "connected",
@@ -223,6 +240,7 @@ export function createWorkbenchStore(
         notice: `${connection.database} · 已连接`,
       });
       setCatalog(set, get, catalog.objects);
+      await get().refreshAdministration();
     } catch (error) {
       const normalized = normalizeDbmsError(error);
       set({
@@ -243,6 +261,8 @@ export function createWorkbenchStore(
         connection: null,
         catalog: [],
         monitor: null,
+        operations: [],
+        serviceStatus: null,
         selectedCatalogObject: null,
         connectionState: "idle",
         transactionActive: false,
@@ -294,6 +314,69 @@ export function createWorkbenchStore(
     try {
       const monitor = await dbms.monitor(connection.connectionId);
       set({ monitor });
+    } catch (error) {
+      const normalized = normalizeDbmsError(error);
+      set({ connectionError: normalized, notice: normalized.message });
+    }
+  },
+
+  refreshAdministration: async () => {
+    const connection = get().connection;
+    if (!connection || connection.mode === "plugin") {
+      set({ operations: [], serviceStatus: null });
+      return;
+    }
+    try {
+      const [operations, serviceStatus] = await Promise.all([
+        dbms.operations(connection.connectionId),
+        dbms.service(connection.connectionId),
+      ]);
+      set({ operations, serviceStatus, connectionError: null });
+    } catch (error) {
+      const normalized = normalizeDbmsError(error);
+      set({ connectionError: normalized, notice: normalized.message });
+    }
+  },
+
+  startAdministrationOperation: async (request) => {
+    const connection = get().connection;
+    if (!connection) {
+      set({ dataSourceOpen: true, notice: "请先连接数据源" });
+      return;
+    }
+    set({ administrationBusy: true, connectionError: null });
+    try {
+      const operation = await dbms.startOperation({
+        ...request,
+        connectionId: connection.connectionId,
+      });
+      set((state) => ({
+        operations: replaceOperation(state.operations, operation),
+        administrationBusy: false,
+        notice: `${operationLabel(operation.kind)}已排队`,
+      }));
+    } catch (error) {
+      const normalized = normalizeDbmsError(error);
+      set({
+        administrationBusy: false,
+        connectionError: normalized,
+        notice: normalized.message,
+      });
+    }
+  },
+
+  cancelAdministrationOperation: async (operationId) => {
+    const connection = get().connection;
+    if (!connection) return;
+    try {
+      const operation = await dbms.cancelOperation(
+        connection.connectionId,
+        operationId,
+      );
+      set((state) => ({
+        operations: replaceOperation(state.operations, operation),
+        notice: "已发送作业取消请求",
+      }));
     } catch (error) {
       const normalized = normalizeDbmsError(error);
       set({ connectionError: normalized, notice: normalized.message });
@@ -496,4 +579,29 @@ function localError(sqlState: string, message: string): DbmsError {
     position: null,
     queryId: `console-${Date.now()}`,
   };
+}
+
+function replaceOperation(
+  operations: DbmsOperationRecord[],
+  incoming: DbmsOperationRecord,
+) {
+  return [
+    incoming,
+    ...operations.filter(
+      (operation) => operation.operationId !== incoming.operationId,
+    ),
+  ];
+}
+
+function operationLabel(kind: DbmsOperationRecord["kind"]) {
+  switch (kind) {
+    case "backup":
+      return "备份";
+    case "restore":
+      return "恢复";
+    case "import":
+      return "导入";
+    case "export":
+      return "导出";
+  }
 }

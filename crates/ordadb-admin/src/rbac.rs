@@ -77,6 +77,18 @@ impl Authorizer {
             .with_detail(format!("{} lacks {action:?} on {object:?}", principal.user)))
     }
 
+    pub fn authorize_all(
+        &self,
+        principal: &Principal,
+        actions: &[Action],
+        object: &DbObject,
+    ) -> Result<()> {
+        for action in actions {
+            self.authorize(principal, *action, object)?;
+        }
+        Ok(())
+    }
+
     pub fn authorize_sql(&self, principal: &Principal, database: &str, sql: &str) -> Result<()> {
         let (action, object) = classify_sql(database, sql);
         self.authorize(principal, action, &object)
@@ -214,6 +226,41 @@ mod tests {
                 .sql_state,
             "XX001"
         );
+    }
+
+    #[test]
+    fn export_authorization_requires_read_and_backup() {
+        let directory = tempdir().expect("tempdir");
+        let store = AuthStore::open(directory.path()).expect("open");
+        store
+            .bootstrap_admin("dba", b"correct horse battery staple")
+            .expect("bootstrap");
+        store.create_role("exporter", false).expect("create role");
+        store
+            .create_user("analyst", b"correct horse battery staple", false)
+            .expect("create user");
+        store.grant_role("exporter", "analyst").expect("grant role");
+        let table = DbObject::Table("public.items".into());
+        store
+            .grant_privilege("exporter", Action::Backup, table.clone())
+            .expect("grant backup");
+        let principal = store.principal("analyst").expect("principal");
+        let authorizer = Authorizer::from_store(&store).expect("authorizer");
+        assert_eq!(
+            authorizer
+                .authorize_all(&principal, &[Action::Read, Action::Backup], &table)
+                .expect_err("read grant is required")
+                .sql_state,
+            "42501"
+        );
+
+        store
+            .grant_privilege("exporter", Action::Read, table.clone())
+            .expect("grant read");
+        Authorizer::from_store(&store)
+            .expect("authorizer")
+            .authorize_all(&principal, &[Action::Read, Action::Backup], &table)
+            .expect("both grants authorize export");
     }
 
     #[test]
