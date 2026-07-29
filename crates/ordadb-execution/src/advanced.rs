@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::fs::OpenOptions;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,10 +15,10 @@ use ordadb_types::{Batch, DbError, Result, Row, Schema, Value};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    BatchPool, ExecutionContext, ExecutionOptions, ExpressionProgram, QueryMemoryContext,
-    SpillManager, SpillRun, compare_rows, create_spill_writer, estimated_row_bytes,
-    estimated_value_bytes, evaluate_binary, evaluate_unary, open_spill_reader, program_limit_error,
-    read_spill_record, sort_rows, spill_io_error, write_spill_record,
+    BatchPool, ExecutionContext, ExecutionOptions, ExpressionProgram, ExpressionStack,
+    QueryMemoryContext, Reservation, SpillManager, SpillRun, compare_rows, create_spill_writer,
+    estimated_row_bytes, estimated_value_bytes, evaluate_binary, evaluate_unary, open_spill_reader,
+    program_limit_error, read_spill_record, sort_rows, spill_io_error, write_spill_record,
 };
 
 const HASH_PARTITIONS: usize = 32;
@@ -51,8 +51,9 @@ pub struct AdvancedExecutionCursor {
     memory: QueryMemoryContext,
     pool: BatchPool,
     spill: SpillManager,
-    expression_stack: Vec<Value>,
+    expression_stack: ExpressionStack,
     output: Option<RowsOutput>,
+    in_flight: Option<Reservation>,
     aggregate: bool,
     exhausted: bool,
 }
@@ -112,6 +113,8 @@ impl AdvancedExecutionCursor {
                     .and_then(limit_from_value)
             })
             .transpose()?;
+        let memory = QueryMemoryContext::new(options.soft_memory_bytes, options.hard_memory_bytes)?;
+        let expression_stack = ExpressionStack::new(&memory)?;
         Ok(Self {
             source,
             schema: plan.schema,
@@ -122,11 +125,12 @@ impl AdvancedExecutionCursor {
             limit,
             emitted: 0,
             params: context.params.to_vec(),
-            memory: QueryMemoryContext::new(options.soft_memory_bytes, options.hard_memory_bytes),
+            memory,
             pool: BatchPool::new(options.batch_rows),
             spill: SpillManager::new(options.spill_root.clone()),
-            expression_stack: Vec::with_capacity(32),
+            expression_stack,
             output: None,
+            in_flight: None,
             aggregate: plan.aggregate,
             options,
             exhausted: false,
@@ -139,6 +143,7 @@ impl AdvancedExecutionCursor {
     }
 
     pub fn next_batch(&mut self) -> Result<Option<Batch>> {
+        self.in_flight = None;
         if self.exhausted {
             return Ok(None);
         }
@@ -149,7 +154,7 @@ impl AdvancedExecutionCursor {
         }
 
         let mut rows = self.pool.take();
-        let mut output_bytes = 0_usize;
+        let mut reservation = self.memory.try_reserve(0)?;
         while rows.len() < self.options.batch_rows {
             if self.limit.is_some_and(|limit| self.emitted >= limit) {
                 break;
@@ -158,8 +163,7 @@ impl AdvancedExecutionCursor {
                 break;
             };
             let bytes = estimated_row_bytes(&row);
-            self.memory.reserve(bytes)?;
-            output_bytes = output_bytes.saturating_add(bytes);
+            reservation.grow(bytes)?;
             rows.push(row);
             self.emitted = self.emitted.saturating_add(1);
         }
@@ -168,7 +172,7 @@ impl AdvancedExecutionCursor {
             self.pool.recycle(rows);
             return Ok(None);
         }
-        self.memory.release(output_bytes);
+        self.in_flight = Some(reservation);
         Ok(Some(Batch {
             schema: self.schema.clone(),
             rows,
@@ -177,11 +181,7 @@ impl AdvancedExecutionCursor {
 
     fn next_output_row(&mut self) -> Result<Option<Row>> {
         if let Some(output) = &mut self.output {
-            let row = output.next_row(
-                &self.order_by,
-                self.options.hard_memory_bytes,
-                &mut self.memory,
-            )?;
+            let row = output.next_row(&self.order_by, &self.memory)?;
             if self.aggregate {
                 return Ok(row);
             }
@@ -243,11 +243,11 @@ impl AdvancedExecutionCursor {
     }
 
     fn initialize_sorted_source(&mut self) -> Result<()> {
-        let mut builder = RowsOutputBuilder::new(&self.order_by);
+        let mut builder = RowsOutputBuilder::new(&self.order_by, &self.memory)?;
         while let Some(row) = self.next_filtered_source_row()? {
-            builder.push(row, &mut self.memory, &mut self.spill)?;
+            builder.push(row, &self.memory, &mut self.spill)?;
         }
-        self.output = Some(builder.finish(&mut self.memory, &mut self.spill)?);
+        self.output = Some(builder.finish(&self.memory, &mut self.spill)?);
         Ok(())
     }
 
@@ -257,60 +257,86 @@ impl AdvancedExecutionCursor {
             .take()
             .ok_or_else(|| DbError::internal("aggregate programs are unavailable"))?;
         let mut groups = Vec::<GroupAccumulator>::new();
-        let mut group_bytes = 0_usize;
+        let mut group_reservation = self.memory.try_reserve(0)?;
         let mut spill_paths = None;
-        let mut ordinal = 0_u64;
-        while let Some(row) = self.next_filtered_source_row()? {
-            let key = programs.group_key(&row, &self.params, &mut self.expression_stack)?;
-            if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
-                group.update(
-                    &programs.aggregate_specs,
-                    &row,
-                    &self.params,
-                    &mut self.expression_stack,
-                )?;
-            } else {
-                let group = GroupAccumulator::new(
-                    key,
-                    row,
-                    ordinal,
+        let unjoined_rows = if self.filter.is_none() && programs.group_by.is_empty() {
+            self.source.take_unjoined_rows()
+        } else {
+            None
+        };
+        if let Some(rows) = unjoined_rows {
+            if let Some((first, remaining)) = rows.split_first() {
+                let mut group = GroupAccumulator::new(
+                    Vec::new(),
+                    first.clone(),
+                    0,
                     &programs.aggregate_specs,
                     &self.params,
                     &mut self.expression_stack,
                 )?;
-                let bytes = group.estimated_bytes();
-                if !groups.is_empty()
-                    && self.memory.current_bytes().saturating_add(bytes)
-                        > self.memory.soft_limit_bytes()
-                {
-                    if spill_paths.is_none() {
-                        spill_paths =
-                            Some(self.spill.partition_paths("aggregate", HASH_PARTITIONS)?);
-                    }
-                    let paths = spill_paths
-                        .as_ref()
-                        .ok_or_else(|| DbError::internal("aggregate spill paths disappeared"))?;
-                    self.spill.write_group_partials(
-                        paths,
-                        &groups,
-                        self.options.hard_memory_bytes,
+                for row in remaining {
+                    group.update(
+                        &programs.aggregate_specs,
+                        row,
+                        &self.params,
+                        &mut self.expression_stack,
                     )?;
-                    groups.clear();
-                    self.memory.release(group_bytes);
-                    group_bytes = 0;
                 }
-                self.memory.reserve(bytes)?;
-                group_bytes = group_bytes.saturating_add(bytes);
+                group_reservation.grow(group.estimated_bytes())?;
+                groups.push(group);
+            } else {
+                let group = GroupAccumulator::empty(&programs.aggregate_specs);
+                group_reservation.grow(group.estimated_bytes())?;
                 groups.push(group);
             }
-            ordinal = ordinal.saturating_add(1);
+        } else {
+            let mut ordinal = 0_u64;
+            while let Some(row) = self.next_filtered_source_row()? {
+                let key = programs.group_key(&row, &self.params, &mut self.expression_stack)?;
+                if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
+                    group.update(
+                        &programs.aggregate_specs,
+                        &row,
+                        &self.params,
+                        &mut self.expression_stack,
+                    )?;
+                } else {
+                    let group = GroupAccumulator::new(
+                        key,
+                        row,
+                        ordinal,
+                        &programs.aggregate_specs,
+                        &self.params,
+                        &mut self.expression_stack,
+                    )?;
+                    let bytes = group.estimated_bytes();
+                    if !groups.is_empty()
+                        && self.memory.current_bytes().saturating_add(bytes)
+                            > self.memory.soft_limit_bytes()
+                    {
+                        if spill_paths.is_none() {
+                            spill_paths =
+                                Some(self.spill.partition_paths("aggregate", HASH_PARTITIONS)?);
+                        }
+                        let paths = spill_paths.as_ref().ok_or_else(|| {
+                            DbError::internal("aggregate spill paths disappeared")
+                        })?;
+                        self.spill
+                            .write_group_partials(paths, &groups, &self.memory)?;
+                        groups.clear();
+                        group_reservation.resize(0)?;
+                    }
+                    group_reservation.grow(bytes)?;
+                    groups.push(group);
+                }
+                ordinal = ordinal.saturating_add(1);
+            }
         }
 
         if programs.group_by.is_empty() && groups.is_empty() {
             let group = GroupAccumulator::empty(&programs.aggregate_specs);
             let bytes = group.estimated_bytes();
-            self.memory.reserve(bytes)?;
-            group_bytes = bytes;
+            group_reservation.grow(bytes)?;
             groups.push(group);
         }
 
@@ -318,42 +344,41 @@ impl AdvancedExecutionCursor {
             && !groups.is_empty()
         {
             self.spill
-                .write_group_partials(paths, &groups, self.options.hard_memory_bytes)?;
+                .write_group_partials(paths, &groups, &self.memory)?;
             groups.clear();
-            self.memory.release(group_bytes);
+            group_reservation.resize(0)?;
         }
 
-        let mut output = RowsOutputBuilder::new(&self.order_by);
+        let mut output = RowsOutputBuilder::new(&self.order_by, &self.memory)?;
         if let Some(paths) = spill_paths {
             for path in paths {
                 if !path.exists() {
                     continue;
                 }
-                let (partition_groups, bytes) = self.spill.read_and_merge_groups(
+                let partition_groups = self.spill.read_and_merge_groups(
                     &path,
-                    &mut self.memory,
+                    &self.memory,
                     &programs.aggregate_specs,
                 )?;
-                for group in partition_groups {
+                for group in partition_groups.values {
                     if let Some(row) =
                         programs.project_group(&group, &self.params, &mut self.expression_stack)?
                     {
-                        output.push(row, &mut self.memory, &mut self.spill)?;
+                        output.push(row, &self.memory, &mut self.spill)?;
                     }
                 }
-                self.memory.release(bytes);
             }
         } else {
             for group in groups {
                 if let Some(row) =
                     programs.project_group(&group, &self.params, &mut self.expression_stack)?
                 {
-                    output.push(row, &mut self.memory, &mut self.spill)?;
+                    output.push(row, &self.memory, &mut self.spill)?;
                 }
             }
-            self.memory.release(group_bytes);
         }
-        self.output = Some(output.finish(&mut self.memory, &mut self.spill)?);
+        drop(group_reservation);
+        self.output = Some(output.finish(&self.memory, &mut self.spill)?);
         self.group_programs = Some(programs);
         Ok(())
     }
@@ -366,6 +391,12 @@ struct JoinedSource {
     prefixes: Vec<Row>,
     frames: Vec<JoinFrame>,
     depth: usize,
+}
+
+enum FastJoinStep {
+    Row(Row),
+    Exhausted,
+    Fallback,
 }
 
 impl JoinedSource {
@@ -402,17 +433,32 @@ impl JoinedSource {
         })
     }
 
+    fn take_unjoined_rows(&mut self) -> Option<Arc<Vec<Row>>> {
+        if !self.joins.is_empty() || self.base_offset != 0 {
+            return None;
+        }
+        self.base_offset = self.base.len();
+        Some(Arc::clone(&self.base))
+    }
+
     fn next_row(
         &mut self,
         params: &[Value],
         memory: &mut QueryMemoryContext,
         spill: &mut SpillManager,
-        expression_stack: &mut Vec<Value>,
+        expression_stack: &mut ExpressionStack,
     ) -> Result<Option<Row>> {
         if self.joins.is_empty() {
             let row = self.base.get(self.base_offset).cloned();
             self.base_offset = self.base_offset.saturating_add(1);
             return Ok(row);
+        }
+        if self.prefixes.is_empty() && self.joins.len() == 1 && !self.joins[0].predicate_required {
+            match self.next_single_hash_row(memory, spill)? {
+                FastJoinStep::Row(row) => return Ok(Some(row)),
+                FastJoinStep::Exhausted => return Ok(None),
+                FastJoinStep::Fallback => {}
+            }
         }
         loop {
             if self.prefixes.is_empty() {
@@ -426,8 +472,7 @@ impl JoinedSource {
             if self.depth == self.joins.len() {
                 let row = self
                     .prefixes
-                    .last()
-                    .cloned()
+                    .pop()
                     .ok_or_else(|| DbError::internal("joined row disappeared"))?;
                 self.depth = self.depth.saturating_sub(1);
                 self.prefixes.truncate(self.depth + 1);
@@ -447,21 +492,25 @@ impl JoinedSource {
                 self.frames[self.depth].next_candidate(&self.joins[self.depth].rows)
             {
                 let mut values = self.prefixes[self.depth].values.clone();
-                values.extend(right.values);
+                values.extend(right.values.iter().cloned());
                 let joined = Row::new(values);
-                let matches = match self.joins[self.depth].predicate.evaluate_reusing(
-                    &joined.values,
-                    params,
-                    expression_stack,
-                )? {
-                    Value::Boolean(matches) => matches,
-                    Value::Null => false,
-                    _ => {
-                        return Err(DbError::new(
-                            "42804",
-                            "join predicate must evaluate to boolean",
-                        ));
+                let matches = if self.joins[self.depth].predicate_required {
+                    match self.joins[self.depth].predicate.evaluate_reusing(
+                        &joined.values,
+                        params,
+                        expression_stack,
+                    )? {
+                        Value::Boolean(matches) => matches,
+                        Value::Null => false,
+                        _ => {
+                            return Err(DbError::new(
+                                "42804",
+                                "join predicate must evaluate to boolean",
+                            ));
+                        }
                     }
+                } else {
+                    true
                 };
                 if matches {
                     self.frames[self.depth].matched = true;
@@ -469,7 +518,7 @@ impl JoinedSource {
                     self.prefixes.push(joined);
                     self.depth += 1;
                     if self.depth < self.frames.len() {
-                        self.frames[self.depth].reset(memory);
+                        self.frames[self.depth].reset();
                     }
                 }
                 continue;
@@ -489,17 +538,60 @@ impl JoinedSource {
                 self.prefixes.push(Row::new(values));
                 self.depth += 1;
                 if self.depth < self.frames.len() {
-                    self.frames[self.depth].reset(memory);
+                    self.frames[self.depth].reset();
                 }
                 continue;
             }
 
-            self.frames[self.depth].reset(memory);
+            self.frames[self.depth].reset();
             if self.depth == 0 {
                 self.prefixes.clear();
             } else {
                 self.prefixes.truncate(self.depth);
                 self.depth -= 1;
+            }
+        }
+    }
+
+    fn next_single_hash_row(
+        &mut self,
+        memory: &mut QueryMemoryContext,
+        spill: &mut SpillManager,
+    ) -> Result<FastJoinStep> {
+        loop {
+            let Some(base) = self.base.get(self.base_offset) else {
+                return Ok(FastJoinStep::Exhausted);
+            };
+            self.base_offset = self.base_offset.saturating_add(1);
+            let candidates = self.joins[0].candidates(base, memory, spill)?;
+            match candidates {
+                CandidateSet::Empty | CandidateSet::One { value: None } => {
+                    if self.joins[0].join.kind == JoinKind::Left {
+                        let mut values =
+                            Vec::with_capacity(base.values.len() + self.joins[0].join.table.width);
+                        values.extend(base.values.iter().cloned());
+                        values.extend(std::iter::repeat_n(
+                            Value::Null,
+                            self.joins[0].join.table.width,
+                        ));
+                        return Ok(FastJoinStep::Row(Row::new(values)));
+                    }
+                }
+                CandidateSet::One { value: Some(index) } => {
+                    let right = self.joins[0].rows.get(index).ok_or_else(|| {
+                        DbError::internal("hash join candidate index is out of bounds")
+                    })?;
+                    let mut values = Vec::with_capacity(base.values.len() + right.values.len());
+                    values.extend(base.values.iter().cloned());
+                    values.extend(right.values.iter().cloned());
+                    return Ok(FastJoinStep::Row(Row::new(values)));
+                }
+                candidates => {
+                    self.prefixes.push(base.clone());
+                    self.frames[0].install(candidates);
+                    self.depth = 0;
+                    return Ok(FastJoinStep::Fallback);
+                }
             }
         }
     }
@@ -509,6 +601,7 @@ struct JoinRuntime {
     join: BoundJoin,
     rows: Arc<Vec<Row>>,
     predicate: ExpressionProgram,
+    predicate_required: bool,
     lookup: JoinLookup,
 }
 
@@ -533,10 +626,12 @@ impl JoinRuntime {
         };
         let predicate =
             ExpressionProgram::compile_with_limit(&join.on, false, max_expression_depth)?;
+        let predicate_required = !matches!(&lookup, JoinLookup::Hash { .. });
         Ok(Self {
             join,
             rows,
             predicate,
+            predicate_required,
             lookup,
         })
     }
@@ -559,33 +654,40 @@ impl JoinRuntime {
                     .get(*left)
                     .ok_or_else(|| DbError::internal("hash join left key is out of bounds"))?;
                 if value.is_null() {
-                    return Ok(CandidateSet::Indexes {
-                        values: Vec::new(),
-                        offset: 0,
-                        reserved_bytes: 0,
-                    });
+                    return Ok(CandidateSet::Empty);
                 }
-                let key = encode_hash_value(value)?;
                 match state {
                     HashLookup::Memory { buckets, .. } => {
-                        let values = buckets.get(&key).cloned().unwrap_or_default();
-                        let bytes = values.len().saturating_mul(std::mem::size_of::<usize>());
-                        memory.reserve(bytes)?;
-                        Ok(CandidateSet::Indexes {
-                            values,
-                            offset: 0,
-                            reserved_bytes: bytes,
-                        })
+                        let key = JoinHashKey::new(value)?;
+                        let Some(matches) = buckets.get(&key) else {
+                            return Ok(CandidateSet::Empty);
+                        };
+                        match matches {
+                            HashBucket::One(value) => Ok(CandidateSet::One {
+                                value: Some(*value),
+                            }),
+                            HashBucket::Many(matches) => {
+                                let values = matches.clone();
+                                let bytes =
+                                    values.len().saturating_mul(std::mem::size_of::<usize>());
+                                let reservation = memory.try_reserve(bytes)?;
+                                Ok(CandidateSet::Indexes {
+                                    values,
+                                    offset: 0,
+                                    _reservation: reservation,
+                                })
+                            }
+                        }
                     }
                     HashLookup::Spilled { paths } => {
+                        let key = encode_hash_value(value)?;
                         let partition = stable_partition(&key, paths.len());
                         let rows =
                             spill.read_matching_rows(&paths[partition], *right, &key, memory)?;
-                        let bytes = rows.iter().map(estimated_row_bytes).sum();
                         Ok(CandidateSet::Rows {
-                            values: rows,
+                            values: rows.values,
                             offset: 0,
-                            reserved_bytes: bytes,
+                            _reservation: rows.reservation,
                         })
                     }
                     HashLookup::Uninitialized => {
@@ -609,12 +711,69 @@ enum JoinLookup {
 enum HashLookup {
     Uninitialized,
     Memory {
-        buckets: HashMap<Vec<u8>, Vec<usize>>,
-        _reserved_bytes: usize,
+        buckets: HashMap<JoinHashKey, HashBucket>,
+        _reservation: Reservation,
     },
     Spilled {
         paths: Vec<PathBuf>,
     },
+}
+
+enum HashBucket {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl HashBucket {
+    fn additional_bytes_for_push(&self) -> usize {
+        match self {
+            Self::One(_) => 2 * std::mem::size_of::<usize>(),
+            Self::Many(values) if values.len() == values.capacity() => values
+                .capacity()
+                .max(1)
+                .saturating_mul(std::mem::size_of::<usize>()),
+            Self::Many(_) => 0,
+        }
+    }
+
+    fn push(&mut self, value: usize) {
+        match self {
+            Self::One(first) => {
+                let first = *first;
+                *self = Self::Many(vec![first, value]);
+            }
+            Self::Many(values) => values.push(value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum JoinHashKey {
+    Boolean(bool),
+    Int16(i16),
+    Int32(i32),
+    Int64(i64),
+    Encoded(Vec<u8>),
+}
+
+impl JoinHashKey {
+    fn new(value: &Value) -> Result<Self> {
+        match value {
+            Value::Boolean(value) => Ok(Self::Boolean(*value)),
+            Value::Int16(value) => Ok(Self::Int16(*value)),
+            Value::Int32(value) => Ok(Self::Int32(*value)),
+            Value::Int64(value) => Ok(Self::Int64(*value)),
+            _ => encode_hash_value(value).map(Self::Encoded),
+        }
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match self {
+                Self::Encoded(value) => value.len(),
+                Self::Boolean(_) | Self::Int16(_) | Self::Int32(_) | Self::Int64(_) => 0,
+            }
+    }
 }
 
 fn ensure_hash_lookup(
@@ -627,8 +786,25 @@ fn ensure_hash_lookup(
     if !matches!(state, HashLookup::Uninitialized) {
         return Ok(());
     }
-    let mut buckets = HashMap::<Vec<u8>, Vec<usize>>::new();
-    let mut reserved_bytes = 0_usize;
+    let entry_bytes = std::mem::size_of::<JoinHashKey>()
+        .saturating_add(std::mem::size_of::<HashBucket>())
+        .saturating_add(16);
+    let table_bytes = rows.len().checked_mul(entry_bytes).ok_or_else(|| {
+        DbError::new("53200", "query memory limit exceeded")
+            .with_detail("hash join table estimate overflow")
+    })?;
+    if !rows.is_empty() && memory.would_cross_soft_limit(table_bytes) {
+        let paths =
+            spill.write_partitioned_rows("hash-join", rows, key_index, HASH_PARTITIONS, memory)?;
+        *state = HashLookup::Spilled { paths };
+        return Ok(());
+    }
+    let mut reservation = memory.try_reserve(table_bytes)?;
+    let mut buckets = HashMap::<JoinHashKey, HashBucket>::new();
+    buckets.try_reserve(rows.len()).map_err(|error| {
+        DbError::new("53200", "query memory limit exceeded")
+            .with_detail(format!("failed to allocate hash join table: {error}"))
+    })?;
     for (index, row) in rows.iter().enumerate() {
         let value = row
             .values
@@ -637,32 +813,35 @@ fn ensure_hash_lookup(
         if value.is_null() {
             continue;
         }
-        let key = encode_hash_value(value)?;
+        let key = JoinHashKey::new(value)?;
         let bytes = key
-            .len()
-            .saturating_add(std::mem::size_of::<usize>())
-            .saturating_add(24);
-        if !buckets.is_empty()
-            && memory.current_bytes().saturating_add(bytes) > memory.soft_limit_bytes()
-        {
-            memory.release(reserved_bytes);
+            .estimated_bytes()
+            .saturating_sub(std::mem::size_of::<JoinHashKey>());
+        if !buckets.is_empty() && memory.would_cross_soft_limit(bytes) {
             let paths = spill.write_partitioned_rows(
                 "hash-join",
                 rows,
                 key_index,
                 HASH_PARTITIONS,
-                memory.hard_limit_bytes(),
+                memory,
             )?;
             *state = HashLookup::Spilled { paths };
             return Ok(());
         }
-        memory.reserve(bytes)?;
-        reserved_bytes = reserved_bytes.saturating_add(bytes);
-        buckets.entry(key).or_default().push(index);
+        reservation.grow(bytes)?;
+        match buckets.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(HashBucket::One(index));
+            }
+            Entry::Occupied(mut entry) => {
+                reservation.grow(entry.get().additional_bytes_for_push())?;
+                entry.get_mut().push(index);
+            }
+        }
     }
     *state = HashLookup::Memory {
         buckets,
-        _reserved_bytes: reserved_bytes,
+        _reservation: reservation,
     };
     Ok(())
 }
@@ -683,14 +862,12 @@ impl JoinFrame {
         self.null_emitted = false;
     }
 
-    fn next_candidate(&mut self, rows: &[Row]) -> Option<Row> {
+    fn next_candidate<'a>(&'a mut self, rows: &'a [Row]) -> Option<&'a Row> {
         self.candidates.as_mut()?.next(rows)
     }
 
-    fn reset(&mut self, memory: &mut QueryMemoryContext) {
-        if let Some(candidates) = self.candidates.take() {
-            memory.release(candidates.reserved_bytes());
-        }
+    fn reset(&mut self) {
+        self.candidates = None;
         self.initialized = false;
         self.matched = false;
         self.null_emitted = false;
@@ -698,6 +875,10 @@ impl JoinFrame {
 }
 
 enum CandidateSet {
+    Empty,
+    One {
+        value: Option<usize>,
+    },
     All {
         offset: usize,
         len: usize,
@@ -705,44 +886,37 @@ enum CandidateSet {
     Indexes {
         values: Vec<usize>,
         offset: usize,
-        reserved_bytes: usize,
+        _reservation: Reservation,
     },
     Rows {
         values: Vec<Row>,
         offset: usize,
-        reserved_bytes: usize,
+        _reservation: Reservation,
     },
 }
 
 impl CandidateSet {
-    fn next(&mut self, rows: &[Row]) -> Option<Row> {
+    fn next<'a>(&'a mut self, rows: &'a [Row]) -> Option<&'a Row> {
         match self {
+            Self::Empty => None,
+            Self::One { value } => rows.get(value.take()?),
             Self::All { offset, len } => {
                 if *offset >= *len {
                     return None;
                 }
-                let row = rows.get(*offset).cloned();
+                let row = rows.get(*offset);
                 *offset = offset.saturating_add(1);
                 row
             }
             Self::Indexes { values, offset, .. } => {
                 let index = values.get(*offset).copied()?;
                 *offset = offset.saturating_add(1);
-                rows.get(index).cloned()
+                rows.get(index)
             }
             Self::Rows { values, offset, .. } => {
-                let row = values.get(*offset).cloned();
+                let row = values.get(*offset);
                 *offset = offset.saturating_add(1);
                 row
-            }
-        }
-    }
-
-    const fn reserved_bytes(&self) -> usize {
-        match self {
-            Self::All { .. } => 0,
-            Self::Indexes { reserved_bytes, .. } | Self::Rows { reserved_bytes, .. } => {
-                *reserved_bytes
             }
         }
     }
@@ -783,7 +957,12 @@ impl GroupPrograms {
         })
     }
 
-    fn group_key(&self, row: &Row, params: &[Value], stack: &mut Vec<Value>) -> Result<Vec<Value>> {
+    fn group_key(
+        &self,
+        row: &Row,
+        params: &[Value],
+        stack: &mut ExpressionStack,
+    ) -> Result<Vec<Value>> {
         self.group_by
             .iter()
             .map(|program| program.evaluate_reusing(&row.values, params, stack))
@@ -794,7 +973,7 @@ impl GroupPrograms {
         &self,
         group: &GroupAccumulator,
         params: &[Value],
-        stack: &mut Vec<Value>,
+        stack: &mut ExpressionStack,
     ) -> Result<Option<Row>> {
         let aggregate_values = group
             .aggregates
@@ -839,6 +1018,7 @@ struct AggregateSpec {
 #[derive(Debug, Clone)]
 struct GroupProgram {
     instructions: Vec<GroupInstruction>,
+    max_stack_slots: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -937,7 +1117,11 @@ impl GroupProgram {
                 )));
             }
         }
-        Ok(Self { instructions })
+        let max_stack_slots = group_stack_slots(&instructions)?;
+        Ok(Self {
+            instructions,
+            max_stack_slots,
+        })
     }
 
     fn evaluate(
@@ -945,29 +1129,27 @@ impl GroupProgram {
         row: &[Value],
         params: &[Value],
         aggregates: &[Value],
-        values: &mut Vec<Value>,
+        values: &mut ExpressionStack,
     ) -> Result<Value> {
-        values.clear();
+        values.prepare(self.max_stack_slots)?;
         for instruction in &self.instructions {
             match instruction {
                 GroupInstruction::LoadColumn(index) => {
-                    values.push(
-                        row.get(*index).cloned().ok_or_else(|| {
-                            DbError::internal("group column index is out of bounds")
-                        })?,
-                    );
+                    values.push(row.get(*index).cloned().ok_or_else(|| {
+                        DbError::internal("group column index is out of bounds")
+                    })?)?;
                 }
-                GroupInstruction::LoadLiteral(value) => values.push(value.clone()),
+                GroupInstruction::LoadLiteral(value) => values.push(value.clone())?,
                 GroupInstruction::LoadParameter(index) => {
                     values.push(params.get(index - 1).cloned().ok_or_else(|| {
                         DbError::new("42P02", format!("no value supplied for parameter ${index}"))
-                    })?);
+                    })?)?;
                 }
                 GroupInstruction::Unary(operator) => {
                     let value = values
                         .pop()
                         .ok_or_else(|| DbError::internal("group value stack underflow"))?;
-                    values.push(evaluate_unary(*operator, value)?);
+                    values.push(evaluate_unary(*operator, value)?)?;
                 }
                 GroupInstruction::Binary(operator) => {
                     let right = values
@@ -976,7 +1158,7 @@ impl GroupProgram {
                     let left = values
                         .pop()
                         .ok_or_else(|| DbError::internal("group value stack underflow"))?;
-                    values.push(evaluate_binary(left, *operator, right)?);
+                    values.push(evaluate_binary(left, *operator, right)?)?;
                 }
                 GroupInstruction::AggregateValue(slot) => {
                     values.push(
@@ -984,13 +1166,13 @@ impl GroupProgram {
                             .get(*slot)
                             .cloned()
                             .ok_or_else(|| DbError::internal("aggregate slot is out of bounds"))?,
-                    );
+                    )?;
                 }
                 GroupInstruction::Coerce(target) => {
                     let value = values
                         .pop()
                         .ok_or_else(|| DbError::internal("group value stack underflow"))?;
-                    values.push(super::coerce_value(value, target)?);
+                    values.push(super::coerce_value(value, target)?)?;
                 }
             }
         }
@@ -1003,6 +1185,45 @@ impl GroupProgram {
             .pop()
             .ok_or_else(|| DbError::internal("group expression result disappeared"))
     }
+}
+
+fn group_stack_slots(instructions: &[GroupInstruction]) -> Result<usize> {
+    let mut depth = 0_usize;
+    let mut maximum = 0_usize;
+    for instruction in instructions {
+        match instruction {
+            GroupInstruction::LoadColumn(_)
+            | GroupInstruction::LoadLiteral(_)
+            | GroupInstruction::LoadParameter(_)
+            | GroupInstruction::AggregateValue(_) => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| program_limit_error("group value stack depth overflowed"))?;
+                maximum = maximum.max(depth);
+            }
+            GroupInstruction::Unary(_) | GroupInstruction::Coerce(_) => {
+                if depth == 0 {
+                    return Err(DbError::internal(
+                        "group expression compiler produced a stack underflow",
+                    ));
+                }
+            }
+            GroupInstruction::Binary(_) => {
+                if depth < 2 {
+                    return Err(DbError::internal(
+                        "group expression compiler produced a stack underflow",
+                    ));
+                }
+                depth -= 1;
+            }
+        }
+    }
+    if depth != 1 {
+        return Err(DbError::internal(
+            "group expression compiler did not produce one stack result",
+        ));
+    }
+    Ok(maximum)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1020,7 +1241,7 @@ impl GroupAccumulator {
         first_ordinal: u64,
         specs: &[AggregateSpec],
         params: &[Value],
-        stack: &mut Vec<Value>,
+        stack: &mut ExpressionStack,
     ) -> Result<Self> {
         let mut group = Self {
             key,
@@ -1046,7 +1267,7 @@ impl GroupAccumulator {
         specs: &[AggregateSpec],
         row: &Row,
         params: &[Value],
-        stack: &mut Vec<Value>,
+        stack: &mut ExpressionStack,
     ) -> Result<()> {
         for (state, spec) in self.aggregates.iter_mut().zip(specs) {
             state.update(spec, row, params, stack)?;
@@ -1098,7 +1319,7 @@ impl AggregateState {
         spec: &AggregateSpec,
         row: &Row,
         params: &[Value],
-        stack: &mut Vec<Value>,
+        stack: &mut ExpressionStack,
     ) -> Result<()> {
         let value = spec
             .argument
@@ -1264,46 +1485,42 @@ fn numeric_value(value: &Value) -> Result<f64> {
 struct RowsOutputBuilder {
     order_by: Vec<BoundOrder>,
     rows: Vec<Row>,
-    reserved_bytes: usize,
+    reservation: Reservation,
     run_paths: Vec<PathBuf>,
 }
 
 impl RowsOutputBuilder {
-    fn new(order_by: &[BoundOrder]) -> Self {
-        Self {
+    fn new(order_by: &[BoundOrder], memory: &QueryMemoryContext) -> Result<Self> {
+        Ok(Self {
             order_by: order_by.to_vec(),
             rows: Vec::new(),
-            reserved_bytes: 0,
+            reservation: memory.try_reserve(0)?,
             run_paths: Vec::new(),
-        }
+        })
     }
 
     fn push(
         &mut self,
         row: Row,
-        memory: &mut QueryMemoryContext,
+        memory: &QueryMemoryContext,
         spill: &mut SpillManager,
     ) -> Result<()> {
         let bytes = estimated_row_bytes(&row);
-        if !self.rows.is_empty()
-            && memory.current_bytes().saturating_add(bytes) > memory.soft_limit_bytes()
-        {
+        if !self.rows.is_empty() && memory.would_cross_soft_limit(bytes) {
             sort_rows(&mut self.rows, &self.order_by)?;
             self.run_paths
-                .push(spill.write_sorted_run(&self.rows, memory.hard_limit_bytes())?);
+                .push(spill.write_sorted_run(&self.rows, memory)?);
             self.rows.clear();
-            memory.release(self.reserved_bytes);
-            self.reserved_bytes = 0;
+            self.reservation.resize(0)?;
         }
-        memory.reserve(bytes)?;
-        self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
+        self.reservation.grow(bytes)?;
         self.rows.push(row);
         Ok(())
     }
 
     fn finish(
         mut self,
-        memory: &mut QueryMemoryContext,
+        memory: &QueryMemoryContext,
         spill: &mut SpillManager,
     ) -> Result<RowsOutput> {
         if self.run_paths.is_empty() {
@@ -1311,19 +1528,20 @@ impl RowsOutputBuilder {
             return Ok(RowsOutput::Memory {
                 rows: self.rows,
                 offset: 0,
-                reserved_bytes: self.reserved_bytes,
+                reservation: Some(self.reservation),
             });
         }
         if !self.rows.is_empty() {
             sort_rows(&mut self.rows, &self.order_by)?;
             self.run_paths
-                .push(spill.write_sorted_run(&self.rows, memory.hard_limit_bytes())?);
-            memory.release(self.reserved_bytes);
+                .push(spill.write_sorted_run(&self.rows, memory)?);
+            self.rows.clear();
+            self.reservation.resize(0)?;
         }
-        let runs = self
-            .run_paths
+        let run_paths = spill.compact_sorted_runs(self.run_paths, &self.order_by, memory)?;
+        let runs = run_paths
             .iter()
-            .map(|path| SpillRun::open(path, memory.hard_limit_bytes()))
+            .map(|path| SpillRun::open(path, memory))
             .collect::<Result<Vec<_>>>()?;
         Ok(RowsOutput::Runs(runs))
     }
@@ -1333,7 +1551,7 @@ enum RowsOutput {
     Memory {
         rows: Vec<Row>,
         offset: usize,
-        reserved_bytes: usize,
+        reservation: Option<Reservation>,
     },
     Runs(Vec<SpillRun>),
 }
@@ -1342,20 +1560,18 @@ impl RowsOutput {
     fn next_row(
         &mut self,
         order_by: &[BoundOrder],
-        hard_limit: usize,
-        memory: &mut QueryMemoryContext,
+        memory: &QueryMemoryContext,
     ) -> Result<Option<Row>> {
         match self {
             Self::Memory {
                 rows,
                 offset,
-                reserved_bytes,
+                reservation,
             } => {
                 let row = rows.get(*offset).cloned();
                 *offset = offset.saturating_add(1);
-                if row.is_none() && *reserved_bytes > 0 {
-                    memory.release(*reserved_bytes);
-                    *reserved_bytes = 0;
+                if row.is_none() {
+                    *reservation = None;
                 }
                 Ok(row)
             }
@@ -1386,27 +1602,19 @@ impl RowsOutput {
                     .current
                     .take()
                     .ok_or_else(|| DbError::internal("spill merge row disappeared"))?;
-                runs[selected].advance(hard_limit)?;
+                runs[selected].advance(memory)?;
                 Ok(Some(row))
             }
         }
     }
 }
 
-impl SpillManager {
-    fn ensure_query_dir(&mut self) -> Result<PathBuf> {
-        if let Some(query_dir) = &self.query_dir {
-            return Ok(query_dir.clone());
-        }
-        let query_id = super::NEXT_QUERY_ID.fetch_add(1, super::AtomicOrdering::Relaxed);
-        let query_dir = self
-            .root
-            .join(format!("ordadb-query-{}-{query_id}", std::process::id()));
-        std::fs::create_dir(&query_dir).map_err(spill_io_error)?;
-        self.query_dir = Some(query_dir.clone());
-        Ok(query_dir)
-    }
+struct ReservedValues<T> {
+    values: Vec<T>,
+    reservation: Reservation,
+}
 
+impl SpillManager {
     fn partition_paths(&mut self, label: &str, count: usize) -> Result<Vec<PathBuf>> {
         let query_dir = self.ensure_query_dir()?;
         Ok((0..count)
@@ -1420,7 +1628,7 @@ impl SpillManager {
         rows: &[Row],
         key_index: usize,
         count: usize,
-        hard_limit: usize,
+        memory: &QueryMemoryContext,
     ) -> Result<Vec<PathBuf>> {
         let paths = self.partition_paths(label, count)?;
         let mut writers = paths
@@ -1437,7 +1645,7 @@ impl SpillManager {
             }
             let key = encode_hash_value(value)?;
             let partition = stable_partition(&key, count);
-            write_spill_record(&mut writers[partition], row, hard_limit)?;
+            write_spill_record(&mut writers[partition], row, memory)?;
         }
         for writer in &mut writers {
             writer.flush().map_err(spill_io_error)?;
@@ -1450,42 +1658,51 @@ impl SpillManager {
         path: &Path,
         key_index: usize,
         key: &[u8],
-        memory: &mut QueryMemoryContext,
-    ) -> Result<Vec<Row>> {
+        memory: &QueryMemoryContext,
+    ) -> Result<ReservedValues<Row>> {
+        let mut reservation = memory.try_reserve(0)?;
         if !path.exists() {
-            return Ok(Vec::new());
+            return Ok(ReservedValues {
+                values: Vec::new(),
+                reservation,
+            });
         }
         let mut rows = Vec::new();
         let mut reader = open_spill_reader(path)?;
-        while let Some(row) = read_spill_record::<Row>(&mut reader, memory.hard_limit_bytes())? {
+        while let Some(record) = read_spill_record::<Row>(&mut reader, memory)? {
+            let row = record.value;
             let value = row
                 .values
                 .get(key_index)
                 .ok_or_else(|| DbError::new("XX001", "hash join spill key is missing"))?;
             if encode_hash_value(value)? == key {
                 let row_bytes = estimated_row_bytes(&row);
-                memory.reserve(row_bytes)?;
+                reservation.grow(row_bytes)?;
                 rows.push(row);
             }
         }
-        Ok(rows)
+        Ok(ReservedValues {
+            values: rows,
+            reservation,
+        })
     }
 
     fn write_group_partials(
         &self,
         paths: &[PathBuf],
         groups: &[GroupAccumulator],
-        hard_limit: usize,
+        memory: &QueryMemoryContext,
     ) -> Result<()> {
         let mut writers = paths
             .iter()
             .map(|path| {
                 if path.exists() {
-                    OpenOptions::new()
-                        .append(true)
+                    let mut writer = OpenOptions::new()
+                        .write(true)
                         .open(path)
-                        .map(BufWriter::new)
-                        .map_err(spill_io_error)
+                        .map_err(spill_io_error)?;
+                    writer.seek(SeekFrom::End(0)).map_err(spill_io_error)?;
+                    Ok(BufWriter::new(writer))
                 } else {
                     create_spill_writer(path)
                 }
@@ -1497,7 +1714,7 @@ impl SpillManager {
                     .with_detail(error.to_string())
             })?;
             let partition = stable_partition(&key, paths.len());
-            write_spill_record(&mut writers[partition], group, hard_limit)?;
+            write_spill_record(&mut writers[partition], group, memory)?;
         }
         for writer in &mut writers {
             writer.flush().map_err(spill_io_error)?;
@@ -1508,15 +1725,14 @@ impl SpillManager {
     fn read_and_merge_groups(
         &self,
         path: &Path,
-        memory: &mut QueryMemoryContext,
+        memory: &QueryMemoryContext,
         specs: &[AggregateSpec],
-    ) -> Result<(Vec<GroupAccumulator>, usize)> {
+    ) -> Result<ReservedValues<GroupAccumulator>> {
         let mut reader = open_spill_reader(path)?;
         let mut groups = Vec::<GroupAccumulator>::new();
-        let mut reserved_bytes = 0_usize;
-        while let Some(incoming) =
-            read_spill_record::<GroupAccumulator>(&mut reader, memory.hard_limit_bytes())?
-        {
+        let mut reservation = memory.try_reserve(0)?;
+        while let Some(record) = read_spill_record::<GroupAccumulator>(&mut reader, memory)? {
+            let incoming = record.value;
             if incoming.aggregates.len() != specs.len() {
                 return Err(DbError::new(
                     "XX001",
@@ -1524,16 +1740,25 @@ impl SpillManager {
                 ));
             }
             if let Some(group) = groups.iter_mut().find(|group| group.key == incoming.key) {
+                let before = group.estimated_bytes();
                 group.merge(incoming)?;
+                let after = group.estimated_bytes();
+                if after > before {
+                    reservation.grow(after - before)?;
+                } else if before > after {
+                    reservation.resize(reservation.bytes().saturating_sub(before - after))?;
+                }
             } else {
                 let group_bytes = incoming.estimated_bytes();
-                memory.reserve(group_bytes)?;
-                reserved_bytes = reserved_bytes.saturating_add(group_bytes);
+                reservation.grow(group_bytes)?;
                 groups.push(incoming);
             }
         }
         groups.sort_by_key(|group| group.first_ordinal);
-        Ok((groups, reserved_bytes))
+        Ok(ReservedValues {
+            values: groups,
+            reservation,
+        })
     }
 }
 

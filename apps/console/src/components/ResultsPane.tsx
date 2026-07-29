@@ -7,10 +7,16 @@ import {
   Rows3,
   Search,
 } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   DbmsError,
   DbmsQueryColumn,
 } from "../lib/dbmsClient";
+import {
+  resultRowAt,
+  resultRows,
+  type ResultPage,
+} from "../lib/resultBuffer";
 import { useWorkbenchStore } from "../store/workbench";
 import type { QueryState, ResultTab } from "../types";
 import { IconAction } from "./IconAction";
@@ -26,11 +32,16 @@ export function ResultsPane() {
   const setActiveTab = useWorkbenchStore((state) => state.setActiveResultTab);
   const queryState = useWorkbenchStore((state) => state.queryState);
   const columns = useWorkbenchStore((state) => state.columns);
-  const rows = useWorkbenchStore((state) => state.rows);
+  const resultBuffer = useWorkbenchStore((state) => state.resultBuffer);
   const logs = useWorkbenchStore((state) => state.logs);
   const error = useWorkbenchStore((state) => state.error);
   const durationMs = useWorkbenchStore((state) => state.durationMs);
   const rowsProcessed = useWorkbenchStore((state) => state.rowsProcessed);
+  const totalRows = Math.max(resultBuffer.totalRows, rowsProcessed);
+  const planRows = useMemo(
+    () => (activeTab === "plan" ? resultRows(resultBuffer.pages) : []),
+    [activeTab, resultBuffer.pages],
+  );
 
   return (
     <section className="results-pane" aria-label="查询结果">
@@ -59,7 +70,10 @@ export function ResultsPane() {
           {queryState === "success" && (
             <span className="query-summary" aria-live="polite">
               <CheckCircle2 size={15} aria-hidden="true" />
-              {rows.length} 行 · {durationMs ?? 0} ms
+              {resultBuffer.rowCount === totalRows
+                ? `${totalRows} 行`
+                : `显示 ${resultBuffer.rowCount} / ${totalRows} 行`}{" "}
+              · {durationMs ?? 0} ms
             </span>
           )}
           <IconAction
@@ -68,7 +82,7 @@ export function ResultsPane() {
           />
           <IconAction
             label="导出结果"
-            disabled={rows.length === 0}
+            disabled={resultBuffer.rowCount === 0}
             icon={<Download size={16} aria-hidden="true" />}
           />
         </div>
@@ -87,10 +101,16 @@ export function ResultsPane() {
           <PlanView
             queryState={queryState}
             columns={columns}
-            rows={rows}
+            rows={planRows}
           />
         ) : (
-          <DataView queryState={queryState} columns={columns} rows={rows} />
+          <DataView
+            queryState={queryState}
+            columns={columns}
+            pages={resultBuffer.pages}
+            rowCount={resultBuffer.rowCount}
+            droppedRows={resultBuffer.droppedRows}
+          />
         )}
       </div>
     </section>
@@ -100,13 +120,17 @@ export function ResultsPane() {
 function DataView({
   queryState,
   columns,
-  rows,
+  pages,
+  rowCount,
+  droppedRows,
 }: {
   queryState: QueryState;
   columns: DbmsQueryColumn[];
-  rows: Array<Array<string | null>>;
+  pages: ResultPage[];
+  rowCount: number;
+  droppedRows: number;
 }) {
-  if (queryState === "running") {
+  if (queryState === "running" && rowCount === 0) {
     return (
       <div className="result-empty result-empty--loading" aria-live="polite">
         <span className="loading-orbit" aria-hidden="true" />
@@ -115,7 +139,7 @@ function DataView({
     );
   }
 
-  if (queryState !== "success") {
+  if (queryState !== "success" && queryState !== "running") {
     return (
       <div className="result-empty">
         <Braces size={24} strokeWidth={1.6} aria-hidden="true" />
@@ -126,7 +150,73 @@ function DataView({
   }
 
   return (
-    <div className="table-scroll">
+    <VirtualResultTable
+      columns={columns}
+      pages={pages}
+      rowCount={rowCount}
+      droppedRows={droppedRows}
+    />
+  );
+}
+
+const RESULT_ROW_HEIGHT = 32;
+const RESULT_OVERSCAN_ROWS = 8;
+
+function VirtualResultTable({
+  columns,
+  pages,
+  rowCount,
+  droppedRows,
+}: {
+  columns: DbmsQueryColumn[];
+  pages: ResultPage[];
+  rowCount: number;
+  droppedRows: number;
+}) {
+  const viewport = useRef<HTMLDivElement>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(320);
+
+  useEffect(() => {
+    const element = viewport.current;
+    if (!element) {
+      return;
+    }
+    const updateHeight = () => setViewportHeight(element.clientHeight || 320);
+    updateHeight();
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  const start = Math.max(
+    0,
+    Math.floor(scrollTop / RESULT_ROW_HEIGHT) - RESULT_OVERSCAN_ROWS,
+  );
+  const visibleCount =
+    Math.ceil(viewportHeight / RESULT_ROW_HEIGHT) + RESULT_OVERSCAN_ROWS * 2;
+  const end = Math.min(rowCount, start + visibleCount);
+  const visibleRows = useMemo(
+    () =>
+      Array.from({ length: end - start }, (_, offset) => ({
+        index: start + offset,
+        row: resultRowAt(pages, start + offset),
+      })),
+    [end, pages, start],
+  );
+  const topHeight = start * RESULT_ROW_HEIGHT;
+  const bottomHeight = Math.max(0, (rowCount - end) * RESULT_ROW_HEIGHT);
+  const columnSpan = Math.max(1, columns.length);
+
+  return (
+    <div
+      className="table-scroll"
+      ref={viewport}
+      onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+    >
       <table className="result-table">
         <thead>
           <tr>
@@ -138,21 +228,38 @@ function DataView({
           </tr>
         </thead>
         <tbody>
-          {rows.map((row, rowIndex) => (
-            <tr key={rowIndex}>
+          {topHeight > 0 && (
+            <tr className="result-spacer" aria-hidden="true">
+              <td colSpan={columnSpan} style={{ height: topHeight }} />
+            </tr>
+          )}
+          {visibleRows.map(({ row, index: rowIndex }) => (
+            <tr key={rowIndex} style={{ height: RESULT_ROW_HEIGHT }}>
               {columns.map((column, columnIndex) => (
                 <td
                   className={columnIndex === 0 ? "cell-id" : undefined}
                   key={`${column.name}:${columnIndex}`}
                 >
-                  {row[columnIndex] ?? <span className="null-value">NULL</span>}
+                  {row?.[columnIndex] ?? (
+                    <span className="null-value">NULL</span>
+                  )}
                 </td>
               ))}
             </tr>
           ))}
+          {bottomHeight > 0 && (
+            <tr className="result-spacer" aria-hidden="true">
+              <td colSpan={columnSpan} style={{ height: bottomHeight }} />
+            </tr>
+          )}
         </tbody>
       </table>
-      {rows.length === 0 && <div className="inline-empty">查询未返回行</div>}
+      {rowCount === 0 && <div className="inline-empty">查询未返回行</div>}
+      {droppedRows > 0 && (
+        <div className="result-buffer-note" role="status">
+          已保留前 {rowCount} 行，另有 {droppedRows} 行未驻留。
+        </div>
+      )}
     </div>
   );
 }

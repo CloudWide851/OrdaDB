@@ -1127,6 +1127,30 @@ button.tree-row:hover {
   background: oklch(0.956 0.02 233 / 0.72);
 }
 
+.result-table .result-spacer td {
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.result-table .result-spacer:hover td {
+  background: transparent;
+}
+
+.result-buffer-note {
+  position: sticky;
+  bottom: 0;
+  width: fit-content;
+  margin: 6px;
+  padding: 4px 8px;
+  color: var(--ink-muted);
+  background: oklch(0.975 0.008 230 / 0.96);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: var(--font-ui);
+  box-shadow: var(--shadow-soft);
+}
+
 .result-table .cell-id,
 .result-table .cell-score {
   color: var(--brand-strong);

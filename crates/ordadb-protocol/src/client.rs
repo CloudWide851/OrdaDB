@@ -18,6 +18,7 @@ use crate::codec::{CANCEL_REQUEST_CODE, PROTOCOL_VERSION_3, io_error, protocol};
 
 const CLIENT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_CLIENT_BATCH_ROWS: usize = 1_024;
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -69,6 +70,20 @@ pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
     pub command_tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PgQueryEvent {
+    Schema(Vec<String>),
+    Batch(Vec<Vec<Option<String>>>),
+    Complete(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuerySummary {
+    pub columns: Vec<String>,
+    pub command_tags: Vec<String>,
+    pub row_count: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -128,18 +143,33 @@ impl PgClient {
     }
 
     pub fn query(&mut self, sql: &str) -> Result<QueryResult> {
+        let mut result = QueryResult::default();
+        self.query_batches(sql, DEFAULT_CLIENT_BATCH_ROWS, |event| {
+            collect_query_event(&mut result, event);
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
+    pub fn query_batches(
+        &mut self,
+        sql: &str,
+        batch_rows: usize,
+        mut on_event: impl FnMut(PgQueryEvent) -> Result<()>,
+    ) -> Result<QuerySummary> {
+        validate_batch_rows(batch_rows)?;
         let mut payload = Vec::with_capacity(sql.len() + 1);
         push_cstring(&mut payload, sql)?;
         write_frontend(&mut self.stream, b'Q', &payload)?;
         self.stream
             .flush()
             .map_err(|error| io_error("failed to flush query", error))?;
-        let mut result = QueryResult::default();
-        let suspended = self.read_query_cycle(&mut result)?;
+        let mut state = QueryStreamState::default();
+        let suspended = self.read_query_cycle_batches(&mut state, batch_rows, &mut on_event)?;
         if suspended {
             return Err(protocol("Simple Query unexpectedly suspended a portal"));
         }
-        Ok(result)
+        Ok(state.into_summary())
     }
 
     pub fn query_prepared(
@@ -149,6 +179,22 @@ impl PgClient {
         parameters: &[Option<Vec<u8>>],
         fetch_rows: u32,
     ) -> Result<QueryResult> {
+        let mut result = QueryResult::default();
+        self.query_prepared_batches(sql, parameter_oids, parameters, fetch_rows, |event| {
+            collect_query_event(&mut result, event);
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
+    pub fn query_prepared_batches(
+        &mut self,
+        sql: &str,
+        parameter_oids: &[u32],
+        parameters: &[Option<Vec<u8>>],
+        fetch_rows: u32,
+        mut on_event: impl FnMut(PgQueryEvent) -> Result<()>,
+    ) -> Result<QuerySummary> {
         if !parameter_oids.is_empty() && parameter_oids.len() != parameters.len() {
             return Err(protocol(
                 "parameter OID count does not match parameter value count",
@@ -191,12 +237,16 @@ impl PgClient {
         self.write_execute(fetch_rows)?;
         write_frontend(&mut self.stream, b'S', &[])?;
 
-        let mut result = QueryResult::default();
-        while self.read_query_cycle(&mut result)? {
+        let batch_rows = usize::try_from(fetch_rows)
+            .ok()
+            .filter(|rows| *rows > 0)
+            .unwrap_or(DEFAULT_CLIENT_BATCH_ROWS);
+        let mut state = QueryStreamState::default();
+        while self.read_query_cycle_batches(&mut state, batch_rows, &mut on_event)? {
             self.write_execute(fetch_rows)?;
             write_frontend(&mut self.stream, b'S', &[])?;
         }
-        Ok(result)
+        Ok(state.into_summary())
     }
 
     pub fn copy_to_stdout(&mut self, table: &str) -> Result<CopyOutResult> {
@@ -289,22 +339,54 @@ impl PgClient {
         write_frontend(&mut self.stream, b'E', &execute)
     }
 
-    fn read_query_cycle(&mut self, result: &mut QueryResult) -> Result<bool> {
+    fn read_query_cycle_batches(
+        &mut self,
+        state: &mut QueryStreamState,
+        batch_rows: usize,
+        on_event: &mut impl FnMut(PgQueryEvent) -> Result<()>,
+    ) -> Result<bool> {
         let mut pending_error = None;
+        let mut callback_error = None;
+        let mut rows = Vec::with_capacity(batch_rows);
         let mut suspended = false;
         loop {
             let message = read_backend(&mut self.stream)?;
             match message.tag {
-                b'T' => result.columns = decode_row_description(&message.payload)?,
-                b'D' => result
-                    .rows
-                    .push(decode_data_row(&message.payload, result.columns.len())?),
-                b'C' => result
-                    .command_tags
-                    .push(decode_only_cstring(&message.payload, "CommandComplete")?),
+                b'T' => {
+                    state.columns = decode_row_description(&message.payload)?;
+                    deliver_query_event(
+                        on_event,
+                        &mut callback_error,
+                        PgQueryEvent::Schema(state.columns.clone()),
+                    );
+                }
+                b'D' => {
+                    rows.push(decode_data_row(&message.payload, state.columns.len())?);
+                    state.row_count = state.row_count.saturating_add(1);
+                    if rows.len() == batch_rows {
+                        deliver_query_event(
+                            on_event,
+                            &mut callback_error,
+                            PgQueryEvent::Batch(std::mem::take(&mut rows)),
+                        );
+                        rows = Vec::with_capacity(batch_rows);
+                    }
+                }
+                b'C' => {
+                    flush_query_rows(on_event, &mut callback_error, &mut rows);
+                    let tag = decode_only_cstring(&message.payload, "CommandComplete")?;
+                    state.command_tags.push(tag.clone());
+                    deliver_query_event(on_event, &mut callback_error, PgQueryEvent::Complete(tag));
+                }
                 b'E' => pending_error = Some(decode_error(&message.payload)),
                 b's' => suspended = true,
-                b'Z' => return pending_error.map_or(Ok(suspended), Err),
+                b'Z' => {
+                    flush_query_rows(on_event, &mut callback_error, &mut rows);
+                    if let Some(error) = pending_error {
+                        return Err(error);
+                    }
+                    return callback_error.map_or(Ok(suspended), Err);
+                }
                 b'1' | b'2' | b'3' | b'N' | b'I' | b'n' => {}
                 b'H' | b'G' | b'd' | b'c' => {
                     return Err(DbError::new(
@@ -319,6 +401,67 @@ impl PgClient {
                 }
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct QueryStreamState {
+    columns: Vec<String>,
+    command_tags: Vec<String>,
+    row_count: u64,
+}
+
+impl QueryStreamState {
+    fn into_summary(self) -> QuerySummary {
+        QuerySummary {
+            columns: self.columns,
+            command_tags: self.command_tags,
+            row_count: self.row_count,
+        }
+    }
+}
+
+fn validate_batch_rows(batch_rows: usize) -> Result<()> {
+    if batch_rows == 0 {
+        return Err(DbError::new(
+            "22023",
+            "PostgreSQL client batch size must be positive",
+        ));
+    }
+    Ok(())
+}
+
+fn collect_query_event(result: &mut QueryResult, event: PgQueryEvent) {
+    match event {
+        PgQueryEvent::Schema(columns) => result.columns = columns,
+        PgQueryEvent::Batch(rows) => result.rows.extend(rows),
+        PgQueryEvent::Complete(tag) => result.command_tags.push(tag),
+    }
+}
+
+fn deliver_query_event(
+    on_event: &mut impl FnMut(PgQueryEvent) -> Result<()>,
+    callback_error: &mut Option<DbError>,
+    event: PgQueryEvent,
+) {
+    if callback_error.is_none()
+        && let Err(error) = on_event(event)
+    {
+        *callback_error = Some(error);
+    }
+}
+
+fn flush_query_rows(
+    on_event: &mut impl FnMut(PgQueryEvent) -> Result<()>,
+    callback_error: &mut Option<DbError>,
+    rows: &mut Vec<Vec<Option<String>>>,
+) {
+    if !rows.is_empty() {
+        deliver_query_event(
+            on_event,
+            callback_error,
+            PgQueryEvent::Batch(std::mem::take(rows)),
+        );
     }
 }
 
