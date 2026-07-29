@@ -26,6 +26,11 @@ import {
   type DbmsServiceStatus,
   type StartDbmsOperationRequest,
 } from "../lib/dbmsClient";
+import {
+  appendResultRows,
+  emptyResultBuffer,
+  type ResultBuffer,
+} from "../lib/resultBuffer";
 import type {
   InspectorTab,
   QueryState,
@@ -78,7 +83,7 @@ export interface WorkbenchState {
   notice: string;
   queryState: QueryState;
   columns: DbmsQueryColumn[];
-  rows: Array<Array<string | null>>;
+  resultBuffer: ResultBuffer;
   logs: string[];
   error: DbmsError | null;
   errorMessage: string | null;
@@ -174,7 +179,7 @@ export function createWorkbenchStore(
   notice: dbms.mode === "preview" ? "Preview · 未连接" : "未连接",
   queryState: "idle",
   columns: [],
-  rows: [],
+  resultBuffer: emptyResultBuffer(),
   logs: [],
   error: null,
   errorMessage: null,
@@ -821,7 +826,7 @@ export function createWorkbenchStore(
     set({
       queryState: "running",
       columns: [],
-      rows: [],
+      resultBuffer: emptyResultBuffer(),
       logs: [],
       error: null,
       errorMessage: null,
@@ -842,7 +847,9 @@ export function createWorkbenchStore(
             set({ columns: event.columns });
             break;
           case "batch":
-            set((state) => ({ rows: [...state.rows, ...event.rows] }));
+            set((state) => ({
+              resultBuffer: appendResultRows(state.resultBuffer, event.rows),
+            }));
             break;
           case "progress":
             set({ rowsProcessed: event.rowsProcessed });
@@ -857,7 +864,7 @@ export function createWorkbenchStore(
               durationMs: event.durationMs,
               activeRequestId: null,
               logs: [...state.logs, event.commandTag],
-              notice: `${event.commandTag} · ${state.rows.length} 行`,
+              notice: `${event.commandTag} · ${state.resultBuffer.totalRows} 行`,
             }));
             break;
           case "error":

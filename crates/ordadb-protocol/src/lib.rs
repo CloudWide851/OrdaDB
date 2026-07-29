@@ -7,7 +7,9 @@ mod security;
 mod server;
 mod value;
 
-pub use client::{ClientConfig, CopyOutResult, PgCancelToken, PgClient, QueryResult};
+pub use client::{
+    ClientConfig, CopyOutResult, PgCancelToken, PgClient, PgQueryEvent, QueryResult, QuerySummary,
+};
 pub use server::{
     PgConnectionContext, PgServerConfig, TlsPaths, load_tls_config, serve_tcp_connection,
     serve_tcp_connection_with_shutdown,

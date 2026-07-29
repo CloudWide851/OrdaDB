@@ -22,7 +22,15 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 mod advanced;
+mod columnar;
+mod memory;
+mod scan;
 pub use advanced::{AdvancedExecutionCursor, AdvancedExecutionPlan};
+pub use columnar::{
+    ChunkPool, ColumnVector, ColumnVectorKind, DataChunk, RowColumnView, SelectionVector,
+};
+pub use memory::{MemoryGrant, Reservation};
+pub use scan::{LeasedDataChunk, SnapshotTableProvider, TableProvider, TableScan};
 
 pub const DEFAULT_BATCH_ROWS: usize = 1024;
 pub const DEFAULT_SOFT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
@@ -90,64 +98,123 @@ impl ExecutionOptions {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct QueryMemoryContext {
-    soft_limit: usize,
-    hard_limit: usize,
-    current: usize,
-    peak: usize,
+pub type QueryMemoryContext = MemoryGrant;
+
+#[derive(Debug)]
+struct ExpressionStack {
+    values: Vec<Value>,
+    reservation: Reservation,
 }
 
-impl QueryMemoryContext {
-    fn new(soft_limit: usize, hard_limit: usize) -> Self {
-        Self {
-            soft_limit,
-            hard_limit,
-            current: 0,
-            peak: 0,
-        }
+impl ExpressionStack {
+    fn new(memory: &MemoryGrant) -> Result<Self> {
+        Ok(Self {
+            values: Vec::new(),
+            reservation: memory.try_reserve(0)?,
+        })
     }
 
-    pub fn reserve(&mut self, bytes: usize) -> Result<()> {
-        let next = self.current.checked_add(bytes).ok_or_else(|| {
-            DbError::new("53200", "query memory limit exceeded")
-                .with_detail("memory accounting overflow")
-        })?;
-        if next > self.hard_limit {
-            return Err(DbError::new("53200", "query memory limit exceeded")
-                .with_detail(format!(
-                    "requested {bytes} bytes with {} of {} bytes already in use",
-                    self.current, self.hard_limit
-                ))
-                .with_hint("Reduce result width, add a LIMIT, or raise the query memory grant."));
+    fn prepare(&mut self, slots: usize) -> Result<()> {
+        self.values.clear();
+        let slot_bytes = slots
+            .checked_mul(std::mem::size_of::<Value>())
+            .ok_or_else(|| {
+                DbError::new("53200", "query memory limit exceeded")
+                    .with_detail("expression stack capacity overflow")
+            })?;
+        self.reservation.resize(slot_bytes)?;
+        if self.values.capacity() < slots {
+            let additional = slots - self.values.capacity();
+            if let Err(error) = self.values.try_reserve_exact(additional) {
+                self.reservation
+                    .resize(self.values.capacity() * std::mem::size_of::<Value>())?;
+                return Err(DbError::new("53200", "query memory limit exceeded")
+                    .with_detail(format!("failed to allocate expression stack: {error}")));
+            }
         }
-        self.current = next;
-        self.peak = self.peak.max(next);
+        let actual_bytes = self
+            .values
+            .capacity()
+            .checked_mul(std::mem::size_of::<Value>())
+            .ok_or_else(|| {
+                DbError::new("53200", "query memory limit exceeded")
+                    .with_detail("expression stack capacity overflow")
+            })?;
+        self.reservation.resize(actual_bytes)
+    }
+
+    fn push(&mut self, value: Value) -> Result<()> {
+        if self.values.len() == self.values.capacity() {
+            return Err(program_limit_error(
+                "expression value stack exceeded its compiled capacity",
+            ));
+        }
+        self.reservation
+            .grow(estimated_value_bytes(&value).saturating_sub(std::mem::size_of::<Value>()))?;
+        self.values.push(value);
         Ok(())
     }
 
-    pub fn release(&mut self, bytes: usize) {
-        self.current = self.current.saturating_sub(bytes);
+    fn pop(&mut self) -> Option<Value> {
+        self.values.pop()
     }
 
-    #[must_use]
-    pub const fn current_bytes(&self) -> usize {
-        self.current
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+}
+
+trait ExpressionValues {
+    fn reset(&mut self) -> Result<()>;
+    fn push_value(&mut self, value: Value) -> Result<()>;
+    fn pop_value(&mut self) -> Option<Value>;
+    fn value_count(&self) -> usize;
+}
+
+impl ExpressionValues for Vec<Value> {
+    fn reset(&mut self) -> Result<()> {
+        self.clear();
+        Ok(())
     }
 
-    #[must_use]
-    pub const fn peak_bytes(&self) -> usize {
-        self.peak
+    fn push_value(&mut self, value: Value) -> Result<()> {
+        self.push(value);
+        Ok(())
     }
 
-    #[must_use]
-    pub const fn soft_limit_bytes(&self) -> usize {
-        self.soft_limit
+    fn pop_value(&mut self) -> Option<Value> {
+        self.pop()
     }
 
-    #[must_use]
-    pub const fn hard_limit_bytes(&self) -> usize {
-        self.hard_limit
+    fn value_count(&self) -> usize {
+        self.len()
+    }
+}
+
+impl ExpressionValues for ExpressionStack {
+    fn reset(&mut self) -> Result<()> {
+        self.values.clear();
+        let capacity_bytes = self
+            .values
+            .capacity()
+            .checked_mul(std::mem::size_of::<Value>())
+            .ok_or_else(|| {
+                DbError::new("53200", "query memory limit exceeded")
+                    .with_detail("expression stack capacity overflow")
+            })?;
+        self.reservation.resize(capacity_bytes)
+    }
+
+    fn push_value(&mut self, value: Value) -> Result<()> {
+        self.push(value)
+    }
+
+    fn pop_value(&mut self) -> Option<Value> {
+        self.pop()
+    }
+
+    fn value_count(&self) -> usize {
+        self.len()
     }
 }
 
@@ -189,12 +256,76 @@ enum OperatorFrame {
     Limit { remaining: usize },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OperatorId(usize);
+
+#[derive(Debug, Default)]
+pub struct OperatorArena {
+    operators: Vec<OperatorFrame>,
+}
+
+impl OperatorArena {
+    fn insert(&mut self, operator: OperatorFrame) -> OperatorId {
+        let id = OperatorId(self.operators.len());
+        self.operators.push(operator);
+        id
+    }
+
+    fn get(&self, id: OperatorId) -> Result<&OperatorFrame> {
+        self.operators
+            .get(id.0)
+            .ok_or_else(|| DbError::internal("operator ID is outside the arena"))
+    }
+
+    fn get_mut(&mut self, id: OperatorId) -> Result<&mut OperatorFrame> {
+        self.operators
+            .get_mut(id.0)
+            .ok_or_else(|| DbError::internal("operator ID is outside the arena"))
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.operators.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.operators.is_empty()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct FrameStack {
+    frames: Vec<OperatorId>,
+}
+
+impl FrameStack {
+    fn push(&mut self, operator: OperatorId) {
+        self.frames.push(operator);
+    }
+
+    fn reverse(&mut self) {
+        self.frames.reverse();
+    }
+
+    fn as_slice(&self) -> &[OperatorId] {
+        &self.frames
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+}
+
 enum SourceCursor {
     Empty,
-    Sequential {
-        rows: Arc<Vec<Row>>,
-        offset: usize,
-    },
+    Sequential(Box<dyn TableScan>),
     Index {
         rows: Arc<Vec<Row>>,
         entries: BPlusTreeOwnedIter,
@@ -202,23 +333,32 @@ enum SourceCursor {
 }
 
 impl SourceCursor {
-    fn next_row(&mut self) -> Result<Option<&Row>> {
+    fn next_chunk(
+        &mut self,
+        batch_rows: usize,
+        memory: &MemoryGrant,
+    ) -> Result<Option<LeasedDataChunk>> {
         match self {
             Self::Empty => Ok(None),
-            Self::Sequential { rows, offset } => {
-                let row = rows.get(*offset);
-                *offset = offset.saturating_add(1);
-                Ok(row)
-            }
-            Self::Index { rows, entries } => entries
-                .next()
-                .map(|entry| {
-                    usize::try_from(entry.row_id.get())
+            Self::Sequential(scan) => scan.next_chunk(batch_rows, memory),
+            Self::Index { rows, entries } => {
+                let mut selected = Vec::with_capacity(batch_rows);
+                while selected.len() < batch_rows {
+                    let Some(entry) = entries.next() else {
+                        break;
+                    };
+                    let row = usize::try_from(entry.row_id.get())
                         .ok()
                         .and_then(|row_id| rows.get(row_id))
-                        .ok_or_else(|| DbError::internal("index row reference is out of bounds"))
-                })
-                .transpose(),
+                        .ok_or_else(|| DbError::internal("index row reference is out of bounds"))?;
+                    selected.push(row.clone());
+                }
+                if selected.is_empty() {
+                    Ok(None)
+                } else {
+                    LeasedDataChunk::from_rows(&selected, memory).map(Some)
+                }
+            }
         }
     }
 }
@@ -226,21 +366,29 @@ impl SourceCursor {
 struct SpillRun {
     reader: BufReader<File>,
     current: Option<Row>,
+    current_reservation: Option<Reservation>,
 }
 
 impl SpillRun {
-    fn open(path: &Path, hard_limit: usize) -> Result<Self> {
+    fn open(path: &Path, memory: &MemoryGrant) -> Result<Self> {
         let reader = open_spill_reader(path)?;
         let mut run = Self {
             reader,
             current: None,
+            current_reservation: None,
         };
-        run.advance(hard_limit)?;
+        run.advance(memory)?;
         Ok(run)
     }
 
-    fn advance(&mut self, hard_limit: usize) -> Result<()> {
-        self.current = read_spill_record(&mut self.reader, hard_limit)?;
+    fn advance(&mut self, memory: &MemoryGrant) -> Result<()> {
+        self.current = None;
+        self.current_reservation = None;
+        if let Some(record) = read_spill_record(&mut self.reader, memory)? {
+            let reservation = memory.try_reserve(estimated_row_bytes(&record.value))?;
+            self.current = Some(record.value);
+            self.current_reservation = Some(reservation);
+        }
         Ok(())
     }
 }
@@ -260,26 +408,87 @@ impl SpillManager {
         }
     }
 
-    fn write_sorted_run(&mut self, rows: &[Row], hard_limit: usize) -> Result<PathBuf> {
-        let query_dir = if let Some(query_dir) = &self.query_dir {
-            query_dir.clone()
-        } else {
-            let query_id = NEXT_QUERY_ID.fetch_add(1, AtomicOrdering::Relaxed);
-            let query_dir = self
-                .root
-                .join(format!("ordadb-query-{}-{query_id}", std::process::id()));
-            fs::create_dir(&query_dir).map_err(spill_io_error)?;
-            self.query_dir = Some(query_dir.clone());
-            query_dir
-        };
-        let path = query_dir.join(format!("run-{}.spill", self.run_count));
+    fn ensure_query_dir(&mut self) -> Result<PathBuf> {
+        if let Some(query_dir) = &self.query_dir {
+            return Ok(query_dir.clone());
+        }
+        let query_id = NEXT_QUERY_ID.fetch_add(1, AtomicOrdering::Relaxed);
+        let query_dir = self
+            .root
+            .join(format!("ordadb-query-{}-{query_id}", std::process::id()));
+        fs::create_dir(&query_dir).map_err(spill_io_error)?;
+        self.query_dir = Some(query_dir.clone());
+        Ok(query_dir)
+    }
+
+    fn next_run_path(&mut self) -> Result<PathBuf> {
+        let path = self
+            .ensure_query_dir()?
+            .join(format!("run-{}.spill", self.run_count));
         self.run_count = self.run_count.saturating_add(1);
+        Ok(path)
+    }
+
+    fn write_sorted_run(&mut self, rows: &[Row], memory: &MemoryGrant) -> Result<PathBuf> {
+        let path = self.next_run_path()?;
         let mut writer = create_spill_writer(&path)?;
         for row in rows {
-            write_spill_record(&mut writer, row, hard_limit)?;
+            write_spill_record(&mut writer, row, memory)?;
         }
         writer.flush().map_err(spill_io_error)?;
         Ok(path)
+    }
+
+    fn compact_sorted_runs(
+        &mut self,
+        mut paths: Vec<PathBuf>,
+        order_by: &[BoundOrder],
+        memory: &MemoryGrant,
+    ) -> Result<Vec<PathBuf>> {
+        while paths.len() > 2 {
+            let mut merged = Vec::with_capacity(paths.len().div_ceil(2));
+            let mut pairs = paths.chunks_exact(2);
+            for pair in &mut pairs {
+                merged.push(self.merge_sorted_pair(&pair[0], &pair[1], order_by, memory)?);
+            }
+            if let Some(path) = pairs.remainder().first() {
+                merged.push((*path).clone());
+            }
+            paths = merged;
+        }
+        Ok(paths)
+    }
+
+    fn merge_sorted_pair(
+        &mut self,
+        left_path: &Path,
+        right_path: &Path,
+        order_by: &[BoundOrder],
+        memory: &MemoryGrant,
+    ) -> Result<PathBuf> {
+        let mut left = SpillRun::open(left_path, memory)?;
+        let mut right = SpillRun::open(right_path, memory)?;
+        let output_path = self.next_run_path()?;
+        let mut writer = create_spill_writer(&output_path)?;
+        loop {
+            let take_left = match (&left.current, &right.current) {
+                (None, None) => break,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (Some(left_row), Some(right_row)) => {
+                    compare_rows(left_row, right_row, order_by)? != Ordering::Greater
+                }
+            };
+            let run = if take_left { &mut left } else { &mut right };
+            let row = run
+                .current
+                .take()
+                .ok_or_else(|| DbError::internal("spill merge row disappeared"))?;
+            write_spill_record(&mut writer, &row, memory)?;
+            run.advance(memory)?;
+        }
+        writer.flush().map_err(spill_io_error)?;
+        Ok(output_path)
     }
 }
 
@@ -293,17 +502,17 @@ impl Drop for SpillManager {
 
 enum SortOutput {
     Memory {
-        rows: Vec<Row>,
-        offset: usize,
-        reserved_bytes: usize,
+        rows: std::vec::IntoIter<Row>,
+        _reservation: Reservation,
     },
     Runs(Vec<SpillRun>),
 }
 
 pub struct ExecutionCursor {
     source: SourceCursor,
-    frames: Vec<OperatorFrame>,
-    sort_index: Option<usize>,
+    arena: OperatorArena,
+    frames: FrameStack,
+    sort_position: Option<usize>,
     sort_output: Option<SortOutput>,
     schema: Schema,
     params: Vec<Value>,
@@ -311,7 +520,8 @@ pub struct ExecutionCursor {
     memory: QueryMemoryContext,
     pool: BatchPool,
     spill: SpillManager,
-    expression_stack: Vec<Value>,
+    expression_stack: ExpressionStack,
+    in_flight: Option<Reservation>,
     exhausted: bool,
 }
 
@@ -327,29 +537,40 @@ impl ExecutionCursor {
         options: ExecutionOptions,
     ) -> Result<Self> {
         options.validate()?;
-        let (source, frames) = build_pipeline(plan, context, &options)?;
-        let sort_indexes = frames
+        let (source, arena, frames) = build_pipeline(plan, context, &options)?;
+        let sort_positions = frames
+            .as_slice()
             .iter()
             .enumerate()
-            .filter_map(|(index, frame)| matches!(frame, OperatorFrame::Sort(_)).then_some(index))
+            .filter_map(|(position, id)| {
+                arena
+                    .get(*id)
+                    .ok()
+                    .is_some_and(|operator| matches!(operator, OperatorFrame::Sort(_)))
+                    .then_some(position)
+            })
             .collect::<Vec<_>>();
-        if sort_indexes.len() > 1 {
+        if sort_positions.len() > 1 {
             return Err(program_limit_error(
                 "a physical pipeline may contain at most one Sort frame",
             ));
         }
-        let sort_index = sort_indexes.first().copied();
+        let sort_position = sort_positions.first().copied();
+        let memory = QueryMemoryContext::new(options.soft_memory_bytes, options.hard_memory_bytes)?;
+        let expression_stack = ExpressionStack::new(&memory)?;
         Ok(Self {
             source,
+            arena,
             frames,
-            sort_index,
+            sort_position,
             sort_output: None,
             schema,
             params: context.params.to_vec(),
-            memory: QueryMemoryContext::new(options.soft_memory_bytes, options.hard_memory_bytes),
+            memory,
             pool: BatchPool::new(options.batch_rows),
             spill: SpillManager::new(options.spill_root.clone()),
-            expression_stack: Vec::with_capacity(16),
+            expression_stack,
+            in_flight: None,
             options,
             exhausted: false,
         })
@@ -361,89 +582,118 @@ impl ExecutionCursor {
     }
 
     pub fn next_batch(&mut self) -> Result<Option<Batch>> {
+        self.in_flight = None;
         if self.exhausted {
             return Ok(None);
         }
-        if self.sort_index.is_some() && self.sort_output.is_none() {
+        if self.sort_position.is_some() && self.sort_output.is_none() {
             self.initialize_sort()?;
         }
 
-        let mut output = self.pool.take();
-        let mut output_bytes = 0_usize;
-        while output.len() < self.options.batch_rows {
-            let row = if let Some(sort_index) = self.sort_index {
+        if let Some(sort_position) = self.sort_position {
+            let mut output = self.pool.take();
+            let mut reservation = self.memory.try_reserve(0)?;
+            while output.len() < self.options.batch_rows {
                 let Some(row) = self.next_sorted_row()? else {
                     break;
                 };
-                apply_frames(
-                    &mut self.frames[sort_index + 1..],
+                let row = apply_row_frames(
+                    &mut self.arena,
+                    &self.frames.as_slice()[sort_position + 1..],
                     &self.params,
                     &mut self.expression_stack,
                     Cow::Owned(row),
-                )?
-            } else {
-                let Some(row) = self.source.next_row()? else {
-                    break;
-                };
-                apply_frames(
-                    &mut self.frames,
-                    &self.params,
-                    &mut self.expression_stack,
-                    Cow::Borrowed(row),
-                )?
-            };
-            if let Some(row) = row {
-                let row_bytes = estimated_row_bytes(&row);
-                self.memory.reserve(row_bytes)?;
-                output_bytes = output_bytes.saturating_add(row_bytes);
-                output.push(row);
+                )?;
+                if let Some(row) = row {
+                    reservation.grow(estimated_row_bytes(&row))?;
+                    output.push(row);
+                }
             }
+            if output.is_empty() {
+                self.exhausted = true;
+                self.pool.recycle(output);
+                return Ok(None);
+            }
+            self.in_flight = Some(reservation);
+            return Ok(Some(Batch {
+                schema: self.schema.clone(),
+                rows: output,
+            }));
         }
-        if output.is_empty() {
-            self.exhausted = true;
-            self.pool.recycle(output);
-            return Ok(None);
+
+        loop {
+            let Some(mut leased) = self
+                .source
+                .next_chunk(self.options.batch_rows, &self.memory)?
+            else {
+                self.exhausted = true;
+                return Ok(None);
+            };
+            if !apply_chunk_frames(
+                &mut self.arena,
+                self.frames.as_slice(),
+                &self.params,
+                &mut self.expression_stack,
+                &mut leased,
+            )? {
+                continue;
+            }
+            if leased.chunk().is_empty() {
+                continue;
+            }
+            let output_reservation = self
+                .memory
+                .try_reserve(leased.chunk().estimated_selected_row_bytes()?)?;
+            let rows = leased.take_rows()?;
+            drop(leased);
+            if rows.is_empty() {
+                continue;
+            }
+            self.in_flight = Some(output_reservation);
+            return Ok(Some(Batch {
+                schema: self.schema.clone(),
+                rows,
+            }));
         }
-        self.memory.release(output_bytes);
-        Ok(Some(Batch {
-            schema: self.schema.clone(),
-            rows: output,
-        }))
     }
 
     fn initialize_sort(&mut self) -> Result<()> {
-        let sort_index = self
-            .sort_index
+        let sort_position = self
+            .sort_position
             .ok_or_else(|| DbError::internal("Sort initialization has no Sort frame"))?;
-        let OperatorFrame::Sort(order_by) = &self.frames[sort_index] else {
+        let sort_id = *self
+            .frames
+            .as_slice()
+            .get(sort_position)
+            .ok_or_else(|| DbError::internal("Sort frame position is invalid"))?;
+        let OperatorFrame::Sort(order_by) = self.arena.get(sort_id)? else {
             return Err(DbError::internal("Sort frame index is invalid"));
         };
         let order_by = order_by.clone();
         let mut rows = Vec::new();
-        let mut reserved_bytes = 0_usize;
+        let mut rows_reservation = self.memory.try_reserve(0)?;
         let mut run_paths = Vec::new();
         loop {
-            let mut input = self.pool.take();
-            let mut input_bytes = 0_usize;
-            while input.len() < self.options.batch_rows {
-                let Some(row) = self.source.next_row()? else {
-                    break;
-                };
-                let row_bytes = estimated_row_bytes(row);
-                self.memory.reserve(row_bytes)?;
-                input_bytes = input_bytes.saturating_add(row_bytes);
-                input.push(row.clone());
-            }
-            if input.is_empty() {
-                self.pool.recycle(input);
+            let Some(mut input) = self
+                .source
+                .next_chunk(self.options.batch_rows, &self.memory)?
+            else {
                 break;
+            };
+            if !apply_chunk_frames(
+                &mut self.arena,
+                &self.frames.as_slice()[..sort_position],
+                &self.params,
+                &mut self.expression_stack,
+                &mut input,
+            )? {
+                continue;
             }
-            for row in input.drain(..) {
-                let source_bytes = estimated_row_bytes(&row);
-                self.memory.release(source_bytes);
-                input_bytes = input_bytes.saturating_sub(source_bytes);
-                let Some(row) = apply_frames(
-                    &mut self.frames[..sort_index],
+            for logical_row in 0..input.chunk().len() {
+                let row = input.chunk().row(logical_row)?;
+                let Some(row) = apply_row_frames(
+                    &mut self.arena,
+                    &[],
                     &self.params,
                     &mut self.expression_stack,
                     Cow::Owned(row),
@@ -452,45 +702,36 @@ impl ExecutionCursor {
                     continue;
                 };
                 let row_bytes = estimated_row_bytes(&row);
-                if !rows.is_empty()
-                    && reserved_bytes.saturating_add(row_bytes) > self.memory.soft_limit_bytes()
-                {
+                if !rows.is_empty() && self.memory.would_cross_soft_limit(row_bytes) {
                     sort_rows(&mut rows, &order_by)?;
-                    run_paths.push(
-                        self.spill
-                            .write_sorted_run(&rows, self.options.hard_memory_bytes)?,
-                    );
+                    run_paths.push(self.spill.write_sorted_run(&rows, &self.memory)?);
                     rows.clear();
-                    self.memory.release(reserved_bytes);
-                    reserved_bytes = 0;
+                    rows_reservation.resize(0)?;
                 }
-                self.memory.reserve(row_bytes)?;
-                reserved_bytes = reserved_bytes.saturating_add(row_bytes);
+                rows_reservation.grow(row_bytes)?;
                 rows.push(row);
             }
-            self.memory.release(input_bytes);
-            self.pool.recycle(input);
+            drop(input);
         }
 
         if run_paths.is_empty() {
             sort_rows(&mut rows, &order_by)?;
             self.sort_output = Some(SortOutput::Memory {
-                rows,
-                offset: 0,
-                reserved_bytes,
+                rows: rows.into_iter(),
+                _reservation: rows_reservation,
             });
         } else {
             if !rows.is_empty() {
                 sort_rows(&mut rows, &order_by)?;
-                run_paths.push(
-                    self.spill
-                        .write_sorted_run(&rows, self.options.hard_memory_bytes)?,
-                );
-                self.memory.release(reserved_bytes);
+                run_paths.push(self.spill.write_sorted_run(&rows, &self.memory)?);
             }
+            drop(rows_reservation);
+            let run_paths = self
+                .spill
+                .compact_sorted_runs(run_paths, &order_by, &self.memory)?;
             let runs = run_paths
                 .iter()
-                .map(|path| SpillRun::open(path, self.options.hard_memory_bytes))
+                .map(|path| SpillRun::open(path, &self.memory))
                 .collect::<Result<Vec<_>>>()?;
             self.sort_output = Some(SortOutput::Runs(runs));
         }
@@ -504,22 +745,18 @@ impl ExecutionCursor {
         match output {
             SortOutput::Memory {
                 rows,
-                offset,
-                reserved_bytes,
-            } => {
-                let row = rows.get(*offset).cloned();
-                *offset = offset.saturating_add(1);
-                if row.is_none() && *reserved_bytes > 0 {
-                    self.memory.release(*reserved_bytes);
-                    *reserved_bytes = 0;
-                }
-                Ok(row)
-            }
+                _reservation: _,
+            } => Ok(rows.next()),
             SortOutput::Runs(runs) => {
-                let sort_index = self
-                    .sort_index
+                let sort_position = self
+                    .sort_position
                     .ok_or_else(|| DbError::internal("Sort output has no frame"))?;
-                let OperatorFrame::Sort(order_by) = &self.frames[sort_index] else {
+                let sort_id = *self
+                    .frames
+                    .as_slice()
+                    .get(sort_position)
+                    .ok_or_else(|| DbError::internal("Sort output position is invalid"))?;
+                let OperatorFrame::Sort(order_by) = self.arena.get(sort_id)? else {
                     return Err(DbError::internal("Sort output frame is invalid"));
                 };
                 let mut selected: Option<usize> = None;
@@ -548,21 +785,116 @@ impl ExecutionCursor {
                     .current
                     .take()
                     .ok_or_else(|| DbError::internal("Sort merge row disappeared"))?;
-                runs[selected].advance(self.options.hard_memory_bytes)?;
+                runs[selected].advance(&self.memory)?;
                 Ok(Some(row))
             }
         }
     }
 }
 
-fn apply_frames(
-    frames: &mut [OperatorFrame],
+fn apply_chunk_frames(
+    arena: &mut OperatorArena,
+    frames: &[OperatorId],
     params: &[Value],
-    expression_stack: &mut Vec<Value>,
+    expression_stack: &mut ExpressionStack,
+    chunk: &mut LeasedDataChunk,
+) -> Result<bool> {
+    for id in frames {
+        match arena.get_mut(*id)? {
+            OperatorFrame::Filter(program) => {
+                let direct = match &program.fast_path {
+                    Some(FastExpression::ColumnLiteralBinary {
+                        column,
+                        column_type,
+                        operator,
+                        literal,
+                        literal_type,
+                        target,
+                    }) if column_type == literal_type && matches!(target, ScalarType::Boolean) => {
+                        chunk
+                            .chunk_mut()
+                            .retain_literal_comparison(*column, literal, *operator)
+                    }
+                    _ => None,
+                };
+                if let Some(result) = direct {
+                    result?;
+                } else {
+                    chunk.chunk_mut().retain_selected(|chunk, physical_row| {
+                        match program.evaluate_chunk_row(
+                            chunk,
+                            physical_row,
+                            params,
+                            expression_stack,
+                        )? {
+                            Value::Boolean(matches) => Ok(matches),
+                            Value::Null => Ok(false),
+                            _ => Err(DbError::new("42804", "predicate must evaluate to boolean")),
+                        }
+                    })?;
+                }
+                if chunk.chunk().is_empty() {
+                    return Ok(false);
+                }
+            }
+            OperatorFrame::Projection(programs) => {
+                let direct = programs
+                    .iter()
+                    .map(ExpressionProgram::column_projection)
+                    .collect::<Option<Vec<_>>>();
+                let projected_in_place = if let Some(projections) = direct {
+                    chunk.chunk_mut().project_columns_in_place(&projections)?
+                } else {
+                    false
+                };
+                if projected_in_place {
+                    chunk.refresh_reservation()?;
+                } else {
+                    let rows = (0..chunk.chunk().len())
+                        .map(|logical_row| {
+                            let row = chunk.chunk().row(logical_row)?;
+                            programs
+                                .iter()
+                                .map(|program| {
+                                    program.evaluate_reusing(&row.values, params, expression_stack)
+                                })
+                                .collect::<Result<Vec<_>>>()
+                                .map(Row::new)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    chunk.replace(DataChunk::from_rows(&rows)?)?;
+                }
+            }
+            OperatorFrame::Limit { remaining } => {
+                if *remaining == 0 {
+                    return Ok(false);
+                }
+                let emitted = chunk.chunk().len().min(*remaining);
+                chunk.chunk_mut().selection_mut().truncate(emitted);
+                *remaining -= emitted;
+                if emitted == 0 {
+                    return Ok(false);
+                }
+            }
+            OperatorFrame::Sort(_) => {
+                return Err(DbError::internal(
+                    "Sort frame reached the streaming chunk evaluator",
+                ));
+            }
+        }
+    }
+    Ok(!chunk.chunk().is_empty())
+}
+
+fn apply_row_frames(
+    arena: &mut OperatorArena,
+    frames: &[OperatorId],
+    params: &[Value],
+    expression_stack: &mut ExpressionStack,
     mut row: Cow<'_, Row>,
 ) -> Result<Option<Row>> {
-    for frame in frames {
-        match frame {
+    for id in frames {
+        match arena.get_mut(*id)? {
             OperatorFrame::Filter(program) => {
                 match program.evaluate_reusing(&row.values, params, expression_stack)? {
                     Value::Boolean(true) => {}
@@ -599,9 +931,10 @@ fn build_pipeline(
     plan: &PlanNode,
     context: &ExecutionContext<'_>,
     options: &ExecutionOptions,
-) -> Result<(SourceCursor, Vec<OperatorFrame>)> {
+) -> Result<(SourceCursor, OperatorArena, FrameStack)> {
     let mut node = plan;
-    let mut frames = Vec::new();
+    let mut arena = OperatorArena::default();
+    let mut frames = FrameStack::default();
     let source = loop {
         if frames.len() >= options.max_plan_depth {
             return Err(program_limit_error(format!(
@@ -614,28 +947,31 @@ fn build_pipeline(
                 table_id, access, ..
             } => break build_source(*table_id, access, context, options.max_expression_depth)?,
             PlanKind::Filter { predicate, input } => {
-                frames.push(OperatorFrame::Filter(
+                let id = arena.insert(OperatorFrame::Filter(
                     ExpressionProgram::compile_with_limit(
                         predicate,
                         false,
                         options.max_expression_depth,
                     )?,
                 ));
+                frames.push(id);
                 node = input;
             }
             PlanKind::Projection { expressions, input } => {
-                frames.push(OperatorFrame::Projection(compile_projections(
+                let id = arena.insert(OperatorFrame::Projection(compile_projections(
                     expressions,
                     options.max_expression_depth,
                 )?));
+                frames.push(id);
                 node = input;
             }
             PlanKind::Sort { order_by, input } => {
-                frames.push(OperatorFrame::Sort(order_by.clone()));
+                let id = arena.insert(OperatorFrame::Sort(order_by.clone()));
+                frames.push(id);
                 node = input;
             }
             PlanKind::Limit { limit, input } => {
-                frames.push(OperatorFrame::Limit {
+                let id = arena.insert(OperatorFrame::Limit {
                     remaining: evaluate_limit_program(
                         &ExpressionProgram::compile_with_limit(
                             limit,
@@ -645,12 +981,13 @@ fn build_pipeline(
                         context.params,
                     )?,
                 });
+                frames.push(id);
                 node = input;
             }
         }
     };
     frames.reverse();
-    Ok((source, frames))
+    Ok((source, arena, frames))
 }
 
 fn build_source(
@@ -659,14 +996,11 @@ fn build_source(
     context: &ExecutionContext<'_>,
     max_expression_depth: usize,
 ) -> Result<SourceCursor> {
-    let rows = context
-        .tables
-        .get(&table_id)
-        .cloned()
-        .unwrap_or_else(|| Arc::new(Vec::new()));
     match access {
         AccessPath::Empty => Ok(SourceCursor::Empty),
-        AccessPath::Sequential => Ok(SourceCursor::Sequential { rows, offset: 0 }),
+        AccessPath::Sequential => SnapshotTableProvider::new(context.tables)
+            .scan(table_id)
+            .map(SourceCursor::Sequential),
         AccessPath::Index {
             index_id,
             operator,
@@ -679,6 +1013,11 @@ fn build_source(
             if value.is_null() {
                 return Ok(SourceCursor::Empty);
             }
+            let rows = context
+                .tables
+                .get(&table_id)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Vec::new()));
             let key = IndexKey::from_values(&[value])?;
             let tree = context
                 .indexes
@@ -767,32 +1106,101 @@ fn open_spill_reader(path: &Path) -> Result<BufReader<File>> {
     Ok(reader)
 }
 
+struct SpillRecord<T> {
+    value: T,
+    _reservation: Reservation,
+}
+
+struct ReservedSpillBuffer {
+    bytes: Vec<u8>,
+    reservation: Reservation,
+    failure: Option<DbError>,
+}
+
+impl ReservedSpillBuffer {
+    fn new(memory: &MemoryGrant) -> Result<Self> {
+        Ok(Self {
+            bytes: Vec::new(),
+            reservation: memory.try_reserve(0)?,
+            failure: None,
+        })
+    }
+}
+
+impl Write for ReservedSpillBuffer {
+    fn write(&mut self, source: &[u8]) -> std::io::Result<usize> {
+        let required = self
+            .bytes
+            .len()
+            .checked_add(source.len())
+            .ok_or_else(|| std::io::Error::other("spill buffer length overflow"))?;
+        if required > self.bytes.capacity() {
+            let old_capacity = self.bytes.capacity();
+            let requested = required - old_capacity;
+            if let Err(error) = self.reservation.grow(requested) {
+                self.failure = Some(error);
+                return Err(std::io::Error::other(
+                    "spill buffer exceeds query memory grant",
+                ));
+            }
+            if let Err(error) = self
+                .bytes
+                .try_reserve_exact(required.saturating_sub(self.bytes.len()))
+            {
+                let _ = self.reservation.resize(old_capacity);
+                let error = DbError::new("53200", "query memory limit exceeded")
+                    .with_detail(format!("failed to allocate spill buffer: {error}"));
+                self.failure = Some(error);
+                return Err(std::io::Error::other("failed to allocate spill buffer"));
+            }
+            let actual_capacity = self.bytes.capacity();
+            if actual_capacity > old_capacity.saturating_add(requested)
+                && let Err(error) = self
+                    .reservation
+                    .grow(actual_capacity - old_capacity - requested)
+            {
+                self.failure = Some(error);
+                return Err(std::io::Error::other(
+                    "spill buffer exceeds query memory grant",
+                ));
+            }
+        }
+        self.bytes.extend_from_slice(source);
+        Ok(source.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn write_spill_record<T: Serialize>(
     writer: &mut BufWriter<File>,
     value: &T,
-    hard_limit: usize,
+    memory: &MemoryGrant,
 ) -> Result<()> {
-    let payload = serde_json::to_vec(value).map_err(|error| {
-        DbError::new("58030", "query spill encoding failed").with_detail(error.to_string())
-    })?;
-    if payload.len() > hard_limit {
-        return Err(DbError::new(
-            "53200",
-            "query spill record exceeds the hard memory limit",
-        ));
+    let mut payload = ReservedSpillBuffer::new(memory)?;
+    if let Err(error) = serde_json::to_writer(&mut payload, value) {
+        if let Some(memory_error) = payload.failure.take() {
+            return Err(memory_error);
+        }
+        return Err(
+            DbError::new("58030", "query spill encoding failed").with_detail(error.to_string())
+        );
     }
-    let length = u32::try_from(payload.len())
+    let length = u32::try_from(payload.bytes.len())
         .map_err(|_| DbError::new("53200", "query spill record length is out of range"))?;
     writer
         .write_all(&length.to_le_bytes())
         .map_err(spill_io_error)?;
-    writer.write_all(&payload).map_err(spill_io_error)
+    writer.write_all(&payload.bytes).map_err(spill_io_error)?;
+    Ok(())
 }
 
 fn read_spill_record<T: DeserializeOwned>(
     reader: &mut BufReader<File>,
-    hard_limit: usize,
-) -> Result<Option<T>> {
+    memory: &MemoryGrant,
+) -> Result<Option<SpillRecord<T>>> {
     let mut length = [0_u8; 4];
     let first = reader.read(&mut length[..1]).map_err(spill_io_error)?;
     if first == 0 {
@@ -802,19 +1210,27 @@ fn read_spill_record<T: DeserializeOwned>(
         .read_exact(&mut length[1..])
         .map_err(|error| spill_corruption("spill record length is truncated", error))?;
     let length = u32::from_le_bytes(length) as usize;
-    if length > hard_limit {
+    if length > memory.hard_limit_bytes() {
         return Err(DbError::new(
             "53200",
             "query spill record exceeds the hard memory limit",
         ));
     }
+    let reservation = memory.try_reserve(length)?;
     let mut payload = vec![0_u8; length];
     reader
         .read_exact(&mut payload)
         .map_err(|error| spill_corruption("spill record payload is truncated", error))?;
-    serde_json::from_slice(&payload).map(Some).map_err(|error| {
-        DbError::new("XX001", "query spill record is corrupt").with_detail(error.to_string())
-    })
+    serde_json::from_slice(&payload)
+        .map(|value| {
+            Some(SpillRecord {
+                value,
+                _reservation: reservation,
+            })
+        })
+        .map_err(|error| {
+            DbError::new("XX001", "query spill record is corrupt").with_detail(error.to_string())
+        })
 }
 
 fn spill_corruption(message: &str, error: std::io::Error) -> DbError {
@@ -827,11 +1243,11 @@ fn program_limit_error(detail: impl Into<String>) -> DbError {
         .with_hint("Reduce nested expressions or split the query into simpler statements.")
 }
 
-fn estimated_row_bytes(row: &Row) -> usize {
+pub(crate) fn estimated_row_bytes(row: &Row) -> usize {
     std::mem::size_of::<Row>() + row.values.iter().map(estimated_value_bytes).sum::<usize>()
 }
 
-fn estimated_value_bytes(value: &Value) -> usize {
+pub(crate) fn estimated_value_bytes(value: &Value) -> usize {
     std::mem::size_of::<Value>()
         + match value {
             Value::Text(value) => value.len(),
@@ -869,6 +1285,7 @@ enum ExpressionInstruction {
 pub struct ExpressionProgram {
     instructions: Vec<ExpressionInstruction>,
     fast_path: Option<FastExpression>,
+    max_stack_slots: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -979,10 +1396,59 @@ impl ExpressionProgram {
                 )));
             }
         }
+        let max_stack_slots = expression_stack_slots(&instructions)?;
         Ok(Self {
             instructions,
             fast_path: detect_fast_expression(expr),
+            max_stack_slots,
         })
+    }
+
+    fn column_projection(&self) -> Option<(usize, ScalarType)> {
+        let Some(FastExpression::Column { index, target }) = &self.fast_path else {
+            return None;
+        };
+        Some((*index, target.clone()))
+    }
+
+    fn evaluate_chunk_row(
+        &self,
+        chunk: &DataChunk,
+        physical_row: usize,
+        params: &[Value],
+        values: &mut ExpressionStack,
+    ) -> Result<Value> {
+        match &self.fast_path {
+            Some(FastExpression::Column { index, target }) => {
+                coerce_value(chunk.value(*index, physical_row)?, target)
+            }
+            Some(FastExpression::ColumnLiteralBinary {
+                column,
+                column_type,
+                operator,
+                literal,
+                literal_type,
+                target,
+            }) => {
+                if column_type == literal_type
+                    && matches!(target, ScalarType::Boolean)
+                    && let Some(value) =
+                        chunk.compare_literal(*column, physical_row, literal, *operator)
+                {
+                    return value;
+                }
+                let left = coerce_value(chunk.value(*column, physical_row)?, column_type)?;
+                let right = coerce_value(literal.clone(), literal_type)?;
+                coerce_value(evaluate_binary(left, *operator, right)?, target)
+            }
+            Some(
+                fast_path @ (FastExpression::Literal { .. } | FastExpression::Parameter { .. }),
+            ) => evaluate_fast_expression(fast_path, &[], params),
+            None => {
+                let row = chunk.physical_row(physical_row)?;
+                self.evaluate_reusing(&row.values, params, values)
+            }
+        }
     }
 
     pub fn evaluate(&self, row: &[Value], params: &[Value]) -> Result<Value> {
@@ -996,11 +1462,12 @@ impl ExpressionProgram {
         &self,
         row: &[Value],
         params: &[Value],
-        values: &mut Vec<Value>,
+        values: &mut ExpressionStack,
     ) -> Result<Value> {
         if let Some(fast_path) = &self.fast_path {
             return evaluate_fast_expression(fast_path, row, params);
         }
+        values.prepare(self.max_stack_slots)?;
         evaluate_instructions_reusing(&self.instructions, row, params, None, values)
     }
 
@@ -1012,6 +1479,45 @@ impl ExpressionProgram {
     ) -> Result<Value> {
         evaluate_instructions(&self.instructions, representative, params, Some(rows))
     }
+}
+
+fn expression_stack_slots(instructions: &[ExpressionInstruction]) -> Result<usize> {
+    let mut depth = 0_usize;
+    let mut maximum = 0_usize;
+    for instruction in instructions {
+        match instruction {
+            ExpressionInstruction::LoadColumn(_)
+            | ExpressionInstruction::LoadLiteral(_)
+            | ExpressionInstruction::LoadParameter(_)
+            | ExpressionInstruction::Aggregate { .. } => {
+                depth = depth.checked_add(1).ok_or_else(|| {
+                    program_limit_error("expression value stack depth overflowed")
+                })?;
+                maximum = maximum.max(depth);
+            }
+            ExpressionInstruction::Unary(_) | ExpressionInstruction::Coerce(_) => {
+                if depth == 0 {
+                    return Err(DbError::internal(
+                        "expression compiler produced a stack underflow",
+                    ));
+                }
+            }
+            ExpressionInstruction::Binary(_) => {
+                if depth < 2 {
+                    return Err(DbError::internal(
+                        "expression compiler produced a stack underflow",
+                    ));
+                }
+                depth -= 1;
+            }
+        }
+    }
+    if depth != 1 {
+        return Err(DbError::internal(
+            "expression compiler did not produce one stack result",
+        ));
+    }
+    Ok(maximum)
 }
 
 fn detect_fast_expression(expr: &BoundExpr) -> Option<FastExpression> {
@@ -1095,68 +1601,68 @@ fn evaluate_instructions(
     evaluate_instructions_reusing(instructions, row, params, group_rows, &mut values)
 }
 
-fn evaluate_instructions_reusing(
+fn evaluate_instructions_reusing<S: ExpressionValues>(
     instructions: &[ExpressionInstruction],
     row: &[Value],
     params: &[Value],
     group_rows: Option<&[Row]>,
-    values: &mut Vec<Value>,
+    values: &mut S,
 ) -> Result<Value> {
-    values.clear();
+    values.reset()?;
     for instruction in instructions {
         match instruction {
             ExpressionInstruction::LoadColumn(index) => {
-                values.push(row.get(*index).cloned().ok_or_else(|| {
+                values.push_value(row.get(*index).cloned().ok_or_else(|| {
                     DbError::internal(format!("bound column index {index} is out of range"))
-                })?);
+                })?)?;
             }
-            ExpressionInstruction::LoadLiteral(value) => values.push(value.clone()),
+            ExpressionInstruction::LoadLiteral(value) => values.push_value(value.clone())?,
             ExpressionInstruction::LoadParameter(index) => {
-                values.push(params.get(index - 1).cloned().ok_or_else(|| {
+                values.push_value(params.get(index - 1).cloned().ok_or_else(|| {
                     DbError::new("42P02", format!("no value supplied for parameter ${index}"))
-                })?);
+                })?)?;
             }
             ExpressionInstruction::Unary(operator) => {
                 let value = values
-                    .pop()
+                    .pop_value()
                     .ok_or_else(|| DbError::internal("expression value stack underflow"))?;
-                values.push(evaluate_unary(*operator, value)?);
+                values.push_value(evaluate_unary(*operator, value)?)?;
             }
             ExpressionInstruction::Binary(operator) => {
                 let right = values
-                    .pop()
+                    .pop_value()
                     .ok_or_else(|| DbError::internal("expression value stack underflow"))?;
                 let left = values
-                    .pop()
+                    .pop_value()
                     .ok_or_else(|| DbError::internal("expression value stack underflow"))?;
-                values.push(evaluate_binary(left, *operator, right)?);
+                values.push_value(evaluate_binary(left, *operator, right)?)?;
             }
             ExpressionInstruction::Aggregate { function, argument } => {
                 let rows = group_rows.ok_or_else(|| {
                     DbError::internal("aggregate expression requires grouped rows")
                 })?;
-                values.push(evaluate_aggregate_program(
+                values.push_value(evaluate_aggregate_program(
                     *function,
                     argument.as_deref(),
                     rows,
                     params,
-                )?);
+                )?)?;
             }
             ExpressionInstruction::Coerce(target) => {
                 let value = values
-                    .pop()
+                    .pop_value()
                     .ok_or_else(|| DbError::internal("expression value stack underflow"))?;
-                values.push(coerce_value(value, target)?);
+                values.push_value(coerce_value(value, target)?)?;
             }
         }
     }
-    if values.len() != 1 {
+    if values.value_count() != 1 {
         return Err(DbError::internal(
             "expression program did not produce exactly one value",
         ));
     }
     values
-        .pop()
+        .pop_value()
         .ok_or_else(|| DbError::internal("expression result disappeared"))
 }
 
@@ -1506,13 +2012,16 @@ mod tests {
 
     use ordadb_catalog::{Catalog, NewColumn};
     use ordadb_optimizer::{AccessPath, PlanKind, PlanNode, optimize_select};
-    use ordadb_sql::{BoundExpr, BoundExprKind, BoundStatement, UnaryOperator, bind, parse};
+    use ordadb_sql::{
+        BinaryOperator, BoundExpr, BoundExprKind, BoundStatement, UnaryOperator, bind, parse,
+    };
     use ordadb_types::{Identifier, Row, ScalarType, Schema, TableId, Value};
     use tempfile::TempDir;
 
     use super::{
-        ExecutionContext, ExecutionCursor, ExecutionOptions, ExpressionProgram, SPILL_MAGIC,
-        SPILL_VERSION, SpillRun, execute,
+        DEFAULT_MAX_EXPRESSION_DEPTH, DEFAULT_MAX_PLAN_DEPTH, ExecutionContext, ExecutionCursor,
+        ExecutionOptions, ExpressionProgram, ExpressionStack, MemoryGrant, SPILL_MAGIC,
+        SPILL_VERSION, SpillManager, SpillRun, execute,
     };
 
     type TestTables = BTreeMap<TableId, Arc<Vec<Row>>>;
@@ -1649,11 +2158,36 @@ mod tests {
         bytes.extend_from_slice(b"short");
         std::fs::write(&path, bytes).expect("write truncated spill");
 
-        let error = match SpillRun::open(&path, 1024) {
+        let memory = super::MemoryGrant::new(1024, 1024).expect("memory grant");
+        let error = match SpillRun::open(&path, &memory) {
             Ok(_) => panic!("truncated spill must fail"),
             Err(error) => error,
         };
         assert_eq!(error.sql_state, "XX001");
+    }
+
+    #[test]
+    fn spill_write_failure_cleans_the_partial_query_directory() {
+        let temp = TempDir::new().expect("temp");
+        let spill_root = temp.path().join("spill");
+        std::fs::create_dir(&spill_root).expect("spill root");
+        let query_dir = {
+            let mut spill = SpillManager::new(spill_root);
+            let memory = MemoryGrant::new(32, 64).expect("memory grant");
+            let error = spill
+                .write_sorted_run(&[Row::new(vec![Value::Text("x".repeat(1_024))])], &memory)
+                .expect_err("oversized spill record");
+            assert_eq!(error.sql_state, "53200");
+            let query_dir = spill.query_dir.clone().expect("query directory");
+            assert_eq!(
+                std::fs::read_dir(&query_dir)
+                    .expect("partial query directory")
+                    .count(),
+                1
+            );
+            query_dir
+        };
+        assert!(!query_dir.exists());
     }
 
     #[test]
@@ -1680,6 +2214,37 @@ mod tests {
             ExecutionCursor::with_options(&plan, &context, schema, options).expect("cursor");
         let error = cursor.next_batch().expect_err("hard memory limit");
         assert_eq!(error.sql_state, "53200");
+    }
+
+    #[test]
+    fn expression_stack_owns_capacity_and_variable_values_through_raii() {
+        let expression = BoundExpr {
+            kind: BoundExprKind::Binary {
+                left: Box::new(BoundExpr {
+                    kind: BoundExprKind::Literal(Value::Text("x".repeat(512))),
+                    data_type: ScalarType::Text,
+                    nullable: false,
+                }),
+                op: BinaryOperator::Eq,
+                right: Box::new(BoundExpr {
+                    kind: BoundExprKind::Literal(Value::Text("x".repeat(512))),
+                    data_type: ScalarType::Text,
+                    nullable: false,
+                }),
+            },
+            data_type: ScalarType::Boolean,
+            nullable: false,
+        };
+        let program = ExpressionProgram::compile(&expression).expect("compile");
+        let memory = MemoryGrant::new(128, 256).expect("grant");
+        let mut stack = ExpressionStack::new(&memory).expect("stack");
+        let error = program
+            .evaluate_reusing(&[], &[], &mut stack)
+            .expect_err("variable-width stack exceeds grant");
+        assert_eq!(error.sql_state, "53200");
+        assert!(memory.current_bytes() > 0);
+        drop(stack);
+        assert_eq!(memory.current_bytes(), 0);
     }
 
     #[test]
@@ -1747,5 +2312,85 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.sql_state, "54001");
+    }
+
+    #[test]
+    fn bounded_deep_expression_and_plan_execute_on_small_native_stack() {
+        let mut expression = BoundExpr {
+            kind: BoundExprKind::Literal(Value::Boolean(true)),
+            data_type: ScalarType::Boolean,
+            nullable: false,
+        };
+        for _ in 0..DEFAULT_MAX_EXPRESSION_DEPTH {
+            expression = BoundExpr {
+                kind: BoundExprKind::Unary {
+                    op: UnaryOperator::Not,
+                    expr: Box::new(expression),
+                },
+                data_type: ScalarType::Boolean,
+                nullable: false,
+            };
+        }
+
+        let table_id = TableId::new(1);
+        let mut plan = PlanNode {
+            kind: PlanKind::Scan {
+                table_id,
+                access: AccessPath::Sequential,
+                required_columns: vec![0],
+            },
+            estimated_rows: 0.0,
+            estimated_cost: 0.0,
+        };
+        for _ in 0..DEFAULT_MAX_PLAN_DEPTH - 1 {
+            plan = PlanNode {
+                kind: PlanKind::Limit {
+                    limit: BoundExpr {
+                        kind: BoundExprKind::Literal(Value::Int64(1)),
+                        data_type: ScalarType::Int64,
+                        nullable: false,
+                    },
+                    input: Box::new(plan),
+                },
+                estimated_rows: 0.0,
+                estimated_cost: 0.0,
+            };
+        }
+        let tables = BTreeMap::from([(table_id, Arc::new(Vec::new()))]);
+        let indexes = BTreeMap::new();
+
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("bounded-query-stack".to_owned())
+                .stack_size(128 * 1_024)
+                .spawn_scoped(scope, move || {
+                    let program = ExpressionProgram::compile_with_limit(
+                        &expression,
+                        false,
+                        DEFAULT_MAX_EXPRESSION_DEPTH,
+                    )
+                    .expect("deep expression compiles iteratively");
+                    assert_eq!(
+                        program.evaluate(&[], &[]).expect("deep expression"),
+                        Value::Boolean(true)
+                    );
+                    let context = ExecutionContext {
+                        tables: &tables,
+                        indexes: &indexes,
+                        params: &[],
+                    };
+                    let mut cursor = ExecutionCursor::with_options(
+                        &plan,
+                        &context,
+                        Schema::empty(),
+                        ExecutionOptions::default(),
+                    )
+                    .expect("deep plan builds iteratively");
+                    assert!(cursor.next_batch().expect("deep plan executes").is_none());
+                })
+                .expect("spawn bounded-stack thread")
+                .join()
+                .expect("bounded-stack thread");
+        });
     }
 }

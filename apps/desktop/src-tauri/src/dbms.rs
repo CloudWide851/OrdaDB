@@ -8,7 +8,7 @@ use ordadb_connectors::{
     CatalogEntry, ConnectorHost, ConnectorRequestV1, ConnectorResponseV1, CredentialPayload,
     CredentialVault, PluginManager,
 };
-use ordadb_protocol::{ClientConfig, PgCancelToken, PgClient, QueryResult};
+use ordadb_protocol::{ClientConfig, PgCancelToken, PgClient, PgQueryEvent};
 use ordadb_types::{DbError, QueryEvent, Value};
 use reqwest::{Client, Method, Url};
 use serde::de::DeserializeOwned;
@@ -1056,17 +1056,42 @@ impl DbmsRuntime {
                     .into_iter()
                     .map(|value| value.map(String::into_bytes))
                     .collect::<Vec<_>>();
-                let result = tokio::task::spawn_blocking(move || {
+                let task_app = app.clone();
+                let task_request_id = request_id.to_owned();
+                tokio::task::spawn_blocking(move || {
                     let mut client = mutex_lock(&client)?;
-                    if params.is_empty() {
-                        client.query(&sql)
+                    let mut processed = 0_u64;
+                    let mut on_event = |event| {
+                        emit_native_pg_event(&task_app, &task_request_id, event, &mut processed);
+                        Ok(())
+                    };
+                    let summary = if params.is_empty() {
+                        client.query_batches(&sql, QUERY_BATCH_ROWS, &mut on_event)?
                     } else {
-                        client.query_prepared(&sql, &[], &params, QUERY_BATCH_ROWS as u32)
-                    }
+                        client.query_prepared_batches(
+                            &sql,
+                            &[],
+                            &params,
+                            QUERY_BATCH_ROWS as u32,
+                            &mut on_event,
+                        )?
+                    };
+                    emit_query(
+                        &task_app,
+                        &task_request_id,
+                        DbmsQueryEvent::Complete {
+                            command_tag: if summary.command_tags.is_empty() {
+                                "OK".into()
+                            } else {
+                                summary.command_tags.join(" · ")
+                            },
+                            duration_ms: elapsed_ms(started.elapsed()),
+                        },
+                    );
+                    Ok::<(), DbError>(())
                 })
                 .await
                 .map_err(join_error)??;
-                emit_native_result(app, request_id, result, started.elapsed());
             }
             ConnectionTransport::Plugin(plugin) => {
                 let RequestCancellation::Plugin(token) = cancellation else {
@@ -2146,51 +2171,39 @@ fn catalog_entry(entry: CatalogEntry) -> CatalogObject {
     }
 }
 
-fn emit_native_result(app: &AppHandle, request_id: &str, result: QueryResult, elapsed: Duration) {
-    emit_query(
-        app,
-        request_id,
-        DbmsQueryEvent::Schema {
-            columns: result
-                .columns
-                .into_iter()
-                .map(|name| QueryColumn {
-                    name,
-                    data_type: "text".into(),
-                })
-                .collect(),
-        },
-    );
-    let mut processed = 0_u64;
-    for rows in result.rows.chunks(QUERY_BATCH_ROWS) {
-        processed = processed.saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
-        emit_query(
+fn emit_native_pg_event(
+    app: &AppHandle,
+    request_id: &str,
+    event: PgQueryEvent,
+    processed: &mut u64,
+) {
+    match event {
+        PgQueryEvent::Schema(columns) => emit_query(
             app,
             request_id,
-            DbmsQueryEvent::Batch {
-                rows: rows.to_vec(),
+            DbmsQueryEvent::Schema {
+                columns: columns
+                    .into_iter()
+                    .map(|name| QueryColumn {
+                        name,
+                        data_type: "text".into(),
+                    })
+                    .collect(),
             },
-        );
-        emit_query(
-            app,
-            request_id,
-            DbmsQueryEvent::Progress {
-                rows_processed: processed,
-            },
-        );
+        ),
+        PgQueryEvent::Batch(rows) => {
+            *processed = processed.saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
+            emit_query(app, request_id, DbmsQueryEvent::Batch { rows });
+            emit_query(
+                app,
+                request_id,
+                DbmsQueryEvent::Progress {
+                    rows_processed: *processed,
+                },
+            );
+        }
+        PgQueryEvent::Complete(_) => {}
     }
-    emit_query(
-        app,
-        request_id,
-        DbmsQueryEvent::Complete {
-            command_tag: if result.command_tags.is_empty() {
-                "OK".into()
-            } else {
-                result.command_tags.join(" · ")
-            },
-            duration_ms: elapsed_ms(elapsed),
-        },
-    );
 }
 
 fn map_connector_event(event: QueryEvent, elapsed: Duration) -> DbmsQueryEvent {

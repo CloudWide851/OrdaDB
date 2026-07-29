@@ -32,7 +32,11 @@ describe("workbench store", () => {
       "score",
       "updated_at",
     ]);
-    expect(store.getState().rows).toHaveLength(5);
+    expect(store.getState().resultBuffer).toMatchObject({
+      rowCount: 5,
+      totalRows: 5,
+      droppedRows: 0,
+    });
     expect(store.getState().logs).toContain(
       "Preview fixture · 不连接真实数据库",
     );

@@ -277,6 +277,71 @@ test.describe("OrdaDB SQL workbench", () => {
     await expect(page.getByText("5 行 · 36 ms")).toBeVisible();
   });
 
+  test("bounds large result buffers and virtualizes the visible rows", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+    await page.addScriptTag({
+      type: "module",
+      content: `
+        import { useWorkbenchStore } from "/src/store/workbench.ts";
+        import {
+          appendResultRows,
+          emptyResultBuffer,
+        } from "/src/lib/resultBuffer.ts";
+
+        let resultBuffer = emptyResultBuffer();
+        for (let start = 0; start < 12_000; start += 1_024) {
+          const end = Math.min(12_000, start + 1_024);
+          const rows = Array.from({ length: end - start }, (_, offset) => {
+            const index = start + offset;
+            return [String(index), "row-" + index];
+          });
+          resultBuffer = appendResultRows(resultBuffer, rows);
+        }
+        useWorkbenchStore.setState({
+          activeResultTab: "data",
+          queryState: "success",
+          columns: [
+            { name: "id", dataType: "Int64" },
+            { name: "payload", dataType: "Text" },
+          ],
+          resultBuffer,
+          rowsProcessed: 12_000,
+          durationMs: 1,
+        });
+        window.__ordadbVirtualizedFixtureReady = true;
+      `,
+    });
+    await page.waitForFunction(
+      () =>
+        (
+          window as Window & {
+            __ordadbVirtualizedFixtureReady?: boolean;
+          }
+        ).__ordadbVirtualizedFixtureReady === true,
+    );
+
+    await expect(page.getByText("显示 10000 / 12000 行 · 1 ms")).toBeVisible();
+    await expect(
+      page.getByText("已保留前 10000 行，另有 2000 行未驻留。"),
+    ).toBeVisible();
+    const renderedRows = page.locator(
+      ".result-table tbody tr:not(.result-spacer)",
+    );
+    expect(await renderedRows.count()).toBeLessThan(100);
+
+    const viewport = page.locator(".table-scroll");
+    await viewport.evaluate((element) => {
+      element.scrollTop = element.scrollHeight;
+      element.dispatchEvent(new Event("scroll", { bubbles: true }));
+    });
+    await expect(page.getByText("row-9999", { exact: true })).toBeVisible();
+    await expect(page.getByText("row-0", { exact: true })).toHaveCount(0);
+    expect(await renderedRows.count()).toBeLessThan(100);
+  });
+
   test("reduces positional motion without removing essential query feedback", async ({
     page,
   }) => {

@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use ordadb_protocol::{ClientConfig, PgClient};
+use ordadb_protocol::{ClientConfig, PgClient, PgQueryEvent};
 use ordadb_server::{ServerConfig, request_bootstrap, start_server};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -88,6 +88,59 @@ async fn pgwire_management_copy_and_restart_are_end_to_end() {
         assert_eq!(selected.columns, ["id", "name"]);
         assert_eq!(selected.rows.len(), 2);
         assert_eq!(selected.rows[1][1].as_deref(), Some("semi;colon"));
+
+        let mut streamed = Vec::new();
+        let summary = pg.query_prepared_batches(
+            "SELECT id, name FROM items ORDER BY id",
+            &[],
+            &[],
+            1,
+            |event| {
+                streamed.push(event);
+                Ok(())
+            },
+        )?;
+        assert_eq!(summary.columns, ["id", "name"]);
+        assert_eq!(summary.row_count, 2);
+        assert_eq!(summary.command_tags, ["SELECT 2"]);
+        assert!(matches!(
+            streamed.as_slice(),
+            [
+                PgQueryEvent::Schema(_),
+                PgQueryEvent::Batch(first),
+                PgQueryEvent::Batch(second),
+                PgQueryEvent::Complete(tag)
+            ] if first.len() == 1 && second.len() == 1 && tag == "SELECT 2"
+        ));
+
+        pg.query("CREATE TABLE portal_items (id BIGINT PRIMARY KEY)")?;
+        let portal_values = (0..1_025)
+            .map(|value| format!("({value})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        pg.query(&format!("INSERT INTO portal_items VALUES {portal_values}"))?;
+        let mut portal_batches = 0_usize;
+        let portal_started = std::time::Instant::now();
+        let portal_summary = pg.query_prepared_batches(
+            "SELECT id FROM portal_items ORDER BY id",
+            &[],
+            &[],
+            1,
+            |event| {
+                if let PgQueryEvent::Batch(rows) = event {
+                    assert_eq!(rows.len(), 1);
+                    portal_batches += 1;
+                }
+                Ok(())
+            },
+        )?;
+        assert_eq!(portal_summary.row_count, 1_025);
+        assert_eq!(portal_batches, 1_025);
+        assert_eq!(portal_summary.command_tags, ["SELECT 1025"]);
+        assert!(
+            portal_started.elapsed() < Duration::from_secs(30),
+            "prepared portal fetch-size=1 exceeded its 30-second evidence budget"
+        );
 
         let extended = pg.query_prepared(
             "SELECT id, name FROM items WHERE id >= $1 ORDER BY id",
