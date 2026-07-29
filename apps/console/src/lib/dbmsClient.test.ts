@@ -5,13 +5,13 @@ describe("PreviewDbmsClient", () => {
   it("keeps the browser adapter explicit and streams ordered query events", async () => {
     const client: DbmsClient = new PreviewDbmsClient();
     const probe = await client.probe({
-      connectorId: "ordadb-postgresql",
+      connectorId: "ordadb-native",
       dialect: "postgresql",
       endpoint: "preview",
       credentialId: "preview-test",
     });
     const connectionId = await client.connect({
-      connectorId: "ordadb-postgresql",
+      connectorId: "ordadb-native",
       dialect: "postgresql",
       endpoint: "preview",
       credentialId: "preview-test",

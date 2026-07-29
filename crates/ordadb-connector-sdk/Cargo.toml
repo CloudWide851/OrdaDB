@@ -1,0 +1,16 @@
+[package]
+name = "ordadb-connector-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+ordadb-types = { path = "../ordadb-types" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+zeroize.workspace = true

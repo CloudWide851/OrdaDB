@@ -67,7 +67,7 @@ describe("PreviewConsoleClient", () => {
       formatVersion: 1,
       profileId: "local",
       label: "本地",
-      connectorId: "ordadb-postgresql",
+      connectorId: "ordadb-native",
       dialect: "postgresql",
       endpoint: "127.0.0.1:54329",
       adminEndpoint: "http://127.0.0.1:9080",

@@ -15,6 +15,10 @@ mod workspace;
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const PLUGIN_PROGRESS_EVENT: &str = "plugin://progress";
+const CONNECTOR_REGISTRY_URL: &str =
+    "https://cloudwide851.github.io/OrdaDB/connectors/v1/catalog-v1.json";
+const CONNECTOR_REGISTRY_PUBLIC_KEY: &str =
+    include_str!("../../../../connectors/trust/registry-ed25519-v1.pub");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,11 +95,14 @@ fn plugin_rollback(
     manager.rollback(&plugin_id)
 }
 
-fn build_plugin_manager_options(plugin_root: PathBuf) -> PluginManagerOptions {
+fn build_plugin_manager_options(
+    plugin_root: PathBuf,
+    bundled_root: PathBuf,
+) -> PluginManagerOptions {
     let mut options = PluginManagerOptions::new(plugin_root);
-    options.registry_url = option_env!("ORDADB_PLUGIN_REGISTRY_URL").map(str::to_owned);
-    options.registry_public_key =
-        option_env!("ORDADB_PLUGIN_REGISTRY_PUBLIC_KEY").map(str::to_owned);
+    options.bundled_root = Some(bundled_root);
+    options.registry_url = Some(CONNECTOR_REGISTRY_URL.into());
+    options.registry_public_key = Some(CONNECTOR_REGISTRY_PUBLIC_KEY.trim().into());
     options
 }
 
@@ -133,8 +140,15 @@ pub fn run() {
                 .app_local_data_dir()
                 .map_err(|error| format!("failed to resolve OrdaDB local data path: {error}"))?
                 .join("connectors");
-            let manager = PluginManager::open_https(build_plugin_manager_options(plugin_root))
-                .map_err(|error| format!("failed to initialize connector manager: {error}"))?;
+            let bundled_root = app
+                .path()
+                .resource_dir()
+                .map_err(|error| format!("failed to resolve OrdaDB resource path: {error}"))?
+                .join("connectors")
+                .join("v1");
+            let manager =
+                PluginManager::open_https(build_plugin_manager_options(plugin_root, bundled_root))
+                    .map_err(|error| format!("failed to initialize connector manager: {error}"))?;
             let mut progress = manager.subscribe_progress();
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -220,7 +234,13 @@ pub fn run() {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{AppStatus, build_app_status, build_plugin_manager_options};
+    use ordadb_connectors::PluginManager;
+    use tempfile::tempdir;
+
+    use super::{
+        AppStatus, CONNECTOR_REGISTRY_PUBLIC_KEY, CONNECTOR_REGISTRY_URL, build_app_status,
+        build_plugin_manager_options,
+    };
 
     #[test]
     fn builds_a_stable_desktop_status() {
@@ -236,20 +256,45 @@ mod tests {
     }
 
     #[test]
-    fn plugin_registry_is_fail_closed_when_packaging_does_not_inject_trust() {
-        let options = build_plugin_manager_options(PathBuf::from(r"C:\OrdaDB\connectors"));
-        assert_eq!(
-            options.registry_url.is_some(),
-            option_env!("ORDADB_PLUGIN_REGISTRY_URL").is_some()
+    fn plugin_registry_uses_the_tracked_production_trust_root() {
+        let options = build_plugin_manager_options(
+            PathBuf::from(r"C:\OrdaDB\connectors"),
+            PathBuf::from(r"C:\Program Files\OrdaDB\connectors\v1"),
         );
         assert_eq!(
-            options.registry_public_key.is_some(),
-            option_env!("ORDADB_PLUGIN_REGISTRY_PUBLIC_KEY").is_some()
+            options.registry_url.as_deref(),
+            Some(CONNECTOR_REGISTRY_URL)
         );
-        if option_env!("ORDADB_PLUGIN_REGISTRY_URL").is_none()
-            || option_env!("ORDADB_PLUGIN_REGISTRY_PUBLIC_KEY").is_none()
-        {
-            assert!(options.registry_url.is_none() || options.registry_public_key.is_none());
+        assert_eq!(
+            options.registry_public_key.as_deref(),
+            Some(CONNECTOR_REGISTRY_PUBLIC_KEY.trim())
+        );
+        assert_eq!(
+            options.bundled_root.as_deref(),
+            Some(PathBuf::from(r"C:\Program Files\OrdaDB\connectors\v1").as_path())
+        );
+    }
+
+    #[test]
+    fn staged_production_helpers_pass_first_startup_activation() {
+        let state = tempdir().expect("connector state");
+        let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("staging")
+            .join("windows-x64")
+            .join("connectors")
+            .join("v1");
+        let manager = PluginManager::open_https(build_plugin_manager_options(
+            state.path().to_path_buf(),
+            bundled,
+        ))
+        .expect("activate production bundle");
+        for connector_id in ["postgresql", "mysql", "sqlite", "sql-server"] {
+            assert!(
+                manager
+                    .active_entry(connector_id)
+                    .expect("active helper")
+                    .is_file()
+            );
         }
     }
 }

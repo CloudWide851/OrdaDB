@@ -8,7 +8,10 @@ use reqwest::Url;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
-use crate::{CONNECTOR_API_VERSION, CONNECTOR_MANIFEST_VERSION, invalid, security_error};
+use crate::{
+    CONNECTOR_API_VERSION, CONNECTOR_MANIFEST_VERSION, MIN_CONNECTOR_API_VERSION, invalid,
+    security_error,
+};
 
 const SIGNATURE_DOMAIN: &[u8] = b"OrdaDB connector manifest v1\0";
 
@@ -64,6 +67,7 @@ pub struct RegistryCatalogV1 {
 #[derive(Debug, Clone)]
 pub struct ManifestPolicy {
     pub host_version: Version,
+    pub minimum_api_version: u32,
     pub supported_api_version: u32,
     pub maximum_artifact_bytes: u64,
     pub allowed_origin: Url,
@@ -85,6 +89,7 @@ impl ManifestPolicy {
         }
         Ok(Self {
             host_version,
+            minimum_api_version: MIN_CONNECTOR_API_VERSION,
             supported_api_version: CONNECTOR_API_VERSION,
             maximum_artifact_bytes,
             allowed_origin,
@@ -112,7 +117,9 @@ pub fn validate_manifest(manifest: &PluginManifestV1, policy: &ManifestPolicy) -
         ))
         .with_hint("Install a connector manifest supported by this OrdaDB host."));
     }
-    if manifest.api_version != policy.supported_api_version {
+    if manifest.api_version < policy.minimum_api_version
+        || manifest.api_version > policy.supported_api_version
+    {
         return Err(DbError::unsupported(format!(
             "connector API version {}",
             manifest.api_version

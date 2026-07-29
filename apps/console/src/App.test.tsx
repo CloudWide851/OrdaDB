@@ -63,7 +63,7 @@ const initialWorkbenchState = useWorkbenchStore.getState();
 
 async function seedPreviewWorkspace() {
   await useWorkbenchStore.getState().connectDataSource({
-    connectorId: "ordadb-postgresql",
+    connectorId: "ordadb-native",
     dialect: "postgresql",
     endpoint: "preview",
     database: "ordadb_preview",
@@ -386,7 +386,7 @@ describe("OrdaDB workbench", () => {
     const pluginView = within(dialog);
 
     for (const connector of [
-      "OrdaDB / PostgreSQL",
+      "PostgreSQL",
       "MySQL",
       "SQLite",
       "SQL Server",

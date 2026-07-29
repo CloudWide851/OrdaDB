@@ -5,6 +5,12 @@ members = [
   "crates/ordadb-admin",
   "crates/ordadb-backup",
   "crates/ordadb-cli",
+  "crates/ordadb-connector-mysql",
+  "crates/ordadb-connector-postgresql",
+  "crates/ordadb-connector-publisher",
+  "crates/ordadb-connector-sdk",
+  "crates/ordadb-connector-sql-server",
+  "crates/ordadb-connector-sqlite",
   "crates/ordadb-connectors",
   "crates/ordadb-engine",
   "crates/ordadb-execution",
@@ -46,8 +52,9 @@ hmac = "0.12.1"
 pbkdf2 = "0.12.2"
 rand = "0.8.7"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
+rusqlite = { version = "0.39.0", features = ["bundled", "chrono", "uuid"] }
 rustls = "0.23.36"
-rust_decimal = { version = "1.42.1", features = ["serde"] }
+rust_decimal = { version = "1.42.1", features = ["serde", "db-tokio-postgres"] }
 semver = { version = "1.0.27", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -58,13 +65,16 @@ tantivy = { version = "0.26.1", default-features = false }
 tempfile = "3.23.0"
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "0.7.19", features = ["rt"] }
+tokio-postgres = { version = "0.7.18", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+tokio-postgres-rustls = { version = "0.14.0", features = ["ring", "native-certs"] }
+tokio-util = { version = "0.7.19", features = ["rt", "compat"] }
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.6.11", features = ["cors", "trace"] }
 uuid = { version = "1.21.0", features = ["serde", "v4"] }
 windows-service = "0.8.1"
 windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation",
+  "Win32_Networking_WinSock",
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Security_Credentials",
@@ -73,3 +83,5 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_System_Threading",
 ] }
 zeroize = { version = "1.9.0", features = ["derive"] }
+mysql_async = { version = "0.37.0", default-features = false, features = ["default-rustls-ring", "chrono", "rust_decimal"] }
+tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "native-tls", "tokio", "chrono", "rust_decimal", "sql-browser-tokio"] }

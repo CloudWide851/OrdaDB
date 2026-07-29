@@ -29,7 +29,7 @@ interface DataSourceDialogProps {
 }
 
 const defaults: DataSourceValues = {
-  connectorId: "ordadb-postgresql",
+  connectorId: "ordadb-native",
   dialect: "postgresql",
   endpoint: "127.0.0.1:54329",
   adminEndpoint: "http://127.0.0.1:9080",
@@ -77,7 +77,7 @@ export function DataSourceDialog({
   if (!open) return null;
 
   const selectedConnector = getConnectorDefinition(values.connectorId);
-  const native = selectedConnector.id === "ordadb-postgresql";
+  const native = selectedConnector.id === "ordadb-native";
   const preview = connection?.mode === "preview";
   const needsBootstrap = connectionProbe?.stages.some(
     (stage) =>
@@ -234,7 +234,7 @@ export function DataSourceDialog({
                   connectorId: connector.id,
                   dialect: connector.sqlDialect,
                   endpoint:
-                    connector.id === "ordadb-postgresql"
+                    connector.id === "ordadb-native"
                       ? "127.0.0.1:54329"
                       : "",
                 }));

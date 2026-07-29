@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroizing;
 
-use crate::{CONNECTOR_API_VERSION, protocol_error};
+use crate::{MIN_CONNECTOR_API_VERSION, protocol_error};
 
 pub const MAX_CONNECTOR_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
@@ -163,7 +163,7 @@ pub fn validate_protocol_ready(
     plugin_id: &str,
     plugin_version: &str,
 ) -> Result<()> {
-    if ready.api_version != CONNECTOR_API_VERSION {
+    if ready.api_version != MIN_CONNECTOR_API_VERSION {
         return Err(DbError::unsupported(format!(
             "connector protocol version {}",
             ready.api_version
@@ -254,7 +254,7 @@ mod tests {
     async fn connector_frames_are_little_endian_bounded_and_typed() {
         let (mut writer, mut reader) = duplex(4096);
         let expected = ConnectorResponseV1::Ready(ProtocolReady {
-            api_version: CONNECTOR_API_VERSION,
+            api_version: MIN_CONNECTOR_API_VERSION,
             plugin_id: "ordadb-postgresql".into(),
             plugin_version: "1.0.0".into(),
         });
@@ -314,7 +314,7 @@ mod tests {
 
         let error = validate_protocol_ready(
             &ProtocolReady {
-                api_version: CONNECTOR_API_VERSION,
+                api_version: MIN_CONNECTOR_API_VERSION,
                 plugin_id: "other".into(),
                 plugin_version: "1.0.0".into(),
             },

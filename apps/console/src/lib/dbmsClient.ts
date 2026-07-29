@@ -279,7 +279,7 @@ const previewCapabilities: DbmsCapabilities = {
 
 export const previewConnection: DbmsConnectionSnapshot = {
   connectionId: "preview-connection",
-  connectorId: "ordadb-postgresql",
+  connectorId: "ordadb-native",
   dialect: "postgresql",
   endpoint: "Preview fixture",
   database: "ordadb_preview",
