@@ -23,15 +23,16 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use zeroize::Zeroizing;
 
 pub const DBMS_QUERY_EVENT: &str = "dbms://query";
-const NATIVE_CONNECTOR_ID: &str = "ordadb-postgresql";
+const NATIVE_CONNECTOR_ID: &str = "ordadb-native";
 const QUERY_BATCH_ROWS: usize = 1_024;
 const MAX_ADMIN_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-const VALID_CONNECTOR_IDS: [&str; 4] = [
+const VALID_CONNECTOR_IDS: [&str; 5] = [
     NATIVE_CONNECTOR_ID,
-    "ordadb-mysql",
-    "ordadb-sqlite",
-    "ordadb-sql-server",
+    "postgresql",
+    "mysql",
+    "sqlite",
+    "sql-server",
 ];
 
 #[derive(Debug, Clone, Serialize)]

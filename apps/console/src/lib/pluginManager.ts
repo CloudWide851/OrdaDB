@@ -2,7 +2,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import {
   compareSemanticVersions,
-  connectorDefinitions,
+  pluginConnectorDefinitions,
   type PluginCatalogItem,
   type PluginCatalogSnapshot,
   type PluginError,
@@ -80,7 +80,7 @@ class PreviewPluginManagerClient implements PluginManagerClient {
     this.operations.clear();
     this.sequence = 0;
     this.registryAvailability = "configured";
-    this.plugins = connectorDefinitions.map((definition, index) => ({
+    this.plugins = pluginConnectorDefinitions.map((definition, index) => ({
       id: definition.id,
       displayName: definition.displayName,
       version: index === 3 ? "2.0.0" : "1.0.0",
@@ -111,7 +111,7 @@ class PreviewPluginManagerClient implements PluginManagerClient {
     return {
       registry: {
         availability: this.registryAvailability,
-        apiVersion: 1,
+        apiVersion: 2,
         message:
           this.registryAvailability === "configured"
             ? "Preview 插件目录 · 不执行网络或文件操作"

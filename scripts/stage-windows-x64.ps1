@@ -2,7 +2,8 @@ $ErrorActionPreference = "Stop"
 
 $target = "x86_64-pc-windows-msvc"
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
-$targetDirectory = Join-Path $repositoryRoot "target\$target\release"
+$packageTargetRoot = Join-Path $repositoryRoot "target\package-windows-x64"
+$targetDirectory = Join-Path $packageTargetRoot "$target\release"
 $stagingDirectory = Join-Path $repositoryRoot "apps\desktop\src-tauri\staging\windows-x64"
 
 function Assert-Amd64Pe {
@@ -35,9 +36,21 @@ function Assert-Amd64Pe {
     }
 }
 
-cargo build --locked --release --target $target --package ordadb-server --package ordadb-cli
+cargo build --locked --release --target $target --target-dir $packageTargetRoot `
+    --package ordadb-server `
+    --package ordadb-cli
 if ($LASTEXITCODE -ne 0) {
     throw "Windows x64 server and CLI release build failed"
+}
+
+cargo build --locked --release --target $target --target-dir $packageTargetRoot `
+    --package ordadb-connector-postgresql `
+    --package ordadb-connector-mysql `
+    --package ordadb-connector-sqlite `
+    --package ordadb-connector-sql-server `
+    --package ordadb-connector-publisher
+if ($LASTEXITCODE -ne 0) {
+    throw "Windows x64 connector helper release build failed"
 }
 
 New-Item -ItemType Directory -Path $stagingDirectory -Force | Out-Null
@@ -53,10 +66,57 @@ foreach ($binary in $binaries) {
     Assert-Amd64Pe -Path $destination
 }
 
+$metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to read the connector bundle version"
+}
+$connectorVersion = ($metadata.packages |
+    Where-Object { $_.name -eq "ordadb-connector-publisher" } |
+    Select-Object -First 1).version
+if (-not $connectorVersion) {
+    throw "Connector publisher package version is missing"
+}
+
+$connectorDirectory = Join-Path $stagingDirectory "connectors\v1"
+$publisher = Join-Path $targetDirectory "ordadb-connector-publisher.exe"
+& $publisher sign-bundle `
+    --artifacts $targetDirectory `
+    --bundle-output $connectorDirectory `
+    --public-key (Join-Path $repositoryRoot "connectors\trust\registry-ed25519-v1.pub") `
+    --version $connectorVersion `
+    --base-url "https://cloudwide851.github.io/OrdaDB/connectors/v1/"
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to sign the Windows x64 connector bundle"
+}
+
+$connectorBinaries = @(
+    "ordadb-connector-postgresql.exe",
+    "ordadb-connector-mysql.exe",
+    "ordadb-connector-sqlite.exe",
+    "ordadb-connector-sql-server.exe"
+)
+foreach ($binary in $connectorBinaries) {
+    Assert-Amd64Pe -Path (Join-Path $connectorDirectory $binary)
+}
+$expectedConnectorFiles = @($connectorBinaries) + @("catalog-v1.json")
+$unexpectedConnectors = Get-ChildItem -LiteralPath $connectorDirectory -File |
+    Where-Object { $_.Name -notin $expectedConnectorFiles }
+if ($unexpectedConnectors) {
+    throw "Connector staging contains unexpected files: $($unexpectedConnectors.Name -join ', ')"
+}
+if ((Get-ChildItem -LiteralPath $connectorDirectory -File).Count -ne $expectedConnectorFiles.Count) {
+    throw "Connector staging does not contain exactly four helpers and one catalog"
+}
+
 $unexpected = Get-ChildItem -LiteralPath $stagingDirectory -File |
     Where-Object { $_.Name -notin $binaries }
 if ($unexpected) {
     throw "Windows staging contains unexpected files: $($unexpected.Name -join ', ')"
 }
+$unexpectedDirectories = Get-ChildItem -LiteralPath $stagingDirectory -Directory |
+    Where-Object { $_.Name -ne "connectors" }
+if ($unexpectedDirectories) {
+    throw "Windows staging contains unexpected directories: $($unexpectedDirectories.Name -join ', ')"
+}
 
-Write-Output "Staged AMD64 binaries in $stagingDirectory"
+Write-Output "Staged AMD64 product binaries and four signed connector resources in $stagingDirectory"

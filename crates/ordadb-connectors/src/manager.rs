@@ -32,6 +32,7 @@ const MAXIMUM_CATALOG_PLUGINS: usize = 64;
 const REGISTRY_TIMEOUT: Duration = Duration::from_secs(30);
 const STATE_FILE: &str = "state-v1.json";
 const MANIFEST_FILE: &str = "manifest-v1.json";
+const BUNDLED_CATALOG_FILE: &str = "catalog-v1.json";
 
 type ProgressCallback = Arc<dyn Fn(u64, Option<u64>) + Send + Sync>;
 
@@ -143,6 +144,7 @@ pub struct PluginCatalogSnapshot {
 #[derive(Debug, Clone)]
 pub struct PluginManagerOptions {
     pub plugin_root: PathBuf,
+    pub bundled_root: Option<PathBuf>,
     pub registry_url: Option<String>,
     pub registry_public_key: Option<String>,
     pub host_version: String,
@@ -154,6 +156,7 @@ impl PluginManagerOptions {
     pub fn new(plugin_root: impl Into<PathBuf>) -> Self {
         Self {
             plugin_root: plugin_root.into(),
+            bundled_root: None,
             registry_url: None,
             registry_public_key: None,
             host_version: env!("CARGO_PKG_VERSION").into(),
@@ -404,8 +407,14 @@ impl PluginManager {
         clean_staging(&staging)?;
 
         let configuration = registry_configuration(&options)?;
-        let state = load_state(&root)?;
+        let mut state = load_state(&root)?;
         validate_persisted_state(&state, configuration_policy(&configuration))?;
+        verify_persisted_artifacts(&root, &state)?;
+        if let Some(bundled_root) = options.bundled_root.as_deref() {
+            let policy =
+                configuration_policy(&configuration).ok_or_else(registry_not_configured)?;
+            activate_bundled_connectors(&root, bundled_root, policy, &mut state)?;
+        }
         let (progress, _) = broadcast::channel(128);
         Ok(Arc::new(Self {
             root,
@@ -529,9 +538,13 @@ impl PluginManager {
         let policy =
             configuration_policy(&self.configuration).ok_or_else(registry_not_configured)?;
         let state = lock(&self.state)?;
-        let plugin = state
+        let installed_id = state
             .plugins
-            .get(plugin_id)
+            .contains_key(plugin_id)
+            .then_some(plugin_id)
+            .or_else(|| legacy_plugin_id(plugin_id));
+        let plugin = installed_id
+            .and_then(|installed_id| state.plugins.get(installed_id))
             .ok_or_else(|| DbError::new("42704", "connector is not installed"))?;
         let version = plugin
             .versions
@@ -843,28 +856,7 @@ impl PluginManager {
             .transport
             .fetch(catalog_url, MAXIMUM_CATALOG_BYTES, cancellation)
             .await?;
-        let registry: RegistryCatalogV1 = serde_json::from_slice(&bytes)
-            .map_err(|error| invalid(format!("connector Registry catalog is invalid: {error}")))?;
-        if registry.schema_version != CONNECTOR_MANIFEST_VERSION {
-            return Err(DbError::unsupported(format!(
-                "connector Registry catalog version {}",
-                registry.schema_version
-            )));
-        }
-        if registry.plugins.len() > MAXIMUM_CATALOG_PLUGINS {
-            return Err(invalid(format!(
-                "connector Registry catalog exceeds {MAXIMUM_CATALOG_PLUGINS} plugins"
-            )));
-        }
-        let mut ids = BTreeSet::new();
-        for manifest in &registry.plugins {
-            validate_manifest(manifest, policy)?;
-            if !ids.insert(manifest.id.as_str()) {
-                return Err(invalid("connector Registry contains duplicate plugin IDs"));
-            }
-        }
-        let mut plugins = registry.plugins;
-        plugins.sort_by(|left, right| left.id.cmp(&right.id));
+        let plugins = parse_registry_catalog(&bytes, policy)?;
         *lock(&self.catalog)? = plugins;
         Ok(())
     }
@@ -981,6 +973,180 @@ fn validate_persisted_state(
         }
     }
     Ok(())
+}
+
+fn verify_persisted_artifacts(root: &Path, state: &PersistedStateV1) -> Result<()> {
+    for plugin in state.plugins.values() {
+        for installed in plugin.versions.values() {
+            verify_installed_version(root, &installed.manifest)?;
+        }
+    }
+    Ok(())
+}
+
+fn activate_bundled_connectors(
+    root: &Path,
+    bundled_root: &Path,
+    policy: &ManifestPolicy,
+    state: &mut PersistedStateV1,
+) -> Result<()> {
+    let bundled_root = fs::canonicalize(bundled_root)
+        .map_err(|error| io_error("failed to resolve bundled connector directory", error))?;
+    if !bundled_root.is_dir() {
+        return Err(invalid(
+            "bundled connector resource path must be a directory",
+        ));
+    }
+    let catalog_path =
+        canonical_bundled_file(&bundled_root, &bundled_root.join(BUNDLED_CATALOG_FILE))?;
+    let catalog_bytes = read_bounded_file(
+        &catalog_path,
+        MAXIMUM_CATALOG_BYTES,
+        "bundled connector catalog",
+    )?;
+    let manifests = parse_registry_catalog(&catalog_bytes, policy)?;
+    let verified = manifests
+        .into_iter()
+        .map(|manifest| {
+            let source =
+                canonical_bundled_file(&bundled_root, &bundled_root.join(&manifest.entry))?;
+            let (bytes, hash) = hash_file(&source)?;
+            if bytes != manifest.size || hash != decode_sha256(&manifest.sha256)? {
+                return Err(security_error(
+                    "bundled connector executable failed integrity verification",
+                ));
+            }
+            Ok((manifest, source))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let staging = root
+        .join("staging")
+        .join(format!("bundled-{}", Uuid::new_v4()));
+    ensure_under_root(root, &staging)?;
+    fs::create_dir(&staging).map_err(|error| {
+        io_error(
+            "failed to create bundled connector staging directory",
+            error,
+        )
+    })?;
+    let activation = stage_and_activate_bundled(root, &staging, &verified, state);
+    if staging.exists() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    activation
+}
+
+fn stage_and_activate_bundled(
+    root: &Path,
+    staging: &Path,
+    verified: &[(PluginManifestV1, PathBuf)],
+    state: &mut PersistedStateV1,
+) -> Result<()> {
+    for (manifest, source) in verified {
+        let version_directory = staging.join(&manifest.id).join(&manifest.version);
+        ensure_under_root(root, &version_directory)?;
+        fs::create_dir_all(&version_directory).map_err(|error| {
+            io_error(
+                "failed to create bundled connector version staging directory",
+                error,
+            )
+        })?;
+        copy_file_synced(source, &version_directory.join(&manifest.entry))?;
+        write_json_synced(&version_directory.join(MANIFEST_FILE), manifest)?;
+    }
+
+    let mut candidate = state.clone();
+    for (manifest, _) in verified {
+        let staged_version = staging.join(&manifest.id).join(&manifest.version);
+        let version_parent = root.join("plugins").join(&manifest.id).join("versions");
+        ensure_under_root(root, &version_parent)?;
+        fs::create_dir_all(&version_parent).map_err(|error| {
+            io_error(
+                "failed to create bundled connector version directory",
+                error,
+            )
+        })?;
+        let installed_version = version_parent.join(&manifest.version);
+        ensure_under_root(root, &installed_version)?;
+        if installed_version.exists() {
+            verify_installed_version(root, manifest)?;
+        } else {
+            fs::rename(&staged_version, &installed_version).map_err(|error| {
+                io_error(
+                    "failed to atomically install bundled connector version",
+                    error,
+                )
+            })?;
+        }
+
+        let plugin = candidate
+            .plugins
+            .entry(manifest.id.clone())
+            .or_insert_with(|| InstalledPluginV1 {
+                active_version: manifest.version.clone(),
+                previous_version: None,
+                versions: BTreeMap::new(),
+            });
+        let active = Version::parse(&plugin.active_version).map_err(|error| {
+            DbError::internal("installed connector version is invalid")
+                .with_detail(error.to_string())
+        })?;
+        let bundled = Version::parse(&manifest.version)
+            .map_err(|error| invalid(format!("connector version is invalid: {error}")))?;
+        plugin.versions.insert(
+            manifest.version.clone(),
+            InstalledVersionV1 {
+                manifest: manifest.clone(),
+            },
+        );
+        if bundled > active {
+            plugin.previous_version = Some(plugin.active_version.clone());
+            plugin.active_version.clone_from(&manifest.version);
+        }
+    }
+    validate_persisted_state(&candidate, None)?;
+    persist_state(root, &candidate)?;
+    *state = candidate;
+    Ok(())
+}
+
+fn canonical_bundled_file(root: &Path, candidate: &Path) -> Result<PathBuf> {
+    let candidate = fs::canonicalize(candidate)
+        .map_err(|error| io_error("failed to resolve bundled connector resource", error))?;
+    if candidate.parent() != Some(root) || !candidate.is_file() {
+        return Err(security_error(
+            "bundled connector resource escaped its immutable directory",
+        ));
+    }
+    Ok(candidate)
+}
+
+fn read_bounded_file(path: &Path, maximum_bytes: u64, name: &str) -> Result<Vec<u8>> {
+    let metadata =
+        fs::metadata(path).map_err(|error| io_error(format!("failed to inspect {name}"), error))?;
+    if metadata.len() == 0 || metadata.len() > maximum_bytes {
+        return Err(invalid(format!(
+            "{name} must be between 1 and {maximum_bytes} bytes"
+        )));
+    }
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| invalid(format!("{name} size does not fit this host")))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    File::open(path)
+        .and_then(|mut file| file.read_to_end(&mut bytes))
+        .map_err(|error| io_error(format!("failed to read {name}"), error))?;
+    Ok(bytes)
+}
+
+fn copy_file_synced(source: &Path, destination: &Path) -> Result<()> {
+    fs::copy(source, destination)
+        .map_err(|error| io_error("failed to stage bundled connector executable", error))?;
+    OpenOptions::new()
+        .write(true)
+        .open(destination)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| io_error("failed to flush bundled connector executable", error))
 }
 
 fn persist_state(root: &Path, state: &PersistedStateV1) -> Result<()> {
@@ -1187,6 +1353,42 @@ fn registry_not_configured() -> DbError {
         .with_hint("Configure the official signed plugin Registry in the Windows package.")
 }
 
+fn parse_registry_catalog(bytes: &[u8], policy: &ManifestPolicy) -> Result<Vec<PluginManifestV1>> {
+    let registry: RegistryCatalogV1 = serde_json::from_slice(bytes)
+        .map_err(|error| invalid(format!("connector Registry catalog is invalid: {error}")))?;
+    if registry.schema_version != CONNECTOR_MANIFEST_VERSION {
+        return Err(DbError::unsupported(format!(
+            "connector Registry catalog version {}",
+            registry.schema_version
+        )));
+    }
+    if registry.plugins.is_empty() || registry.plugins.len() > MAXIMUM_CATALOG_PLUGINS {
+        return Err(invalid(format!(
+            "connector Registry catalog must contain 1-{MAXIMUM_CATALOG_PLUGINS} plugins"
+        )));
+    }
+    let mut ids = BTreeSet::new();
+    for manifest in &registry.plugins {
+        validate_manifest(manifest, policy)?;
+        if !ids.insert(manifest.id.as_str()) {
+            return Err(invalid("connector Registry contains duplicate plugin IDs"));
+        }
+    }
+    let mut plugins = registry.plugins;
+    plugins.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(plugins)
+}
+
+fn legacy_plugin_id(plugin_id: &str) -> Option<&'static str> {
+    match plugin_id {
+        "postgresql" => Some("ordadb-postgresql"),
+        "mysql" => Some("ordadb-mysql"),
+        "sqlite" => Some("ordadb-sqlite"),
+        "sql-server" => Some("ordadb-sql-server"),
+        _ => None,
+    }
+}
+
 fn cancelled() -> DbError {
     DbError::new("57014", "connector operation was cancelled")
 }
@@ -1279,17 +1481,37 @@ mod tests {
         artifact: &[u8],
         version: &str,
     ) -> PluginManifestV1 {
+        signed_manifest_for(
+            signing_key,
+            artifact,
+            version,
+            "ordadb-postgresql",
+            "ordadb-postgresql.exe",
+            ConnectorDialect::PostgreSql,
+            vec![ConnectorPermission::Network],
+        )
+    }
+
+    fn signed_manifest_for(
+        signing_key: &SigningKey,
+        artifact: &[u8],
+        version: &str,
+        id: &str,
+        entry: &str,
+        dialect: ConnectorDialect,
+        permissions: Vec<ConnectorPermission>,
+    ) -> PluginManifestV1 {
         let mut manifest = PluginManifestV1 {
             schema_version: CONNECTOR_MANIFEST_VERSION,
-            id: "ordadb-postgresql".into(),
+            id: id.into(),
             display_name: "OrdaDB / PostgreSQL".into(),
             version: version.into(),
             api_version: CONNECTOR_API_VERSION,
             architecture: ConnectorArchitecture::WindowsX64,
-            dialect: ConnectorDialect::PostgreSql,
+            dialect,
             publisher: "OrdaDB".into(),
-            permissions: vec![ConnectorPermission::Network],
-            entry: "ordadb-postgresql.exe".into(),
+            permissions,
+            entry: entry.into(),
             size: u64::try_from(artifact.len()).expect("artifact length"),
             sha256: Sha256::digest(artifact)
                 .iter()
@@ -1308,11 +1530,27 @@ mod tests {
     }
 
     fn catalog(manifest: PluginManifestV1) -> Vec<u8> {
+        catalog_with(vec![manifest])
+    }
+
+    fn catalog_with(plugins: Vec<PluginManifestV1>) -> Vec<u8> {
         serde_json::to_vec(&RegistryCatalogV1 {
             schema_version: CONNECTOR_MANIFEST_VERSION,
-            plugins: vec![manifest],
+            plugins,
         })
         .expect("catalog")
+    }
+
+    fn write_bundle(root: &Path, manifests: &[PluginManifestV1], artifacts: &[(&str, &[u8])]) {
+        fs::create_dir_all(root).expect("bundle directory");
+        fs::write(
+            root.join(BUNDLED_CATALOG_FILE),
+            catalog_with(manifests.to_vec()),
+        )
+        .expect("bundle catalog");
+        for (entry, artifact) in artifacts {
+            fs::write(root.join(entry), artifact).expect("bundle artifact");
+        }
     }
 
     fn options(root: &Path, signing_key: &SigningKey) -> PluginManagerOptions {
@@ -1320,6 +1558,16 @@ mod tests {
         options.registry_url = Some("https://plugins.ordadb.test/catalog.json".into());
         options.registry_public_key = Some(BASE64.encode(signing_key.verifying_key().to_bytes()));
         options.maximum_artifact_bytes = 1024 * 1024;
+        options
+    }
+
+    fn bundled_options(
+        root: &Path,
+        bundled_root: &Path,
+        signing_key: &SigningKey,
+    ) -> PluginManagerOptions {
+        let mut options = options(root, signing_key);
+        options.bundled_root = Some(bundled_root.to_path_buf());
         options
     }
 
@@ -1450,6 +1698,122 @@ mod tests {
         let retry = manager.retry(&manifest.id).await.expect("retry");
         let completed = wait_terminal(&mut progress, &retry.operation_id).await;
         assert_eq!(completed.phase, PluginProgressPhase::Complete);
+    }
+
+    #[test]
+    fn bundled_connectors_are_verified_and_activated_as_one_state_change() {
+        let directory = tempdir().expect("tempdir");
+        let bundled = tempdir().expect("bundled");
+        let signing_key = SigningKey::from_bytes(&[21_u8; 32]);
+        let postgresql_artifact = b"postgresql-connector".as_slice();
+        let sqlite_artifact = b"sqlite-connector".as_slice();
+        let postgresql = signed_manifest_for(
+            &signing_key,
+            postgresql_artifact,
+            "1.0.0",
+            "postgresql",
+            "ordadb-connector-postgresql.exe",
+            ConnectorDialect::PostgreSql,
+            vec![ConnectorPermission::Network],
+        );
+        let sqlite = signed_manifest_for(
+            &signing_key,
+            sqlite_artifact,
+            "1.0.0",
+            "sqlite",
+            "ordadb-connector-sqlite.exe",
+            ConnectorDialect::Sqlite,
+            vec![ConnectorPermission::LocalDatabaseFile],
+        );
+        write_bundle(
+            bundled.path(),
+            &[postgresql.clone(), sqlite.clone()],
+            &[
+                (&postgresql.entry, postgresql_artifact),
+                (&sqlite.entry, sqlite_artifact),
+            ],
+        );
+
+        let manager = PluginManager::open(
+            bundled_options(directory.path(), bundled.path(), &signing_key),
+            Arc::new(FakeTransport::new(Vec::new(), Vec::new())),
+        )
+        .expect("bundled manager");
+        assert!(
+            manager
+                .active_entry("postgresql")
+                .expect("postgresql")
+                .is_file()
+        );
+        assert!(manager.active_entry("sqlite").expect("sqlite").is_file());
+        let state = load_state(directory.path()).expect("state");
+        assert_eq!(state.plugins.len(), 2);
+        assert_eq!(state.plugins["postgresql"].active_version, "1.0.0");
+        assert_eq!(state.plugins["sqlite"].active_version, "1.0.0");
+    }
+
+    #[test]
+    fn a_tampered_bundle_keeps_the_existing_active_state() {
+        let directory = tempdir().expect("tempdir");
+        let bundled = tempdir().expect("bundled");
+        let signing_key = SigningKey::from_bytes(&[22_u8; 32]);
+        let first_artifact = b"connector-v1".as_slice();
+        let first = signed_manifest_for(
+            &signing_key,
+            first_artifact,
+            "1.0.0",
+            "postgresql",
+            "ordadb-connector-postgresql.exe",
+            ConnectorDialect::PostgreSql,
+            vec![ConnectorPermission::Network],
+        );
+        write_bundle(
+            bundled.path(),
+            std::slice::from_ref(&first),
+            &[(&first.entry, first_artifact)],
+        );
+        let manager = PluginManager::open(
+            bundled_options(directory.path(), bundled.path(), &signing_key),
+            Arc::new(FakeTransport::new(Vec::new(), Vec::new())),
+        )
+        .expect("initial bundle");
+        drop(manager);
+
+        let second_artifact = b"connector-v2".as_slice();
+        let second = signed_manifest_for(
+            &signing_key,
+            second_artifact,
+            "2.0.0",
+            "postgresql",
+            "ordadb-connector-postgresql.exe",
+            ConnectorDialect::PostgreSql,
+            vec![ConnectorPermission::Network],
+        );
+        write_bundle(
+            bundled.path(),
+            std::slice::from_ref(&second),
+            &[(&second.entry, b"tampered-v2")],
+        );
+        let error = PluginManager::open(
+            bundled_options(directory.path(), bundled.path(), &signing_key),
+            Arc::new(FakeTransport::new(Vec::new(), Vec::new())),
+        )
+        .expect_err("tampered bundle");
+        assert_eq!(error.sql_state, "28000");
+
+        let reopened = PluginManager::open(
+            options(directory.path(), &signing_key),
+            Arc::new(FakeTransport::new(Vec::new(), Vec::new())),
+        )
+        .expect("reopen existing state");
+        let state = load_state(directory.path()).expect("state");
+        assert_eq!(state.plugins["postgresql"].active_version, "1.0.0");
+        assert!(
+            reopened
+                .active_entry("postgresql")
+                .expect("active")
+                .is_file()
+        );
     }
 
     #[tokio::test]

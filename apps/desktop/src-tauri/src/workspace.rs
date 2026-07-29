@@ -30,6 +30,7 @@ const MAX_WORKSPACE_ENTRIES: usize = 10_000;
 const MAX_OPEN_DOCUMENTS: usize = 32;
 const MAX_DRAFT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONNECTION_PROFILES: usize = 32;
+const NATIVE_CONNECTOR_ID: &str = "ordadb-native";
 
 type DesktopResult<T> = std::result::Result<T, DbmsError>;
 
@@ -242,7 +243,11 @@ impl ConsoleRuntime {
         });
         runtime.load_settings()?.validate()?;
         runtime.load_session()?;
-        runtime.load_profiles()?;
+        let (profiles, migrated) = runtime.load_profiles_with_migration()?;
+        if migrated {
+            let _guard = runtime.lock_writes()?;
+            write_json_atomic(&runtime.root.join(PROFILES_FILE), &profiles)?;
+        }
         Ok(runtime)
     }
 
@@ -323,7 +328,13 @@ impl ConsoleRuntime {
     }
 
     fn load_profiles(&self) -> Result<ConnectionProfilesV1, DbError> {
-        let document: ConnectionProfilesV1 = read_json_or_default(&self.root.join(PROFILES_FILE))?;
+        self.load_profiles_with_migration()
+            .map(|(document, _)| document)
+    }
+
+    fn load_profiles_with_migration(&self) -> Result<(ConnectionProfilesV1, bool), DbError> {
+        let mut document: ConnectionProfilesV1 =
+            read_json_or_default(&self.root.join(PROFILES_FILE))?;
         if document.format_version != PROFILES_VERSION {
             return Err(unsupported_version(
                 "connection profiles",
@@ -334,13 +345,19 @@ impl ConsoleRuntime {
             return Err(resource("connection profile limit exceeded"));
         }
         let mut ids = BTreeSet::new();
-        for profile in &document.profiles {
+        let mut migrated = false;
+        for profile in &mut document.profiles {
+            let connector_id = migrate_connector_id(&profile.connector_id);
+            if connector_id != profile.connector_id {
+                profile.connector_id = connector_id.into();
+                migrated = true;
+            }
             validate_profile(profile)?;
             if !ids.insert(profile.profile_id.as_str()) {
                 return Err(invalid("connection profile IDs must be unique"));
             }
         }
-        Ok(document)
+        Ok((document, migrated))
     }
 
     fn snapshot(&self, root_path: &str) -> Result<WorkspaceSnapshot, DbError> {
@@ -674,6 +691,16 @@ fn validate_profile(profile: &ConnectionProfileV1) -> Result<(), DbError> {
         validate_text(database, 1, 256, "database name")?;
     }
     Ok(())
+}
+
+fn migrate_connector_id(connector_id: &str) -> &str {
+    match connector_id {
+        "ordadb-postgresql" => NATIVE_CONNECTOR_ID,
+        "ordadb-mysql" => "mysql",
+        "ordadb-sqlite" => "sqlite",
+        "ordadb-sql-server" => "sql-server",
+        current => current,
+    }
 }
 
 fn canonical_workspace_root(value: &str) -> Result<PathBuf, DbError> {
@@ -1121,7 +1148,7 @@ mod tests {
                 format_version: 1,
                 profile_id: "local".into(),
                 label: "本地 OrdaDB".into(),
-                connector_id: "ordadb-postgresql".into(),
+                connector_id: NATIVE_CONNECTOR_ID.into(),
                 dialect: "postgresql".into(),
                 endpoint: "127.0.0.1:54329".into(),
                 admin_endpoint: Some("http://127.0.0.1:9080".into()),
@@ -1135,5 +1162,40 @@ mod tests {
         assert!(encoded.contains("local-credential"));
         assert!(!encoded.to_ascii_lowercase().contains("password"));
         assert!(!encoded.to_ascii_lowercase().contains("api key"));
+    }
+
+    #[test]
+    fn legacy_connector_ids_migrate_atomically_without_changing_credentials() {
+        let directory = tempdir().expect("tempdir");
+        let root = directory.path().join("state");
+        fs::create_dir_all(&root).expect("state directory");
+        let document = ConnectionProfilesV1 {
+            format_version: PROFILES_VERSION,
+            profiles: vec![ConnectionProfileV1 {
+                format_version: PROFILES_VERSION,
+                profile_id: "legacy-local".into(),
+                label: "Legacy local".into(),
+                connector_id: "ordadb-postgresql".into(),
+                dialect: "postgresql".into(),
+                endpoint: "127.0.0.1:54329".into(),
+                admin_endpoint: Some("http://127.0.0.1:9080".into()),
+                database: Some("ordadb".into()),
+                credential_id: "credential-reference".into(),
+                auto_reconnect: true,
+            }],
+        };
+        write_json_atomic(&root.join(PROFILES_FILE), &document).expect("legacy document");
+
+        let runtime = ConsoleRuntime::open(root).expect("runtime");
+        let migrated = runtime.load_profiles().expect("migrated profiles");
+        assert_eq!(migrated.profiles[0].connector_id, NATIVE_CONNECTOR_ID);
+        assert_eq!(
+            migrated.profiles[0].credential_id, "credential-reference",
+            "the Credential Manager reference must survive ID migration"
+        );
+        let persisted =
+            fs::read_to_string(runtime.root.join(PROFILES_FILE)).expect("persisted migration");
+        assert!(persisted.contains("\"connectorId\": \"ordadb-native\""));
+        assert!(!persisted.contains("ordadb-postgresql"));
     }
 }

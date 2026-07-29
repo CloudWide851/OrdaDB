@@ -1,0 +1,170 @@
+name: Connectors Windows x64
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/connectors-windows.yml"
+      - "apps/console/**"
+      - "apps/desktop/src-tauri/**"
+      - "connectors/**"
+      - "crates/ordadb-connector-*/**"
+      - "crates/ordadb-connectors/**"
+      - "crates/ordadb-windows/**"
+      - "scripts/*connector*.ps1"
+      - "scripts/stage-windows-x64.ps1"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "pnpm-lock.yaml"
+  workflow_dispatch:
+    inputs:
+      run_real_matrix:
+        description: Run PostgreSQL 18, MySQL 8.4, and SQL Server 2022/2025 acceptance
+        required: true
+        type: boolean
+        default: false
+      publish_pages:
+        description: Sign and deploy connectors/v1 to GitHub Pages
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: connectors-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify connector suite
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.29.2
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify frontend connector contracts
+        run: |
+          pnpm typecheck
+          pnpm test
+      - name: Verify Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Verify strict connector Clippy
+        run: >-
+          cargo clippy --locked
+          --package ordadb-connectors
+          --package ordadb-connector-publisher
+          --package ordadb-connector-postgresql
+          --package ordadb-connector-mysql
+          --package ordadb-connector-sqlite
+          --package ordadb-connector-sql-server
+          --all-targets
+          --target x86_64-pc-windows-msvc
+          -- -D warnings
+      - name: Test connector suite
+        run: >-
+          cargo test --locked
+          --package ordadb-connectors
+          --package ordadb-connector-publisher
+          --package ordadb-connector-postgresql
+          --package ordadb-connector-mysql
+          --package ordadb-connector-sqlite
+          --package ordadb-connector-sql-server
+          --target x86_64-pc-windows-msvc
+
+  real-database-matrix:
+    name: Real database matrix
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_real_matrix }}
+    needs: verify
+    runs-on: windows-latest
+    env:
+      ORDADB_TEST_POSTGRESQL_HOST: ${{ secrets.ORDADB_TEST_POSTGRESQL_HOST }}
+      ORDADB_TEST_POSTGRESQL_PORT: ${{ secrets.ORDADB_TEST_POSTGRESQL_PORT }}
+      ORDADB_TEST_POSTGRESQL_DATABASE: ${{ secrets.ORDADB_TEST_POSTGRESQL_DATABASE }}
+      ORDADB_TEST_POSTGRESQL_USER: ${{ secrets.ORDADB_TEST_POSTGRESQL_USER }}
+      ORDADB_TEST_POSTGRESQL_PASSWORD: ${{ secrets.ORDADB_TEST_POSTGRESQL_PASSWORD }}
+      ORDADB_TEST_POSTGRESQL_TLS: verifyFull
+      ORDADB_TEST_MYSQL_HOST: ${{ secrets.ORDADB_TEST_MYSQL_HOST }}
+      ORDADB_TEST_MYSQL_PORT: ${{ secrets.ORDADB_TEST_MYSQL_PORT }}
+      ORDADB_TEST_MYSQL_DATABASE: ${{ secrets.ORDADB_TEST_MYSQL_DATABASE }}
+      ORDADB_TEST_MYSQL_USER: ${{ secrets.ORDADB_TEST_MYSQL_USER }}
+      ORDADB_TEST_MYSQL_PASSWORD: ${{ secrets.ORDADB_TEST_MYSQL_PASSWORD }}
+      ORDADB_TEST_MYSQL_TLS: verifyFull
+      ORDADB_TEST_SQL_SERVER_HOST: ${{ secrets.ORDADB_TEST_SQL_SERVER_HOST }}
+      ORDADB_TEST_SQL_SERVER_PORT: ${{ secrets.ORDADB_TEST_SQL_SERVER_PORT }}
+      ORDADB_TEST_SQL_SERVER_DATABASE: ${{ secrets.ORDADB_TEST_SQL_SERVER_DATABASE }}
+      ORDADB_TEST_SQL_SERVER_INSTANCE: ${{ secrets.ORDADB_TEST_SQL_SERVER_INSTANCE }}
+      ORDADB_TEST_SQL_SERVER_USER: ${{ secrets.ORDADB_TEST_SQL_SERVER_USER }}
+      ORDADB_TEST_SQL_SERVER_PASSWORD: ${{ secrets.ORDADB_TEST_SQL_SERVER_PASSWORD }}
+      ORDADB_TEST_SQL_SERVER_TLS: verifyFull
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Run mandatory real connector acceptance
+        run: .\scripts\test-connectors-real-windows-x64.ps1
+
+  stage-pages:
+    name: Stage signed Pages payload
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_pages }}
+    needs: verify
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    env:
+      ORDADB_CONNECTOR_SIGNING_KEY: ${{ secrets.ORDADB_CONNECTOR_SIGNING_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build signed Windows x64 inputs
+        run: .\scripts\stage-windows-x64.ps1
+      - name: Prepare versioned connector site
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages |
+            Where-Object { $_.name -eq "ordadb-connector-publisher" } |
+            Select-Object -First 1).version
+          .\scripts\prepare-connector-pages.ps1 `
+            -Publisher ".\target\package-windows-x64\x86_64-pc-windows-msvc\release\ordadb-connector-publisher.exe" `
+            -Artifacts ".\target\package-windows-x64\x86_64-pc-windows-msvc\release" `
+            -OutputRoot "${{ runner.temp }}\ordadb-pages" `
+            -Version $version `
+            -PublicKey ".\connectors\trust\registry-ed25519-v1.pub"
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}\ordadb-pages
+
+  deploy-pages:
+    name: Deploy connector Pages
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_pages }}
+    needs: stage-pages
+    runs-on: windows-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy signed connector catalog
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -12,11 +12,12 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signer as _, SigningKey};
 use ordadb_connectors::{
-    CONNECTOR_API_VERSION, CONNECTOR_MANIFEST_VERSION, ConnectorArchitecture, ConnectorDialect,
-    ConnectorHost, ConnectorPermission, ConnectorRequestV1, ConnectorResponseV1, CredentialPayload,
-    DownloadReceipt, OperationStarted, PluginManager, PluginManagerOptions, PluginManifestV1,
-    PluginProgress, PluginProgressPhase, ProtocolReady, RegistryCatalogV1, RegistryTransport,
-    manifest_signing_payload, read_connector_frame, write_connector_frame,
+    CONNECTOR_MANIFEST_VERSION, ConnectorArchitecture, ConnectorDialect, ConnectorHost,
+    ConnectorPermission, ConnectorRequestV1, ConnectorResponseV1, CredentialPayload,
+    DownloadReceipt, MIN_CONNECTOR_API_VERSION, OperationStarted, PluginManager,
+    PluginManagerOptions, PluginManifestV1, PluginProgress, PluginProgressPhase, ProtocolReady,
+    RegistryCatalogV1, RegistryTransport, manifest_signing_payload, read_connector_frame,
+    write_connector_frame,
 };
 use ordadb_types::{
     Batch, CommandComplete, DbError, Field, QueryEvent, QueryProgress, Row, ScalarType, Schema,
@@ -157,13 +158,13 @@ async fn run_fixture(pipe_name: &OsStr) -> Result<(), BoxError> {
             api_version,
             plugin_id,
             plugin_version,
-        } if api_version == CONNECTOR_API_VERSION => (plugin_id, plugin_version),
+        } if api_version == MIN_CONNECTOR_API_VERSION => (plugin_id, plugin_version),
         request => return Err(format!("unexpected connector handshake: {request:?}").into()),
     };
     write_connector_frame(
         &mut pipe,
         &ConnectorResponseV1::Ready(ProtocolReady {
-            api_version: CONNECTOR_API_VERSION,
+            api_version: MIN_CONNECTOR_API_VERSION,
             plugin_id,
             plugin_version,
         }),
@@ -349,7 +350,7 @@ fn signed_manifest(signing_key: &SigningKey, artifact: &[u8]) -> PluginManifestV
         id: "ordadb-postgresql".into(),
         display_name: "OrdaDB PostgreSQL Fixture".into(),
         version: "1.0.0".into(),
-        api_version: CONNECTOR_API_VERSION,
+        api_version: MIN_CONNECTOR_API_VERSION,
         architecture: ConnectorArchitecture::WindowsX64,
         dialect: ConnectorDialect::PostgreSql,
         publisher: "OrdaDB Test".into(),

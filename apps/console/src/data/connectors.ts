@@ -98,8 +98,18 @@ export interface ConnectorViewModel
 
 export const connectorDefinitions: ConnectorDefinition[] = [
   {
-    id: "ordadb-postgresql",
-    displayName: "OrdaDB / PostgreSQL",
+    id: "ordadb-native",
+    displayName: "OrdaDB",
+    shortName: "OrdaDB",
+    dialect: "postgreSql",
+    sqlDialect: "postgresql",
+    publisher: "OrdaDB",
+    permissions: ["network"],
+    size: 0,
+  },
+  {
+    id: "postgresql",
+    displayName: "PostgreSQL",
     shortName: "PostgreSQL",
     dialect: "postgreSql",
     sqlDialect: "postgresql",
@@ -108,7 +118,7 @@ export const connectorDefinitions: ConnectorDefinition[] = [
     size: 8_388_608,
   },
   {
-    id: "ordadb-mysql",
+    id: "mysql",
     displayName: "MySQL",
     shortName: "MySQL",
     dialect: "mySql",
@@ -118,7 +128,7 @@ export const connectorDefinitions: ConnectorDefinition[] = [
     size: 7_340_032,
   },
   {
-    id: "ordadb-sqlite",
+    id: "sqlite",
     displayName: "SQLite",
     shortName: "SQLite",
     dialect: "sqlite",
@@ -128,7 +138,7 @@ export const connectorDefinitions: ConnectorDefinition[] = [
     size: 4_194_304,
   },
   {
-    id: "ordadb-sql-server",
+    id: "sql-server",
     displayName: "SQL Server",
     shortName: "SQL Server",
     dialect: "sqlServer",
@@ -138,6 +148,10 @@ export const connectorDefinitions: ConnectorDefinition[] = [
     size: 9_437_184,
   },
 ];
+
+export const pluginConnectorDefinitions = connectorDefinitions.filter(
+  (definition) => definition.id !== "ordadb-native",
+);
 
 const definitionById = new Map(
   connectorDefinitions.map((definition) => [definition.id, definition]),
@@ -149,7 +163,7 @@ export function projectConnectorCatalog(
   const pluginById = new Map(
     snapshot.plugins.map((plugin) => [plugin.id, plugin]),
   );
-  return connectorDefinitions.map((definition) => {
+  return pluginConnectorDefinitions.map((definition) => {
     const plugin = pluginById.get(definition.id);
     if (plugin) {
       return {

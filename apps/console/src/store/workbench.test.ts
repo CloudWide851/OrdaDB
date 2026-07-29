@@ -68,7 +68,7 @@ describe("workbench store", () => {
     const store = createWorkbenchStore(new PreviewDbmsClient());
 
     await store.getState().connectDataSource({
-      connectorId: "ordadb-postgresql",
+      connectorId: "ordadb-native",
       dialect: "postgresql",
       endpoint: "preview",
       database: "ordadb_preview",
@@ -271,7 +271,7 @@ async function connectPreview(
   store: ReturnType<typeof createWorkbenchStore>,
 ) {
   await store.getState().connectDataSource({
-    connectorId: "ordadb-postgresql",
+    connectorId: "ordadb-native",
     dialect: "postgresql",
     endpoint: "preview",
     database: "ordadb_preview",

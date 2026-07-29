@@ -34,7 +34,12 @@
     "icon": ["icons/icon.ico"],
     "resources": {
       "staging/windows-x64/ordadb-server.exe": "ordadb-server.exe",
-      "staging/windows-x64/ordadb-cli.exe": "ordadb-cli.exe"
+      "staging/windows-x64/ordadb-cli.exe": "ordadb-cli.exe",
+      "staging/windows-x64/connectors/v1/catalog-v1.json": "connectors/v1/catalog-v1.json",
+      "staging/windows-x64/connectors/v1/ordadb-connector-postgresql.exe": "connectors/v1/ordadb-connector-postgresql.exe",
+      "staging/windows-x64/connectors/v1/ordadb-connector-mysql.exe": "connectors/v1/ordadb-connector-mysql.exe",
+      "staging/windows-x64/connectors/v1/ordadb-connector-sqlite.exe": "connectors/v1/ordadb-connector-sqlite.exe",
+      "staging/windows-x64/connectors/v1/ordadb-connector-sql-server.exe": "connectors/v1/ordadb-connector-sql-server.exe"
     },
     "windows": {
       "nsis": {

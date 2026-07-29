@@ -654,7 +654,7 @@ export function createWorkbenchStore(
         adminEndpoint: values.adminEndpoint,
         database: values.database,
         credentialId: values.credentialId,
-        autoReconnect: values.connectorId === "ordadb-postgresql",
+        autoReconnect: values.connectorId === "ordadb-native",
       });
       set({ connectionProfiles: profiles });
       await get().refreshAdministration();

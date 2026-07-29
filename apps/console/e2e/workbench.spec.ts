@@ -144,7 +144,7 @@ test.describe("OrdaDB SQL workbench", () => {
       connectorManager.getByText("Preview 不执行网络下载或文件写入"),
     ).toBeVisible();
     for (const connector of [
-      "OrdaDB / PostgreSQL",
+      "PostgreSQL",
       "MySQL",
       "SQLite",
       "SQL Server",
