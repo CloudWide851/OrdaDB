@@ -2,6 +2,7 @@ import {
   Braces,
   ChevronDown,
   ChevronRight,
+  Clock3,
   Database,
   Eye,
   FileCode2,
@@ -26,6 +27,7 @@ import {
 import { useMemo, useState } from "react";
 import type { DbmsCatalogObject } from "../lib/dbmsClient";
 import { useWorkbenchStore } from "../store/workbench";
+import { ConnectionStatusIcon } from "./ConnectionStatusIcon";
 import { IconAction } from "./IconAction";
 
 interface CatalogGroup {
@@ -77,7 +79,6 @@ const catalogGroups: CatalogGroup[] = [
 ];
 
 export function SchemaPane() {
-  const [view, setView] = useState<"workspace" | "database">("workspace");
   const [filter, setFilter] = useState("");
   const [expandedGroups, setExpandedGroups] = useState(() => new Set<string>());
   const [selectedEntry, setSelectedEntry] = useState<string | null>(null);
@@ -88,11 +89,14 @@ export function SchemaPane() {
   const connection = useWorkbenchStore((state) => state.connection);
   const connectionState = useWorkbenchStore((state) => state.connectionState);
   const workspace = useWorkbenchStore((state) => state.workspace);
+  const recentFiles = useWorkbenchStore((state) => state.recentFiles);
   const documents = useWorkbenchStore((state) => state.documents);
   const activeDocumentPath = useWorkbenchStore(
     (state) => state.activeDocumentPath,
   );
   const settings = useWorkbenchStore((state) => state.settings);
+  const view = useWorkbenchStore((state) => state.sidebarView);
+  const setView = useWorkbenchStore((state) => state.setSidebarView);
   const setSelectedObject = useWorkbenchStore(
     (state) => state.setSelectedObject,
   );
@@ -102,6 +106,8 @@ export function SchemaPane() {
   );
   const refreshCatalog = useWorkbenchStore((state) => state.refreshCatalog);
   const openWorkspace = useWorkbenchStore((state) => state.openWorkspace);
+  const openFile = useWorkbenchStore((state) => state.openFile);
+  const openRecentFile = useWorkbenchStore((state) => state.openRecentFile);
   const openDocument = useWorkbenchStore((state) => state.openDocument);
   const createDocument = useWorkbenchStore((state) => state.createDocument);
   const renameWorkspaceEntry = useWorkbenchStore(
@@ -126,12 +132,13 @@ export function SchemaPane() {
       })
       .filter(
         (group) =>
-          (!settings.hideEmptyCatalog || group.objects.length > 0) &&
+          (!settings.appearance.hideEmptyCatalog ||
+            group.objects.length > 0) &&
           (!normalized ||
           group.label.toLowerCase().includes(normalized) ||
           group.objects.length > 0),
       );
-  }, [catalog, filter, settings.hideEmptyCatalog]);
+  }, [catalog, filter, settings.appearance.hideEmptyCatalog]);
 
   const database =
     catalog.find((object) => object.kind === "database")?.name ??
@@ -170,17 +177,14 @@ export function SchemaPane() {
                 onClick={() => void openWorkspace()}
               />
               <IconAction
+                label="打开 SQL 文件"
+                icon={<FileCode2 size={16} aria-hidden="true" />}
+                onClick={() => void openFile()}
+              />
+              <IconAction
                 label="新建 SQL 文件"
                 icon={<Plus size={17} aria-hidden="true" />}
-                disabled={!workspace}
-                onClick={() => {
-                  const selected = workspace?.entries.find(
-                    (entry) => entry.path === selectedEntry,
-                  );
-                  void createDocument(
-                    selected?.kind === "directory" ? selected.path : "",
-                  );
-                }}
+                onClick={() => void createDocument()}
               />
             </>
           ) : (
@@ -240,20 +244,69 @@ export function SchemaPane() {
       {view === "workspace" ? (
         <nav className="schema-tree workspace-tree" aria-label="SQL 项目文件">
           {!workspace ? (
-            <button
-              type="button"
-              className="schema-empty schema-empty--primary"
-              onClick={() => void openWorkspace()}
-            >
-              <FolderOpen size={16} aria-hidden="true" />
-              打开 SQL 项目
-            </button>
+            <div className="workspace-welcome">
+              <button
+                type="button"
+                className="schema-empty schema-empty--primary"
+                onClick={() => void createDocument()}
+              >
+                <Plus size={16} aria-hidden="true" />
+                新建 SQL
+              </button>
+              <button
+                type="button"
+                className="schema-empty"
+                onClick={() => void openFile()}
+              >
+                <FileCode2 size={16} aria-hidden="true" />
+                打开文件
+              </button>
+              <button
+                type="button"
+                className="schema-empty"
+                onClick={() => void openWorkspace()}
+              >
+                <FolderOpen size={16} aria-hidden="true" />
+                打开项目
+              </button>
+              {recentFiles.length > 0 && (
+                <div className="recent-files">
+                  <strong>
+                    <Clock3 size={13} aria-hidden="true" />
+                    最近文件
+                  </strong>
+                  {recentFiles.slice(0, 8).map((entry) => (
+                    <button
+                      type="button"
+                      key={`${entry.locator.kind}:${
+                        entry.locator.kind === "workspace"
+                          ? `${entry.locator.rootPath}:${entry.locator.path}`
+                          : entry.locator.path
+                      }`}
+                      onClick={() => void openRecentFile(entry)}
+                    >
+                      <FileCode2 size={13} aria-hidden="true" />
+                      <span>{entry.name}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           ) : (
             visibleEntries.map((entry) => {
               const open = documents.some(
-                (document) => document.path === entry.path,
+                (document) =>
+                  document.locator.kind === "workspace" &&
+                  document.locator.rootPath === workspace.rootPath &&
+                  document.locator.path === entry.path,
               );
-              const active = activeDocumentPath === entry.path;
+              const active = documents.some(
+                (document) =>
+                  document.path === activeDocumentPath &&
+                  document.locator.kind === "workspace" &&
+                  document.locator.rootPath === workspace.rootPath &&
+                  document.locator.path === entry.path,
+              );
               const selected = selectedEntry === entry.path;
               return (
                 <div className="workspace-entry" key={entry.path}>
@@ -327,12 +380,11 @@ export function SchemaPane() {
             <ChevronDown size={15} aria-hidden="true" />
             <Server size={16} aria-hidden="true" />
             <span>{connection.endpoint}</span>
-            <span
-              className={`tree-status tree-status--${connectionState}`}
-              aria-label={`连接状态：${connectionState}`}
-            >
-              {connection.mode === "preview" ? "PREVIEW" : "LIVE"}
-            </span>
+            <ConnectionStatusIcon
+              className="tree-status"
+              state={connectionState}
+              preview={connection.mode === "preview"}
+            />
           </button>
           {database && (
             <div className="tree-row tree-row--database">

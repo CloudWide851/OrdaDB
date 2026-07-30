@@ -18,6 +18,10 @@ import {
 } from "./lib/pluginManager";
 import { useWorkbenchStore } from "./store/workbench";
 
+const tauriMocks = vi.hoisted(() => ({
+  fileDropSubscribers: [] as Array<(paths: string[]) => void>,
+}));
+
 vi.mock("@monaco-editor/react", () => ({
   default: ({
     value,
@@ -43,6 +47,15 @@ vi.mock("./lib/tauri", () => ({
     state: "preview",
   }),
   runWindowAction: vi.fn().mockResolvedValue(undefined),
+  subscribeFileDrops: vi.fn(
+    async (listener: (paths: string[]) => void) => {
+      tauriMocks.fileDropSubscribers.push(listener);
+      return () => {
+        const index = tauriMocks.fileDropSubscribers.indexOf(listener);
+        if (index >= 0) tauriMocks.fileDropSubscribers.splice(index, 1);
+      };
+    },
+  ),
 }));
 
 const renderApp = () => {
@@ -69,7 +82,7 @@ async function seedPreviewWorkspace() {
     database: "ordadb_preview",
     credentialId: "preview-ui",
     username: "dba",
-    password: "disposable-secret",
+    tlsMode: "disable",
   });
   const revision = {
     sizeBytes: initialSql.length,
@@ -91,6 +104,11 @@ async function seedPreviewWorkspace() {
     },
     documents: [
       {
+        locator: {
+          kind: "workspace",
+          rootPath: "C:\\Preview\\project",
+          path: "query.sql",
+        },
         path: "query.sql",
         name: "query.sql",
         content: initialSql,
@@ -111,9 +129,11 @@ describe("OrdaDB workbench", () => {
     cleanup();
   });
 
-  beforeEach(() => {
+  beforeEach(async () => {
     resetPreviewPluginManagerForTests();
+    tauriMocks.fileDropSubscribers.length = 0;
     useWorkbenchStore.setState(initialWorkbenchState, true);
+    await useWorkbenchStore.getState().discardRecovery();
   });
 
   it("renders the Windows shell and professional database islands", async () => {
@@ -169,6 +189,31 @@ describe("OrdaDB workbench", () => {
     expect(screen.getByText("5 行 · 36 ms")).toBeVisible();
   });
 
+  it("renders the configured NULL value without changing result data", () => {
+    useWorkbenchStore.setState((state) => ({
+      initialize: async () => undefined,
+      settings: {
+        ...state.settings,
+        results: { ...state.settings.results, nullDisplay: "∅" },
+      },
+      queryState: "success",
+      activeResultTab: "data",
+      columns: [{ name: "optional_value", dataType: "text" }],
+      resultBuffer: {
+        pages: [{ start: 0, rows: [[null]], bytes: 4 }],
+        rowCount: 1,
+        totalRows: 1,
+        bytes: 4,
+        droppedRows: 0,
+      },
+      rowsProcessed: 1,
+    }));
+
+    renderApp();
+
+    expect(screen.getByText("∅")).toHaveClass("null-value");
+  });
+
   it("opens compact settings with 11px UI and 12px data/editor defaults", async () => {
     const user = userEvent.setup();
     renderApp();
@@ -178,13 +223,24 @@ describe("OrdaDB workbench", () => {
     const dialog = screen.getByRole("dialog", { name: "设置" });
     expect(within(dialog).getByLabelText("界面字体")).toHaveValue(11);
     expect(within(dialog).getByLabelText("数据字体")).toHaveValue(12);
-    expect(within(dialog).getByLabelText("编辑器字体")).toHaveValue(12);
+    await user.click(
+      within(dialog).getByRole("button", { name: "编辑器" }),
+    );
+    expect(within(dialog).getByLabelText("字号")).toHaveValue(12);
+    await user.click(
+      within(dialog).getByRole("button", { name: "文件与工作区" }),
+    );
     expect(
-      within(dialog).getByLabelText("启动时自动恢复上次 SQL 项目"),
+      within(dialog).getByLabelText("启动时恢复上次 SQL 项目"),
     ).not.toBeChecked();
+    await user.click(within(dialog).getByRole("button", { name: "外观" }));
     expect(
       within(dialog).getByLabelText("隐藏空的 Catalog 分类"),
     ).toBeChecked();
+    const settingsSearch = within(dialog).getByLabelText("搜索设置");
+    await user.type(settingsSearch, "模型");
+    expect(within(dialog).getByLabelText("模型")).toHaveValue("gpt-5.6");
+    await user.clear(settingsSearch);
     await user.click(
       within(dialog).getByRole("button", { name: "保存设置" }),
     );
@@ -319,9 +375,37 @@ describe("OrdaDB workbench", () => {
     const dataSource = screen.getByRole("dialog", { name: "数据源" });
     expect(dataSource).toBeVisible();
     expect(
-      within(dataSource).getByText("密码仅提交到桌面凭据库"),
+      within(dataSource).getByText("Preview 不保存数据库密码"),
     ).toBeVisible();
+    expect(within(dataSource).queryByLabelText("密码")).not.toBeInTheDocument();
     expect(within(dataSource).getByText("PREVIEW fixture")).toBeVisible();
+    expect(within(dataSource).getByLabelText("服务地址")).toHaveValue(
+      "127.0.0.1:54329",
+    );
+    expect(within(dataSource).getByLabelText("管理 API")).toBeVisible();
+    expect(within(dataSource).queryByLabelText("TLS")).not.toBeInTheDocument();
+    await user.click(
+      within(dataSource).getByRole("button", { name: "PostgreSQL" }),
+    );
+    expect(within(dataSource).getByLabelText("主机与端口")).toHaveValue(
+      "127.0.0.1:5432",
+    );
+    expect(within(dataSource).getByLabelText("TLS")).toBeVisible();
+    expect(
+      within(dataSource).queryByLabelText("管理 API"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dataSource).queryByText("OrdaDB / PostgreSQL"),
+    ).not.toBeInTheDocument();
+    const connectorLogos = dataSource.querySelectorAll(
+      ".data-source-choice img",
+    );
+    expect(connectorLogos).toHaveLength(5);
+    for (const image of connectorLogos) {
+      expect(image.getAttribute("src")).toMatch(
+        /^(?:data:image\/svg\+xml|\/src\/assets\/connectors\/)/,
+      );
+    }
     await user.click(
       within(dataSource).getByRole("button", { name: "关闭数据源" }),
     );
@@ -359,8 +443,95 @@ describe("OrdaDB workbench", () => {
     );
   });
 
+  it("routes required shortcuts, file drops, navigation focus, and modal ownership", async () => {
+    const user = userEvent.setup();
+    const explain = vi.fn().mockResolvedValue(undefined);
+    const openExternalFiles = vi.fn().mockResolvedValue(undefined);
+    useWorkbenchStore.setState({
+      runExplain: explain,
+      openExternalFiles,
+      inspectorVisible: false,
+    });
+    renderApp();
+    await waitFor(() => {
+      expect(tauriMocks.fileDropSubscribers).toHaveLength(1);
+    });
+
+    expect(
+      document.querySelector(".query-dot, .connection-dot"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText("连接状态：未连接")).toBeVisible();
+
+    await user.keyboard("{Control>}n{/Control}");
+    expect(
+      screen.getByRole("button", { name: /未命名-1\.sql/ }),
+    ).toBeVisible();
+    fireEvent.change(screen.getByRole("textbox", { name: "SQL 编辑器" }), {
+      target: { value: "select id from items;" },
+    });
+    await user.keyboard("{Control>}{Alt>}l{/Alt}{/Control}");
+    expect(useWorkbenchStore.getState().sql).toBe("SELECT id FROM items;");
+
+    await user.keyboard("{Alt>}2{/Alt}");
+    expect(useWorkbenchStore.getState().sidebarView).toBe("workspace");
+    await user.keyboard("{Alt>}1{/Alt}");
+    expect(useWorkbenchStore.getState().sidebarView).toBe("database");
+    await user.keyboard("{Alt>}3{/Alt}");
+    expect(useWorkbenchStore.getState().inspectorVisible).toBe(true);
+
+    await user.keyboard("{Control>}e{/Control}");
+    expect(
+      screen.getByRole("dialog", { name: "最近文件" }),
+    ).toBeVisible();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(
+      screen.queryByRole("dialog", { name: "最近文件" }),
+    ).not.toBeInTheDocument();
+
+    await user.keyboard("{Control>}{Shift>}n{/Shift}{/Control}");
+    expect(screen.getByRole("dialog", { name: "转到文件" })).toBeVisible();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(
+      screen.queryByRole("dialog", { name: "转到文件" }),
+    ).not.toBeInTheDocument();
+
+    await user.keyboard("{Alt>}{Home}{/Alt}");
+    expect(screen.getByRole("navigation", { name: "导航栏" })).toHaveFocus();
+
+    await user.keyboard("{Control>}{Alt>}e{/Alt}{/Control}");
+    expect(explain).toHaveBeenCalledTimes(1);
+
+    await user.keyboard(
+      "{Control>}{Alt>}{Shift>}s{/Shift}{/Alt}{/Control}",
+    );
+    const dataSource = screen.getByRole("dialog", { name: "数据源" });
+    const documentCount = useWorkbenchStore.getState().documents.length;
+    await user.keyboard("{Control>}n{/Control}");
+    expect(useWorkbenchStore.getState().documents).toHaveLength(documentCount);
+    await user.click(
+      within(dataSource).getByRole("button", { name: "关闭数据源" }),
+    );
+
+    await user.keyboard("{Shift}{Shift}");
+    expect(screen.getByRole("dialog", { name: "全局搜索" })).toBeVisible();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(
+      screen.queryByRole("dialog", { name: "全局搜索" }),
+    ).not.toBeInTheDocument();
+
+    tauriMocks.fileDropSubscribers[0]([
+      "C:\\SQL\\dropped.sql",
+      "C:\\SQL\\ignored.txt",
+    ]);
+    expect(openExternalFiles).toHaveBeenCalledWith([
+      "C:\\SQL\\dropped.sql",
+      "C:\\SQL\\ignored.txt",
+    ]);
+  });
+
   it("renders structured DBMS errors from the query stream", async () => {
     const user = userEvent.setup();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
     await seedPreviewWorkspace();
     renderApp();
 
@@ -379,10 +550,7 @@ describe("OrdaDB workbench", () => {
     const user = userEvent.setup();
     renderApp();
 
-    await user.keyboard(
-      "{Control>}{Alt>}{Shift>}s{/Shift}{/Alt}{/Control}",
-    );
-    const dialog = await screen.findByRole("dialog", { name: "连接插件" });
+    const dialog = await openPluginManagerFromDataSources(user);
     const pluginView = within(dialog);
 
     for (const connector of [
@@ -446,10 +614,7 @@ describe("OrdaDB workbench", () => {
     setPreviewRegistryAvailabilityForTests("notConfigured");
     renderApp();
 
-    await user.keyboard(
-      "{Control>}{Alt>}{Shift>}s{/Shift}{/Alt}{/Control}",
-    );
-    const dialog = await screen.findByRole("dialog", { name: "连接插件" });
+    const dialog = await openPluginManagerFromDataSources(user);
     expect(
       within(dialog).getByRole("status"),
     ).toHaveTextContent("插件仓库未配置");
@@ -460,3 +625,19 @@ describe("OrdaDB workbench", () => {
     ).toBeDisabled();
   });
 });
+
+async function openPluginManagerFromDataSources(
+  user: ReturnType<typeof userEvent.setup>,
+) {
+  await user.keyboard(
+    "{Control>}{Alt>}{Shift>}s{/Shift}{/Alt}{/Control}",
+  );
+  const sources = await screen.findByRole("dialog", { name: "数据源" });
+  await user.click(
+    within(sources).getByRole("button", { name: "PostgreSQL" }),
+  );
+  await user.click(
+    within(sources).getByRole("button", { name: "连接插件" }),
+  );
+  return screen.findByRole("dialog", { name: "连接插件" });
+}

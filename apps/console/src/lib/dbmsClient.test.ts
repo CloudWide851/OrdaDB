@@ -29,6 +29,16 @@ describe("PreviewDbmsClient", () => {
     expect(probe.ready).toBe(true);
     expect(probe.stages).toHaveLength(6);
     expect(probe.stages.every((stage) => stage.status === "skipped")).toBe(true);
+    await expect(
+      client.promptCredential({
+        credentialId: "preview-test",
+        connectorId: "ordadb-native",
+        suggestedUsername: "dba",
+      }),
+    ).resolves.toEqual({
+      credentialId: "preview-test",
+      username: "dba",
+    });
     expect(connectionId.connectionId).toBe("preview-connection");
     expect(operation.requestId).toMatch(/^preview-/);
     expect(events.map((event) => event.kind)).toEqual([

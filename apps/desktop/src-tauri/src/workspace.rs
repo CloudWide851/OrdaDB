@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ordadb_types::DbError;
 use serde::de::DeserializeOwned;
@@ -18,18 +18,22 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::dbms::DbmsError;
 
-const SETTINGS_FILE: &str = "console-settings-v1.json";
+const SETTINGS_FILE: &str = "console-settings-v2.json";
+const LEGACY_SETTINGS_FILE: &str = "console-settings-v1.json";
 const SESSION_FILE: &str = "workspace-session-v1.json";
-const PROFILES_FILE: &str = "connection-profiles-v1.json";
-const SETTINGS_VERSION: u32 = 1;
+const RECENT_FILES_FILE: &str = "recent-files-v1.json";
+const PROFILES_FILE: &str = "connection-profiles-v2.json";
+const LEGACY_PROFILES_FILE: &str = "connection-profiles-v1.json";
+const SETTINGS_VERSION: u32 = 2;
 const SESSION_VERSION: u32 = 1;
-const PROFILES_VERSION: u32 = 1;
+const PROFILES_VERSION: u32 = 2;
 const MAX_SQL_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DIRECTORY_DEPTH: usize = 32;
 const MAX_WORKSPACE_ENTRIES: usize = 10_000;
 const MAX_OPEN_DOCUMENTS: usize = 32;
 const MAX_DRAFT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONNECTION_PROFILES: usize = 32;
+const MAX_RECENT_FILES: usize = 50;
 const NATIVE_CONNECTOR_ID: &str = "ordadb-native";
 
 type DesktopResult<T> = std::result::Result<T, DbmsError>;
@@ -49,7 +53,7 @@ pub struct ConsoleSettingsV1 {
 impl Default for ConsoleSettingsV1 {
     fn default() -> Self {
         Self {
-            format_version: SETTINGS_VERSION,
+            format_version: 1,
             ui_font_size: 11,
             data_font_size: 12,
             editor_font_size: 12,
@@ -62,7 +66,7 @@ impl Default for ConsoleSettingsV1 {
 
 impl ConsoleSettingsV1 {
     fn validate(&self) -> Result<(), DbError> {
-        if self.format_version != SETTINGS_VERSION {
+        if self.format_version != 1 {
             return Err(unsupported_version("console settings", self.format_version));
         }
         if !(9..=16).contains(&self.ui_font_size)
@@ -82,6 +86,225 @@ impl ConsoleSettingsV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConsoleSettingsV2 {
+    format_version: u32,
+    appearance: AppearanceSettingsV2,
+    editor: EditorSettingsV2,
+    files: FileSettingsV2,
+    results: ResultSettingsV2,
+    connections: ConnectionSettingsV2,
+    ai: AiSettingsV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AppearanceSettingsV2 {
+    theme: String,
+    zoom_percent: u16,
+    ui_font_size: u8,
+    data_font_size: u8,
+    density: String,
+    reduce_motion: bool,
+    hide_empty_catalog: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EditorSettingsV2 {
+    font_family: String,
+    font_size: u8,
+    tab_size: u8,
+    word_wrap: String,
+    minimap: bool,
+    format_on_save: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FileSettingsV2 {
+    recovery_policy: String,
+    auto_save: String,
+    auto_save_delay_ms: u32,
+    confirm_dirty_close: bool,
+    reopen_last_project: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResultSettingsV2 {
+    page_size: u16,
+    resident_row_limit: u32,
+    resident_memory_bytes: u64,
+    null_display: String,
+    query_timeout_ms: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConnectionSettingsV2 {
+    timeout_ms: u32,
+    auto_reconnect_local: bool,
+    confirm_dangerous_writes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AiSettingsV2 {
+    provider: String,
+    model: String,
+    endpoint: Option<String>,
+    reasoning: String,
+    data_sharing: String,
+    credential_id: Option<String>,
+}
+
+impl Default for ConsoleSettingsV2 {
+    fn default() -> Self {
+        Self {
+            format_version: SETTINGS_VERSION,
+            appearance: AppearanceSettingsV2 {
+                theme: "system".to_owned(),
+                zoom_percent: 100,
+                ui_font_size: 11,
+                data_font_size: 12,
+                density: "compact".to_owned(),
+                reduce_motion: false,
+                hide_empty_catalog: true,
+            },
+            editor: EditorSettingsV2 {
+                font_family: "Cascadia Mono".to_owned(),
+                font_size: 12,
+                tab_size: 2,
+                word_wrap: "off".to_owned(),
+                minimap: false,
+                format_on_save: false,
+            },
+            files: FileSettingsV2 {
+                recovery_policy: "prompt".to_owned(),
+                auto_save: "off".to_owned(),
+                auto_save_delay_ms: 1_000,
+                confirm_dirty_close: true,
+                reopen_last_project: false,
+            },
+            results: ResultSettingsV2 {
+                page_size: 256,
+                resident_row_limit: 10_000,
+                resident_memory_bytes: 16 * 1024 * 1024,
+                null_display: "NULL".to_owned(),
+                query_timeout_ms: 30_000,
+            },
+            connections: ConnectionSettingsV2 {
+                timeout_ms: 30_000,
+                auto_reconnect_local: true,
+                confirm_dangerous_writes: true,
+            },
+            ai: AiSettingsV2 {
+                provider: "openai".to_owned(),
+                model: "gpt-5.6".to_owned(),
+                endpoint: None,
+                reasoning: "medium".to_owned(),
+                data_sharing: "schemaOnly".to_owned(),
+                credential_id: None,
+            },
+        }
+    }
+}
+
+impl From<ConsoleSettingsV1> for ConsoleSettingsV2 {
+    fn from(legacy: ConsoleSettingsV1) -> Self {
+        let mut settings = Self::default();
+        settings.appearance.ui_font_size = legacy.ui_font_size;
+        settings.appearance.data_font_size = legacy.data_font_size;
+        settings.appearance.density = legacy.density;
+        settings.appearance.hide_empty_catalog = legacy.hide_empty_catalog;
+        settings.editor.font_size = legacy.editor_font_size;
+        settings.files.reopen_last_project = legacy.reopen_last_project;
+        settings
+    }
+}
+
+impl ConsoleSettingsV2 {
+    fn validate(&self) -> Result<(), DbError> {
+        if self.format_version != SETTINGS_VERSION {
+            return Err(unsupported_version("console settings", self.format_version));
+        }
+        validate_choice(
+            &self.appearance.theme,
+            &["system", "light", "dark"],
+            "theme",
+        )?;
+        if !(80..=150).contains(&self.appearance.zoom_percent)
+            || !(9..=16).contains(&self.appearance.ui_font_size)
+            || !(10..=18).contains(&self.appearance.data_font_size)
+        {
+            return Err(invalid("appearance values are outside the supported range"));
+        }
+        validate_choice(
+            &self.appearance.density,
+            &["compact", "comfortable"],
+            "density",
+        )?;
+        validate_text(&self.editor.font_family, 1, 128, "editor font family")?;
+        if !(10..=24).contains(&self.editor.font_size) || !(1..=8).contains(&self.editor.tab_size) {
+            return Err(invalid("editor values are outside the supported range"));
+        }
+        validate_choice(
+            &self.editor.word_wrap,
+            &["off", "on", "bounded"],
+            "editor word wrap",
+        )?;
+        validate_choice(
+            &self.files.recovery_policy,
+            &["prompt", "never", "automatic"],
+            "recovery policy",
+        )?;
+        validate_choice(
+            &self.files.auto_save,
+            &["off", "afterDelay", "onFocusChange"],
+            "auto save",
+        )?;
+        if !(250..=60_000).contains(&self.files.auto_save_delay_ms) {
+            return Err(invalid("auto-save delay is outside the supported range"));
+        }
+        if !(50..=1_000).contains(&self.results.page_size)
+            || !(100..=100_000).contains(&self.results.resident_row_limit)
+            || !(1024 * 1024..=64 * 1024 * 1024).contains(&self.results.resident_memory_bytes)
+            || !(1_000..=600_000).contains(&self.results.query_timeout_ms)
+        {
+            return Err(invalid("result settings are outside the supported range"));
+        }
+        validate_text(&self.results.null_display, 1, 32, "NULL display")?;
+        if !(1_000..=120_000).contains(&self.connections.timeout_ms) {
+            return Err(invalid("connection timeout is outside the supported range"));
+        }
+        validate_choice(
+            &self.ai.provider,
+            &["openai", "openaiCompatible", "ollama"],
+            "AI provider",
+        )?;
+        validate_text(&self.ai.model, 1, 128, "AI model")?;
+        if let Some(endpoint) = &self.ai.endpoint {
+            validate_text(endpoint, 1, 2_048, "AI endpoint")?;
+        }
+        validate_choice(
+            &self.ai.reasoning,
+            &["low", "medium", "high"],
+            "AI reasoning",
+        )?;
+        validate_choice(
+            &self.ai.data_sharing,
+            &["schemaOnly", "askEachTime", "allowSamples"],
+            "AI data sharing",
+        )?;
+        if let Some(credential_id) = &self.ai.credential_id {
+            validate_id(credential_id, "AI credential ID")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileRevision {
     size_bytes: u64,
     modified_at_ms: u64,
@@ -91,10 +314,24 @@ pub struct FileRevision {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SqlDocument {
+    locator: DocumentLocator,
     path: String,
     name: String,
     content: String,
     revision: FileRevision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum DocumentLocator {
+    Workspace { root_path: String, path: String },
+    External { path: String },
+    Untitled { id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +362,10 @@ pub struct WorkspaceSnapshot {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceDraft {
     path: String,
+    #[serde(default)]
+    locator: Option<DocumentLocator>,
+    #[serde(default)]
+    name: Option<String>,
     content: String,
     base_revision: Option<FileRevision>,
 }
@@ -145,6 +386,30 @@ impl Default for WorkspaceSessionV1 {
             root_path: None,
             active_path: None,
             open_documents: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecentFileEntry {
+    locator: DocumentLocator,
+    name: String,
+    opened_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecentFilesV1 {
+    format_version: u32,
+    entries: Vec<RecentFileEntry>,
+}
+
+impl Default for RecentFilesV1 {
+    fn default() -> Self {
+        Self {
+            format_version: 1,
+            entries: Vec::new(),
         }
     }
 }
@@ -174,18 +439,157 @@ struct ConnectionProfilesV1 {
 impl Default for ConnectionProfilesV1 {
     fn default() -> Self {
         Self {
+            format_version: 1,
+            profiles: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DataSourceKind {
+    OrdadbNative,
+    Postgresql,
+    Mysql,
+    Sqlite,
+    SqlServer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConnectionProfileV2 {
+    format_version: u32,
+    profile_id: String,
+    label: String,
+    data_source_kind: DataSourceKind,
+    connector_id: String,
+    dialect: String,
+    endpoint: String,
+    admin_endpoint: Option<String>,
+    database: Option<String>,
+    tls_mode: String,
+    credential_id: String,
+    auto_reconnect: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConnectionProfilesV2 {
+    format_version: u32,
+    profiles: Vec<ConnectionProfileV2>,
+}
+
+impl Default for ConnectionProfilesV2 {
+    fn default() -> Self {
+        Self {
             format_version: PROFILES_VERSION,
             profiles: Vec::new(),
         }
     }
 }
 
+impl From<ConnectionProfileV1> for ConnectionProfileV2 {
+    fn from(legacy: ConnectionProfileV1) -> Self {
+        let connector_id = migrate_connector_id(&legacy.connector_id);
+        let data_source_kind = data_source_kind(connector_id);
+        let tls_mode = if data_source_kind == DataSourceKind::OrdadbNative {
+            "disable"
+        } else {
+            "prefer"
+        };
+        Self {
+            format_version: PROFILES_VERSION,
+            profile_id: legacy.profile_id,
+            label: legacy.label,
+            data_source_kind,
+            connector_id: connector_id.to_owned(),
+            dialect: legacy.dialect,
+            endpoint: legacy.endpoint,
+            admin_endpoint: legacy.admin_endpoint,
+            database: legacy.database,
+            tls_mode: tls_mode.to_owned(),
+            credential_id: legacy.credential_id,
+            auto_reconnect: legacy.auto_reconnect,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectorDescriptor {
+    data_source_kind: DataSourceKind,
+    connector_id: &'static str,
+    display_name: &'static str,
+    default_endpoint: &'static str,
+    default_admin_endpoint: Option<&'static str>,
+    default_database: Option<&'static str>,
+    default_tls_mode: &'static str,
+    logo_asset: &'static str,
+}
+
+fn connector_descriptors() -> Vec<ConnectorDescriptor> {
+    vec![
+        ConnectorDescriptor {
+            data_source_kind: DataSourceKind::OrdadbNative,
+            connector_id: NATIVE_CONNECTOR_ID,
+            display_name: "OrdaDB",
+            default_endpoint: "127.0.0.1:54329",
+            default_admin_endpoint: Some("http://127.0.0.1:9080"),
+            default_database: Some("ordadb"),
+            default_tls_mode: "disable",
+            logo_asset: "ordadb",
+        },
+        ConnectorDescriptor {
+            data_source_kind: DataSourceKind::Postgresql,
+            connector_id: "postgresql",
+            display_name: "PostgreSQL",
+            default_endpoint: "127.0.0.1:5432",
+            default_admin_endpoint: None,
+            default_database: Some("postgres"),
+            default_tls_mode: "prefer",
+            logo_asset: "postgresql",
+        },
+        ConnectorDescriptor {
+            data_source_kind: DataSourceKind::Mysql,
+            connector_id: "mysql",
+            display_name: "MySQL",
+            default_endpoint: "127.0.0.1:3306",
+            default_admin_endpoint: None,
+            default_database: None,
+            default_tls_mode: "prefer",
+            logo_asset: "mysql",
+        },
+        ConnectorDescriptor {
+            data_source_kind: DataSourceKind::Sqlite,
+            connector_id: "sqlite",
+            display_name: "SQLite",
+            default_endpoint: "",
+            default_admin_endpoint: None,
+            default_database: None,
+            default_tls_mode: "disable",
+            logo_asset: "sqlite",
+        },
+        ConnectorDescriptor {
+            data_source_kind: DataSourceKind::SqlServer,
+            connector_id: "sql-server",
+            display_name: "SQL Server",
+            default_endpoint: "127.0.0.1:1433",
+            default_admin_endpoint: None,
+            default_database: None,
+            default_tls_mode: "require",
+            logo_asset: "sql-server",
+        },
+    ]
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsoleBootstrap {
-    settings: ConsoleSettingsV1,
+    settings: ConsoleSettingsV2,
     recovery: Option<WorkspaceSessionV1>,
-    connection_profiles: Vec<ConnectionProfileV1>,
+    recent_files: Vec<RecentFileEntry>,
+    connection_profiles: Vec<ConnectionProfileV2>,
+    connector_descriptors: Vec<ConnectorDescriptor>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +625,28 @@ pub struct SaveDocumentRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExternalDocumentRequest {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SaveExternalDocumentRequest {
+    path: String,
+    content: String,
+    expected_revision: Option<FileRevision>,
+    force: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SaveDocumentAsRequest {
+    content: String,
+    suggested_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RenameEntryRequest {
     root_path: String,
     path: String,
@@ -241,12 +667,19 @@ impl ConsoleRuntime {
             root,
             write_lock: Mutex::new(()),
         });
-        runtime.load_settings()?.validate()?;
+        let (settings, settings_migrated) = runtime.load_settings_with_migration()?;
+        settings.validate()?;
         runtime.load_session()?;
-        let (profiles, migrated) = runtime.load_profiles_with_migration()?;
-        if migrated {
+        runtime.load_recent_files()?;
+        let (profiles, profiles_migrated) = runtime.load_profiles_with_migration()?;
+        if settings_migrated || profiles_migrated {
             let _guard = runtime.lock_writes()?;
-            write_json_atomic(&runtime.root.join(PROFILES_FILE), &profiles)?;
+            if settings_migrated {
+                write_json_atomic(&runtime.root.join(SETTINGS_FILE), &settings)?;
+            }
+            if profiles_migrated {
+                write_json_atomic(&runtime.root.join(PROFILES_FILE), &profiles)?;
+            }
         }
         Ok(runtime)
     }
@@ -255,7 +688,7 @@ impl ConsoleRuntime {
         let settings = self.load_settings()?;
         settings.validate()?;
         let session = self.load_session()?;
-        let recovery = if session.root_path.is_some() && !session.open_documents.is_empty() {
+        let recovery = if !session.open_documents.is_empty() {
             Some(session)
         } else {
             None
@@ -263,19 +696,40 @@ impl ConsoleRuntime {
         Ok(ConsoleBootstrap {
             settings,
             recovery,
+            recent_files: self.load_recent_files()?.entries,
             connection_profiles: self.load_profiles()?.profiles,
+            connector_descriptors: connector_descriptors(),
         })
     }
 
-    fn save_settings(&self, settings: ConsoleSettingsV1) -> Result<ConsoleSettingsV1, DbError> {
+    fn save_settings(&self, settings: ConsoleSettingsV2) -> Result<ConsoleSettingsV2, DbError> {
         settings.validate()?;
         let _guard = self.lock_writes()?;
         write_json_atomic(&self.root.join(SETTINGS_FILE), &settings)?;
         Ok(settings)
     }
 
-    fn load_settings(&self) -> Result<ConsoleSettingsV1, DbError> {
-        read_json_or_default(&self.root.join(SETTINGS_FILE))
+    fn load_settings(&self) -> Result<ConsoleSettingsV2, DbError> {
+        self.load_settings_with_migration()
+            .map(|(settings, _)| settings)
+    }
+
+    fn load_settings_with_migration(&self) -> Result<(ConsoleSettingsV2, bool), DbError> {
+        let current = self.root.join(SETTINGS_FILE);
+        if current.exists() {
+            let settings: ConsoleSettingsV2 = read_json_or_default(&current)?;
+            settings.validate()?;
+            return Ok((settings, false));
+        }
+        let legacy = self.root.join(LEGACY_SETTINGS_FILE);
+        if legacy.exists() {
+            let settings: ConsoleSettingsV1 = read_json_or_default(&legacy)?;
+            settings.validate()?;
+            let migrated = ConsoleSettingsV2::from(settings);
+            migrated.validate()?;
+            return Ok((migrated, true));
+        }
+        Ok((ConsoleSettingsV2::default(), false))
     }
 
     fn save_session(&self, session: WorkspaceSessionV1) -> Result<(), DbError> {
@@ -290,11 +744,43 @@ impl ConsoleRuntime {
         Ok(session)
     }
 
+    fn load_recent_files(&self) -> Result<RecentFilesV1, DbError> {
+        let recent: RecentFilesV1 = read_json_or_default(&self.root.join(RECENT_FILES_FILE))?;
+        validate_recent_files(&recent)?;
+        Ok(recent)
+    }
+
+    fn record_recent_document(
+        &self,
+        document: &SqlDocument,
+    ) -> Result<Vec<RecentFileEntry>, DbError> {
+        let _guard = self.lock_writes()?;
+        let mut recent = self.load_recent_files()?;
+        let entry = RecentFileEntry {
+            locator: document.locator.clone(),
+            name: document.name.clone(),
+            opened_at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| invalid("current time is before the Unix epoch"))?
+                .as_millis()
+                .try_into()
+                .map_err(|_| resource("recent-file timestamp overflowed"))?,
+        };
+        validate_recent_entry(&entry)?;
+        recent
+            .entries
+            .retain(|candidate| candidate.locator != entry.locator);
+        recent.entries.insert(0, entry);
+        recent.entries.truncate(MAX_RECENT_FILES);
+        write_json_atomic(&self.root.join(RECENT_FILES_FILE), &recent)?;
+        Ok(recent.entries)
+    }
+
     fn save_profile(
         &self,
-        profile: ConnectionProfileV1,
-    ) -> Result<Vec<ConnectionProfileV1>, DbError> {
-        validate_profile(&profile)?;
+        profile: ConnectionProfileV2,
+    ) -> Result<Vec<ConnectionProfileV2>, DbError> {
+        validate_profile_v2(&profile)?;
         let _guard = self.lock_writes()?;
         let mut document = self.load_profiles()?;
         if let Some(current) = document
@@ -316,7 +802,7 @@ impl ConsoleRuntime {
         Ok(document.profiles)
     }
 
-    fn delete_profile(&self, profile_id: &str) -> Result<Vec<ConnectionProfileV1>, DbError> {
+    fn delete_profile(&self, profile_id: &str) -> Result<Vec<ConnectionProfileV2>, DbError> {
         validate_id(profile_id, "connection profile ID")?;
         let _guard = self.lock_writes()?;
         let mut document = self.load_profiles()?;
@@ -327,37 +813,43 @@ impl ConsoleRuntime {
         Ok(document.profiles)
     }
 
-    fn load_profiles(&self) -> Result<ConnectionProfilesV1, DbError> {
+    fn load_profiles(&self) -> Result<ConnectionProfilesV2, DbError> {
         self.load_profiles_with_migration()
             .map(|(document, _)| document)
     }
 
-    fn load_profiles_with_migration(&self) -> Result<(ConnectionProfilesV1, bool), DbError> {
-        let mut document: ConnectionProfilesV1 =
-            read_json_or_default(&self.root.join(PROFILES_FILE))?;
-        if document.format_version != PROFILES_VERSION {
+    fn load_profiles_with_migration(&self) -> Result<(ConnectionProfilesV2, bool), DbError> {
+        let current = self.root.join(PROFILES_FILE);
+        if current.exists() {
+            let document: ConnectionProfilesV2 = read_json_or_default(&current)?;
+            validate_profiles_v2(&document)?;
+            return Ok((document, false));
+        }
+        let legacy_path = self.root.join(LEGACY_PROFILES_FILE);
+        if !legacy_path.exists() {
+            return Ok((ConnectionProfilesV2::default(), false));
+        }
+        let legacy: ConnectionProfilesV1 = read_json_or_default(&legacy_path)?;
+        if legacy.format_version != 1 {
             return Err(unsupported_version(
                 "connection profiles",
-                document.format_version,
+                legacy.format_version,
             ));
         }
-        if document.profiles.len() > MAX_CONNECTION_PROFILES {
+        if legacy.profiles.len() > MAX_CONNECTION_PROFILES {
             return Err(resource("connection profile limit exceeded"));
         }
-        let mut ids = BTreeSet::new();
-        let mut migrated = false;
-        for profile in &mut document.profiles {
-            let connector_id = migrate_connector_id(&profile.connector_id);
-            if connector_id != profile.connector_id {
-                profile.connector_id = connector_id.into();
-                migrated = true;
-            }
-            validate_profile(profile)?;
-            if !ids.insert(profile.profile_id.as_str()) {
-                return Err(invalid("connection profile IDs must be unique"));
-            }
-        }
-        Ok((document, migrated))
+        let profiles = legacy
+            .profiles
+            .into_iter()
+            .map(ConnectionProfileV2::from)
+            .collect();
+        let document = ConnectionProfilesV2 {
+            format_version: PROFILES_VERSION,
+            profiles,
+        };
+        validate_profiles_v2(&document)?;
+        Ok((document, true))
     }
 
     fn snapshot(&self, root_path: &str) -> Result<WorkspaceSnapshot, DbError> {
@@ -415,7 +907,9 @@ impl ConsoleRuntime {
     fn open_document(&self, request: &DocumentRequest) -> Result<SqlDocument, DbError> {
         let root = canonical_workspace_root(&request.root_path)?;
         let path = resolve_workspace_entry(&root, &request.path)?;
-        read_sql_document(&root, &path)
+        let document = read_workspace_document(&root, &path)?;
+        self.record_recent_document(&document)?;
+        Ok(document)
     }
 
     fn new_document(&self, request: &NewDocumentRequest) -> Result<SqlDocument, DbError> {
@@ -439,7 +933,10 @@ impl ConsoleRuntime {
         file.write_all(b"")
             .and_then(|_| file.sync_all())
             .map_err(|error| io_error("failed to synchronize new SQL file", error))?;
-        read_sql_document(&root, &path)
+        let document = read_workspace_document(&root, &path)?;
+        drop(_guard);
+        self.record_recent_document(&document)?;
+        Ok(document)
     }
 
     fn save_document(&self, request: &SaveDocumentRequest) -> Result<SqlDocument, DbError> {
@@ -464,7 +961,66 @@ impl ConsoleRuntime {
                 .with_hint("reload the file or explicitly overwrite the external revision"));
         }
         write_bytes_atomic(&path, request.content.as_bytes())?;
-        read_sql_document(&root, &path)
+        let document = read_workspace_document(&root, &path)?;
+        drop(_guard);
+        self.record_recent_document(&document)?;
+        Ok(document)
+    }
+
+    fn open_external_document(
+        &self,
+        request: &ExternalDocumentRequest,
+    ) -> Result<SqlDocument, DbError> {
+        let path = canonical_external_sql_file(&request.path)?;
+        let document = read_external_document(&path)?;
+        self.record_recent_document(&document)?;
+        Ok(document)
+    }
+
+    fn save_external_document(
+        &self,
+        request: &SaveExternalDocumentRequest,
+    ) -> Result<SqlDocument, DbError> {
+        if request.content.len() as u64 > MAX_SQL_FILE_BYTES {
+            return Err(resource("SQL file exceeds the 4 MiB limit"));
+        }
+        let _guard = self.lock_writes()?;
+        let path = canonical_external_sql_file(&request.path)?;
+        let current = file_revision(&path)?;
+        if !request.force
+            && request
+                .expected_revision
+                .as_ref()
+                .is_some_and(|expected| expected != &current)
+        {
+            return Err(DbError::new("40001", "SQL file changed outside OrdaDB")
+                .with_detail("the on-disk revision no longer matches the opened document")
+                .with_hint("reload the file or explicitly overwrite the external revision"));
+        }
+        write_bytes_atomic(&path, request.content.as_bytes())?;
+        let document = read_external_document(&path)?;
+        drop(_guard);
+        self.record_recent_document(&document)?;
+        Ok(document)
+    }
+
+    fn save_document_as_path(
+        &self,
+        request: &SaveDocumentAsRequest,
+        selected_path: &Path,
+    ) -> Result<SqlDocument, DbError> {
+        if request.content.len() as u64 > MAX_SQL_FILE_BYTES {
+            return Err(resource("SQL file exceeds the 4 MiB limit"));
+        }
+        validate_file_name(&request.suggested_name)?;
+        let _guard = self.lock_writes()?;
+        let path = normalize_save_destination(selected_path)?;
+        write_bytes_atomic(&path, request.content.as_bytes())?;
+        let path = canonical_external_sql_file(&path.display().to_string())?;
+        let document = read_external_document(&path)?;
+        drop(_guard);
+        self.record_recent_document(&document)?;
+        Ok(document)
     }
 
     fn rename_entry(&self, request: &RenameEntryRequest) -> Result<WorkspaceSnapshot, DbError> {
@@ -526,8 +1082,8 @@ pub fn console_bootstrap(
 #[tauri::command(rename_all = "camelCase")]
 pub fn console_save_settings(
     runtime: State<'_, Arc<ConsoleRuntime>>,
-    settings: ConsoleSettingsV1,
-) -> DesktopResult<ConsoleSettingsV1> {
+    settings: ConsoleSettingsV2,
+) -> DesktopResult<ConsoleSettingsV2> {
     runtime.save_settings(settings).map_err(Into::into)
 }
 
@@ -563,12 +1119,45 @@ pub async fn workspace_pick_folder(
         .transpose()
 }
 
+#[tauri::command]
+pub async fn workspace_pick_document(
+    runtime: State<'_, Arc<ConsoleRuntime>>,
+) -> DesktopResult<Option<SqlDocument>> {
+    let selected = tauri::async_runtime::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("打开 SQL 文件")
+            .add_filter("SQL", &["sql"])
+            .pick_file()
+    })
+    .await
+    .map_err(|error| {
+        DbmsError::from(DbError::internal("file picker task failed").with_detail(error.to_string()))
+    })?;
+    selected
+        .map(|path| {
+            runtime
+                .open_external_document(&ExternalDocumentRequest {
+                    path: path.display().to_string(),
+                })
+                .map_err(Into::into)
+        })
+        .transpose()
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub fn workspace_open_document(
     runtime: State<'_, Arc<ConsoleRuntime>>,
     request: DocumentRequest,
 ) -> DesktopResult<SqlDocument> {
     runtime.open_document(&request).map_err(Into::into)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn workspace_open_external_document(
+    runtime: State<'_, Arc<ConsoleRuntime>>,
+    request: ExternalDocumentRequest,
+) -> DesktopResult<SqlDocument> {
+    runtime.open_external_document(&request).map_err(Into::into)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -585,6 +1174,43 @@ pub fn workspace_save_document(
     request: SaveDocumentRequest,
 ) -> DesktopResult<SqlDocument> {
     runtime.save_document(&request).map_err(Into::into)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn workspace_save_external_document(
+    runtime: State<'_, Arc<ConsoleRuntime>>,
+    request: SaveExternalDocumentRequest,
+) -> DesktopResult<SqlDocument> {
+    runtime.save_external_document(&request).map_err(Into::into)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn workspace_save_document_as(
+    runtime: State<'_, Arc<ConsoleRuntime>>,
+    request: SaveDocumentAsRequest,
+) -> DesktopResult<Option<SqlDocument>> {
+    validate_file_name(&request.suggested_name).map_err(DbmsError::from)?;
+    let suggested_name = request.suggested_name.clone();
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        rfd::FileDialog::new()
+            .set_title("保存 SQL 文件")
+            .add_filter("SQL", &["sql"])
+            .set_file_name(&suggested_name)
+            .save_file()
+    })
+    .await
+    .map_err(|error| {
+        DbmsError::from(
+            DbError::internal("Save As picker task failed").with_detail(error.to_string()),
+        )
+    })?;
+    selected
+        .map(|path| {
+            runtime
+                .save_document_as_path(&request, &path)
+                .map_err(Into::into)
+        })
+        .transpose()
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -614,8 +1240,8 @@ pub fn workspace_save_session(
 #[tauri::command(rename_all = "camelCase")]
 pub fn console_save_connection_profile(
     runtime: State<'_, Arc<ConsoleRuntime>>,
-    profile: ConnectionProfileV1,
-) -> DesktopResult<Vec<ConnectionProfileV1>> {
+    profile: ConnectionProfileV2,
+) -> DesktopResult<Vec<ConnectionProfileV2>> {
     runtime.save_profile(profile).map_err(Into::into)
 }
 
@@ -623,7 +1249,7 @@ pub fn console_save_connection_profile(
 pub fn console_delete_connection_profile(
     runtime: State<'_, Arc<ConsoleRuntime>>,
     profile_id: String,
-) -> DesktopResult<Vec<ConnectionProfileV1>> {
+) -> DesktopResult<Vec<ConnectionProfileV2>> {
     runtime.delete_profile(&profile_id).map_err(Into::into)
 }
 
@@ -641,7 +1267,27 @@ fn validate_session(session: &WorkspaceSessionV1) -> Result<(), DbError> {
         .open_documents
         .iter()
         .try_fold(0_usize, |total, draft| {
-            validate_relative_sql_path(&draft.path)?;
+            validate_text(&draft.path, 1, 32_768, "document identity")?;
+            if let Some(locator) = &draft.locator {
+                validate_document_locator(locator)?;
+                if matches!(locator, DocumentLocator::Untitled { .. })
+                    && draft.base_revision.is_some()
+                {
+                    return Err(invalid(
+                        "untitled recovery drafts cannot carry a file revision",
+                    ));
+                }
+            } else {
+                if session.root_path.is_none() {
+                    return Err(invalid(
+                        "legacy workspace recovery documents require a workspace root",
+                    ));
+                }
+                validate_relative_sql_path(&draft.path)?;
+            }
+            if let Some(name) = &draft.name {
+                validate_text(name, 1, 255, "document name")?;
+            }
             total
                 .checked_add(draft.content.len())
                 .ok_or_else(|| resource("workspace draft size overflowed"))
@@ -650,7 +1296,7 @@ fn validate_session(session: &WorkspaceSessionV1) -> Result<(), DbError> {
         return Err(resource("workspace recovery drafts exceed 16 MiB"));
     }
     if let Some(active_path) = &session.active_path {
-        validate_relative_sql_path(active_path)?;
+        validate_text(active_path, 1, 32_768, "active document identity")?;
         if !session
             .open_documents
             .iter()
@@ -661,17 +1307,75 @@ fn validate_session(session: &WorkspaceSessionV1) -> Result<(), DbError> {
             ));
         }
     }
-    if session.root_path.is_none()
-        && (session.active_path.is_some() || !session.open_documents.is_empty())
-    {
-        return Err(invalid(
-            "workspace recovery documents require a workspace root",
-        ));
+    Ok(())
+}
+
+fn validate_recent_files(recent: &RecentFilesV1) -> Result<(), DbError> {
+    if recent.format_version != 1 {
+        return Err(unsupported_version("recent files", recent.format_version));
+    }
+    if recent.entries.len() > MAX_RECENT_FILES {
+        return Err(resource("recent-file limit exceeded"));
+    }
+    for (index, entry) in recent.entries.iter().enumerate() {
+        validate_recent_entry(entry)?;
+        if recent.entries[..index]
+            .iter()
+            .any(|candidate| candidate.locator == entry.locator)
+        {
+            return Err(invalid("recent-file locators must be unique"));
+        }
     }
     Ok(())
 }
 
-fn validate_profile(profile: &ConnectionProfileV1) -> Result<(), DbError> {
+fn validate_recent_entry(entry: &RecentFileEntry) -> Result<(), DbError> {
+    validate_text(&entry.name, 1, 255, "recent file name")?;
+    validate_document_locator(&entry.locator)?;
+    if matches!(entry.locator, DocumentLocator::Untitled { .. }) {
+        return Err(invalid("untitled documents cannot enter recent files"));
+    }
+    Ok(())
+}
+
+fn validate_document_locator(locator: &DocumentLocator) -> Result<(), DbError> {
+    match locator {
+        DocumentLocator::Workspace { root_path, path } => {
+            validate_absolute_path_text(root_path, "workspace root")?;
+            validate_relative_sql_path(path)
+        }
+        DocumentLocator::External { path } => {
+            validate_absolute_path_text(path, "external SQL file")?;
+            if !is_sql_path(Path::new(path)) {
+                return Err(invalid("external documents must use the .sql extension"));
+            }
+            Ok(())
+        }
+        DocumentLocator::Untitled { id } => validate_id(id, "untitled document ID"),
+    }
+}
+
+fn validate_profiles_v2(document: &ConnectionProfilesV2) -> Result<(), DbError> {
+    if document.format_version != PROFILES_VERSION {
+        return Err(unsupported_version(
+            "connection profiles",
+            document.format_version,
+        ));
+    }
+    if document.profiles.len() > MAX_CONNECTION_PROFILES {
+        return Err(resource("connection profile limit exceeded"));
+    }
+    let mut ids = BTreeSet::new();
+    for profile in &document.profiles {
+        validate_profile_v2(profile)?;
+        if !ids.insert(profile.profile_id.as_str()) {
+            return Err(invalid("connection profile IDs must be unique"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_profile_v2(profile: &ConnectionProfileV2) -> Result<(), DbError> {
     if profile.format_version != PROFILES_VERSION {
         return Err(unsupported_version(
             "connection profile",
@@ -690,6 +1394,52 @@ fn validate_profile(profile: &ConnectionProfileV1) -> Result<(), DbError> {
     if let Some(database) = &profile.database {
         validate_text(database, 1, 256, "database name")?;
     }
+    validate_choice(
+        &profile.tls_mode,
+        &["disable", "prefer", "require", "verifyCa", "verifyFull"],
+        "TLS mode",
+    )?;
+    if profile.data_source_kind != data_source_kind(&profile.connector_id) {
+        return Err(invalid(
+            "data source kind does not match the connector identity",
+        ));
+    }
+    match profile.data_source_kind {
+        DataSourceKind::OrdadbNative => {
+            if profile.connector_id != NATIVE_CONNECTOR_ID
+                || profile.dialect != "postgresql"
+                || profile.admin_endpoint.is_none()
+                || profile.tls_mode != "disable"
+            {
+                return Err(invalid("native OrdaDB profile fields are inconsistent"));
+            }
+        }
+        DataSourceKind::Postgresql => {
+            if profile.connector_id != "postgresql"
+                || profile.dialect != "postgresql"
+                || profile.admin_endpoint.is_some()
+            {
+                return Err(invalid(
+                    "external PostgreSQL profile fields are inconsistent",
+                ));
+            }
+        }
+        DataSourceKind::Mysql => {
+            if profile.connector_id != "mysql" || profile.dialect != "mysql" {
+                return Err(invalid("MySQL profile fields are inconsistent"));
+            }
+        }
+        DataSourceKind::Sqlite => {
+            if profile.connector_id != "sqlite" || profile.dialect != "sqlite" {
+                return Err(invalid("SQLite profile fields are inconsistent"));
+            }
+        }
+        DataSourceKind::SqlServer => {
+            if profile.connector_id != "sql-server" || profile.dialect != "sqlServer" {
+                return Err(invalid("SQL Server profile fields are inconsistent"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -703,6 +1453,25 @@ fn migrate_connector_id(connector_id: &str) -> &str {
     }
 }
 
+fn data_source_kind(connector_id: &str) -> DataSourceKind {
+    match migrate_connector_id(connector_id) {
+        NATIVE_CONNECTOR_ID => DataSourceKind::OrdadbNative,
+        "postgresql" => DataSourceKind::Postgresql,
+        "mysql" => DataSourceKind::Mysql,
+        "sqlite" => DataSourceKind::Sqlite,
+        "sql-server" => DataSourceKind::SqlServer,
+        _ => DataSourceKind::Postgresql,
+    }
+}
+
+fn validate_choice(value: &str, allowed: &[&str], field: &str) -> Result<(), DbError> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(invalid(format!("{field} is not supported")))
+    }
+}
+
 fn canonical_workspace_root(value: &str) -> Result<PathBuf, DbError> {
     validate_text(value, 1, 32_768, "workspace root")?;
     let root = fs::canonicalize(value)
@@ -711,6 +1480,55 @@ fn canonical_workspace_root(value: &str) -> Result<PathBuf, DbError> {
         return Err(invalid("SQL workspace root must be a directory"));
     }
     Ok(root)
+}
+
+fn canonical_external_sql_file(value: &str) -> Result<PathBuf, DbError> {
+    validate_absolute_path_text(value, "external SQL file")?;
+    let path = fs::canonicalize(value)
+        .map_err(|error| io_error("failed to open external SQL file", error))?;
+    if !path.is_file() || !is_sql_path(&path) {
+        return Err(invalid("external document must be an existing .sql file"));
+    }
+    Ok(path)
+}
+
+fn normalize_save_destination(selected_path: &Path) -> Result<PathBuf, DbError> {
+    if !selected_path.is_absolute() {
+        return Err(invalid("Save As destination must be an absolute path"));
+    }
+    let mut destination = selected_path.to_path_buf();
+    if destination.extension().is_none() {
+        destination.set_extension("sql");
+    }
+    if !is_sql_path(&destination) {
+        return Err(invalid("Save As destination must use the .sql extension"));
+    }
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| invalid("Save As destination has no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    validate_file_name(&file_name)?;
+    if destination.exists() {
+        return canonical_external_sql_file(&destination.display().to_string());
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| invalid("Save As destination has no parent directory"))?;
+    let parent = fs::canonicalize(parent)
+        .map_err(|error| io_error("failed to resolve Save As directory", error))?;
+    if !parent.is_dir() {
+        return Err(invalid("Save As parent must be a directory"));
+    }
+    Ok(parent.join(file_name))
+}
+
+fn validate_absolute_path_text(value: &str, context: &str) -> Result<(), DbError> {
+    validate_text(value, 1, 32_768, context)?;
+    if !Path::new(value).is_absolute() {
+        return Err(invalid(format!("{context} must be an absolute path")));
+    }
+    Ok(())
 }
 
 fn resolve_workspace_entry(root: &Path, relative: &str) -> Result<PathBuf, DbError> {
@@ -812,15 +1630,46 @@ fn is_sql_path(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("sql"))
 }
 
-fn read_sql_document(root: &Path, path: &Path) -> Result<SqlDocument, DbError> {
+fn read_workspace_document(root: &Path, path: &Path) -> Result<SqlDocument, DbError> {
     if !path.is_file() || !is_sql_path(path) {
         return Err(invalid("workspace document must be an existing .sql file"));
+    }
+    let relative = relative_display_path(root, path)?;
+    read_sql_document_at(
+        path,
+        DocumentLocator::Workspace {
+            root_path: root.display().to_string(),
+            path: relative.clone(),
+        },
+        relative,
+    )
+}
+
+fn read_external_document(path: &Path) -> Result<SqlDocument, DbError> {
+    let absolute = path.display().to_string();
+    read_sql_document_at(
+        path,
+        DocumentLocator::External {
+            path: absolute.clone(),
+        },
+        absolute,
+    )
+}
+
+fn read_sql_document_at(
+    path: &Path,
+    locator: DocumentLocator,
+    display_path: String,
+) -> Result<SqlDocument, DbError> {
+    if !path.is_file() || !is_sql_path(path) {
+        return Err(invalid("SQL document must be an existing .sql file"));
     }
     let (bytes, revision) = read_sql_file_snapshot(path)?;
     let content = String::from_utf8(bytes)
         .map_err(|error| invalid("SQL file must be valid UTF-8").with_detail(error.to_string()))?;
     Ok(SqlDocument {
-        path: relative_display_path(root, path)?,
+        locator,
+        path: display_path,
         name: path
             .file_name()
             .ok_or_else(|| invalid("SQL file has no name"))?
@@ -1036,6 +1885,7 @@ mod tests {
                 .bootstrap()
                 .expect("bootstrap")
                 .settings
+                .appearance
                 .ui_font_size,
             11
         );
@@ -1050,6 +1900,8 @@ mod tests {
                 active_path: Some("draft.sql".into()),
                 open_documents: vec![WorkspaceDraft {
                     path: "draft.sql".into(),
+                    locator: None,
+                    name: None,
                     content: "select 2;".into(),
                     base_revision: None,
                 }],
@@ -1105,6 +1957,82 @@ mod tests {
     }
 
     #[test]
+    fn external_documents_save_as_recent_files_and_untitled_recovery_are_bounded() {
+        let directory = tempdir().expect("tempdir");
+        let runtime = ConsoleRuntime::open(directory.path().join("state")).expect("runtime");
+        let external = directory.path().join("outside.sql");
+        fs::write(&external, "select 1;").expect("external SQL");
+
+        let opened = runtime
+            .open_external_document(&ExternalDocumentRequest {
+                path: external.display().to_string(),
+            })
+            .expect("open external");
+        assert!(matches!(
+            &opened.locator,
+            DocumentLocator::External { path } if Path::new(path).is_absolute()
+        ));
+        runtime
+            .open_external_document(&ExternalDocumentRequest {
+                path: external.display().to_string(),
+            })
+            .expect("reopen external");
+        assert_eq!(
+            runtime
+                .load_recent_files()
+                .expect("recent files")
+                .entries
+                .len(),
+            1,
+            "normalized absolute paths must be deduplicated"
+        );
+
+        fs::write(&external, "select 2;").expect("external edit");
+        let error = runtime
+            .save_external_document(&SaveExternalDocumentRequest {
+                path: external.display().to_string(),
+                content: "select 3;".into(),
+                expected_revision: Some(opened.revision),
+                force: false,
+            })
+            .expect_err("external conflict");
+        assert_eq!(error.sql_state, "40001");
+
+        let saved = runtime
+            .save_document_as_path(
+                &SaveDocumentAsRequest {
+                    content: "select 42;".into(),
+                    suggested_name: "query.sql".into(),
+                },
+                &directory.path().join("saved-query"),
+            )
+            .expect("Save As");
+        assert_eq!(saved.name, "saved-query.sql");
+        assert_eq!(
+            fs::read_to_string(directory.path().join("saved-query.sql")).expect("saved SQL"),
+            "select 42;"
+        );
+
+        runtime
+            .save_session(WorkspaceSessionV1 {
+                format_version: 1,
+                root_path: None,
+                active_path: Some("untitled:1".into()),
+                open_documents: vec![WorkspaceDraft {
+                    path: "untitled:1".into(),
+                    locator: Some(DocumentLocator::Untitled {
+                        id: "untitled-1".into(),
+                    }),
+                    name: Some("未命名-1.sql".into()),
+                    content: "select now();".into(),
+                    base_revision: None,
+                }],
+            })
+            .expect("untitled recovery");
+        assert!(runtime.bootstrap().expect("bootstrap").recovery.is_some());
+    }
+
+    #[test]
     fn workspace_rejects_intermediate_reparse_points() {
         let directory = tempdir().expect("tempdir");
         let runtime = ConsoleRuntime::open(directory.path().join("state")).expect("runtime");
@@ -1144,18 +2072,21 @@ mod tests {
         let directory = tempdir().expect("tempdir");
         let runtime = ConsoleRuntime::open(directory.path().join("state")).expect("runtime");
         let profiles = runtime
-            .save_profile(ConnectionProfileV1 {
-                format_version: 1,
-                profile_id: "local".into(),
-                label: "本地 OrdaDB".into(),
-                connector_id: NATIVE_CONNECTOR_ID.into(),
-                dialect: "postgresql".into(),
-                endpoint: "127.0.0.1:54329".into(),
-                admin_endpoint: Some("http://127.0.0.1:9080".into()),
-                database: Some("ordadb".into()),
-                credential_id: "local-credential".into(),
-                auto_reconnect: true,
-            })
+            .save_profile(
+                ConnectionProfileV1 {
+                    format_version: 1,
+                    profile_id: "local".into(),
+                    label: "本地 OrdaDB".into(),
+                    connector_id: NATIVE_CONNECTOR_ID.into(),
+                    dialect: "postgresql".into(),
+                    endpoint: "127.0.0.1:54329".into(),
+                    admin_endpoint: Some("http://127.0.0.1:9080".into()),
+                    database: Some("ordadb".into()),
+                    credential_id: "local-credential".into(),
+                    auto_reconnect: true,
+                }
+                .into(),
+            )
             .expect("profile");
         assert_eq!(profiles.len(), 1);
         let encoded = fs::read_to_string(runtime.root.join(PROFILES_FILE)).expect("read profiles");
@@ -1170,9 +2101,9 @@ mod tests {
         let root = directory.path().join("state");
         fs::create_dir_all(&root).expect("state directory");
         let document = ConnectionProfilesV1 {
-            format_version: PROFILES_VERSION,
+            format_version: 1,
             profiles: vec![ConnectionProfileV1 {
-                format_version: PROFILES_VERSION,
+                format_version: 1,
                 profile_id: "legacy-local".into(),
                 label: "Legacy local".into(),
                 connector_id: "ordadb-postgresql".into(),
@@ -1184,11 +2115,15 @@ mod tests {
                 auto_reconnect: true,
             }],
         };
-        write_json_atomic(&root.join(PROFILES_FILE), &document).expect("legacy document");
+        write_json_atomic(&root.join(LEGACY_PROFILES_FILE), &document).expect("legacy document");
 
         let runtime = ConsoleRuntime::open(root).expect("runtime");
         let migrated = runtime.load_profiles().expect("migrated profiles");
         assert_eq!(migrated.profiles[0].connector_id, NATIVE_CONNECTOR_ID);
+        assert_eq!(
+            migrated.profiles[0].data_source_kind,
+            DataSourceKind::OrdadbNative
+        );
         assert_eq!(
             migrated.profiles[0].credential_id, "credential-reference",
             "the Credential Manager reference must survive ID migration"
@@ -1197,5 +2132,55 @@ mod tests {
             fs::read_to_string(runtime.root.join(PROFILES_FILE)).expect("persisted migration");
         assert!(persisted.contains("\"connectorId\": \"ordadb-native\""));
         assert!(!persisted.contains("ordadb-postgresql"));
+    }
+
+    #[test]
+    fn legacy_settings_migrate_to_v2_without_deleting_the_source() {
+        let directory = tempdir().expect("tempdir");
+        let root = directory.path().join("state");
+        fs::create_dir_all(&root).expect("state directory");
+        let legacy = ConsoleSettingsV1 {
+            format_version: 1,
+            ui_font_size: 10,
+            data_font_size: 13,
+            editor_font_size: 14,
+            density: "compact".into(),
+            reopen_last_project: true,
+            hide_empty_catalog: false,
+        };
+        write_json_atomic(&root.join(LEGACY_SETTINGS_FILE), &legacy).expect("legacy settings");
+
+        let runtime = ConsoleRuntime::open(root).expect("runtime");
+        let migrated = runtime.load_settings().expect("migrated settings");
+        assert_eq!(migrated.format_version, 2);
+        assert_eq!(migrated.appearance.ui_font_size, 10);
+        assert_eq!(migrated.appearance.data_font_size, 13);
+        assert_eq!(migrated.editor.font_size, 14);
+        assert!(migrated.files.reopen_last_project);
+        assert!(!migrated.appearance.hide_empty_catalog);
+        assert!(runtime.root.join(LEGACY_SETTINGS_FILE).exists());
+        assert!(runtime.root.join(SETTINGS_FILE).exists());
+    }
+
+    #[test]
+    fn postgresql_profiles_cannot_carry_native_admin_fields() {
+        let mut profile = ConnectionProfileV2 {
+            format_version: PROFILES_VERSION,
+            profile_id: "external-pg".into(),
+            label: "PostgreSQL".into(),
+            data_source_kind: DataSourceKind::Postgresql,
+            connector_id: "postgresql".into(),
+            dialect: "postgresql".into(),
+            endpoint: "127.0.0.1:5432".into(),
+            admin_endpoint: None,
+            database: Some("postgres".into()),
+            tls_mode: "prefer".into(),
+            credential_id: "external-credential".into(),
+            auto_reconnect: false,
+        };
+        validate_profile_v2(&profile).expect("valid external PostgreSQL");
+        profile.admin_endpoint = Some("http://127.0.0.1:9080".into());
+        let error = validate_profile_v2(&profile).expect_err("native admin endpoint rejected");
+        assert_eq!(error.sql_state, "22023");
     }
 }
