@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="SQLite">
+  <rect x="5" y="8" width="28" height="32" rx="5" fill="#0F80CC"/>
+  <path fill="#fff" opacity=".95" d="M10 14h18v4H10zm0 8h18v4H10zm0 8h12v4H10z"/>
+  <path fill="#7BC8F0" d="M42.2 5.4c-7.6 2.2-13.3 7.3-16.9 15.4l3.5 1.8C31.6 16 35.3 11.7 40 9.7c-3.8 3.8-6.6 8.2-8.4 13.3l3.2 1.3c2.1-6.9 4.6-13.2 7.4-18.9Z"/>
+  <path fill="#075D91" d="m24.4 36.6 4.4-14 6 2.4-6.6 13.3-3.8-1.7Z"/>
+</svg>

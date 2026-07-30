@@ -34,3 +34,14 @@ export async function runWindowAction(action: WindowAction): Promise<void> {
     await appWindow.toggleMaximize();
   }
 }
+
+export async function subscribeFileDrops(
+  listener: (paths: string[]) => void,
+): Promise<() => void> {
+  if (!isTauriRuntime()) return () => {};
+  return getCurrentWindow().onDragDropEvent((event) => {
+    if (event.payload.type === "drop") {
+      listener(event.payload.paths);
+    }
+  });
+}

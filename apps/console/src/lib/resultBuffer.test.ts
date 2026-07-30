@@ -50,4 +50,29 @@ describe("result buffer", () => {
       bytes: 0,
     });
   });
+
+  it("uses configured page, row, and byte limits", () => {
+    const rowBounded = appendResultRows(
+      emptyResultBuffer(),
+      [["one"], ["two"], ["three"]],
+      { pageRows: 1, maxRows: 2, maxBytes: 1_024 },
+    );
+    expect(rowBounded).toMatchObject({
+      rowCount: 2,
+      totalRows: 3,
+      droppedRows: 1,
+    });
+    expect(rowBounded.pages).toHaveLength(2);
+
+    const byteBounded = appendResultRows(
+      emptyResultBuffer(),
+      [["too large"]],
+      { pageRows: 50, maxRows: 100, maxBytes: 8 },
+    );
+    expect(byteBounded).toMatchObject({
+      rowCount: 0,
+      totalRows: 1,
+      droppedRows: 1,
+    });
+  });
 });

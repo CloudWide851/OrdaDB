@@ -1,10 +1,11 @@
 import {
   Cable,
-  CheckCircle2,
-  Circle,
+  Check,
   DatabaseZap,
+  LoaderCircle,
   PlugZap,
   ShieldCheck,
+  TriangleAlert,
   Unplug,
   UserPlus,
   X,
@@ -36,7 +37,7 @@ const defaults: DataSourceValues = {
   database: "ordadb",
   credentialId: "ordadb-local",
   username: "ordadb_admin",
-  password: "",
+  tlsMode: "disable",
 };
 
 export function DataSourceDialog({
@@ -48,6 +49,7 @@ export function DataSourceDialog({
   const [submitting, setSubmitting] = useState(false);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const runtimeMode = useWorkbenchStore((state) => state.runtimeMode);
   const connection = useWorkbenchStore((state) => state.connection);
   const activeCredentialId = useWorkbenchStore(
     (state) => state.activeCredentialId,
@@ -78,16 +80,22 @@ export function DataSourceDialog({
 
   const selectedConnector = getConnectorDefinition(values.connectorId);
   const native = selectedConnector.id === "ordadb-native";
-  const preview = connection?.mode === "preview";
-  const needsBootstrap = connectionProbe?.stages.some(
-    (stage) =>
-      stage.stage === "initialization" &&
-      stage.status === "failed" &&
-      stage.error?.sqlState === "55000",
-  );
+  const postgresql = selectedConnector.id === "postgresql";
+  const preview = runtimeMode === "preview";
+  const activeConnector = connection
+    ? getConnectorDefinition(connection.connectorId)
+    : null;
+  const needsBootstrap =
+    native &&
+    Boolean(connectionProbe?.bootstrapTicket) &&
+    connectionProbe?.stages.some(
+      (stage) =>
+        stage.stage === "initialization" &&
+        stage.status === "failed" &&
+        stage.error?.sqlState === "55000",
+    );
 
   const close = () => {
-    setValues((current) => ({ ...current, password: "" }));
     onClose();
     window.setTimeout(() => previousFocusRef.current?.focus());
   };
@@ -97,7 +105,6 @@ export function DataSourceDialog({
     setSubmitting(true);
     try {
       await connectDataSource(values);
-      setValues((current) => ({ ...current, password: "" }));
       close();
     } catch {
       // The store owns the structured error rendered below.
@@ -109,12 +116,7 @@ export function DataSourceDialog({
   const bootstrap = async () => {
     setSubmitting(true);
     try {
-      await bootstrapAdministrator({
-        username: values.username,
-        password: values.password,
-      });
-      await connectDataSource(values);
-      setValues((current) => ({ ...current, password: "" }));
+      await bootstrapAdministrator(values);
       close();
     } catch {
       // The store owns the structured error rendered below.
@@ -159,10 +161,10 @@ export function DataSourceDialog({
           />
         </header>
 
-        {connection && (
+        {connection && activeConnector && (
           <div className="active-connection" role="status">
             <span className="active-connection-mark" aria-hidden="true">
-              <Cable size={16} />
+              <img src={activeConnector.logoUrl} alt="" />
             </span>
             <div>
               <strong>{connection.database}</strong>
@@ -183,7 +185,7 @@ export function DataSourceDialog({
           </div>
         )}
 
-        {connectionProbe && (
+        {connectionProbe && native && (
           <ol className="connection-probe" aria-label="连接诊断">
             {connectionProbe.stages.map((stage) => (
               <li
@@ -191,11 +193,11 @@ export function DataSourceDialog({
                 key={stage.stage}
               >
                 {stage.status === "passed" ? (
-                  <CheckCircle2 size={14} aria-hidden="true" />
+                  <Check size={14} aria-hidden="true" />
                 ) : stage.status === "failed" ? (
                   <XCircle size={14} aria-hidden="true" />
                 ) : (
-                  <Circle size={14} aria-hidden="true" />
+                  <TriangleAlert size={14} aria-hidden="true" />
                 )}
                 <span>{probeStageLabel(stage.stage)}</span>
                 {stage.error && <small>{stage.error.message}</small>}
@@ -209,12 +211,12 @@ export function DataSourceDialog({
             <UserPlus size={17} aria-hidden="true" />
             <div>
               <strong>创建首位管理员</strong>
-              <span>使用下方用户名和密码完成一次本机初始化。</span>
+              <span>仅通过本机受保护通道执行一次。</span>
             </div>
             <button
               className="secondary-action"
               type="button"
-              disabled={submitting || !values.password}
+              disabled={submitting}
               onClick={() => void bootstrap()}
             >
               初始化并连接
@@ -223,38 +225,59 @@ export function DataSourceDialog({
         )}
 
         <form className="data-source-form" onSubmit={(event) => void submit(event)}>
-          <label className="form-field form-field--wide">
-            <span>连接类型</span>
-            <select
-              value={values.connectorId}
-              onChange={(event) => {
-                const connector = getConnectorDefinition(event.target.value);
-                setValues((current) => ({
-                  ...current,
-                  connectorId: connector.id,
-                  dialect: connector.sqlDialect,
-                  endpoint:
-                    connector.id === "ordadb-native"
-                      ? "127.0.0.1:54329"
-                      : "",
-                }));
-              }}
-            >
+          <fieldset className="data-source-picker form-field--wide">
+            <legend>数据库</legend>
+            <div>
               {connectorDefinitions.map((connector) => (
-                <option value={connector.id} key={connector.id}>
-                  {connector.displayName}
-                </option>
+                <button
+                  className={
+                    connector.id === selectedConnector.id
+                      ? "data-source-choice data-source-choice--active"
+                      : "data-source-choice"
+                  }
+                  type="button"
+                  key={connector.id}
+                  aria-pressed={connector.id === selectedConnector.id}
+                  onClick={() =>
+                    setValues((current) => ({
+                      ...current,
+                      connectorId: connector.id,
+                      dialect: connector.sqlDialect,
+                      endpoint: connector.defaultEndpoint,
+                      adminEndpoint: connector.defaultAdminEndpoint,
+                      database: connector.defaultDatabase,
+                      tlsMode: connector.defaultTlsMode,
+                      credentialId:
+                        connector.id === "ordadb-native"
+                          ? "ordadb-local"
+                          : `${connector.id}-default`,
+                    }))
+                  }
+                >
+                  <img src={connector.logoUrl} alt="" />
+                  <span>{connector.displayName}</span>
+                </button>
               ))}
-            </select>
-          </label>
+            </div>
+          </fieldset>
+
+          <div className="data-source-identity form-field--wide">
+            <img src={selectedConnector.logoUrl} alt="" />
+            <div>
+              <strong>{selectedConnector.displayName}</strong>
+              <span>
+                {native ? "OrdaDB 本地服务" : "外部数据库"}
+              </span>
+            </div>
+          </div>
 
           <label className="form-field">
-            <span>地址</span>
+            <span>{native ? "服务地址" : "主机与端口"}</span>
             <input
               required
               autoComplete="off"
               value={values.endpoint}
-              placeholder={native ? "127.0.0.1:54329" : "连接地址"}
+              placeholder={selectedConnector.defaultEndpoint || "连接地址"}
               onChange={(event) =>
                 setValues((current) => ({
                   ...current,
@@ -294,6 +317,27 @@ export function DataSourceDialog({
             </label>
           )}
 
+          {postgresql && (
+            <label className="form-field form-field--wide">
+              <span>TLS</span>
+              <select
+                value={values.tlsMode}
+                onChange={(event) =>
+                  setValues((current) => ({
+                    ...current,
+                    tlsMode: event.target.value as DataSourceValues["tlsMode"],
+                  }))
+                }
+              >
+                <option value="disable">Disable</option>
+                <option value="prefer">Prefer</option>
+                <option value="require">Require</option>
+                <option value="verifyCa">Verify CA</option>
+                <option value="verifyFull">Verify Full</option>
+              </select>
+            </label>
+          )}
+
           <label className="form-field">
             <span>用户</span>
             <input
@@ -304,22 +348,6 @@ export function DataSourceDialog({
                 setValues((current) => ({
                   ...current,
                   username: event.target.value,
-                }))
-              }
-            />
-          </label>
-
-          <label className="form-field">
-            <span>密码</span>
-            <input
-              required
-              type="password"
-              autoComplete="current-password"
-              value={values.password}
-              onChange={(event) =>
-                setValues((current) => ({
-                  ...current,
-                  password: event.target.value,
                 }))
               }
             />
@@ -354,7 +382,9 @@ export function DataSourceDialog({
           <footer className="dbms-dialog-footer form-field--wide">
             <span className="credential-boundary">
               <ShieldCheck size={15} aria-hidden="true" />
-              密码仅提交到桌面凭据库
+              {preview
+                ? "Preview 不保存数据库密码"
+                : "密码由 Windows 安全提示直接写入凭据库，不进入网页界面"}
             </span>
             {!native && (
               <button
@@ -381,7 +411,15 @@ export function DataSourceDialog({
               type="submit"
               disabled={submitting || connectionState === "connecting"}
             >
-              <Cable size={15} aria-hidden="true" />
+              {submitting || connectionState === "connecting" ? (
+                <LoaderCircle
+                  className="connector-spinner"
+                  size={15}
+                  aria-hidden="true"
+                />
+              ) : (
+                <Cable size={15} aria-hidden="true" />
+              )}
               {submitting || connectionState === "connecting" ? "连接中" : "连接"}
             </button>
           </footer>

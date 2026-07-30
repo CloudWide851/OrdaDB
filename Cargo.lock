@@ -3434,6 +3434,7 @@ dependencies = [
  "ordadb-protocol",
  "ordadb-server",
  "ordadb-types",
+ "ordadb-windows",
  "reqwest",
  "rfd",
  "serde",

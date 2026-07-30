@@ -7,6 +7,8 @@ import { DataSourceDialog } from "./components/DataSourceDialog";
 import { EditorPane } from "./components/EditorPane";
 import { ObjectInspector } from "./components/ObjectInspector";
 import { OperationsPanel } from "./components/OperationsPanel";
+import { NavigationBar } from "./components/NavigationBar";
+import { QuickOpen } from "./components/QuickOpen";
 import { ResultsPane } from "./components/ResultsPane";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { SchemaPane } from "./components/SchemaPane";
@@ -14,10 +16,11 @@ import { StatusBar } from "./components/StatusBar";
 import { TitleBar } from "./components/TitleBar";
 import { WorkspaceRecovery } from "./components/WorkspaceRecovery";
 import {
+  commandForKeyboardEvent,
   commandById,
   type WorkbenchCommandId,
 } from "./data/commands";
-import { getAppStatus } from "./lib/tauri";
+import { getAppStatus, subscribeFileDrops } from "./lib/tauri";
 import {
   useWorkbenchStore,
   type OperationView,
@@ -56,6 +59,7 @@ function useCenterWorkspaceFlip(
     if (
       !previousRect ||
       reducedMotion ||
+      document.documentElement.dataset.reduceMotion === "true" ||
       typeof element.animate !== "function" ||
       nextRect.width === 0
     ) {
@@ -102,11 +106,22 @@ function Workbench() {
   );
   const dataSourceOpen = useWorkbenchStore((state) => state.dataSourceOpen);
   const settingsOpen = useWorkbenchStore((state) => state.settingsOpen);
+  const quickOpenMode = useWorkbenchStore((state) => state.quickOpenMode);
   const recovery = useWorkbenchStore((state) => state.recovery);
   const operationsOpen = useWorkbenchStore((state) => state.operationsOpen);
   const initialize = useWorkbenchStore((state) => state.initialize);
   const toggleSchema = useWorkbenchStore((state) => state.toggleSchema);
   const toggleInspector = useWorkbenchStore((state) => state.toggleInspector);
+  const setSchemaVisible = useWorkbenchStore(
+    (state) => state.setSchemaVisible,
+  );
+  const setInspectorVisible = useWorkbenchStore(
+    (state) => state.setInspectorVisible,
+  );
+  const setSidebarView = useWorkbenchStore((state) => state.setSidebarView);
+  const setQuickOpenMode = useWorkbenchStore(
+    (state) => state.setQuickOpenMode,
+  );
   const setCommandPaletteOpen = useWorkbenchStore(
     (state) => state.setCommandPaletteOpen,
   );
@@ -122,9 +137,22 @@ function Workbench() {
   );
   const setNotice = useWorkbenchStore((state) => state.setNotice);
   const openWorkspace = useWorkbenchStore((state) => state.openWorkspace);
+  const openFile = useWorkbenchStore((state) => state.openFile);
+  const openExternalFiles = useWorkbenchStore(
+    (state) => state.openExternalFiles,
+  );
   const createDocument = useWorkbenchStore((state) => state.createDocument);
+  const saveActiveDocument = useWorkbenchStore(
+    (state) => state.saveActiveDocument,
+  );
+  const saveActiveDocumentAs = useWorkbenchStore(
+    (state) => state.saveActiveDocumentAs,
+  );
   const saveAllDocuments = useWorkbenchStore(
     (state) => state.saveAllDocuments,
+  );
+  const formatActiveDocument = useWorkbenchStore(
+    (state) => state.formatActiveDocument,
   );
   const restoreRecovery = useWorkbenchStore((state) => state.restoreRecovery);
   const discardRecovery = useWorkbenchStore((state) => state.discardRecovery);
@@ -157,6 +185,20 @@ function Workbench() {
         toggleInspector();
         return;
       }
+      if (commandId === "database-view") {
+        setSchemaVisible(true);
+        setSidebarView("database");
+        return;
+      }
+      if (commandId === "files-view") {
+        setSchemaVisible(true);
+        setSidebarView("workspace");
+        return;
+      }
+      if (commandId === "object-inspector") {
+        setInspectorVisible(true);
+        return;
+      }
       if (commandId === "command-palette") {
         setCommandPaletteOpen(true);
         return;
@@ -181,12 +223,40 @@ function Workbench() {
         void createDocument();
         return;
       }
+      if (commandId === "open-file") {
+        void openFile();
+        return;
+      }
       if (commandId === "open-project") {
         void openWorkspace();
         return;
       }
       if (commandId === "save-all") {
         void saveAllDocuments();
+        return;
+      }
+      if (commandId === "save-file") {
+        void saveActiveDocument();
+        return;
+      }
+      if (commandId === "save-as") {
+        void saveActiveDocumentAs();
+        return;
+      }
+      if (commandId === "format-sql") {
+        formatActiveDocument();
+        return;
+      }
+      if (commandId === "recent-files") {
+        setQuickOpenMode("recent");
+        return;
+      }
+      if (commandId === "go-to-file") {
+        setQuickOpenMode("files");
+        return;
+      }
+      if (commandId === "focus-navigation") {
+        document.querySelector<HTMLElement>("[data-navigation-bar]")?.focus();
         return;
       }
       if (commandId === "settings") {
@@ -205,13 +275,21 @@ function Workbench() {
     [
       cancelQuery,
       createDocument,
+      formatActiveDocument,
+      openFile,
       openWorkspace,
       openOperations,
       runExplain,
       runQuery,
       saveAllDocuments,
+      saveActiveDocument,
+      saveActiveDocumentAs,
       setCommandPaletteOpen,
       setDataSourceOpen,
+      setInspectorVisible,
+      setQuickOpenMode,
+      setSchemaVisible,
+      setSidebarView,
       setSettingsOpen,
       setPluginManagerOpen,
       setNotice,
@@ -221,72 +299,67 @@ function Workbench() {
   );
 
   useEffect(() => {
+    let lastShiftAt = 0;
     const handleKeyDown = (event: KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-        event.preventDefault();
-        void runQuery();
-      } else if (
-        (event.metaKey || event.ctrlKey) &&
-        event.shiftKey &&
-        event.key.toLowerCase() === "p"
+      const modalOwnsFocus =
+        commandPaletteOpen ||
+        pluginManagerOpen ||
+        dataSourceOpen ||
+        settingsOpen ||
+        operationsOpen ||
+        recovery !== null ||
+        quickOpenMode !== null;
+      if (event.isComposing || event.repeat || modalOwnsFocus) {
+        lastShiftAt = 0;
+        return;
+      }
+      if (
+        event.key === "Shift" &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !event.metaKey
       ) {
+        const now = performance.now();
+        if (now - lastShiftAt <= 400) {
+          event.preventDefault();
+          lastShiftAt = 0;
+          setQuickOpenMode("global");
+        } else {
+          lastShiftAt = now;
+        }
+        return;
+      }
+      lastShiftAt = 0;
+      const commandId = commandForKeyboardEvent(event);
+      if (commandId) {
         event.preventDefault();
-        setCommandPaletteOpen(true);
-      } else if (
-        (event.metaKey || event.ctrlKey) &&
-        event.altKey &&
-        event.shiftKey &&
-        event.key.toLowerCase() === "s"
-      ) {
-        event.preventDefault();
-        setPluginManagerOpen(true);
-      } else if (
-        (event.metaKey || event.ctrlKey) &&
-        event.key.toLowerCase() === "o"
-      ) {
-        event.preventDefault();
-        void openWorkspace();
-      } else if (
-        (event.metaKey || event.ctrlKey) &&
-        event.altKey &&
-        event.key.toLowerCase() === "s"
-      ) {
-        event.preventDefault();
-        setSettingsOpen(true);
-      } else if (
-        (event.metaKey || event.ctrlKey) &&
-        event.key.toLowerCase() === "s"
-      ) {
-        event.preventDefault();
-        void saveAllDocuments();
-      } else if (
-        (event.metaKey || event.ctrlKey) &&
-        event.key.toLowerCase() === "n"
-      ) {
-        event.preventDefault();
-        void createDocument();
-      } else if (event.altKey && event.key === "1") {
-        event.preventDefault();
-        toggleSchema();
-      } else if (event.altKey && event.key === "2") {
-        event.preventDefault();
-        toggleInspector();
+        handleCommand(commandId);
       }
     };
 
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
   }, [
-    runQuery,
-    createDocument,
-    openWorkspace,
-    saveAllDocuments,
-    setCommandPaletteOpen,
-    setPluginManagerOpen,
-    setSettingsOpen,
-    toggleInspector,
-    toggleSchema,
+    commandPaletteOpen,
+    dataSourceOpen,
+    handleCommand,
+    operationsOpen,
+    pluginManagerOpen,
+    quickOpenMode,
+    recovery,
+    setQuickOpenMode,
+    settingsOpen,
   ]);
+
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    void subscribeFileDrops((paths) => {
+      void openExternalFiles(paths);
+    }).then((unlisten) => {
+      dispose = unlisten;
+    });
+    return () => dispose?.();
+  }, [openExternalFiles]);
 
   return (
     <div className="app-shell">
@@ -295,6 +368,7 @@ function Workbench() {
         inspectorVisible={inspectorVisible}
         onCommand={handleCommand}
       />
+      <NavigationBar />
 
       <main
         className={`workbench ${
@@ -327,6 +401,7 @@ function Workbench() {
         onClose={() => setCommandPaletteOpen(false)}
         onCommand={handleCommand}
       />
+      <QuickOpen onCommand={handleCommand} />
       <ConnectorManager
         open={pluginManagerOpen}
         onClose={() => setPluginManagerOpen(false)}

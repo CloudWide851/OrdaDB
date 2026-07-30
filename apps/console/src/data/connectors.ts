@@ -1,3 +1,12 @@
+import ordadbLogoUrl from "../../../../logo.svg?url";
+import mysqlLogoUrl from "../assets/connectors/mysql.svg?url";
+import postgresqlLogoUrl from "../assets/connectors/postgresql.svg?url";
+import sqliteLogoUrl from "../assets/connectors/sqlite.svg?url";
+import sqlServerLogoUrl from "../assets/connectors/sql-server.svg?url";
+import type {
+  ConnectorDescriptor,
+  DataSourceKind,
+} from "../lib/consoleClient";
 import type { SqlDialect } from "../types";
 
 export type ConnectorManifestDialect =
@@ -80,8 +89,14 @@ export interface PluginOperationStarted {
 
 export interface ConnectorDefinition {
   id: string;
+  dataSourceKind: DataSourceKind;
   displayName: string;
   shortName: string;
+  logoUrl: string;
+  defaultEndpoint: string;
+  defaultAdminEndpoint?: string;
+  defaultDatabase?: string;
+  defaultTlsMode: ConnectorDescriptor["defaultTlsMode"];
   dialect: ConnectorManifestDialect;
   sqlDialect: SqlDialect;
   publisher: string;
@@ -93,14 +108,21 @@ export interface ConnectorViewModel
   extends Omit<PluginCatalogItem, "lifecycle"> {
   shortName: string;
   sqlDialect: SqlDialect;
+  logoUrl: string;
   lifecycle: ConnectorViewLifecycle;
 }
 
 export const connectorDefinitions: ConnectorDefinition[] = [
   {
     id: "ordadb-native",
+    dataSourceKind: "ordadbNative",
     displayName: "OrdaDB",
     shortName: "OrdaDB",
+    logoUrl: ordadbLogoUrl,
+    defaultEndpoint: "127.0.0.1:54329",
+    defaultAdminEndpoint: "http://127.0.0.1:9080",
+    defaultDatabase: "ordadb",
+    defaultTlsMode: "disable",
     dialect: "postgreSql",
     sqlDialect: "postgresql",
     publisher: "OrdaDB",
@@ -109,8 +131,13 @@ export const connectorDefinitions: ConnectorDefinition[] = [
   },
   {
     id: "postgresql",
+    dataSourceKind: "postgresql",
     displayName: "PostgreSQL",
     shortName: "PostgreSQL",
+    logoUrl: postgresqlLogoUrl,
+    defaultEndpoint: "127.0.0.1:5432",
+    defaultDatabase: "postgres",
+    defaultTlsMode: "prefer",
     dialect: "postgreSql",
     sqlDialect: "postgresql",
     publisher: "OrdaDB",
@@ -119,8 +146,12 @@ export const connectorDefinitions: ConnectorDefinition[] = [
   },
   {
     id: "mysql",
+    dataSourceKind: "mysql",
     displayName: "MySQL",
     shortName: "MySQL",
+    logoUrl: mysqlLogoUrl,
+    defaultEndpoint: "127.0.0.1:3306",
+    defaultTlsMode: "prefer",
     dialect: "mySql",
     sqlDialect: "mysql",
     publisher: "OrdaDB",
@@ -129,8 +160,12 @@ export const connectorDefinitions: ConnectorDefinition[] = [
   },
   {
     id: "sqlite",
+    dataSourceKind: "sqlite",
     displayName: "SQLite",
     shortName: "SQLite",
+    logoUrl: sqliteLogoUrl,
+    defaultEndpoint: "",
+    defaultTlsMode: "disable",
     dialect: "sqlite",
     sqlDialect: "sqlite",
     publisher: "OrdaDB",
@@ -139,8 +174,12 @@ export const connectorDefinitions: ConnectorDefinition[] = [
   },
   {
     id: "sql-server",
+    dataSourceKind: "sqlServer",
     displayName: "SQL Server",
     shortName: "SQL Server",
+    logoUrl: sqlServerLogoUrl,
+    defaultEndpoint: "127.0.0.1:1433",
+    defaultTlsMode: "require",
     dialect: "sqlServer",
     sqlDialect: "sqlServer",
     publisher: "OrdaDB",
@@ -170,6 +209,7 @@ export function projectConnectorCatalog(
         ...plugin,
         shortName: definition.shortName,
         sqlDialect: definition.sqlDialect,
+        logoUrl: definition.logoUrl,
       };
     }
     return {

@@ -12,10 +12,10 @@ export interface DbmsError {
   queryId: string;
 }
 
-export interface SaveCredentialRequest {
+export interface PromptCredentialRequest {
   credentialId: string;
-  username: string;
-  password: string;
+  connectorId: string;
+  suggestedUsername: string;
 }
 
 export interface CredentialSaved {
@@ -49,11 +49,18 @@ export interface ConnectionProbeStage {
 export interface ConnectionProbe {
   ready: boolean;
   stages: ConnectionProbeStage[];
+  bootstrapTicket: LocalBootstrapTicket | null;
+}
+
+export interface LocalBootstrapTicket {
+  ticket: string;
+  expiresInMs: number;
 }
 
 export interface BootstrapAdminRequest {
-  username: string;
-  password: string;
+  ticket: string;
+  connection: DbmsConnectionRequest;
+  suggestedUsername: string;
 }
 
 export interface BootstrapAdminResult {
@@ -229,7 +236,9 @@ export interface DbmsServiceStatus {
 
 export interface DbmsClient {
   readonly mode: "desktop" | "preview";
-  saveCredential(request: SaveCredentialRequest): Promise<CredentialSaved>;
+  promptCredential(
+    request: PromptCredentialRequest,
+  ): Promise<CredentialSaved | null>;
   deleteCredential(credentialId: string): Promise<void>;
   probe(request: DbmsConnectionRequest): Promise<ConnectionProbe>;
   bootstrapAdmin(request: BootstrapAdminRequest): Promise<BootstrapAdminResult>;
@@ -336,8 +345,8 @@ const previewCatalog: DbmsCatalogObject[] = [
 class TauriDbmsClient implements DbmsClient {
   readonly mode = "desktop";
 
-  saveCredential(request: SaveCredentialRequest) {
-    return invoke<CredentialSaved>("dbms_save_credential", { request });
+  promptCredential(request: PromptCredentialRequest) {
+    return invoke<CredentialSaved | null>("dbms_prompt_credential", { request });
   }
 
   deleteCredential(credentialId: string) {
@@ -456,15 +465,16 @@ export class PreviewDbmsClient implements DbmsClient {
     },
   ];
 
-  saveCredential: DbmsClient["saveCredential"] = async (request) => ({
+  promptCredential: DbmsClient["promptCredential"] = async (request) => ({
     credentialId: request.credentialId,
-    username: request.username,
+    username: request.suggestedUsername,
   });
 
   deleteCredential: DbmsClient["deleteCredential"] = async () => {};
 
   probe: DbmsClient["probe"] = async () => ({
     ready: true,
+    bootstrapTicket: null,
     stages: [
       "service",
       "pgPort",
@@ -481,7 +491,7 @@ export class PreviewDbmsClient implements DbmsClient {
 
   bootstrapAdmin: DbmsClient["bootstrapAdmin"] = async (request) => ({
     success: true,
-    user: request.username,
+    user: request.suggestedUsername,
     error: null,
   });
 

@@ -262,7 +262,7 @@ export function ConnectorManager({ open, onClose }: ConnectorManagerProps) {
                   key={connector.id}
                 >
                   <div className="connector-mark" aria-hidden="true">
-                    {connector.shortName.slice(0, 2).toUpperCase()}
+                    <img src={connector.logoUrl} alt="" />
                   </div>
                   <div className="connector-identity">
                     <strong>{connector.displayName}</strong>

@@ -5,8 +5,11 @@ import Editor, {
 } from "@monaco-editor/react";
 import {
   AlignLeft,
+  Braces,
   Check,
   ChevronDown,
+  FileOutput,
+  FilePenLine,
   GitBranch,
   ListTree,
   Play,
@@ -14,9 +17,10 @@ import {
   RotateCcw,
   Save,
   Square,
+  TriangleAlert,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   formatSqlForDialect,
   getSqlDialect,
@@ -46,6 +50,27 @@ const configureMonaco: BeforeMount = (monaco) => {
       "editor.selectionBackground": "#CFE0EB",
       "editorIndentGuide.background1": "#DFE7EC",
       "editorIndentGuide.activeBackground1": "#AABEC9",
+    },
+  });
+  monaco.editor.defineTheme("ordadb-dark", {
+    base: "vs-dark",
+    inherit: true,
+    rules: [
+      { token: "keyword.sql", foreground: "78A9D1", fontStyle: "bold" },
+      { token: "string.sql", foreground: "D7A678" },
+      { token: "number.sql", foreground: "BE8FD1" },
+      { token: "comment.sql", foreground: "8B9AA5", fontStyle: "italic" },
+    ],
+    colors: {
+      "editor.background": "#172027",
+      "editor.foreground": "#D9E2E8",
+      "editorLineNumber.foreground": "#6F808C",
+      "editorLineNumber.activeForeground": "#78A9D1",
+      "editor.lineHighlightBackground": "#202C34",
+      "editorCursor.foreground": "#78A9D1",
+      "editor.selectionBackground": "#34546A",
+      "editorIndentGuide.background1": "#2B3942",
+      "editorIndentGuide.activeBackground1": "#587181",
     },
   });
 };
@@ -118,15 +143,21 @@ function registerDialectCompletion(
 export function EditorPane() {
   const monacoRef = useRef<Monaco | null>(null);
   const completionRef = useRef<{ dispose: () => void } | null>(null);
+  const editorBlurRef = useRef<{ dispose: () => void } | null>(null);
+  const [systemDark, setSystemDark] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-color-scheme: dark)").matches,
+  );
   const sql = useWorkbenchStore((state) => state.sql);
   const setSql = useWorkbenchStore((state) => state.setSql);
   const settings = useWorkbenchStore((state) => state.settings);
-  const workspace = useWorkbenchStore((state) => state.workspace);
   const documents = useWorkbenchStore((state) => state.documents);
   const activeDocumentPath = useWorkbenchStore(
     (state) => state.activeDocumentPath,
   );
   const openWorkspace = useWorkbenchStore((state) => state.openWorkspace);
+  const openFile = useWorkbenchStore((state) => state.openFile);
   const createDocument = useWorkbenchStore((state) => state.createDocument);
   const activateDocument = useWorkbenchStore(
     (state) => state.activateDocument,
@@ -138,6 +169,16 @@ export function EditorPane() {
   const saveActiveDocument = useWorkbenchStore(
     (state) => state.saveActiveDocument,
   );
+  const saveActiveDocumentAs = useWorkbenchStore(
+    (state) => state.saveActiveDocumentAs,
+  );
+  const saveActiveDocumentOnFocusChange = useWorkbenchStore(
+    (state) => state.saveActiveDocumentOnFocusChange,
+  );
+  const formatActiveDocument = useWorkbenchStore(
+    (state) => state.formatActiveDocument,
+  );
+  const focusSaveRef = useRef(saveActiveDocumentOnFocusChange);
   const activeDocument = documents.find(
     (document) => document.path === activeDocumentPath,
   );
@@ -160,8 +201,23 @@ export function EditorPane() {
     (state) => state.transactionActive,
   );
   const connection = useWorkbenchStore((state) => state.connection);
-  const setNotice = useWorkbenchStore((state) => state.setNotice);
   const dialectDescriptor = getSqlDialect(dialect);
+  const editorTheme =
+    settings.appearance.theme === "dark" ||
+    (settings.appearance.theme === "system" && systemDark)
+      ? "ordadb-dark"
+      : "ordadb-light";
+
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const update = () => setSystemDark(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  useEffect(() => {
+    focusSaveRef.current = saveActiveDocumentOnFocusChange;
+  }, [saveActiveDocumentOnFocusChange]);
 
   const installCompletion = useCallback(
     (monaco: Monaco) => {
@@ -174,9 +230,13 @@ export function EditorPane() {
     [dialectDescriptor],
   );
 
-  const handleEditorMount: OnMount = (_editor, monaco) => {
+  const handleEditorMount: OnMount = (editor, monaco) => {
     monacoRef.current = monaco;
     installCompletion(monaco);
+    editorBlurRef.current?.dispose();
+    editorBlurRef.current = editor.onDidBlurEditorText(() => {
+      void focusSaveRef.current().catch(() => undefined);
+    });
   };
 
   useEffect(() => {
@@ -189,6 +249,14 @@ export function EditorPane() {
       completionRef.current = null;
     };
   }, [installCompletion]);
+
+  useEffect(
+    () => () => {
+      editorBlurRef.current?.dispose();
+      editorBlurRef.current = null;
+    },
+    [],
+  );
 
   return (
     <section className="editor-pane" aria-label="SQL 编辑器">
@@ -208,12 +276,19 @@ export function EditorPane() {
                 onClick={() => activateDocument(document.path)}
               >
                 {(document.dirty || document.conflict) && (
-                  <span
-                    className={`query-dot ${
-                      document.conflict ? "query-dot--conflict" : ""
-                    }`}
-                    aria-label={document.conflict ? "外部冲突" : "未保存"}
-                  />
+                  document.conflict ? (
+                    <TriangleAlert
+                      className="query-document-state query-document-state--conflict"
+                      size={12}
+                      aria-label="外部冲突"
+                    />
+                  ) : (
+                    <FilePenLine
+                      className="query-document-state"
+                      size={12}
+                      aria-label="未保存"
+                    />
+                  )
                 )}
                 {document.name}
               </button>
@@ -224,6 +299,7 @@ export function EditorPane() {
                 onClick={() => {
                   if (
                     !document.dirty ||
+                    !settings.files.confirmDirtyClose ||
                     window.confirm(`${document.name} 尚未保存，仍要关闭吗？`)
                   ) {
                     void closeDocument(document.path);
@@ -234,16 +310,14 @@ export function EditorPane() {
           );
         })}
         <IconAction
-          label={workspace ? "新建 SQL 文件" : "打开 SQL 项目"}
+          label="新建 SQL 文件"
           className="query-add"
           icon={<Plus size={17} aria-hidden="true" />}
-          onClick={() =>
-            workspace ? void createDocument() : void openWorkspace()
-          }
+          onClick={() => void createDocument()}
         />
         <span className="query-tabs-spacer" />
         <label className="dialect-selector">
-          <span className="connection-dot" aria-hidden="true" />
+          <Braces size={13} aria-hidden="true" />
           <select
             aria-label="SQL 方言"
             aria-describedby="dialect-tooltip"
@@ -297,16 +371,19 @@ export function EditorPane() {
           label="格式化 SQL"
           disabled={!activeDocumentPath}
           icon={<AlignLeft size={17} aria-hidden="true" />}
-          onClick={() => {
-            setSql(formatSqlForDialect(sql, dialectDescriptor));
-            setNotice(`格式化 SQL · ${dialectDescriptor.label}`);
-          }}
+          onClick={formatActiveDocument}
         />
         <IconAction
           label="保存 SQL 文件"
           disabled={!activeDocumentPath}
           icon={<Save size={16} aria-hidden="true" />}
           onClick={() => void saveActiveDocument()}
+        />
+        <IconAction
+          label="SQL 文件另存为"
+          disabled={!activeDocumentPath}
+          icon={<FileOutput size={16} aria-hidden="true" />}
+          onClick={() => void saveActiveDocumentAs()}
         />
         {activeDocument?.conflict && (
           <div className="conflict-actions" role="alert">
@@ -367,25 +444,24 @@ export function EditorPane() {
             onMount={handleEditorMount}
             height="100%"
             language="sql"
-            path={`${activeDocumentPath}.${dialect}`}
-            theme="ordadb-light"
+            path={`${encodeURIComponent(activeDocumentPath)}.${dialect}`}
+            theme={editorTheme}
             value={sql}
             onChange={(value) => setSql(value ?? "")}
             loading={<span className="editor-loading">正在加载 SQL 编辑器</span>}
             options={{
               ariaLabel: "SQL 编辑器",
-              fontFamily:
-                '"Cascadia Code", "SFMono-Regular", Consolas, monospace',
-              fontSize: settings.editorFontSize,
-              lineHeight: settings.editorFontSize + 7,
-              minimap: { enabled: false },
+              fontFamily: settings.editor.fontFamily,
+              fontSize: settings.editor.fontSize,
+              lineHeight: settings.editor.fontSize + 7,
+              tabSize: settings.editor.tabSize,
+              wordWrap: settings.editor.wordWrap,
+              minimap: { enabled: settings.editor.minimap },
               padding: { top: 12, bottom: 12 },
               scrollBeyondLastLine: false,
               smoothScrolling: true,
               renderLineHighlight: "all",
-              wordWrap: "on",
               automaticLayout: true,
-              tabSize: 2,
               cursorBlinking: "smooth",
               overviewRulerBorder: false,
               hideCursorInOverviewRuler: true,
@@ -394,12 +470,16 @@ export function EditorPane() {
           />
         ) : (
           <div className="editor-empty-state">
-            <button type="button" onClick={() => void openWorkspace()}>
-              打开 SQL 项目
+            <button type="button" onClick={() => void createDocument()}>
+              新建 SQL
             </button>
             <span>或</span>
-            <button type="button" onClick={() => void createDocument()}>
-              新建 SQL 文件
+            <button type="button" onClick={() => void openFile()}>
+              打开文件
+            </button>
+            <span>或</span>
+            <button type="button" onClick={() => void openWorkspace()}>
+              打开 SQL 项目
             </button>
           </div>
         )}

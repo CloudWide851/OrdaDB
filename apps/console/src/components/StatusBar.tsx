@@ -1,7 +1,8 @@
-import { Circle, GitBranch, ShieldCheck } from "lucide-react";
+import { GitBranch } from "lucide-react";
 import { getSqlDialect } from "../data/dialects";
 import { useWorkbenchStore } from "../store/workbench";
 import type { AppStatus } from "../types";
+import { ConnectionStatusIcon } from "./ConnectionStatusIcon";
 
 interface StatusBarProps {
   status?: AppStatus;
@@ -24,18 +25,17 @@ export function StatusBar({ status, loading }: StatusBarProps) {
       : "界面预览";
 
   return (
-    <footer className="status-bar" aria-label="工作台状态">
+      <footer className="status-bar" aria-label="工作台状态">
       <div className="status-primary" aria-live="polite">
-        <Circle size={8} fill="currentColor" strokeWidth={0} aria-hidden="true" />
         <span>{connection?.database ?? "未连接"}</span>
         <span className="status-separator" aria-hidden="true" />
         <span>{notice}</span>
       </div>
       <div className="status-details">
-        <span>
-          <ShieldCheck size={14} aria-hidden="true" />
-          {connection?.mode === "preview" ? "PREVIEW" : connectionState}
-        </span>
+        <ConnectionStatusIcon
+          state={connectionState}
+          preview={connection?.mode === "preview"}
+        />
         <span>
           <GitBranch size={14} aria-hidden="true" />
           {transactionActive ? "事务进行中" : "自动提交"}

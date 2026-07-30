@@ -1,19 +1,24 @@
 import { create } from "zustand";
-import { getSqlDialect } from "../data/dialects";
+import { formatSqlForDialect, getSqlDialect } from "../data/dialects";
 import {
+  cloneConsoleSettings,
+  defaultConnectorDescriptors,
   defaultConsoleSettings,
   getConsoleClient,
-  type ConnectionProfileV1,
+  type ConnectionProfileV2,
+  type ConnectorDescriptor,
   type ConsoleClient,
-  type ConsoleSettingsV1,
+  type ConsoleSettingsV2,
+  type DocumentLocator,
   type OpenSqlDocument,
+  type RecentFileEntry,
+  type SqlDocument,
   type WorkspaceSessionV1,
   type WorkspaceSnapshot,
 } from "../lib/consoleClient";
 import {
   getDbmsClient,
   normalizeDbmsError,
-  type BootstrapAdminRequest,
   type ConnectionProbe,
   type DbmsCatalogObject,
   type DbmsClient,
@@ -30,6 +35,7 @@ import {
   appendResultRows,
   emptyResultBuffer,
   type ResultBuffer,
+  type ResultBufferLimits,
 } from "../lib/resultBuffer";
 import type {
   InspectorTab,
@@ -47,10 +53,12 @@ export type OperationView =
   | "backup"
   | "importExport"
   | "service";
+export type SidebarView = "workspace" | "database";
+export type QuickOpenMode = "recent" | "files" | "global";
 
 export interface DataSourceValues extends DbmsConnectionRequest {
   username: string;
-  password: string;
+  tlsMode: ConnectionProfileV2["tlsMode"];
 }
 
 interface RunQueryOptions {
@@ -59,16 +67,21 @@ interface RunQueryOptions {
 }
 
 export interface WorkbenchState {
+  runtimeMode: DbmsClient["mode"];
   sql: string;
-  settings: ConsoleSettingsV1;
+  settings: ConsoleSettingsV2;
   settingsOpen: boolean;
   workspace: WorkspaceSnapshot | null;
   documents: OpenSqlDocument[];
   activeDocumentPath: string | null;
   recovery: WorkspaceSessionV1 | null;
-  connectionProfiles: ConnectionProfileV1[];
+  recentFiles: RecentFileEntry[];
+  connectionProfiles: ConnectionProfileV2[];
+  connectorDescriptors: ConnectorDescriptor[];
   connectionProbe: ConnectionProbe | null;
   dialect: SqlDialect;
+  sidebarView: SidebarView;
+  quickOpenMode: QuickOpenMode | null;
   schemaVisible: boolean;
   inspectorVisible: boolean;
   activeResultTab: ResultTab;
@@ -103,9 +116,12 @@ export interface WorkbenchState {
   initialize: () => Promise<void>;
   setSql: (sql: string) => void;
   setSettingsOpen: (open: boolean) => void;
-  saveSettings: (settings: ConsoleSettingsV1) => Promise<void>;
+  saveSettings: (settings: ConsoleSettingsV2) => Promise<void>;
   openWorkspace: () => Promise<void>;
   openWorkspacePath: (rootPath: string) => Promise<void>;
+  openFile: () => Promise<void>;
+  openExternalFiles: (paths: string[]) => Promise<void>;
+  openRecentFile: (entry: RecentFileEntry) => Promise<void>;
   restoreRecovery: () => Promise<void>;
   discardRecovery: () => Promise<void>;
   openDocument: (path: string) => Promise<void>;
@@ -114,10 +130,17 @@ export interface WorkbenchState {
   closeDocument: (path: string) => Promise<void>;
   reloadActiveDocument: () => Promise<void>;
   saveActiveDocument: (force?: boolean) => Promise<void>;
+  saveActiveDocumentAs: () => Promise<void>;
   saveAllDocuments: () => Promise<void>;
+  saveActiveDocumentOnFocusChange: () => Promise<void>;
+  formatActiveDocument: () => void;
   renameWorkspaceEntry: (path: string, newName: string) => Promise<void>;
   trashWorkspaceEntry: (path: string) => Promise<void>;
   setDialect: (dialect: SqlDialect) => void;
+  setSidebarView: (view: SidebarView) => void;
+  setQuickOpenMode: (mode: QuickOpenMode | null) => void;
+  setSchemaVisible: (visible: boolean) => void;
+  setInspectorVisible: (visible: boolean) => void;
   toggleSchema: () => void;
   toggleInspector: () => void;
   setActiveResultTab: (tab: ResultTab) => void;
@@ -129,7 +152,7 @@ export interface WorkbenchState {
   openOperations: (view: OperationView) => Promise<void>;
   setOperationsOpen: (open: boolean) => void;
   setNotice: (notice: string) => void;
-  bootstrapAdministrator: (request: BootstrapAdminRequest) => Promise<void>;
+  bootstrapAdministrator: (values: DataSourceValues) => Promise<void>;
   connectDataSource: (values: DataSourceValues) => Promise<void>;
   disconnectDataSource: () => Promise<void>;
   deleteStoredCredential: () => Promise<void>;
@@ -155,16 +178,23 @@ export function createWorkbenchStore(
 ) {
   const sessionSaveController: SessionSaveController = {};
   return create<WorkbenchState>((set, get) => ({
+  runtimeMode: dbms.mode,
   sql: "",
-  settings: { ...defaultConsoleSettings },
+  settings: cloneConsoleSettings(defaultConsoleSettings),
   settingsOpen: false,
   workspace: null,
   documents: [],
   activeDocumentPath: null,
   recovery: null,
+  recentFiles: [],
   connectionProfiles: [],
+  connectorDescriptors: defaultConnectorDescriptors.map((descriptor) => ({
+    ...descriptor,
+  })),
   connectionProbe: null,
   dialect: "postgresql",
+  sidebarView: "workspace",
+  quickOpenMode: null,
   schemaVisible: true,
   inspectorVisible: true,
   activeResultTab: "data",
@@ -203,16 +233,33 @@ export function createWorkbenchStore(
       set({
         settings: bootstrap.settings,
         recovery: bootstrap.recovery,
+        recentFiles: bootstrap.recentFiles,
         connectionProfiles: bootstrap.connectionProfiles,
+        connectorDescriptors: bootstrap.connectorDescriptors,
       });
       applyConsoleSettings(bootstrap.settings);
-      if (bootstrap.settings.reopenLastProject && bootstrap.recovery) {
+      if (
+        bootstrap.recovery &&
+        (bootstrap.settings.files.recoveryPolicy === "automatic" ||
+          bootstrap.settings.files.reopenLastProject)
+      ) {
         await get().restoreRecovery();
+      } else if (
+        bootstrap.recovery &&
+        bootstrap.settings.files.recoveryPolicy === "never"
+      ) {
+        set({ recovery: null });
+        await consoleClient.saveSession(emptyWorkspaceSession());
       }
       const reconnect = bootstrap.connectionProfiles.find(
-        (profile) => profile.autoReconnect,
+        (profile) =>
+          profile.connectorId === "ordadb-native" && profile.autoReconnect,
       );
-      if (reconnect && dbms.mode === "desktop") {
+      if (
+        reconnect &&
+        bootstrap.settings.connections.autoReconnectLocal &&
+        dbms.mode === "desktop"
+      ) {
         await connectProfile(reconnect, dbms, consoleClient, set, get);
       }
     } catch (error) {
@@ -231,12 +278,15 @@ export function createWorkbenchStore(
           ? {
               ...document,
               content: sql,
-              dirty: sql !== document.savedContent,
+              dirty:
+                document.locator.kind === "untitled" ||
+                sql !== document.savedContent,
             }
           : document,
       ),
     }));
     scheduleSessionSave(sessionSaveController, consoleClient, get);
+    scheduleDocumentAutoSave(sessionSaveController, consoleClient, set, get);
   },
   setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
   saveSettings: async (settings) => {
@@ -248,6 +298,7 @@ export function createWorkbenchStore(
         settingsOpen: false,
         notice: "设置已保存",
       });
+      scheduleDocumentAutoSave(sessionSaveController, consoleClient, set, get);
     } catch (error) {
       const normalized = normalizeDbmsError(error);
       set({ notice: normalized.message });
@@ -274,17 +325,88 @@ export function createWorkbenchStore(
       throw normalized;
     }
   },
+  openFile: async () => {
+    try {
+      const document = await consoleClient.pickDocument();
+      if (!document) return;
+      activateSqlDocument(document, set, get, "已打开");
+      await persistSession(consoleClient, get);
+    } catch (error) {
+      const normalized = normalizeDbmsError(error);
+      set({ notice: normalized.message });
+    }
+  },
+  openExternalFiles: async (paths) => {
+    for (const path of paths) {
+      if (!path.toLowerCase().endsWith(".sql")) continue;
+      try {
+        const document = await consoleClient.openExternalDocument(path);
+        activateSqlDocument(document, set, get, "已打开");
+      } catch (error) {
+        const normalized = normalizeDbmsError(error);
+        set({ notice: normalized.message });
+      }
+    }
+    await persistSession(consoleClient, get);
+  },
+  openRecentFile: async (entry) => {
+    try {
+      if (entry.locator.kind === "workspace") {
+        if (get().workspace?.rootPath !== entry.locator.rootPath) {
+          const snapshot = await consoleClient.openWorkspace(
+            entry.locator.rootPath,
+          );
+          await activateWorkspace(snapshot, consoleClient, set, get);
+        }
+        await get().openDocument(entry.locator.path);
+      } else {
+        const document = await consoleClient.openExternalDocument(
+          entry.locator.path,
+        );
+        activateSqlDocument(document, set, get, "已打开");
+        await persistSession(consoleClient, get);
+      }
+    } catch (error) {
+      const normalized = normalizeDbmsError(error);
+      set({ notice: normalized.message });
+    }
+  },
   restoreRecovery: async () => {
     const recovery = get().recovery;
-    if (!recovery?.rootPath) return;
+    if (!recovery) return;
     try {
-      const snapshot = await consoleClient.openWorkspace(recovery.rootPath);
+      const snapshot = recovery.rootPath
+        ? await consoleClient.openWorkspace(recovery.rootPath)
+        : null;
       const documents: OpenSqlDocument[] = [];
       for (const draft of recovery.openDocuments) {
-        const current = await consoleClient.openDocument(
-          snapshot.rootPath,
-          draft.path,
-        );
+        const locator =
+          draft.locator ??
+          (recovery.rootPath
+            ? {
+                kind: "workspace" as const,
+                rootPath: recovery.rootPath,
+                path: draft.path,
+              }
+            : null);
+        if (!locator) continue;
+        if (locator.kind === "untitled") {
+          documents.push({
+            locator,
+            path: draft.path,
+            name: draft.name ?? nextUntitledName(documents),
+            content: draft.content,
+            revision: null,
+            savedContent: "",
+            dirty: true,
+            conflict: false,
+          });
+          continue;
+        }
+        const current =
+          locator.kind === "workspace"
+            ? await consoleClient.openDocument(locator.rootPath, locator.path)
+            : await consoleClient.openExternalDocument(locator.path);
         documents.push({
           ...current,
           content: draft.content,
@@ -331,13 +453,7 @@ export function createWorkbenchStore(
     }
     try {
       const document = await consoleClient.openDocument(workspace.rootPath, path);
-      const openDocument = toOpenDocument(document);
-      set((state) => ({
-        documents: [...state.documents, openDocument],
-        activeDocumentPath: openDocument.path,
-        sql: openDocument.content,
-        notice: `${openDocument.name} · 已打开`,
-      }));
+      activateSqlDocument(document, set, get, "已打开");
       scheduleSessionSave(sessionSaveController, consoleClient, get);
     } catch (error) {
       const normalized = normalizeDbmsError(error);
@@ -345,33 +461,27 @@ export function createWorkbenchStore(
     }
   },
   createDocument: async (parentPath = "") => {
-    let workspace = get().workspace;
-    if (!workspace) {
-      await get().openWorkspace();
-      workspace = get().workspace;
-    }
-    if (!workspace) return;
-    const fileName = nextQueryFileName(workspace);
-    try {
-      const document = await consoleClient.newDocument(
-        workspace.rootPath,
-        parentPath,
-        fileName,
-      );
-      const snapshot = await consoleClient.openWorkspace(workspace.rootPath);
-      const openDocument = toOpenDocument(document);
-      set((state) => ({
-        workspace: snapshot,
-        documents: [...state.documents, openDocument],
-        activeDocumentPath: openDocument.path,
-        sql: "",
-        notice: `${openDocument.name} · 已创建`,
-      }));
-      scheduleSessionSave(sessionSaveController, consoleClient, get);
-    } catch (error) {
-      const normalized = normalizeDbmsError(error);
-      set({ notice: normalized.message });
-    }
+    void parentPath;
+    const id = nextUntitledId(get().documents);
+    const name = nextUntitledName(get().documents);
+    const document: OpenSqlDocument = {
+      locator: { kind: "untitled", id },
+      path: `untitled:${id}`,
+      name,
+      content: "",
+      revision: null,
+      savedContent: "",
+      dirty: true,
+      conflict: false,
+    };
+    set((state) => ({
+      documents: [...state.documents, document],
+      activeDocumentPath: document.path,
+      sql: "",
+      notice: `${name} · 首次保存时选择位置`,
+    }));
+    scheduleSessionSave(sessionSaveController, consoleClient, get);
+    scheduleDocumentAutoSave(sessionSaveController, consoleClient, set, get);
   },
   activateDocument: (path) => {
     const document = get().documents.find((candidate) => candidate.path === path);
@@ -401,14 +511,19 @@ export function createWorkbenchStore(
     await persistSession(consoleClient, get);
   },
   reloadActiveDocument: async () => {
-    const workspace = get().workspace;
     const activePath = get().activeDocumentPath;
-    if (!workspace || !activePath) return;
+    const active = get().documents.find(
+      (candidate) => candidate.path === activePath,
+    );
+    if (!active || active.locator.kind === "untitled") return;
     try {
-      const document = await consoleClient.openDocument(
-        workspace.rootPath,
-        activePath,
-      );
+      const document =
+        active.locator.kind === "workspace"
+          ? await consoleClient.openDocument(
+              active.locator.rootPath,
+              active.locator.path,
+            )
+          : await consoleClient.openExternalDocument(active.locator.path);
       const reloaded = toOpenDocument(document);
       set((state) => ({
         documents: state.documents.map((candidate) =>
@@ -424,52 +539,85 @@ export function createWorkbenchStore(
     }
   },
   saveActiveDocument: async (force = false) => {
-    const workspace = get().workspace;
     const activePath = get().activeDocumentPath;
     const document = get().documents.find(
       (candidate) => candidate.path === activePath,
     );
-    if (!workspace || !document) return;
+    if (!document) return;
+    if (document.locator.kind === "untitled") {
+      await get().saveActiveDocumentAs();
+      return;
+    }
+    clearDocumentAutoSave(sessionSaveController);
+    await saveNamedDocument(document.path, force, consoleClient, set, get);
+  },
+  saveActiveDocumentAs: async () => {
+    const activePath = get().activeDocumentPath;
+    const document = get().documents.find(
+      (candidate) => candidate.path === activePath,
+    );
+    if (!document) return;
+    clearDocumentAutoSave(sessionSaveController);
+    const prepared = prepareDocumentForSave(
+      document,
+      get().settings,
+      get().dialect,
+    );
     try {
-      const saved = await consoleClient.saveDocument(
-        workspace.rootPath,
-        document,
-        force,
-      );
+      const saved = await consoleClient.saveDocumentAs({
+        content: prepared.content,
+        suggestedName:
+          document.locator.kind === "untitled" ? document.name : document.name,
+      });
+      if (!saved) {
+        set({ notice: "已取消保存" });
+        return;
+      }
+      const open = toOpenDocument(saved);
       set((state) => ({
         documents: state.documents.map((candidate) =>
-          candidate.path === saved.path ? toOpenDocument(saved) : candidate,
+          candidate.path === activePath ? open : candidate,
         ),
-        sql: saved.content,
-        notice: `${saved.name} · 已保存`,
+        activeDocumentPath: open.path,
+        sql: open.content,
+        recentFiles: addRecentFile(state.recentFiles, saved),
+        notice: `${open.name} · 已另存为`,
       }));
       await persistSession(consoleClient, get);
     } catch (error) {
       const normalized = normalizeDbmsError(error);
-      set((state) => ({
-        documents: state.documents.map((candidate) =>
-          candidate.path === document.path
-            ? { ...candidate, conflict: normalized.sqlState === "40001" }
-            : candidate,
-        ),
-        notice: normalized.message,
-      }));
+      set({ notice: normalized.message });
       throw normalized;
     }
   },
   saveAllDocuments: async () => {
-    const workspace = get().workspace;
-    if (!workspace) return;
+    clearDocumentAutoSave(sessionSaveController);
     for (const document of get().documents.filter((candidate) => candidate.dirty)) {
+      const prepared = prepareDocumentForSave(
+        document,
+        get().settings,
+        get().dialect,
+      );
       try {
-        const saved = await consoleClient.saveDocument(
-          workspace.rootPath,
-          document,
-        );
+        const saved =
+          prepared.locator.kind === "untitled"
+            ? await consoleClient.saveDocumentAs({
+                content: prepared.content,
+                suggestedName: prepared.name,
+              })
+            : await saveOpenDocument(consoleClient, prepared);
+        if (!saved) return;
         set((state) => ({
           documents: state.documents.map((candidate) =>
-            candidate.path === saved.path ? toOpenDocument(saved) : candidate,
+            candidate.path === document.path
+              ? toOpenDocument(saved)
+              : candidate,
           ),
+          activeDocumentPath:
+            state.activeDocumentPath === document.path
+              ? saved.path
+              : state.activeDocumentPath,
+          recentFiles: addRecentFile(state.recentFiles, saved),
         }));
       } catch (error) {
         const normalized = normalizeDbmsError(error);
@@ -490,6 +638,28 @@ export function createWorkbenchStore(
     set({ sql: active?.content ?? "", notice: "全部 SQL 文件已保存" });
     await persistSession(consoleClient, get);
   },
+  saveActiveDocumentOnFocusChange: async () => {
+    const state = get();
+    const document = state.documents.find(
+      (candidate) => candidate.path === state.activeDocumentPath,
+    );
+    if (
+      state.settings.files.autoSave !== "onFocusChange" ||
+      !document?.dirty ||
+      document.conflict ||
+      document.locator.kind === "untitled"
+    ) {
+      return;
+    }
+    await state.saveActiveDocument();
+  },
+  formatActiveDocument: () => {
+    const state = get();
+    if (!state.activeDocumentPath) return;
+    const dialect = getSqlDialect(state.dialect);
+    state.setSql(formatSqlForDialect(state.sql, dialect));
+    set({ notice: `格式化 SQL · ${dialect.label}` });
+  },
   renameWorkspaceEntry: async (path, newName) => {
     const workspace = get().workspace;
     if (!workspace) return;
@@ -501,16 +671,34 @@ export function createWorkbenchStore(
       );
       const nextPath = renamedPath(path, newName);
       const documents = get().documents.map((document) => {
-        const pathAfterRename = replacePathPrefix(document.path, path, nextPath);
+        if (
+          document.locator.kind !== "workspace" ||
+          document.locator.rootPath !== workspace.rootPath
+        ) {
+          return document;
+        }
+        const pathAfterRename = replacePathPrefix(
+          document.locator.path,
+          path,
+          nextPath,
+        );
         return {
           ...document,
           path: pathAfterRename,
           name: pathAfterRename.split("/").at(-1) ?? document.name,
+          locator: {
+            ...document.locator,
+            path: pathAfterRename,
+          },
         };
       });
-      const activeDocumentPath = get().activeDocumentPath
-        ? replacePathPrefix(get().activeDocumentPath!, path, nextPath)
-        : null;
+      const activeIndex = get().documents.findIndex(
+        (document) => document.path === get().activeDocumentPath,
+      );
+      const activeDocumentPath =
+        activeIndex >= 0
+          ? documents[activeIndex]?.path ?? null
+          : get().activeDocumentPath;
       set({
         workspace: snapshot,
         documents,
@@ -530,7 +718,10 @@ export function createWorkbenchStore(
       const snapshot = await consoleClient.trashEntry(workspace.rootPath, path);
       const documents = get().documents.filter(
         (document) =>
-          document.path !== path && !document.path.startsWith(`${path}/`),
+          document.locator.kind !== "workspace" ||
+          document.locator.rootPath !== workspace.rootPath ||
+          (document.locator.path !== path &&
+            !document.locator.path.startsWith(`${path}/`)),
       );
       const activeDocumentPath = documents.some(
         (document) => document.path === get().activeDocumentPath,
@@ -560,6 +751,10 @@ export function createWorkbenchStore(
         get().connection?.mode === "preview" ? " · Preview" : ""
       }`,
     }),
+  setSidebarView: (sidebarView) => set({ sidebarView }),
+  setQuickOpenMode: (quickOpenMode) => set({ quickOpenMode }),
+  setSchemaVisible: (schemaVisible) => set({ schemaVisible }),
+  setInspectorVisible: (inspectorVisible) => set({ inspectorVisible }),
   toggleSchema: () => set((state) => ({ schemaVisible: !state.schemaVisible })),
   toggleInspector: () =>
     set((state) => ({ inspectorVisible: !state.inspectorVisible })),
@@ -577,19 +772,56 @@ export function createWorkbenchStore(
   setOperationsOpen: (operationsOpen) => set({ operationsOpen }),
   setNotice: (notice) => set({ notice }),
 
-  bootstrapAdministrator: async (request) => {
+  bootstrapAdministrator: async (values) => {
     try {
-      const result = await dbms.bootstrapAdmin(request);
+      const request = toConnectionRequest(values);
+      const ticket = get().connectionProbe?.bootstrapTicket;
+      if (values.connectorId !== "ordadb-native") {
+        throw localError(
+          "0A000",
+          "管理员初始化仅适用于本机 OrdaDB 数据源",
+        );
+      }
+      if (!ticket) {
+        throw localError(
+          "55000",
+          "本地初始化票据不存在或已失效，请重新运行连接诊断",
+        );
+      }
+      const result = await dbms.bootstrapAdmin({
+        ticket: ticket.ticket,
+        connection: request,
+        suggestedUsername: values.username,
+      });
       if (!result.success || result.error) {
         throw result.error ?? localError("55000", "管理员初始化未完成");
       }
       set({
-        notice: `${result.user ?? request.username} · 管理员初始化完成`,
-        connectionProbe: null,
+        activeCredentialId: values.credentialId,
+        notice: `${result.user ?? values.username} · 管理员初始化完成，正在复检`,
       });
+      const probe = await runConnectionStep(
+        "管理员初始化复检",
+        dbms.probe(request),
+        get,
+      );
+      set({ connectionProbe: probe });
+      requireReadyProbe(probe, "管理员初始化后的连接诊断未通过");
+      await establishDataSourceConnection(
+        values,
+        request,
+        dbms,
+        consoleClient,
+        set,
+        get,
+      );
     } catch (error) {
       const normalized = normalizeDbmsError(error);
-      set({ connectionError: normalized, notice: normalized.message });
+      set({
+        connectionState: "error",
+        connectionError: normalized,
+        notice: normalized.message,
+      });
       throw normalized;
     }
   },
@@ -606,63 +838,46 @@ export function createWorkbenchStore(
       notice: "正在连接数据源",
     });
     try {
-      await dbms.saveCredential({
-        credentialId: values.credentialId,
-        username: values.username,
-        password: values.password,
-      });
-      set({ activeCredentialId: values.credentialId });
-      const request = {
-        connectorId: values.connectorId,
-        dialect: values.dialect,
-        endpoint: values.endpoint,
-        adminEndpoint: values.adminEndpoint,
-        database: values.database,
-        credentialId: values.credentialId,
-      };
-      const probe = await dbms.probe(request);
-      set({ connectionProbe: probe });
-      const failed = probe.stages.find(
-        (stage) => stage.status === "failed" && stage.stage !== "service",
-      );
-      if (!probe.ready) {
-        throw (
-          failed?.error ??
-          localError("08001", "本地数据库连接诊断未通过")
+      const request = toConnectionRequest(values);
+      if (values.connectorId === "ordadb-native") {
+        const preflight = await runConnectionStep(
+          "本地服务诊断",
+          dbms.probe(request),
+          get,
         );
+        set({ connectionProbe: preflight });
+        if (preflight.bootstrapTicket) {
+          throw (
+            failedProbeError(preflight) ??
+            localError("55000", "OrdaDB 需要创建首位管理员")
+          );
+        }
+        requireNativePreflight(preflight);
       }
-      const connection = await dbms.connect(request);
-      const [catalog, monitor] = await Promise.all([
-        dbms.catalog(connection.connectionId),
-        dbms.monitor(connection.connectionId),
-      ]);
-      set({
-        connection,
-        monitor,
-        operations: [],
-        serviceStatus: null,
-        dialect: connection.dialect,
-        dataSourceOpen: false,
-        connectionState: "connected",
-        connectionError: null,
-        transactionActive: false,
-        notice: `${connection.database} · 已连接`,
-      });
-      setCatalog(set, get, catalog.objects);
-      const profiles = await consoleClient.saveConnectionProfile({
-        formatVersion: 1,
-        profileId: values.credentialId,
-        label: values.database || values.endpoint,
-        connectorId: values.connectorId,
-        dialect: values.dialect,
-        endpoint: values.endpoint,
-        adminEndpoint: values.adminEndpoint,
-        database: values.database,
+      const credential = await dbms.promptCredential({
         credentialId: values.credentialId,
-        autoReconnect: values.connectorId === "ordadb-native",
+        connectorId: values.connectorId,
+        suggestedUsername: values.username,
       });
-      set({ connectionProfiles: profiles });
-      await get().refreshAdministration();
+      if (!credential) {
+        throw localError("57014", "已取消 Windows 凭据输入");
+      }
+      set({ activeCredentialId: values.credentialId });
+      const probe = await runConnectionStep(
+        "连接诊断",
+        dbms.probe(request),
+        get,
+      );
+      set({ connectionProbe: probe });
+      requireReadyProbe(probe, "数据库连接诊断未通过");
+      await establishDataSourceConnection(
+        values,
+        request,
+        dbms,
+        consoleClient,
+        set,
+        get,
+      );
     } catch (error) {
       const normalized = normalizeDbmsError(error);
       set({
@@ -823,6 +1038,18 @@ export function createWorkbenchStore(
       });
       return;
     }
+    if (
+      get().settings.connections.confirmDangerousWrites &&
+      requiresDangerousWriteConfirmation(sql) &&
+      (typeof window === "undefined" ||
+        !window.confirm("该语句可能修改数据库。确认继续执行吗？"))
+    ) {
+      set({ notice: "已取消可能修改数据库的语句" });
+      return;
+    }
+    const queryTimeoutMs = get().settings.results.queryTimeoutMs;
+    const queryDeadline = Date.now() + queryTimeoutMs;
+    const resultLimits = resultBufferLimits(get().settings);
     set({
       queryState: "running",
       columns: [],
@@ -838,17 +1065,44 @@ export function createWorkbenchStore(
         connection.mode === "preview" ? "正在运行 Preview 查询" : "正在运行查询",
     });
     try {
-      const operation = await dbms.execute(connection.connectionId, sql);
+      const operation = await withTimeout(
+        dbms.execute(connection.connectionId, sql),
+        queryTimeoutMs,
+        () => queryTimeoutError(queryTimeoutMs),
+      );
       set({ activeRequestId: operation.requestId });
       let terminal = false;
-      for await (const event of operation.events) {
+      const iterator = operation.events[Symbol.asyncIterator]();
+      while (true) {
+        const remainingMs = Math.max(1, queryDeadline - Date.now());
+        let next: IteratorResult<
+          Awaited<ReturnType<typeof iterator.next>>["value"]
+        >;
+        try {
+          next = await withTimeout(iterator.next(), remainingMs, () =>
+            queryTimeoutError(queryTimeoutMs),
+          );
+        } catch (error) {
+          const normalized = normalizeDbmsError(error);
+          if (normalized.sqlState === "57014") {
+            void dbms.cancel(operation.requestId).catch(() => undefined);
+            void Promise.resolve(iterator.return?.()).catch(() => undefined);
+          }
+          throw normalized;
+        }
+        if (next.done) break;
+        const event = next.value;
         switch (event.kind) {
           case "schema":
             set({ columns: event.columns });
             break;
           case "batch":
             set((state) => ({
-              resultBuffer: appendResultRows(state.resultBuffer, event.rows),
+              resultBuffer: appendResultRows(
+                state.resultBuffer,
+                event.rows,
+                resultLimits,
+              ),
             }));
             break;
           case "progress":
@@ -1008,6 +1262,85 @@ function localError(sqlState: string, message: string): DbmsError {
   };
 }
 
+function withTimeout<T>(
+  operation: PromiseLike<T>,
+  timeoutMs: number,
+  createError: () => DbmsError,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(createError()), timeoutMs);
+    void Promise.resolve(operation).then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function runConnectionStep<T>(
+  label: string,
+  operation: PromiseLike<T>,
+  get: StoreGet,
+) {
+  const timeoutMs = get().settings.connections.timeoutMs;
+  return withTimeout(operation, timeoutMs, () =>
+    localError("08001", `${label}超过 ${Math.ceil(timeoutMs / 1_000)} 秒`),
+  );
+}
+
+function queryTimeoutError(timeoutMs: number) {
+  return localError(
+    "57014",
+    `查询超过 ${Math.ceil(timeoutMs / 1_000)} 秒，已请求取消`,
+  );
+}
+
+function resultBufferLimits(settings: ConsoleSettingsV2): ResultBufferLimits {
+  return {
+    pageRows: settings.results.pageSize,
+    maxRows: settings.results.residentRowLimit,
+    maxBytes: settings.results.residentMemoryBytes,
+  };
+}
+
+const READ_ONLY_SQL_KEYWORDS = new Set([
+  "DESC",
+  "DESCRIBE",
+  "EXPLAIN",
+  "SELECT",
+  "SHOW",
+  "TABLE",
+  "VALUES",
+]);
+
+function requiresDangerousWriteConfirmation(sql: string) {
+  return !READ_ONLY_SQL_KEYWORDS.has(leadingSqlKeyword(sql));
+}
+
+function leadingSqlKeyword(sql: string) {
+  let offset = 0;
+  while (offset < sql.length) {
+    while (offset < sql.length && /\s/u.test(sql[offset])) offset += 1;
+    if (sql.startsWith("--", offset)) {
+      const newline = sql.indexOf("\n", offset + 2);
+      offset = newline === -1 ? sql.length : newline + 1;
+      continue;
+    }
+    if (sql.startsWith("/*", offset)) {
+      const end = sql.indexOf("*/", offset + 2);
+      offset = end === -1 ? sql.length : end + 2;
+      continue;
+    }
+    break;
+  }
+  return sql.slice(offset).match(/^[A-Za-z]+/u)?.[0]?.toUpperCase() ?? "";
+}
+
 function replaceOperation(
   operations: DbmsOperationRecord[],
   incoming: DbmsOperationRecord,
@@ -1022,15 +1355,24 @@ function replaceOperation(
 
 interface SessionSaveController {
   timer?: ReturnType<typeof setTimeout>;
+  autoSaveTimer?: ReturnType<typeof setTimeout>;
 }
 
-function applyConsoleSettings(settings: ConsoleSettingsV1) {
+function applyConsoleSettings(settings: ConsoleSettingsV2) {
   if (typeof document === "undefined") return;
   const root = document.documentElement;
-  root.style.setProperty("--font-ui", `${settings.uiFontSize}px`);
-  root.style.setProperty("--font-data", `${settings.dataFontSize}px`);
-  root.style.setProperty("--font-editor", `${settings.editorFontSize}px`);
-  root.dataset.density = settings.density;
+  root.style.setProperty("--font-ui", `${settings.appearance.uiFontSize}px`);
+  root.style.setProperty("--font-data", `${settings.appearance.dataFontSize}px`);
+  root.style.setProperty("--font-editor", `${settings.editor.fontSize}px`);
+  root.style.setProperty("--ui-zoom", `${settings.appearance.zoomPercent / 100}`);
+  root.style.setProperty("--editor-font-family", settings.editor.fontFamily);
+  root.dataset.density = settings.appearance.density;
+  root.dataset.theme = settings.appearance.theme;
+  root.dataset.reduceMotion = String(settings.appearance.reduceMotion);
+  root.style.colorScheme =
+    settings.appearance.theme === "system"
+      ? "light dark"
+      : settings.appearance.theme;
 }
 
 function toOpenDocument(
@@ -1044,10 +1386,140 @@ function toOpenDocument(
   };
 }
 
+function prepareDocumentForSave(
+  document: OpenSqlDocument,
+  settings: ConsoleSettingsV2,
+  dialect: SqlDialect,
+) {
+  if (!settings.editor.formatOnSave) return document;
+  const content = formatSqlForDialect(document.content, getSqlDialect(dialect));
+  return content === document.content ? document : { ...document, content };
+}
+
+function activateSqlDocument(
+  document: SqlDocument,
+  set: StoreSet,
+  get: StoreGet,
+  status: string,
+) {
+  const key = documentLocatorKey(document.locator);
+  const existing = get().documents.find(
+    (candidate) => documentLocatorKey(candidate.locator) === key,
+  );
+  if (existing) {
+    set({
+      activeDocumentPath: existing.path,
+      sql: existing.content,
+      recentFiles: addRecentFile(get().recentFiles, document),
+      notice: `${existing.name} · 已切换`,
+    });
+    return;
+  }
+  const open = toOpenDocument(document);
+  set((state) => ({
+    documents: [...state.documents, open],
+    activeDocumentPath: open.path,
+    sql: open.content,
+    recentFiles: addRecentFile(state.recentFiles, document),
+    notice: `${open.name} · ${status}`,
+  }));
+}
+
+async function saveOpenDocument(
+  consoleClient: ConsoleClient,
+  document: OpenSqlDocument,
+  force = false,
+) {
+  switch (document.locator.kind) {
+    case "workspace":
+      return consoleClient.saveDocument(
+        document.locator.rootPath,
+        document,
+        force,
+      );
+    case "external":
+      return consoleClient.saveExternalDocument(document, force);
+    case "untitled":
+      throw localError("55000", "未命名文档需要先选择保存位置");
+  }
+}
+
+async function saveNamedDocument(
+  path: string,
+  force: boolean,
+  consoleClient: ConsoleClient,
+  set: StoreSet,
+  get: StoreGet,
+) {
+  const document = get().documents.find((candidate) => candidate.path === path);
+  if (!document || document.locator.kind === "untitled") return;
+  const prepared = prepareDocumentForSave(
+    document,
+    get().settings,
+    get().dialect,
+  );
+  try {
+    const saved = await saveOpenDocument(consoleClient, prepared, force);
+    set((state) => {
+      const active = state.activeDocumentPath === path;
+      return {
+        documents: state.documents.map((candidate) =>
+          candidate.path === path ? toOpenDocument(saved) : candidate,
+        ),
+        activeDocumentPath: active ? saved.path : state.activeDocumentPath,
+        sql: active ? saved.content : state.sql,
+        recentFiles: addRecentFile(state.recentFiles, saved),
+        notice: `${saved.name} · 已保存`,
+      };
+    });
+    await persistSession(consoleClient, get);
+  } catch (error) {
+    const normalized = normalizeDbmsError(error);
+    set((state) => ({
+      documents: state.documents.map((candidate) =>
+        candidate.path === path
+          ? { ...candidate, conflict: normalized.sqlState === "40001" }
+          : candidate,
+      ),
+      notice: normalized.message,
+    }));
+    throw normalized;
+  }
+}
+
+function addRecentFile(
+  recentFiles: RecentFileEntry[],
+  document: SqlDocument,
+): RecentFileEntry[] {
+  const key = documentLocatorKey(document.locator);
+  return [
+    {
+      locator: document.locator,
+      name: document.name,
+      openedAtMs: Date.now(),
+    },
+    ...recentFiles.filter(
+      (entry) => documentLocatorKey(entry.locator) !== key,
+    ),
+  ].slice(0, 50);
+}
+
+function documentLocatorKey(locator: DocumentLocator) {
+  switch (locator.kind) {
+    case "workspace":
+      return `workspace:${locator.rootPath.toLocaleLowerCase()}:${locator.path.toLocaleLowerCase()}`;
+    case "external":
+      return `external:${locator.path.toLocaleLowerCase()}`;
+    case "untitled":
+      return `untitled:${locator.id}`;
+  }
+}
+
 function sameRevision(
   left: OpenSqlDocument["revision"],
   right: OpenSqlDocument["revision"],
 ) {
+  if (!left || !right) return left === right;
   return (
     left.sizeBytes === right.sizeBytes &&
     left.modifiedAtMs === right.modifiedAtMs &&
@@ -1061,13 +1533,21 @@ async function activateWorkspace(
   set: StoreSet,
   get: StoreGet,
 ) {
-  set({
-    workspace: snapshot,
-    documents: [],
-    activeDocumentPath: null,
-    sql: "",
-    recovery: null,
-    notice: `${snapshot.rootPath} · 项目已打开`,
+  set((state) => {
+    const documents = state.documents.filter(
+      (document) => document.locator.kind !== "workspace",
+    );
+    const active = documents.find(
+      (document) => document.path === state.activeDocumentPath,
+    );
+    return {
+      workspace: snapshot,
+      documents,
+      activeDocumentPath: active?.path ?? null,
+      sql: active?.content ?? "",
+      recovery: null,
+      notice: `${snapshot.rootPath} · 项目已打开`,
+    };
   });
   await persistSession(consoleClient, get);
 }
@@ -1082,13 +1562,14 @@ function emptyWorkspaceSession(): WorkspaceSessionV1 {
 }
 
 function workspaceSession(state: WorkbenchState): WorkspaceSessionV1 {
-  if (!state.workspace) return emptyWorkspaceSession();
   return {
     formatVersion: 1,
-    rootPath: state.workspace.rootPath,
+    rootPath: state.workspace?.rootPath ?? null,
     activePath: state.activeDocumentPath,
     openDocuments: state.documents.map((document) => ({
       path: document.path,
+      locator: document.locator,
+      name: document.name,
       content: document.content,
       baseRevision: document.revision,
     })),
@@ -1107,6 +1588,55 @@ function scheduleSessionSave(
   }, 500);
 }
 
+function clearDocumentAutoSave(controller: SessionSaveController) {
+  if (!controller.autoSaveTimer) return;
+  clearTimeout(controller.autoSaveTimer);
+  controller.autoSaveTimer = undefined;
+}
+
+function scheduleDocumentAutoSave(
+  controller: SessionSaveController,
+  consoleClient: ConsoleClient,
+  set: StoreSet,
+  get: StoreGet,
+) {
+  clearDocumentAutoSave(controller);
+  const state = get();
+  const document = state.documents.find(
+    (candidate) => candidate.path === state.activeDocumentPath,
+  );
+  if (
+    state.settings.files.autoSave !== "afterDelay" ||
+    !document?.dirty ||
+    document.conflict ||
+    document.locator.kind === "untitled"
+  ) {
+    return;
+  }
+  const activePath = document.path;
+  controller.autoSaveTimer = setTimeout(async () => {
+    controller.autoSaveTimer = undefined;
+    const current = get();
+    const pending = current.documents.find(
+      (candidate) => candidate.path === activePath,
+    );
+    if (
+      !pending?.dirty ||
+      pending.conflict ||
+      pending.locator.kind === "untitled"
+    ) {
+      return;
+    }
+    await saveNamedDocument(
+      activePath,
+      false,
+      consoleClient,
+      set,
+      get,
+    ).catch(() => undefined);
+  }, state.settings.files.autoSaveDelayMs);
+}
+
 async function persistSession(consoleClient: ConsoleClient, get: StoreGet) {
   try {
     await consoleClient.saveSession(workspaceSession(get()));
@@ -1116,18 +1646,32 @@ async function persistSession(consoleClient: ConsoleClient, get: StoreGet) {
   }
 }
 
-function nextQueryFileName(workspace: WorkspaceSnapshot) {
-  const names = new Set(
-    workspace.entries
-      .filter((entry) => entry.kind === "sqlFile")
-      .map((entry) => entry.name.toLowerCase()),
-  );
-  if (!names.has("query.sql")) return "query.sql";
-  for (let index = 2; index <= 9_999; index += 1) {
-    const name = `query_${String(index).padStart(2, "0")}.sql`;
+function nextUntitledName(documents: OpenSqlDocument[]) {
+  const names = new Set(documents.map((document) => document.name.toLowerCase()));
+  for (let sequence = 1; sequence <= 9_999; sequence += 1) {
+    const name = `未命名-${sequence}.sql`;
     if (!names.has(name.toLowerCase())) return name;
   }
-  return `query_${Date.now()}.sql`;
+  return `未命名-${Date.now()}.sql`;
+}
+
+function nextUntitledId(documents: OpenSqlDocument[]) {
+  const ids = new Set(
+    documents
+      .filter(
+        (
+          document,
+        ): document is OpenSqlDocument & {
+          locator: Extract<DocumentLocator, { kind: "untitled" }>;
+        } => document.locator.kind === "untitled",
+      )
+      .map((document) => document.locator.id),
+  );
+  for (let sequence = 1; sequence <= 9_999; sequence += 1) {
+    const id = `untitled-${sequence}`;
+    if (!ids.has(id)) return id;
+  }
+  return `untitled-${Date.now()}`;
 }
 
 function renamedPath(path: string, newName: string) {
@@ -1143,7 +1687,7 @@ function replacePathPrefix(path: string, before: string, after: string) {
 }
 
 async function connectProfile(
-  profile: ConnectionProfileV1,
+  profile: ConnectionProfileV2,
   dbms: DbmsClient,
   _consoleClient: ConsoleClient,
   set: StoreSet,
@@ -1155,16 +1699,13 @@ async function connectProfile(
     activeCredentialId: profile.credentialId,
     notice: `正在重连 ${profile.label}`,
   });
-  const request = {
-    connectorId: profile.connectorId,
-    dialect: profile.dialect,
-    endpoint: profile.endpoint,
-    adminEndpoint: profile.adminEndpoint,
-    database: profile.database,
-    credentialId: profile.credentialId,
-  };
+  const request = toConnectionRequest(profile);
   try {
-    const probe = await dbms.probe(request);
+    const probe = await runConnectionStep(
+      "自动重连诊断",
+      dbms.probe(request),
+      get,
+    );
     set({ connectionProbe: probe });
     if (!probe.ready) {
       throw (
@@ -1173,11 +1714,26 @@ async function connectProfile(
         )?.error ?? localError("08001", "本地数据库自动重连诊断未通过")
       );
     }
-    const connection = await dbms.connect(request);
-    const [catalog, monitor] = await Promise.all([
-      dbms.catalog(connection.connectionId),
-      dbms.monitor(connection.connectionId),
-    ]);
+    const connection = await runConnectionStep(
+      "自动重连",
+      dbms.connect(request),
+      get,
+    );
+    let catalog: Awaited<ReturnType<DbmsClient["catalog"]>>;
+    let monitor: Awaited<ReturnType<DbmsClient["monitor"]>>;
+    try {
+      [catalog, monitor] = await runConnectionStep(
+        "自动重连元数据加载",
+        Promise.all([
+          dbms.catalog(connection.connectionId),
+          dbms.monitor(connection.connectionId),
+        ]),
+        get,
+      );
+    } catch (error) {
+      void dbms.disconnect(connection.connectionId).catch(() => undefined);
+      throw error;
+    }
     set({
       connection,
       monitor,
@@ -1196,6 +1752,119 @@ async function connectProfile(
       notice: `自动重连失败 · ${normalized.sqlState}`,
     });
   }
+}
+
+function toConnectionRequest(
+  values:
+    | DataSourceValues
+    | Pick<
+        ConnectionProfileV2,
+        | "connectorId"
+        | "dialect"
+        | "endpoint"
+        | "adminEndpoint"
+        | "database"
+        | "credentialId"
+      >,
+): DbmsConnectionRequest {
+  return {
+    connectorId: values.connectorId,
+    dialect: values.dialect,
+    endpoint: values.endpoint,
+    adminEndpoint: values.adminEndpoint,
+    database: values.database,
+    credentialId: values.credentialId,
+  };
+}
+
+function failedProbeError(probe: ConnectionProbe) {
+  return probe.stages.find((stage) => stage.status === "failed")?.error ?? null;
+}
+
+function requireNativePreflight(probe: ConnectionProbe) {
+  const blocking = probe.stages.find(
+    (stage) =>
+      stage.status === "failed" &&
+      ["service", "pgPort", "adminApi", "initialization"].includes(stage.stage),
+  );
+  if (blocking) {
+    throw (
+      blocking.error ?? localError("08001", "本地 OrdaDB 连接前置诊断未通过")
+    );
+  }
+}
+
+function requireReadyProbe(probe: ConnectionProbe, fallbackMessage: string) {
+  if (!probe.ready) {
+    throw failedProbeError(probe) ?? localError("08001", fallbackMessage);
+  }
+}
+
+async function establishDataSourceConnection(
+  values: DataSourceValues,
+  request: DbmsConnectionRequest,
+  dbms: DbmsClient,
+  consoleClient: ConsoleClient,
+  set: StoreSet,
+  get: StoreGet,
+) {
+  const descriptor = get().connectorDescriptors.find(
+    (candidate) => candidate.connectorId === values.connectorId,
+  );
+  if (!descriptor) {
+    throw localError("22023", "未知的数据源类型");
+  }
+  const connection = await runConnectionStep(
+    "建立数据库连接",
+    dbms.connect(request),
+    get,
+  );
+  let catalog: Awaited<ReturnType<DbmsClient["catalog"]>>;
+  let monitor: Awaited<ReturnType<DbmsClient["monitor"]>>;
+  try {
+    [catalog, monitor] = await runConnectionStep(
+      "加载数据库元数据",
+      Promise.all([
+        dbms.catalog(connection.connectionId),
+        dbms.monitor(connection.connectionId),
+      ]),
+      get,
+    );
+  } catch (error) {
+    void dbms.disconnect(connection.connectionId).catch(() => undefined);
+    throw error;
+  }
+  const profiles = await consoleClient.saveConnectionProfile({
+    formatVersion: 2,
+    profileId: values.credentialId,
+    label: values.database || values.endpoint,
+    dataSourceKind: descriptor.dataSourceKind,
+    connectorId: values.connectorId,
+    dialect: values.dialect,
+    endpoint: values.endpoint,
+    adminEndpoint: values.adminEndpoint,
+    database: values.database,
+    tlsMode: values.tlsMode,
+    credentialId: values.credentialId,
+    autoReconnect:
+      values.connectorId === "ordadb-native" &&
+      get().settings.connections.autoReconnectLocal,
+  });
+  set({
+    connection,
+    monitor,
+    operations: [],
+    serviceStatus: null,
+    dialect: connection.dialect,
+    dataSourceOpen: false,
+    connectionState: "connected",
+    connectionError: null,
+    transactionActive: false,
+    connectionProfiles: profiles,
+    notice: `${connection.database} · 已连接`,
+  });
+  setCatalog(set, get, catalog.objects);
+  await get().refreshAdministration();
 }
 
 function operationLabel(kind: DbmsOperationRecord["kind"]) {

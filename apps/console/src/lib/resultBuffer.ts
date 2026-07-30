@@ -18,6 +18,18 @@ export const RESULT_PAGE_ROWS = 256;
 export const MAX_RESULT_ROWS = 10_000;
 export const MAX_RESULT_BYTES = 16 * 1024 * 1024;
 
+export interface ResultBufferLimits {
+  pageRows: number;
+  maxRows: number;
+  maxBytes: number;
+}
+
+export const DEFAULT_RESULT_BUFFER_LIMITS: ResultBufferLimits = {
+  pageRows: RESULT_PAGE_ROWS,
+  maxRows: MAX_RESULT_ROWS,
+  maxBytes: MAX_RESULT_BYTES,
+};
+
 export function emptyResultBuffer(): ResultBuffer {
   return {
     pages: [],
@@ -31,6 +43,7 @@ export function emptyResultBuffer(): ResultBuffer {
 export function appendResultRows(
   current: ResultBuffer,
   incoming: ResultRow[],
+  limits: ResultBufferLimits = DEFAULT_RESULT_BUFFER_LIMITS,
 ): ResultBuffer {
   if (incoming.length === 0) {
     return current;
@@ -46,23 +59,20 @@ export function appendResultRows(
 
   let offset = 0;
   while (offset < incoming.length) {
-    if (
-      next.rowCount >= MAX_RESULT_ROWS ||
-      next.bytes >= MAX_RESULT_BYTES
-    ) {
+    if (next.rowCount >= limits.maxRows || next.bytes >= limits.maxBytes) {
       next.droppedRows += incoming.length - offset;
       break;
     }
 
     const source = incoming[offset];
     const bytes = estimateResultRowBytes(source);
-    if (next.bytes + bytes > MAX_RESULT_BYTES) {
+    if (next.bytes + bytes > limits.maxBytes) {
       next.droppedRows += incoming.length - offset;
       break;
     }
 
     const last = next.pages.at(-1);
-    if (last && last.rows.length < RESULT_PAGE_ROWS) {
+    if (last && last.rows.length < limits.pageRows) {
       const rows = last.rows.slice();
       rows.push(source);
       next.pages[next.pages.length - 1] = {

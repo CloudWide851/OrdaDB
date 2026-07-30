@@ -16,11 +16,18 @@ OrdaDB 是一个以 Rust 构建的单机持久化关系数据库与 Windows SQL
 - 常用关系 SQL、DDL、PL/pgSQL 子集、触发器、全文索引、VECTOR/HNSW 和混合检索
 - Axum 管理 API、Windows LocalService 服务、机器可读 CLI
 - 一致性逻辑归档 v1、原子恢复、CSV/JSON Lines 原子导入导出
-- React、Monaco 与 Tauri 2 Console：对象树、查询流、事务、监控、检查点和作业管理
+- React、Monaco 与 Tauri 2 Console：独立 OrdaDB/PostgreSQL 数据源、六阶段
+  本地诊断、对象树、查询流、事务、监控、检查点和作业管理
+- SQL 工作台支持未命名/工作区/外部文件、首次保存时 Save As、拖放、最近文件、
+  冲突恢复、命令注册表快捷键，以及可搜索的六类 `ConsoleSettingsV2`
 - 官方签名的 Windows x64 隔离连接插件；未配置 Registry 时默认拒绝下载
 
 浏览器开发预览始终显示 `Preview fixture`，不会伪装真实数据库、文件写入或服务操作。
 AI 面板仍是后续入口，不执行模型推理。
+
+数据库密码由 Rust 调用 Windows 原生安全提示并直接写入 Credential Manager；密码
+不会进入 React、Zustand、Tauri 请求 DTO、日志或 LocalAppData 状态文件。结果分页、
+驻留内存、NULL 显示、查询/连接超时、自动保存和危险写入确认均由已验证的设置驱动。
 
 ## 开发环境
 
@@ -57,10 +64,11 @@ cargo test --workspace --target x86_64-pc-windows-msvc
 cargo build --workspace --release --target x86_64-pc-windows-msvc
 cargo deny check
 cargo audit
-cargo llvm-cov --workspace --target x86_64-pc-windows-msvc --summary-only
+cargo llvm-cov --no-clean -p <affected-crate> --target x86_64-pc-windows-msvc --summary-only -- --test-threads=1
 ```
 
 Cargo 检查必须串行运行；Playwright 应独占运行，避免与 release/installer 构建争用。
+覆盖率按受影响 crate 拆分，不在此 Windows 主机运行整 workspace 聚合插桩。
 
 ## 最终规模门禁
 

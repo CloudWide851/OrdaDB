@@ -1,19 +1,22 @@
 use std::collections::BTreeMap;
+use std::fs;
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use ordadb_connectors::{
     CatalogEntry, ConnectorHost, ConnectorRequestV1, ConnectorResponseV1, CredentialPayload,
-    CredentialVault, PluginManager,
+    PluginManager,
 };
 use ordadb_protocol::{ClientConfig, PgCancelToken, PgClient, PgQueryEvent};
 use ordadb_types::{DbError, QueryEvent, Value};
+use ordadb_windows::{CredentialVault, PromptedCredential, prompt_for_credential};
 use reqwest::{Client, Method, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
@@ -27,6 +30,8 @@ const NATIVE_CONNECTOR_ID: &str = "ordadb-native";
 const QUERY_BATCH_ROWS: usize = 1_024;
 const MAX_ADMIN_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const BOOTSTRAP_TICKET_TTL: Duration = Duration::from_secs(120);
+const MAX_BOOTSTRAP_TICKETS: usize = 32;
 const VALID_CONNECTOR_IDS: [&str; 5] = [
     NATIVE_CONNECTOR_ID,
     "postgresql",
@@ -42,23 +47,12 @@ pub struct CredentialSaved {
     username: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SaveCredentialRequest {
+pub struct PromptCredentialRequest {
     credential_id: String,
-    username: String,
-    password: String,
-}
-
-impl std::fmt::Debug for SaveCredentialRequest {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("SaveCredentialRequest")
-            .field("credential_id", &self.credential_id)
-            .field("username", &self.username)
-            .field("password", &"<redacted>")
-            .finish()
-    }
+    connector_id: String,
+    suggested_username: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -104,6 +98,7 @@ pub struct ConnectionProbeStage {
 pub struct ConnectionProbe {
     ready: bool,
     stages: Vec<ConnectionProbeStage>,
+    bootstrap_ticket: Option<LocalBootstrapTicket>,
 }
 
 impl ConnectionProbe {
@@ -111,6 +106,7 @@ impl ConnectionProbe {
         Self {
             ready: false,
             stages: Vec::with_capacity(6),
+            bootstrap_ticket: None,
         }
     }
 
@@ -146,19 +142,28 @@ impl ConnectionProbe {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalBootstrapTicket {
+    ticket: String,
+    expires_in_ms: u64,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BootstrapAdminRequest {
-    username: String,
-    password: String,
+    ticket: String,
+    connection: ConnectRequest,
+    suggested_username: String,
 }
 
 impl std::fmt::Debug for BootstrapAdminRequest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BootstrapAdminRequest")
-            .field("username", &self.username)
-            .field("password", &"<redacted>")
+            .field("ticket", &"<redacted>")
+            .field("connection", &self.connection)
+            .field("suggested_username", &self.suggested_username)
             .finish()
     }
 }
@@ -584,12 +589,27 @@ struct ActiveRequest {
     cancellation: RequestCancellation,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServiceIdentity {
+    process_id: u32,
+    data_dir: PathBuf,
+    pipe_name: String,
+}
+
+#[derive(Debug)]
+struct BootstrapTicketRecord {
+    expires_at: Instant,
+    request_fingerprint: [u8; 32],
+    service: ServiceIdentity,
+}
+
 #[derive(Debug)]
 pub struct DbmsRuntime {
     credentials: CredentialVault,
     plugin_manager: Arc<PluginManager>,
     connections: RwLock<BTreeMap<String, Arc<ConnectionHandle>>>,
     requests: RwLock<BTreeMap<String, ActiveRequest>>,
+    bootstrap_tickets: Mutex<BTreeMap<String, BootstrapTicketRecord>>,
     http: Client,
 }
 
@@ -608,7 +628,41 @@ impl DbmsRuntime {
             plugin_manager,
             connections: RwLock::new(BTreeMap::new()),
             requests: RwLock::new(BTreeMap::new()),
+            bootstrap_tickets: Mutex::new(BTreeMap::new()),
             http,
+        }))
+    }
+
+    async fn prompt_and_store_credential(
+        &self,
+        request: PromptCredentialRequest,
+    ) -> Result<Option<CredentialSaved>, DbError> {
+        validate_id(&request.credential_id, "credential ID")?;
+        if !VALID_CONNECTOR_IDS.contains(&request.connector_id.as_str()) {
+            return Err(invalid("unknown connector ID"));
+        }
+        validate_text(
+            &request.suggested_username,
+            1,
+            256,
+            "suggested credential username",
+        )?;
+        let prompted =
+            prompt_database_credential(request.connector_id, request.suggested_username, false)
+                .await?;
+        let Some(prompted) = prompted else {
+            return Ok(None);
+        };
+        validate_text(&prompted.username, 1, 256, "credential username")?;
+        validate_text(prompted.password.as_str(), 1, 1_024, "credential password")?;
+        self.credentials.store(
+            &request.credential_id,
+            &prompted.username,
+            &prompted.password,
+        )?;
+        Ok(Some(CredentialSaved {
+            credential_id: request.credential_id,
+            username: prompted.username,
         }))
     }
 
@@ -756,14 +810,24 @@ impl DbmsRuntime {
             return probe;
         }
 
-        match tauri::async_runtime::spawn_blocking(probe_windows_service).await {
-            Ok(Ok(())) => probe.passed(ConnectionProbeStageName::Service),
-            Ok(Err(error)) => probe.failed(ConnectionProbeStageName::Service, error),
-            Err(error) => probe.failed(
-                ConnectionProbeStageName::Service,
-                task_error("Windows service probe task failed", error),
-            ),
-        }
+        let service_identity =
+            match tauri::async_runtime::spawn_blocking(probe_windows_service).await {
+                Ok(Ok(identity)) => {
+                    probe.passed(ConnectionProbeStageName::Service);
+                    Some(identity)
+                }
+                Ok(Err(error)) => {
+                    probe.failed(ConnectionProbeStageName::Service, error);
+                    None
+                }
+                Err(error) => {
+                    probe.failed(
+                        ConnectionProbeStageName::Service,
+                        task_error("Windows service probe task failed", error),
+                    );
+                    None
+                }
+            };
 
         let address = match request.endpoint.parse::<SocketAddr>() {
             Ok(address) => {
@@ -834,11 +898,36 @@ impl DbmsRuntime {
             }
 
             match admin_get::<Health>(&self.http, &public, "/v1/health/ready", false).await {
-                Ok(health) if health.bootstrap_required => probe.failed(
-                    ConnectionProbeStageName::Initialization,
-                    DbError::new("55000", "OrdaDB requires its first administrator")
-                        .with_hint("complete the local administrator setup, then retry"),
-                ),
+                Ok(health) if health.bootstrap_required => {
+                    if let Some(identity) = &service_identity {
+                        match self.issue_bootstrap_ticket(&request, identity) {
+                            Ok(ticket) => {
+                                probe.bootstrap_ticket = Some(ticket);
+                                probe.failed(
+                                    ConnectionProbeStageName::Initialization,
+                                    DbError::new(
+                                        "55000",
+                                        "OrdaDB requires its first administrator",
+                                    )
+                                    .with_hint(
+                                        "complete the local administrator setup, then retry",
+                                    ),
+                                );
+                            }
+                            Err(error) => {
+                                probe.failed(ConnectionProbeStageName::Initialization, error);
+                            }
+                        }
+                    } else {
+                        probe.failed(
+                            ConnectionProbeStageName::Initialization,
+                            DbError::new(
+                                "55000",
+                                "OrdaDB bootstrap requires a verified local service",
+                            ),
+                        );
+                    }
+                }
                 Ok(health) if health.status == "ready" && !health.version.is_empty() => {
                     probe.passed(ConnectionProbeStageName::Initialization)
                 }
@@ -932,6 +1021,124 @@ impl DbmsRuntime {
         }
         probe.finish();
         probe
+    }
+
+    fn issue_bootstrap_ticket(
+        &self,
+        request: &ConnectRequest,
+        service: &ServiceIdentity,
+    ) -> Result<LocalBootstrapTicket, DbError> {
+        let token = Uuid::new_v4().to_string();
+        let now = Instant::now();
+        let mut tickets = mutex_lock(&self.bootstrap_tickets)?;
+        tickets.retain(|_, record| record.expires_at > now);
+        if tickets.len() >= MAX_BOOTSTRAP_TICKETS
+            && let Some(oldest) = tickets
+                .iter()
+                .min_by_key(|(_, record)| record.expires_at)
+                .map(|(ticket, _)| ticket.clone())
+        {
+            tickets.remove(&oldest);
+        }
+        tickets.insert(
+            token.clone(),
+            BootstrapTicketRecord {
+                expires_at: now + BOOTSTRAP_TICKET_TTL,
+                request_fingerprint: connection_fingerprint(request),
+                service: service.clone(),
+            },
+        );
+        Ok(LocalBootstrapTicket {
+            ticket: token,
+            expires_in_ms: BOOTSTRAP_TICKET_TTL.as_millis() as u64,
+        })
+    }
+
+    fn consume_bootstrap_ticket(
+        &self,
+        request: &BootstrapAdminRequest,
+    ) -> Result<BootstrapTicketRecord, DbError> {
+        validate_id(&request.ticket, "local bootstrap ticket")?;
+        let record = mutex_lock(&self.bootstrap_tickets)?
+            .remove(&request.ticket)
+            .ok_or_else(|| {
+                DbError::new(
+                    "55000",
+                    "local bootstrap ticket is invalid or already consumed",
+                )
+                .with_hint("run the local OrdaDB connection probe again")
+            })?;
+        if record.expires_at <= Instant::now() {
+            return Err(DbError::new("55000", "local bootstrap ticket expired")
+                .with_hint("run the local OrdaDB connection probe again"));
+        }
+        if record.request_fingerprint != connection_fingerprint(&request.connection) {
+            return Err(DbError::new(
+                "28000",
+                "local bootstrap ticket does not match this connection",
+            ));
+        }
+        Ok(record)
+    }
+
+    async fn bootstrap_admin(
+        &self,
+        request: BootstrapAdminRequest,
+    ) -> Result<BootstrapAdminResult, DbError> {
+        validate_connect_request(&request.connection)?;
+        if request.connection.connector_id != NATIVE_CONNECTOR_ID {
+            return Err(invalid(
+                "administrator bootstrap is available only for native OrdaDB",
+            ));
+        }
+        validate_text(
+            &request.suggested_username,
+            1,
+            128,
+            "suggested administrator username",
+        )?;
+        let prompted = prompt_database_credential(
+            NATIVE_CONNECTOR_ID.to_owned(),
+            request.suggested_username.clone(),
+            true,
+        )
+        .await?
+        .ok_or_else(|| DbError::new("57014", "administrator credential prompt was cancelled"))?;
+        validate_text(&prompted.username, 1, 128, "administrator username")?;
+        validate_text(
+            prompted.password.as_str(),
+            8,
+            1_024,
+            "administrator password",
+        )?;
+        let record = self.consume_bootstrap_ticket(&request)?;
+        let current = tauri::async_runtime::spawn_blocking(probe_windows_service)
+            .await
+            .map_err(|error| task_error("Windows service identity check failed", error))??;
+        if current != record.service {
+            return Err(
+                DbError::new("55000", "OrdaDB service changed after the bootstrap probe")
+                    .with_hint("run the local OrdaDB connection probe again"),
+            );
+        }
+        let response = ordadb_server::request_bootstrap(
+            &record.service.pipe_name,
+            prompted.username.clone(),
+            Zeroizing::new(prompted.password.to_string()),
+        )
+        .await?;
+        if response.success {
+            self.credentials.store(
+                &request.connection.credential_id,
+                &prompted.username,
+                &prompted.password,
+            )?;
+        }
+        Ok(BootstrapAdminResult {
+            success: response.success,
+            user: response.user,
+            error: response.error.map(Into::into),
+        })
     }
 
     async fn disconnect(&self, connection_id: &str) -> Result<(), DbError> {
@@ -1516,20 +1723,14 @@ struct ApiErrorEnvelope {
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub async fn dbms_save_credential(
+pub async fn dbms_prompt_credential(
     runtime: State<'_, Arc<DbmsRuntime>>,
-    request: SaveCredentialRequest,
-) -> DesktopResult<CredentialSaved> {
-    validate_id(&request.credential_id, "credential ID")?;
-    validate_text(&request.username, 1, 256, "credential username")?;
-    let password = Zeroizing::new(request.password);
+    request: PromptCredentialRequest,
+) -> DesktopResult<Option<CredentialSaved>> {
     runtime
-        .credentials
-        .store(&request.credential_id, &request.username, &password)?;
-    Ok(CredentialSaved {
-        credential_id: request.credential_id,
-        username: request.username,
-    })
+        .prompt_and_store_credential(request)
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1561,20 +1762,10 @@ pub async fn dbms_probe_connection(
 
 #[tauri::command(rename_all = "camelCase")]
 pub async fn dbms_bootstrap_admin(
+    runtime: State<'_, Arc<DbmsRuntime>>,
     request: BootstrapAdminRequest,
 ) -> DesktopResult<BootstrapAdminResult> {
-    validate_text(&request.username, 1, 128, "administrator username")?;
-    validate_text(&request.password, 8, 1_024, "administrator password")?;
-    let data_dir = ordadb_server::default_data_dir();
-    let pipe = ordadb_server::bootstrap_pipe_name(&data_dir);
-    let response =
-        ordadb_server::request_bootstrap(&pipe, request.username, Zeroizing::new(request.password))
-            .await?;
-    Ok(BootstrapAdminResult {
-        success: response.success,
-        user: response.user,
-        error: response.error.map(Into::into),
-    })
+    runtime.bootstrap_admin(request).await.map_err(Into::into)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -2332,14 +2523,50 @@ fn write_lock<T>(lock: &RwLock<T>) -> Result<RwLockWriteGuard<'_, T>, DbError> {
         .map_err(|_| DbError::internal("desktop DBMS state lock was poisoned"))
 }
 
-fn probe_windows_service() -> Result<(), DbError> {
+async fn prompt_database_credential(
+    connector_id: String,
+    suggested_username: String,
+    first_administrator: bool,
+) -> Result<Option<PromptedCredential>, DbError> {
+    let (caption, message) = if first_administrator {
+        (
+            "创建 OrdaDB 首位管理员".to_owned(),
+            "请输入首位管理员用户名和密码。凭据只在受保护的本机窗口与 Windows 凭据库中处理。"
+                .to_owned(),
+        )
+    } else {
+        let display_name = match connector_id.as_str() {
+            NATIVE_CONNECTOR_ID => "OrdaDB",
+            "postgresql" => "PostgreSQL",
+            "mysql" => "MySQL",
+            "sqlite" => "SQLite",
+            "sql-server" => "SQL Server",
+            _ => return Err(invalid("unknown connector ID")),
+        };
+        (
+            format!("连接 {display_name}"),
+            format!("请输入 {display_name} 用户名和密码。密码不会进入 OrdaDB 网页界面或状态文件。"),
+        )
+    };
+    let target = format!("OrdaDB Console/{connector_id}");
+    tauri::async_runtime::spawn_blocking(move || {
+        prompt_for_credential(&target, &suggested_username, &caption, &message)
+    })
+    .await
+    .map_err(|error| task_error("Windows credential prompt task failed", error))?
+}
+
+fn probe_windows_service() -> Result<ServiceIdentity, DbError> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|error| {
             DbError::new("58030", "failed to open Windows Service Control Manager")
                 .with_detail(error.to_string())
         })?;
     let service = manager
-        .open_service(ordadb_server::SERVICE_NAME, ServiceAccess::QUERY_STATUS)
+        .open_service(
+            ordadb_server::SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+        )
         .map_err(|error| {
             DbError::new("55000", "OrdaDB Windows service is not installed")
                 .with_detail(error.to_string())
@@ -2356,7 +2583,126 @@ fn probe_windows_service() -> Result<(), DbError> {
                 .with_hint("start the OrdaDB service, then retry"),
         );
     }
-    Ok(())
+    let process_id = status
+        .process_id
+        .filter(|process_id| *process_id != 0)
+        .ok_or_else(|| {
+            DbError::new(
+                "55000",
+                "OrdaDB Windows service has no running process identity",
+            )
+        })?;
+    let configuration = service.query_config().map_err(|error| {
+        DbError::new(
+            "58030",
+            "failed to query OrdaDB Windows service configuration",
+        )
+        .with_detail(error.to_string())
+    })?;
+    let command_line = configuration.executable_path.to_string_lossy();
+    let arguments = split_windows_command_line(&command_line)?;
+    let data_dir = arguments
+        .windows(2)
+        .find_map(|pair| (pair[0] == "--data-dir").then(|| PathBuf::from(&pair[1])))
+        .ok_or_else(|| {
+            DbError::new(
+                "55000",
+                "OrdaDB Windows service configuration has no data directory",
+            )
+            .with_hint("repair the OrdaDB service registration, then retry")
+        })?;
+    let data_dir = fs::canonicalize(&data_dir).map_err(|error| {
+        DbError::new("58030", "failed to resolve OrdaDB service data directory")
+            .with_detail(error.to_string())
+    })?;
+    let pipe_name = ordadb_server::bootstrap_pipe_name(&data_dir);
+    Ok(ServiceIdentity {
+        process_id,
+        data_dir,
+        pipe_name,
+    })
+}
+
+fn split_windows_command_line(command_line: &str) -> Result<Vec<String>, DbError> {
+    let characters = command_line.chars().collect::<Vec<_>>();
+    let mut arguments = Vec::new();
+    let mut offset = 0_usize;
+    while offset < characters.len() {
+        while offset < characters.len() && characters[offset].is_whitespace() {
+            offset += 1;
+        }
+        if offset == characters.len() {
+            break;
+        }
+        let mut argument = String::new();
+        let mut quoted = false;
+        while offset < characters.len() {
+            match characters[offset] {
+                character if character.is_whitespace() && !quoted => break,
+                '"' => {
+                    quoted = !quoted;
+                    offset += 1;
+                }
+                '\\' => {
+                    let start = offset;
+                    while offset < characters.len() && characters[offset] == '\\' {
+                        offset += 1;
+                    }
+                    let count = offset - start;
+                    if offset < characters.len() && characters[offset] == '"' {
+                        argument.extend(std::iter::repeat_n('\\', count / 2));
+                        if count % 2 == 0 {
+                            quoted = !quoted;
+                        } else {
+                            argument.push('"');
+                        }
+                        offset += 1;
+                    } else {
+                        argument.extend(std::iter::repeat_n('\\', count));
+                    }
+                }
+                character => {
+                    argument.push(character);
+                    offset += 1;
+                }
+            }
+        }
+        if quoted {
+            return Err(invalid(
+                "OrdaDB Windows service command line contains an unmatched quote",
+            ));
+        }
+        arguments.push(argument);
+        while offset < characters.len() && characters[offset].is_whitespace() {
+            offset += 1;
+        }
+    }
+    if arguments.is_empty() {
+        return Err(invalid("OrdaDB Windows service command line is empty"));
+    }
+    Ok(arguments)
+}
+
+fn connection_fingerprint(request: &ConnectRequest) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    for value in [
+        Some(request.connector_id.as_str()),
+        Some(request.dialect.as_str()),
+        Some(request.endpoint.as_str()),
+        request.admin_endpoint.as_deref(),
+        request.database.as_deref(),
+        Some(request.credential_id.as_str()),
+    ] {
+        match value {
+            Some(value) => {
+                hash.update([1]);
+                hash.update((value.len() as u64).to_le_bytes());
+                hash.update(value.as_bytes());
+            }
+            None => hash.update([0]),
+        }
+    }
+    hash.finalize().into()
 }
 
 fn invalid(message: impl Into<String>) -> DbError {
@@ -2368,26 +2714,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn credential_request_debug_is_redacted() {
-        let request = SaveCredentialRequest {
+    fn credential_prompt_request_contains_no_secret_field() {
+        let request = PromptCredentialRequest {
             credential_id: "local".into(),
-            username: "dba".into(),
-            password: "never-print-this".into(),
+            connector_id: NATIVE_CONNECTOR_ID.into(),
+            suggested_username: "dba".into(),
         };
         let debug = format!("{request:?}");
-        assert!(debug.contains("<redacted>"));
-        assert!(!debug.contains("never-print-this"));
+        assert!(debug.contains("suggested_username"));
+        assert!(!debug.contains("password"));
+        assert!(
+            serde_json::from_value::<PromptCredentialRequest>(serde_json::json!({
+                "credentialId": "local",
+                "connectorId": NATIVE_CONNECTOR_ID,
+                "suggestedUsername": "dba",
+                "password": null
+            }))
+            .is_err()
+        );
     }
 
     #[test]
     fn bootstrap_request_debug_is_redacted_and_probe_stages_are_structured() {
+        let connection = native_connect_request();
         let request = BootstrapAdminRequest {
-            username: "ordadb_admin".into(),
-            password: "never-print-bootstrap".into(),
+            ticket: "bootstrap-ticket-secret".into(),
+            connection,
+            suggested_username: "ordadb_admin".into(),
         };
         let debug = format!("{request:?}");
         assert!(debug.contains("<redacted>"));
-        assert!(!debug.contains("never-print-bootstrap"));
+        assert!(!debug.contains("bootstrap-ticket-secret"));
+        assert!(!debug.contains("password"));
 
         let mut probe = ConnectionProbe::new();
         probe.passed(ConnectionProbeStageName::Service);
@@ -2405,6 +2763,144 @@ mod tests {
         assert_eq!(value["stages"][1]["stage"], "pgPort");
         assert_eq!(value["stages"][3]["status"], "failed");
         assert_eq!(value["stages"][3]["error"]["sqlState"], "55000");
+        assert!(value["bootstrapTicket"].is_null());
+    }
+
+    #[test]
+    fn bootstrap_ticket_is_bound_expires_and_can_be_consumed_only_once() {
+        let (_root, runtime) = test_runtime();
+        let request = native_connect_request();
+        let service = ServiceIdentity {
+            process_id: 41,
+            data_dir: PathBuf::from(r"C:\ProgramData\OrdaDB\data"),
+            pipe_name: r"\\.\pipe\ordadb-bootstrap-test".into(),
+        };
+
+        let issued = runtime
+            .issue_bootstrap_ticket(&request, &service)
+            .expect("issue ticket");
+        let payload = BootstrapAdminRequest {
+            ticket: issued.ticket.clone(),
+            connection: request.clone(),
+            suggested_username: "ordadb_admin".into(),
+        };
+        assert_eq!(
+            runtime
+                .consume_bootstrap_ticket(&payload)
+                .expect("consume ticket")
+                .service,
+            service
+        );
+        assert_eq!(
+            runtime
+                .consume_bootstrap_ticket(&payload)
+                .expect_err("ticket replay")
+                .sql_state,
+            "55000"
+        );
+
+        let issued = runtime
+            .issue_bootstrap_ticket(&request, &service)
+            .expect("issue fingerprint ticket");
+        let mut mismatched_connection = request.clone();
+        mismatched_connection.endpoint = "127.0.0.1:54330".into();
+        let mismatched = BootstrapAdminRequest {
+            ticket: issued.ticket.clone(),
+            connection: mismatched_connection,
+            suggested_username: "ordadb_admin".into(),
+        };
+        assert_eq!(
+            runtime
+                .consume_bootstrap_ticket(&mismatched)
+                .expect_err("fingerprint mismatch")
+                .sql_state,
+            "28000"
+        );
+        assert_eq!(
+            runtime
+                .consume_bootstrap_ticket(&BootstrapAdminRequest {
+                    ticket: issued.ticket,
+                    connection: request.clone(),
+                    suggested_username: "ordadb_admin".into(),
+                })
+                .expect_err("mismatched ticket is consumed")
+                .sql_state,
+            "55000"
+        );
+
+        let issued = runtime
+            .issue_bootstrap_ticket(&request, &service)
+            .expect("issue expiring ticket");
+        mutex_lock(&runtime.bootstrap_tickets)
+            .expect("ticket lock")
+            .get_mut(&issued.ticket)
+            .expect("issued ticket")
+            .expires_at = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            runtime
+                .consume_bootstrap_ticket(&BootstrapAdminRequest {
+                    ticket: issued.ticket,
+                    connection: request,
+                    suggested_username: "ordadb_admin".into(),
+                })
+                .expect_err("expired ticket")
+                .sql_state,
+            "55000"
+        );
+    }
+
+    #[test]
+    fn bootstrap_ticket_serialization_exposes_only_the_bounded_capability() {
+        let ticket = LocalBootstrapTicket {
+            ticket: "ticket-1".into(),
+            expires_in_ms: 120_000,
+        };
+        let mut probe = ConnectionProbe::new();
+        probe.bootstrap_ticket = Some(ticket);
+        let value = serde_json::to_value(probe).expect("serialize ticket");
+        assert_eq!(value["bootstrapTicket"]["ticket"], "ticket-1");
+        assert_eq!(value["bootstrapTicket"]["expiresInMs"], 120_000);
+        assert_eq!(
+            value["bootstrapTicket"]
+                .as_object()
+                .expect("ticket object")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn windows_service_command_line_parser_preserves_quoted_data_directories() {
+        assert_eq!(
+            split_windows_command_line(
+                r#""C:\Program Files\OrdaDB\ordadb-server.exe" service --data-dir "D:\Orda Data\cluster""#
+            )
+            .expect("quoted command line"),
+            vec![
+                r"C:\Program Files\OrdaDB\ordadb-server.exe",
+                "service",
+                "--data-dir",
+                r"D:\Orda Data\cluster",
+            ]
+        );
+        assert_eq!(
+            split_windows_command_line(
+                r#""C:\OrdaDB\ordadb-server.exe" service --data-dir "D:\quoted\\\"name""#
+            )
+            .expect("escaped quote"),
+            vec![
+                r"C:\OrdaDB\ordadb-server.exe",
+                "service",
+                "--data-dir",
+                "D:\\quoted\\\"name",
+            ]
+        );
+        assert_eq!(
+            split_windows_command_line(r#""C:\OrdaDB\ordadb-server.exe --data-dir D:\data"#)
+                .expect_err("unmatched quote")
+                .sql_state,
+            "22023"
+        );
     }
 
     #[test]
@@ -2588,5 +3084,25 @@ mod tests {
         assert_eq!(value["error"]["sqlState"], "XX001");
         assert!(value["error"].get("sql_state").is_none());
         assert!(value["error"].get("queryId").is_some());
+    }
+
+    fn native_connect_request() -> ConnectRequest {
+        ConnectRequest {
+            connector_id: NATIVE_CONNECTOR_ID.into(),
+            dialect: "postgresql".into(),
+            endpoint: "127.0.0.1:54329".into(),
+            admin_endpoint: Some("http://127.0.0.1:9080".into()),
+            database: Some("ordadb".into()),
+            credential_id: "ordadb-local".into(),
+        }
+    }
+
+    fn test_runtime() -> (tempfile::TempDir, Arc<DbmsRuntime>) {
+        let root = tempfile::tempdir().expect("temporary plugin root");
+        let manager =
+            PluginManager::open_https(ordadb_connectors::PluginManagerOptions::new(root.path()))
+                .expect("plugin manager");
+        let runtime = DbmsRuntime::new(manager).expect("DBMS runtime");
+        (root, runtime)
     }
 }

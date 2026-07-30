@@ -37,6 +37,9 @@ export function ResultsPane() {
   const error = useWorkbenchStore((state) => state.error);
   const durationMs = useWorkbenchStore((state) => state.durationMs);
   const rowsProcessed = useWorkbenchStore((state) => state.rowsProcessed);
+  const nullDisplay = useWorkbenchStore(
+    (state) => state.settings.results.nullDisplay,
+  );
   const totalRows = Math.max(resultBuffer.totalRows, rowsProcessed);
   const planRows = useMemo(
     () => (activeTab === "plan" ? resultRows(resultBuffer.pages) : []),
@@ -110,6 +113,7 @@ export function ResultsPane() {
             pages={resultBuffer.pages}
             rowCount={resultBuffer.rowCount}
             droppedRows={resultBuffer.droppedRows}
+            nullDisplay={nullDisplay}
           />
         )}
       </div>
@@ -123,12 +127,14 @@ function DataView({
   pages,
   rowCount,
   droppedRows,
+  nullDisplay,
 }: {
   queryState: QueryState;
   columns: DbmsQueryColumn[];
   pages: ResultPage[];
   rowCount: number;
   droppedRows: number;
+  nullDisplay: string;
 }) {
   if (queryState === "running" && rowCount === 0) {
     return (
@@ -155,6 +161,7 @@ function DataView({
       pages={pages}
       rowCount={rowCount}
       droppedRows={droppedRows}
+      nullDisplay={nullDisplay}
     />
   );
 }
@@ -167,11 +174,13 @@ function VirtualResultTable({
   pages,
   rowCount,
   droppedRows,
+  nullDisplay,
 }: {
   columns: DbmsQueryColumn[];
   pages: ResultPage[];
   rowCount: number;
   droppedRows: number;
+  nullDisplay: string;
 }) {
   const viewport = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -241,7 +250,7 @@ function VirtualResultTable({
                   key={`${column.name}:${columnIndex}`}
                 >
                   {row?.[columnIndex] ?? (
-                    <span className="null-value">NULL</span>
+                    <span className="null-value">{nullDisplay}</span>
                   )}
                 </td>
               ))}

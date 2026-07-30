@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  defaultConnectorDescriptors,
   defaultConsoleSettings,
   PreviewConsoleClient,
-  type ConnectionProfileV1,
+  type ConnectionProfileV2,
 } from "./consoleClient";
 
 describe("PreviewConsoleClient", () => {
@@ -12,7 +13,9 @@ describe("PreviewConsoleClient", () => {
     await expect(client.bootstrap()).resolves.toEqual({
       settings: defaultConsoleSettings,
       recovery: null,
+      recentFiles: [],
       connectionProfiles: [],
+      connectorDescriptors: defaultConnectorDescriptors,
     });
     const workspace = await client.pickWorkspace();
     expect(workspace).toMatchObject({
@@ -60,18 +63,26 @@ describe("PreviewConsoleClient", () => {
     const client = new PreviewConsoleClient();
     const settings = {
       ...defaultConsoleSettings,
-      uiFontSize: 10,
-      reopenLastProject: true,
+      appearance: {
+        ...defaultConsoleSettings.appearance,
+        uiFontSize: 10,
+      },
+      files: {
+        ...defaultConsoleSettings.files,
+        reopenLastProject: true,
+      },
     };
-    const profile: ConnectionProfileV1 = {
-      formatVersion: 1,
+    const profile: ConnectionProfileV2 = {
+      formatVersion: 2,
       profileId: "local",
       label: "本地",
+      dataSourceKind: "ordadbNative",
       connectorId: "ordadb-native",
       dialect: "postgresql",
       endpoint: "127.0.0.1:54329",
       adminEndpoint: "http://127.0.0.1:9080",
       database: "ordadb",
+      tlsMode: "disable",
       credentialId: "credential-reference",
       autoReconnect: true,
     };

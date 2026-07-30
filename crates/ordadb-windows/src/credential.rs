@@ -3,13 +3,18 @@ use std::ptr;
 use std::slice;
 
 use ordadb_types::{DbError, Result};
-use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
+use windows_sys::Win32::Foundation::{ERROR_CANCELLED, ERROR_NOT_FOUND, GetLastError, NO_ERROR};
 use windows_sys::Win32::Security::Credentials::{
     CRED_MAX_CREDENTIAL_BLOB_SIZE, CRED_MAX_GENERIC_TARGET_NAME_LENGTH, CRED_MAX_USERNAME_LENGTH,
-    CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredFree, CredReadW,
+    CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CREDUI_FLAGS_ALWAYS_SHOW_UI,
+    CREDUI_FLAGS_DO_NOT_PERSIST, CREDUI_FLAGS_EXCLUDE_CERTIFICATES,
+    CREDUI_FLAGS_GENERIC_CREDENTIALS, CREDUI_INFOW, CREDUI_MAX_CAPTION_LENGTH,
+    CREDUI_MAX_MESSAGE_LENGTH, CredDeleteW, CredFree, CredReadW, CredUIPromptForCredentialsW,
     CredWriteW,
 };
 use zeroize::{Zeroize, Zeroizing};
+
+const CREDUI_PASSWORD_BUFFER_UNITS: usize = 257;
 
 #[derive(Clone)]
 pub struct StoredCredential {
@@ -25,6 +30,108 @@ impl Debug for StoredCredential {
             .field("password", &"<redacted>")
             .finish()
     }
+}
+
+pub struct PromptedCredential {
+    pub username: String,
+    pub password: Zeroizing<String>,
+}
+
+impl Debug for PromptedCredential {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PromptedCredential")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+pub fn prompt_for_credential(
+    target_name: &str,
+    suggested_username: &str,
+    caption: &str,
+    message: &str,
+) -> Result<Option<PromptedCredential>> {
+    let mut target = prompt_text(
+        target_name,
+        CRED_MAX_GENERIC_TARGET_NAME_LENGTH as usize,
+        "credential prompt target",
+    )?;
+    let mut caption = prompt_text(
+        caption,
+        CREDUI_MAX_CAPTION_LENGTH as usize,
+        "credential prompt caption",
+    )?;
+    let mut message = prompt_text(
+        message,
+        CREDUI_MAX_MESSAGE_LENGTH as usize,
+        "credential prompt message",
+    )?;
+    let suggested = prompt_text(
+        suggested_username,
+        CRED_MAX_USERNAME_LENGTH as usize,
+        "suggested credential username",
+    )?;
+    let mut username = vec![0_u16; CRED_MAX_USERNAME_LENGTH as usize + 1];
+    username[..suggested.len()].copy_from_slice(&suggested[..suggested.len()]);
+    let mut password = Zeroizing::new(vec![0_u16; CREDUI_PASSWORD_BUFFER_UNITS]);
+    let mut save = 0;
+    let info = CREDUI_INFOW {
+        cbSize: u32::try_from(std::mem::size_of::<CREDUI_INFOW>())
+            .map_err(|_| invalid("credential prompt structure size overflowed"))?,
+        hwndParent: ptr::null_mut(),
+        pszMessageText: message.as_ptr(),
+        pszCaptionText: caption.as_ptr(),
+        hbmBanner: ptr::null_mut(),
+    };
+    // SAFETY: all input strings are live NUL-terminated UTF-16 buffers,
+    // output buffers are writable for the declared lengths, and no pointers
+    // escape this call.
+    let result = unsafe {
+        CredUIPromptForCredentialsW(
+            &info,
+            target.as_ptr(),
+            ptr::null(),
+            0,
+            username.as_mut_ptr(),
+            username.len() as u32,
+            password.as_mut_ptr(),
+            password.len() as u32,
+            &mut save,
+            CREDUI_FLAGS_ALWAYS_SHOW_UI
+                | CREDUI_FLAGS_DO_NOT_PERSIST
+                | CREDUI_FLAGS_EXCLUDE_CERTIFICATES
+                | CREDUI_FLAGS_GENERIC_CREDENTIALS,
+        )
+    };
+    target.zeroize();
+    caption.zeroize();
+    message.zeroize();
+    if result == ERROR_CANCELLED {
+        username.zeroize();
+        return Ok(None);
+    }
+    if result != NO_ERROR {
+        username.zeroize();
+        return Err(DbError::new("58030", "Windows credential prompt failed")
+            .with_detail(format!("Windows error {result}")));
+    }
+    let prompted_username = string_from_wide_buffer(
+        &username,
+        CRED_MAX_USERNAME_LENGTH as usize,
+        "prompted credential username",
+    )?;
+    username.zeroize();
+    let prompted_password = string_from_wide_buffer(
+        &password,
+        CREDUI_PASSWORD_BUFFER_UNITS - 1,
+        "prompted credential password",
+    )?;
+    Ok(Some(PromptedCredential {
+        username: prompted_username,
+        password: Zeroizing::new(prompted_password),
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +298,26 @@ fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+fn prompt_text(value: &str, maximum: usize, context: &str) -> Result<Vec<u16>> {
+    if value.contains('\0') || value.encode_utf16().count() > maximum {
+        return Err(invalid(format!(
+            "{context} must be NUL-free and fit the Windows limit"
+        )));
+    }
+    Ok(wide(value))
+}
+
+fn string_from_wide_buffer(buffer: &[u16], maximum: usize, context: &str) -> Result<String> {
+    let length = buffer
+        .iter()
+        .take(maximum + 1)
+        .position(|unit| *unit == 0)
+        .ok_or_else(|| invalid(format!("{context} exceeds the Windows limit")))?;
+    String::from_utf16(&buffer[..length]).map_err(|error| {
+        invalid(format!("{context} is invalid UTF-16")).with_detail(error.to_string())
+    })
+}
+
 fn wide_pointer_to_string(pointer: *const u16, maximum: usize, context: &str) -> Result<String> {
     if pointer.is_null() {
         return Ok(String::new());
@@ -259,5 +386,25 @@ mod tests {
         assert!(!debug.contains("credential-test-secret"));
         vault.delete(id).expect("delete");
         assert_eq!(vault.load(id).expect_err("deleted").sql_state, "42704");
+    }
+
+    #[test]
+    fn credential_prompt_helpers_are_bounded_and_secret_safe() {
+        let prompted = PromptedCredential {
+            username: "dba".to_owned(),
+            password: Zeroizing::new("prompt-secret".to_owned()),
+        };
+        let debug = format!("{prompted:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("prompt-secret"));
+
+        assert_eq!(
+            string_from_wide_buffer(&[b'd' as u16, b'b' as u16, b'a' as u16, 0], 3, "username")
+                .expect("bounded username"),
+            "dba"
+        );
+        assert!(string_from_wide_buffer(&[b'd' as u16; 4], 3, "username").is_err());
+        assert!(prompt_text("contains\0nul", 32, "message").is_err());
+        assert!(prompt_text("too-long", 3, "message").is_err());
     }
 }

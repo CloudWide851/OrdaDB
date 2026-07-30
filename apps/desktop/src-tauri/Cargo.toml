@@ -22,6 +22,7 @@ ordadb-connectors = { path = "../../../crates/ordadb-connectors" }
 ordadb-protocol = { path = "../../../crates/ordadb-protocol" }
 ordadb-server = { path = "../../../crates/ordadb-server" }
 ordadb-types = { path = "../../../crates/ordadb-types" }
+ordadb-windows = { path = "../../../crates/ordadb-windows" }
 reqwest.workspace = true
 rfd = { version = "0.15.4", default-features = false }
 serde = { version = "1", features = ["derive"] }
