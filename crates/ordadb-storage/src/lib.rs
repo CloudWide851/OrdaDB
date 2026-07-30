@@ -7,13 +7,19 @@ mod tuple;
 
 pub use buffer::{BufferPool, DurabilityBarrier, NoWalBarrier, PageGuard};
 pub use disk::DiskManager;
-pub use page::{FILE_FORMAT_VERSION, PAGE_SIZE, PageId, PageType, SLOT_SIZE, SlottedPage};
+pub use page::{
+    FILE_FORMAT_VERSION, MAX_RECORD_BYTES, PAGE_SIZE, PageId, PageType, SLOT_SIZE, SlottedPage,
+};
 pub use recovery::{RecoveryDataFile, RecoveryFileState, RecoveryPlan};
 pub use store::{
-    ApplyPoint, DatabaseStore, IndexManifest, PageDelta, PersistentState, PreparedCommit,
-    TableManifest,
+    ApplyPoint, DATABASE_FILE_NAME, DATABASE_FORMAT_V1, DATABASE_FORMAT_V2, DataFormat,
+    DatabaseStore, IndexManifest, IndexRebuildContractV2, IndexRebuildModeV2, PageDelta,
+    PersistentState, PreparedCommit, StorageEstimate, StorageInspection, TableManifest,
 };
-pub use tuple::{decode_row, encode_row};
+pub use tuple::{
+    FROZEN_TRANSACTION_ID, TUPLE_FORMAT_V1, TUPLE_FORMAT_V2, TUPLE_HEADER_V2_BYTES, TupleHeaderV2,
+    decode_row, decode_row_v2, encode_row, encode_row_v2,
+};
 
 use std::io;
 

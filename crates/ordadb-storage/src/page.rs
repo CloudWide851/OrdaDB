@@ -12,6 +12,7 @@ pub const SLOT_SIZE: usize = 6;
 
 const PAGE_MAGIC: [u8; 4] = *b"ORDA";
 const HEADER_SIZE: usize = 40;
+pub const MAX_RECORD_BYTES: usize = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE;
 const CHECKSUM_OFFSET: usize = 24;
 const LOWER_OFFSET: usize = 28;
 const UPPER_OFFSET: usize = 30;

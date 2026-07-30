@@ -129,7 +129,9 @@ impl WalManager {
         data_file.sync_all()?;
         self.check_fault(crate::FaultPoint::AfterDataSync)?;
         data_file.finish()?;
-        let durable_data_generation = DatabaseStore::open(data_dir)?.committed_state().generation;
+        let durable_data_generation = DatabaseStore::open_read_only(data_dir)?
+            .committed_state()
+            .generation;
 
         let checkpoint_lsn = self.checkpoint(CheckpointState {
             active_transactions: BTreeMap::new(),

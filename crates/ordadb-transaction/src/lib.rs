@@ -11,7 +11,10 @@ pub use record::{
     WAL_MAGIC, WAL_MAX_RECORD_LEN, WalPayload, WalRecord,
 };
 pub use recovery::RecoveryReport;
-pub use wal::{CheckpointState, LoggedTransaction, WalManager};
+pub use wal::{
+    CheckpointState, LoggedTransaction, WAL_FILE_NAME, WalInspection, WalManager,
+    inspect_wal_read_only,
+};
 pub use writer::{WriterCoordinator, WriterLease};
 
 use std::io;

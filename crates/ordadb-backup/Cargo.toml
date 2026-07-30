@@ -11,7 +11,10 @@ base64.workspace = true
 chrono.workspace = true
 csv.workspace = true
 ordadb-catalog = { path = "../ordadb-catalog" }
+ordadb-cluster = { path = "../ordadb-cluster" }
 ordadb-engine = { path = "../ordadb-engine" }
+ordadb-storage = { path = "../ordadb-storage" }
+ordadb-transaction = { path = "../ordadb-transaction" }
 ordadb-types = { path = "../ordadb-types" }
 rust_decimal.workspace = true
 serde.workspace = true

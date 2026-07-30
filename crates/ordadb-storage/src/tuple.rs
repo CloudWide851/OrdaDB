@@ -1,5 +1,5 @@
 use chrono::{Datelike, NaiveDate, NaiveTime, Timelike};
-use ordadb_types::{Result, Row, Value};
+use ordadb_types::{DbError, Result, Row, Value};
 use rust_decimal::Decimal;
 
 use crate::corruption;
@@ -22,14 +22,50 @@ const TAG_JSONB: u8 = 14;
 const TAG_UUID: u8 = 15;
 const TAG_VECTOR: u8 = 16;
 
+pub const TUPLE_FORMAT_V1: u16 = 1;
+pub const TUPLE_FORMAT_V2: u16 = 2;
+pub const TUPLE_HEADER_V2_BYTES: u16 = 32;
+pub const FROZEN_TRANSACTION_ID: u64 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TupleHeaderV2 {
+    pub flags: u16,
+    pub column_count: u16,
+    pub xmin: u64,
+    pub xmax: u64,
+    pub command_id: u32,
+}
+
+impl TupleHeaderV2 {
+    pub fn frozen(row: &Row) -> Result<Self> {
+        Ok(Self {
+            flags: 0,
+            column_count: value_count(row)?,
+            xmin: FROZEN_TRANSACTION_ID,
+            xmax: 0,
+            command_id: 0,
+        })
+    }
+
+    fn validate(self) -> Result<Self> {
+        if self.flags != 0 {
+            return Err(corruption(format!(
+                "tuple v2 uses unsupported flags 0x{:04x}",
+                self.flags
+            )));
+        }
+        if self.xmin == 0 {
+            return Err(corruption("tuple v2 xmin must be non-zero"));
+        }
+        Ok(self)
+    }
+}
+
 pub fn encode_row(row: &Row) -> Result<Vec<u8>> {
-    let value_count = u16::try_from(row.values.len())
-        .map_err(|_| corruption("tuple contains more than 65535 values"))?;
+    let value_count = value_count(row)?;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&value_count.to_le_bytes());
-    for value in &row.values {
-        encode_value(value, &mut bytes)?;
-    }
+    encode_values(row, &mut bytes)?;
     Ok(bytes)
 }
 
@@ -44,6 +80,84 @@ pub fn decode_row(bytes: &[u8]) -> Result<Row> {
         return Err(corruption("tuple contains trailing bytes"));
     }
     Ok(Row::new(values))
+}
+
+pub fn encode_row_v2(row: &Row, header: TupleHeaderV2) -> Result<Vec<u8>> {
+    let header = header.validate()?;
+    let actual_count = value_count(row)?;
+    if header.column_count != actual_count {
+        return Err(corruption(format!(
+            "tuple v2 header declares {} columns for a row with {actual_count}",
+            header.column_count
+        )));
+    }
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&TUPLE_FORMAT_V2.to_le_bytes());
+    bytes.extend_from_slice(&TUPLE_HEADER_V2_BYTES.to_le_bytes());
+    bytes.extend_from_slice(&header.flags.to_le_bytes());
+    bytes.extend_from_slice(&header.column_count.to_le_bytes());
+    bytes.extend_from_slice(&header.xmin.to_le_bytes());
+    bytes.extend_from_slice(&header.xmax.to_le_bytes());
+    bytes.extend_from_slice(&header.command_id.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    encode_values(row, &mut bytes)?;
+    Ok(bytes)
+}
+
+pub fn decode_row_v2(bytes: &[u8]) -> Result<(TupleHeaderV2, Row)> {
+    let mut cursor = Cursor::new(bytes);
+    let format_version = cursor.read_u16()?;
+    if format_version != TUPLE_FORMAT_V2 {
+        return Err(unsupported_tuple_version(format_version));
+    }
+    let header_bytes = cursor.read_u16()?;
+    if header_bytes != TUPLE_HEADER_V2_BYTES {
+        return Err(corruption(format!(
+            "tuple v2 header is {header_bytes} bytes; expected {TUPLE_HEADER_V2_BYTES}"
+        )));
+    }
+    let header = TupleHeaderV2 {
+        flags: cursor.read_u16()?,
+        column_count: cursor.read_u16()?,
+        xmin: cursor.read_u64()?,
+        xmax: cursor.read_u64()?,
+        command_id: cursor.read_u32()?,
+    }
+    .validate()?;
+    let reserved = cursor.read_u32()?;
+    if reserved != 0 {
+        return Err(corruption("tuple v2 reserved header bytes are not zero"));
+    }
+    let mut values = Vec::with_capacity(usize::from(header.column_count));
+    for _ in 0..header.column_count {
+        values.push(decode_value(&mut cursor)?);
+    }
+    if !cursor.is_finished() {
+        return Err(corruption("tuple v2 contains trailing bytes"));
+    }
+    Ok((header, Row::new(values)))
+}
+
+fn value_count(row: &Row) -> Result<u16> {
+    u16::try_from(row.values.len()).map_err(|_| corruption("tuple contains more than 65535 values"))
+}
+
+fn encode_values(row: &Row, bytes: &mut Vec<u8>) -> Result<()> {
+    for value in &row.values {
+        encode_value(value, bytes)?;
+    }
+    Ok(())
+}
+
+fn unsupported_tuple_version(version: u16) -> DbError {
+    DbError::new(
+        "0A000",
+        format!("tuple format version {version} is not supported"),
+    )
+    .with_detail(format!(
+        "this OrdaDB build supports tuple format versions {TUPLE_FORMAT_V1} and {TUPLE_FORMAT_V2}"
+    ))
+    .with_hint("restore from a compatible logical backup or run an explicit migration")
 }
 
 fn encode_value(value: &Value, bytes: &mut Vec<u8>) -> Result<()> {
@@ -246,6 +360,14 @@ impl<'a> Cursor<'a> {
         Ok(u16::from_le_bytes(self.read_array()?))
     }
 
+    fn read_u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.read_array()?))
+    }
+
+    fn read_u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.read_array()?))
+    }
+
     fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
         self.ensure_remaining(N)?;
         let end = self.offset + N;
@@ -316,6 +438,36 @@ mod tests {
 
         let encoded = encode_row(&row).expect("encode");
         assert_eq!(decode_row(&encoded).expect("decode"), row);
+        let header = TupleHeaderV2::frozen(&row).expect("header");
+        let encoded = encode_row_v2(&row, header).expect("encode v2");
+        assert_eq!(decode_row_v2(&encoded).expect("decode v2"), (header, row));
+    }
+
+    #[test]
+    fn tuple_v2_header_has_a_stable_little_endian_golden_encoding() {
+        let row = Row::new(vec![Value::Int64(42)]);
+        let encoded = encode_row_v2(
+            &row,
+            TupleHeaderV2 {
+                flags: 0,
+                column_count: 1,
+                xmin: FROZEN_TRANSACTION_ID,
+                xmax: 0,
+                command_id: 7,
+            },
+        )
+        .expect("encode");
+        assert_eq!(
+            &encoded[..TUPLE_HEADER_V2_BYTES as usize],
+            &[
+                2, 0, 32, 0, 0, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0,
+                0, 0, 0, 0, 0,
+            ]
+        );
+        assert_eq!(
+            &encoded[TUPLE_HEADER_V2_BYTES as usize..],
+            &[TAG_INT64, 42, 0, 0, 0, 0, 0, 0, 0]
+        );
     }
 
     #[test]
@@ -341,6 +493,18 @@ mod tests {
         );
         assert_eq!(
             decode_row(&[1, 0, 255]).expect_err("unknown tag").sql_state,
+            "XX001"
+        );
+        assert_eq!(
+            decode_row_v2(&[9, 0]).expect_err("version").sql_state,
+            "0A000"
+        );
+        let row = Row::new(vec![Value::Null]);
+        let mut encoded =
+            encode_row_v2(&row, TupleHeaderV2::frozen(&row).expect("header")).expect("encode");
+        encoded[28] = 1;
+        assert_eq!(
+            decode_row_v2(&encoded).expect_err("reserved").sql_state,
             "XX001"
         );
     }
