@@ -3244,7 +3244,10 @@ dependencies = [
  "chrono",
  "csv",
  "ordadb-catalog",
+ "ordadb-cluster",
  "ordadb-engine",
+ "ordadb-storage",
+ "ordadb-transaction",
  "ordadb-types",
  "rust_decimal",
  "serde",
@@ -3267,14 +3270,33 @@ dependencies = [
 name = "ordadb-cli"
 version = "0.1.0"
 dependencies = [
+ "ordadb-backup",
  "ordadb-protocol",
  "ordadb-server",
+ "ordadb-storage",
  "ordadb-types",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "zeroize",
+]
+
+[[package]]
+name = "ordadb-cluster"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "ordadb-catalog",
+ "ordadb-storage",
+ "ordadb-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3537,8 +3559,11 @@ dependencies = [
  "axum",
  "axum-server",
  "ordadb-admin",
+ "ordadb-backup",
+ "ordadb-cluster",
  "ordadb-engine",
  "ordadb-protocol",
+ "ordadb-storage",
  "ordadb-types",
  "ordadb-windows",
  "rand 0.8.7",
@@ -3579,6 +3604,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "uuid",
 ]

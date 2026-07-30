@@ -10,6 +10,7 @@ use crate::{PAGE_SIZE, PageId, SlottedPage, corruption, io_error};
 pub struct DiskManager {
     path: PathBuf,
     file: File,
+    read_only: bool,
 }
 
 impl DiskManager {
@@ -22,7 +23,29 @@ impl DiskManager {
             .truncate(false)
             .open(&path)
             .map_err(|error| io_error("failed to open database file", error))?;
-        let manager = Self { path, file };
+        let manager = Self {
+            path,
+            file,
+            read_only: false,
+        };
+        manager.page_count()?;
+        Ok(manager)
+    }
+
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .create(false)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| io_error("failed to open database file read-only", error))?;
+        let manager = Self {
+            path,
+            file,
+            read_only: true,
+        };
         manager.page_count()?;
         Ok(manager)
     }
@@ -66,6 +89,7 @@ impl DiskManager {
     }
 
     pub fn write_page(&mut self, page: &SlottedPage) -> Result<()> {
+        self.ensure_writable()?;
         page.validate()?;
         let page_count = self.page_count()?;
         if page.page_id().get() > page_count {
@@ -84,6 +108,7 @@ impl DiskManager {
     }
 
     pub fn truncate_pages(&mut self, page_count: u64) -> Result<()> {
+        self.ensure_writable()?;
         let length = page_count
             .checked_mul(PAGE_SIZE as u64)
             .ok_or_else(|| corruption("database file length overflow"))?;
@@ -96,6 +121,16 @@ impl DiskManager {
         self.file
             .sync_all()
             .map_err(|error| io_error("failed to synchronize database file", error))
+    }
+
+    fn ensure_writable(&self) -> Result<()> {
+        if self.read_only {
+            return Err(
+                ordadb_types::DbError::new("25006", "database file was opened read-only")
+                    .with_hint("run an explicit migration into a writable v2 database"),
+            );
+        }
+        Ok(())
     }
 }
 

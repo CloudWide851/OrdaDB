@@ -37,7 +37,9 @@ use ordadb_sql::{
     ParsedStatement, SqlDialect, bind, bind_catalog_expression,
     bind_catalog_expression_with_parameter_types, parse, parse_with_dialect,
 };
-use ordadb_storage::{ApplyPoint, DatabaseStore, DurabilityBarrier, PersistentState, encode_row};
+use ordadb_storage::{
+    ApplyPoint, DataFormat, DatabaseStore, DurabilityBarrier, PersistentState, encode_row,
+};
 use ordadb_transaction::{
     CheckpointState, FaultInjector, FaultPoint, NoFaultInjector, TransactionId, WalManager,
     WriterCoordinator, WriterLease,
@@ -56,6 +58,8 @@ pub const LOGICAL_SNAPSHOT_VERSION: u16 = 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
     pub data_dir: PathBuf,
+    pub cluster_root: PathBuf,
+    pub minimum_next_transaction_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -88,6 +92,7 @@ pub struct SearchResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineStatusSnapshot {
+    pub data_format: DataFormat,
     pub generation: u64,
     pub table_count: usize,
     pub row_count: u64,
@@ -109,8 +114,24 @@ pub struct LogicalDatabaseSnapshot {
 impl EngineConfig {
     #[must_use]
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        let data_dir = data_dir.into();
+        Self {
+            cluster_root: data_dir.clone(),
+            data_dir,
+            minimum_next_transaction_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn for_cluster(
+        data_dir: impl Into<PathBuf>,
+        cluster_root: impl Into<PathBuf>,
+        minimum_next_transaction_id: u64,
+    ) -> Self {
         Self {
             data_dir: data_dir.into(),
+            cluster_root: cluster_root.into(),
+            minimum_next_transaction_id: Some(minimum_next_transaction_id),
         }
     }
 }
@@ -135,12 +156,35 @@ impl Engine {
         config: EngineConfig,
         fault_injector: Arc<dyn FaultInjector>,
     ) -> Result<Self> {
+        if DatabaseStore::detect_format_read_only(&config.data_dir)? == Some(DataFormat::V1) {
+            return Err(DbError::new(
+                "0A000",
+                "legacy database format v1 cannot be opened for normal execution",
+            )
+            .with_hint("run the offline storage migration before starting the database service"));
+        }
         let wal = WalManager::open_with_fault_injector(&config.data_dir, fault_injector)?;
         wal.recover(&config.data_dir)?;
-        let writer = WriterCoordinator::from_last_transaction_id(wal.last_transaction_id()?)?;
+        let wal_next_transaction_id = wal
+            .last_transaction_id()?
+            .map(|transaction_id| {
+                transaction_id
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| DbError::new("54000", "transaction ID space is exhausted"))
+            })
+            .transpose()?
+            .unwrap_or(1);
+        let next_transaction_id = config
+            .minimum_next_transaction_id
+            .unwrap_or(1)
+            .max(wal_next_transaction_id);
+        let writer = WriterCoordinator::from_next_transaction_id(next_transaction_id)?;
         let barrier: Arc<dyn DurabilityBarrier> = wal.clone();
-        let store = DatabaseStore::open_with_barrier(&config.data_dir, barrier)?;
-        let state = DatabaseState::from_persistent(store.committed_state().clone())?;
+        let store =
+            DatabaseStore::open_with_barrier_and_format(&config.data_dir, barrier, DataFormat::V2)?;
+        let state =
+            DatabaseState::from_persistent(store.committed_state().clone(), store.data_format())?;
         Ok(Self {
             config: Arc::new(config),
             state: Arc::new(RwLock::new(state)),
@@ -300,6 +344,7 @@ impl Engine {
             .flat_map(|table| table.indexes())
             .count();
         Ok(EngineStatusSnapshot {
+            data_format: DataFormat::V2,
             generation: state.generation,
             table_count,
             row_count,
@@ -1245,13 +1290,61 @@ struct AdvancedExecution {
 }
 
 impl DatabaseState {
-    fn from_persistent(state: PersistentState) -> Result<Self> {
+    fn from_persistent(state: PersistentState, data_format: DataFormat) -> Result<Self> {
         let PersistentState {
             generation,
             catalog,
             tables,
             indexes,
         } = state;
+        if data_format == DataFormat::V2 {
+            if !indexes.is_empty() {
+                return Err(DbError::new(
+                    "XX001",
+                    "database v2 contains durable derived index state",
+                ));
+            }
+            let catalog_table_ids = catalog
+                .database()
+                .schemas()
+                .flat_map(|schema| schema.tables())
+                .map(|table| table.id)
+                .collect::<BTreeSet<_>>();
+            if tables
+                .keys()
+                .any(|table_id| !catalog_table_ids.contains(table_id))
+            {
+                return Err(DbError::new(
+                    "XX001",
+                    "database v2 contains rows for a table absent from its catalog",
+                ));
+            }
+            let rows = catalog_table_ids
+                .iter()
+                .map(|table_id| {
+                    (
+                        *table_id,
+                        Arc::new(tables.get(table_id).cloned().unwrap_or_default()),
+                    )
+                })
+                .collect();
+            let mut state = Self {
+                catalog: Arc::new(catalog),
+                rows,
+                indexes: BTreeMap::new(),
+                searches: Arc::new(SearchCatalog::default()),
+                generation,
+                trigger_depth: 0,
+                triggers_fired: 0,
+                routine_depth: 0,
+                cancellation: None,
+            };
+            validate_database_rows(&state)?;
+            for table_id in catalog_table_ids {
+                rebuild_table_derived(&mut state, table_id)?;
+            }
+            return Ok(state);
+        }
         let indexes = indexes
             .into_iter()
             .map(|(index_id, entries)| {
@@ -4278,6 +4371,34 @@ mod tests {
         }
         assert!(directory.path().join("ordadb.data").is_file());
         assert!(Engine::open(EngineConfig::new(directory.path())).is_ok());
+    }
+
+    #[test]
+    fn cluster_transaction_floor_seeds_the_first_durable_transaction() {
+        let directory = tempdir().expect("tempdir");
+        let engine = Engine::open(EngineConfig::for_cluster(
+            directory.path().join("database"),
+            directory.path(),
+            42,
+        ))
+        .expect("open cluster database");
+        let mut session = engine.connect().expect("session");
+        execute(
+            &mut session,
+            "CREATE TABLE migration_floor (id BIGINT)",
+            &[],
+        );
+        drop(session);
+        drop(engine);
+
+        assert_eq!(
+            ordadb_transaction::inspect_wal_read_only(directory.path().join("database"))
+                .expect("inspect WAL")
+                .max_transaction_id
+                .expect("transaction ID")
+                .get(),
+            42
+        );
     }
 
     #[test]

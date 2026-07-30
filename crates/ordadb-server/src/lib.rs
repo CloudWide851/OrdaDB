@@ -18,6 +18,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use ordadb_admin::{AdminState, AuthStore, SessionRegistry, api_router};
+use ordadb_cluster::{RootAuthority, initialize_empty_v2, inspect_root, legacy_requires_migration};
 use ordadb_engine::{Engine, EngineConfig};
 use ordadb_protocol::{
     PgConnectionContext, PgServerConfig, load_tls_config, serve_tcp_connection_with_shutdown,
@@ -143,8 +144,17 @@ impl RunningServer {
 pub async fn start_server(config: ServerConfig) -> Result<RunningServer> {
     config.validate()?;
     let pg_tls = config.tls.as_ref().map(load_tls_config).transpose()?;
-    let engine = Arc::new(Engine::open(EngineConfig::new(&config.data_dir))?);
-    let auth = Arc::new(AuthStore::open(&config.data_dir)?);
+    let cluster = match inspect_root(&config.data_dir)? {
+        RootAuthority::Empty => initialize_empty_v2(&config.data_dir)?,
+        RootAuthority::LegacyV1(_) => return Err(legacy_requires_migration(&config.data_dir)),
+        RootAuthority::V2(cluster) => *cluster,
+    };
+    let engine = Arc::new(Engine::open(EngineConfig::for_cluster(
+        &cluster.database_dir,
+        &config.data_dir,
+        cluster.transaction_state.next_transaction_id,
+    ))?);
+    let auth = Arc::new(AuthStore::open(&cluster.roles_dir)?);
     let registry = Arc::new(SessionRegistry::default());
     let bootstrap_required = !auth.has_users()?;
 
@@ -369,6 +379,10 @@ fn io_error(context: impl Into<String>, error: std::io::Error) -> DbError {
 
 #[cfg(test)]
 mod tests {
+    use ordadb_admin::AuthStore;
+    use ordadb_backup::{MigrationRunOptionsV2, migrate_v1_to_v2};
+    use ordadb_cluster::resolve_active_v2;
+    use ordadb_storage::DatabaseStore;
     use tempfile::tempdir;
 
     use super::*;
@@ -393,6 +407,59 @@ mod tests {
         assert!(server.pg_address.port() > 0);
         assert!(server.admin_address.port() > 0);
         assert!(server.bootstrap_pipe.is_some());
+        server.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn legacy_v1_startup_is_rejected_before_wal_or_listener_creation() {
+        let directory = tempdir().expect("tempdir");
+        let root = directory.path().join("legacy");
+        drop(DatabaseStore::open(&root).expect("legacy v1 store"));
+        let data_path = root.join("ordadb.data");
+        let before = std::fs::read(&data_path).expect("legacy bytes");
+        let mut config = ServerConfig::new(&root);
+        config.pg_bind = "127.0.0.1:0".parse().expect("pg");
+        config.admin_bind = "127.0.0.1:0".parse().expect("admin");
+
+        let error = start_server(config)
+            .await
+            .expect_err("legacy startup refused");
+
+        assert_eq!(error.sql_state, "0A000");
+        assert!(error.message.contains("migration"));
+        assert!(!root.join("ordadb.wal").exists());
+        assert_eq!(std::fs::read(data_path).expect("legacy after"), before);
+    }
+
+    #[tokio::test]
+    async fn migrated_shared_roles_reopen_with_the_v2_server() {
+        let directory = tempdir().expect("tempdir");
+        let root = directory.path().join("legacy");
+        drop(DatabaseStore::open(&root).expect("legacy v1 store"));
+        let auth = AuthStore::open(&root).expect("legacy auth");
+        auth.bootstrap_admin("migration_admin", b"StrongMigrationPassword-29")
+            .expect("legacy administrator");
+        drop(auth);
+
+        migrate_v1_to_v2(
+            &root,
+            MigrationRunOptionsV2 {
+                available_bytes_override: Some(u64::MAX),
+                ..MigrationRunOptionsV2::default()
+            },
+        )
+        .expect("migrate v1 cluster");
+        let active = resolve_active_v2(&root).expect("active v2 cluster");
+        AuthStore::open(&active.roles_dir)
+            .expect("migrated auth")
+            .authenticate_password("migration_admin", b"StrongMigrationPassword-29")
+            .expect("migrated administrator authenticates");
+
+        let mut config = ServerConfig::new(&root);
+        config.pg_bind = "127.0.0.1:0".parse().expect("pg");
+        config.admin_bind = "127.0.0.1:0".parse().expect("admin");
+        let server = start_server(config).await.expect("start migrated server");
+        assert!(server.bootstrap_pipe.is_none());
         server.shutdown().await.expect("shutdown");
     }
 }

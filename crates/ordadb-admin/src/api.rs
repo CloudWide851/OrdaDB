@@ -74,12 +74,7 @@ impl std::fmt::Debug for AdminState {
 impl AdminState {
     #[must_use]
     pub fn new(engine: Arc<Engine>, auth: Arc<AuthStore>, registry: Arc<SessionRegistry>) -> Self {
-        let operations_root = engine
-            .config()
-            .data_dir
-            .parent()
-            .unwrap_or(&engine.config().data_dir)
-            .join("operations");
+        let operations_root = engine.config().cluster_root.join("operations");
         Self {
             operations: OperationManager::new(Arc::clone(&engine), operations_root),
             engine,
@@ -363,6 +358,7 @@ struct Metrics {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SerializableEngineStatus {
+    data_format_version: u16,
     generation: u64,
     table_count: usize,
     row_count: u64,
@@ -375,6 +371,7 @@ struct SerializableEngineStatus {
 impl From<EngineStatusSnapshot> for SerializableEngineStatus {
     fn from(status: EngineStatusSnapshot) -> Self {
         Self {
+            data_format_version: status.data_format.version(),
             generation: status.generation,
             table_count: status.table_count,
             row_count: status.row_count,
@@ -603,7 +600,7 @@ async fn service(
         name: "OrdaDB",
         process_running: true,
         windows_service_supported: cfg!(windows),
-        data_dir: state.engine.config().data_dir.clone(),
+        data_dir: state.engine.config().cluster_root.clone(),
         operations_root: state.operations.operations_root().to_path_buf(),
     })))
 }

@@ -30,6 +30,16 @@ impl WriterCoordinator {
                 .ok_or_else(|| DbError::new("54000", "transaction ID space is exhausted"))?,
             None => 1,
         };
+        Self::from_next_transaction_id(next_transaction_id)
+    }
+
+    pub fn from_next_transaction_id(next_transaction_id: u64) -> Result<Arc<Self>> {
+        if TransactionId::new(next_transaction_id).is_none() {
+            return Err(DbError::new(
+                "22023",
+                "next transaction ID must be non-zero",
+            ));
+        }
         Ok(Arc::new(Self {
             next_transaction_id: AtomicU64::new(next_transaction_id),
             owner: Mutex::new(None),
@@ -160,6 +170,25 @@ mod tests {
                 .expect("resumed transaction ID")
                 .get(),
             42
+        );
+    }
+
+    #[test]
+    fn coordinator_can_start_at_a_migration_transaction_floor() {
+        let coordinator =
+            WriterCoordinator::from_next_transaction_id(42).expect("seed coordinator");
+        assert_eq!(
+            coordinator
+                .next_transaction_id()
+                .expect("migration transaction ID")
+                .get(),
+            42
+        );
+        assert_eq!(
+            WriterCoordinator::from_next_transaction_id(0)
+                .expect_err("zero floor refused")
+                .sql_state,
+            "22023"
         );
     }
 }

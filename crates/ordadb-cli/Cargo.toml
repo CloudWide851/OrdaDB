@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+ordadb-backup = { path = "../ordadb-backup" }
 ordadb-server = { path = "../ordadb-server" }
 ordadb-types = { path = "../ordadb-types" }
 ordadb-protocol = { path = "../ordadb-protocol" }
@@ -15,3 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+ordadb-storage = { path = "../ordadb-storage" }
+tempfile.workspace = true

@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use ordadb_cluster::{AUTH_FILE_NAME, resolve_active_v2};
 use ordadb_protocol::{ClientConfig, PgClient, PgQueryEvent};
 use ordadb_server::{ServerConfig, request_bootstrap, start_server};
 use reqwest::StatusCode;
@@ -545,7 +546,8 @@ async fn pgwire_security_ddl_is_autocommit_redacted_and_persistent() {
         .expect("second shutdown timeout")
         .expect("second shutdown");
 
-    let auth = std::fs::read_to_string(directory.path().join("ordadb.auth.json"))
+    let cluster = resolve_active_v2(directory.path()).expect("active cluster");
+    let auth = std::fs::read_to_string(cluster.roles_dir.join(AUTH_FILE_NAME))
         .expect("persisted auth catalog");
     assert!(!auth.contains(USER_PASSWORD));
     assert!(!auth.contains(REPLACEMENT_PASSWORD));

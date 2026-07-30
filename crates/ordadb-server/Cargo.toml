@@ -10,6 +10,7 @@ authors.workspace = true
 axum.workspace = true
 axum-server.workspace = true
 ordadb-admin = { path = "../ordadb-admin" }
+ordadb-cluster = { path = "../ordadb-cluster" }
 ordadb-engine = { path = "../ordadb-engine" }
 ordadb-protocol = { path = "../ordadb-protocol" }
 ordadb-types = { path = "../ordadb-types" }
@@ -26,5 +27,7 @@ windows-sys.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+ordadb-backup = { path = "../ordadb-backup" }
+ordadb-storage = { path = "../ordadb-storage" }
 reqwest.workspace = true
 tempfile.workspace = true

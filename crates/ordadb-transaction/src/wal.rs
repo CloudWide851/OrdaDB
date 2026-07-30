@@ -13,7 +13,40 @@ use crate::{
     WAL_HEADER_LEN, WalPayload, WalRecord, corruption, io_error,
 };
 
-const WAL_FILE_NAME: &str = "ordadb.wal";
+pub const WAL_FILE_NAME: &str = "ordadb.wal";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalInspection {
+    pub file_bytes: u64,
+    pub record_count: usize,
+    pub max_transaction_id: Option<TransactionId>,
+}
+
+pub fn inspect_wal_read_only(data_dir: impl AsRef<Path>) -> Result<WalInspection> {
+    let path = data_dir.as_ref().join(WAL_FILE_NAME);
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WalInspection::default());
+        }
+        Err(error) => return Err(io_error("failed to open the WAL read-only", error)),
+    };
+    let file_bytes = file
+        .metadata()
+        .map_err(|error| io_error("failed to inspect the WAL read-only", error))?
+        .len();
+    let scan = scan_file(&mut file, false)?;
+    let max_transaction_id = scan
+        .records
+        .iter()
+        .filter_map(WalRecord::transaction_id)
+        .max();
+    Ok(WalInspection {
+        file_bytes,
+        record_count: scan.records.len(),
+        max_transaction_id,
+    })
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointState {
@@ -684,7 +717,7 @@ mod tests {
     use ordadb_storage::DurabilityBarrier;
     use tempfile::tempdir;
 
-    use super::WalManager;
+    use super::{WalManager, inspect_wal_read_only};
     use crate::{
         DeterministicFaultInjector, FaultInjector, FaultPoint, Lsn, TransactionId, WalPayload,
         WalRecord,
@@ -692,6 +725,68 @@ mod tests {
 
     fn transaction_id(value: u64) -> TransactionId {
         TransactionId::new(value).expect("non-zero transaction ID")
+    }
+
+    #[test]
+    fn read_only_inspection_treats_a_missing_wal_as_empty() {
+        let directory = tempdir().expect("temp directory");
+
+        let inspection = inspect_wal_read_only(directory.path()).expect("inspect missing WAL");
+
+        assert_eq!(inspection.file_bytes, 0);
+        assert_eq!(inspection.record_count, 0);
+        assert_eq!(inspection.max_transaction_id, None);
+        assert!(
+            directory
+                .path()
+                .read_dir()
+                .expect("read directory")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn read_only_inspection_reports_exact_records_and_transaction_high_water_mark() {
+        let directory = tempdir().expect("temp directory");
+        let wal = WalManager::open(directory.path()).expect("open WAL");
+        wal.append(Some(transaction_id(4)), None, WalPayload::Begin)
+            .expect("append first Begin");
+        wal.append(Some(transaction_id(9)), None, WalPayload::Begin)
+            .expect("append second Begin");
+        let expected_bytes = wal.path().metadata().expect("inspect WAL").len();
+        drop(wal);
+
+        let inspection = inspect_wal_read_only(directory.path()).expect("inspect WAL");
+
+        assert_eq!(inspection.file_bytes, expected_bytes);
+        assert_eq!(inspection.record_count, 2);
+        assert_eq!(inspection.max_transaction_id, Some(transaction_id(9)));
+    }
+
+    #[test]
+    fn read_only_inspection_rejects_an_incomplete_tail_without_repairing_it() {
+        let directory = tempdir().expect("temp directory");
+        let wal = WalManager::open(directory.path()).expect("open WAL");
+        wal.append(Some(transaction_id(1)), None, WalPayload::Begin)
+            .expect("append Begin");
+        let path = wal.path().to_path_buf();
+        drop(wal);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open tail")
+            .write_all(b"ORDA")
+            .expect("append partial header");
+        let before = std::fs::read(&path).expect("read WAL before inspection");
+
+        let error = inspect_wal_read_only(directory.path()).expect_err("incomplete tail refused");
+
+        assert_eq!(error.sql_state, "XX001");
+        assert_eq!(
+            std::fs::read(path).expect("read WAL after inspection"),
+            before
+        );
     }
 
     #[test]

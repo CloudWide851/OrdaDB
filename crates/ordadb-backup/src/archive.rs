@@ -11,7 +11,7 @@ use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 const ARCHIVE_MAGIC: [u8; 8] = *b"ORDBAK01";
-const ARCHIVE_HEADER_BYTES: u64 = 8 + 2 + 2 + 8 + 32;
+pub const ARCHIVE_HEADER_BYTES: u64 = 8 + 2 + 2 + 8 + 32;
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
 pub const ARCHIVE_FORMAT_VERSION: u16 = 1;
 
@@ -69,6 +69,18 @@ pub struct LogicalArchive {
     snapshot: LogicalDatabaseSnapshot,
 }
 
+impl LogicalArchive {
+    #[must_use]
+    pub const fn snapshot(&self) -> &LogicalDatabaseSnapshot {
+        &self.snapshot
+    }
+
+    #[must_use]
+    pub fn into_snapshot(self) -> LogicalDatabaseSnapshot {
+        self.snapshot
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupSummary {
@@ -98,6 +110,14 @@ pub fn write_archive(
     path: impl AsRef<Path>,
     limits: ArchiveLimits,
 ) -> Result<BackupSummary> {
+    write_snapshot_archive(engine.logical_snapshot()?, path, limits)
+}
+
+pub fn write_snapshot_archive(
+    snapshot: LogicalDatabaseSnapshot,
+    path: impl AsRef<Path>,
+    limits: ArchiveLimits,
+) -> Result<BackupSummary> {
     let limits = limits.validate()?;
     let path = absolute_output_path(path.as_ref())?;
     if path.exists() {
@@ -106,10 +126,10 @@ pub fn write_archive(
                 .with_hint("choose a new archive path; existing backups are never overwritten"),
         );
     }
-    let snapshot = engine.logical_snapshot()?;
     validate_snapshot(&snapshot, limits)?;
     let (table_count, row_count) = snapshot_counts(&snapshot)?;
-    let created_at = Utc::now();
+    let created_at = DateTime::from_timestamp(Utc::now().timestamp(), 0)
+        .ok_or_else(|| internal_time_error("current archive timestamp is out of range"))?;
     let archive_id = Uuid::new_v4();
     let database_name = snapshot.catalog.database().name.to_string();
     let archive = LogicalArchive {
@@ -191,6 +211,43 @@ pub fn write_archive(
             .ok_or_else(|| resource_limit("logical backup archive size overflowed"))?,
         sha256: hex_digest(&digest),
     })
+}
+
+pub fn estimate_snapshot_archive_bytes(
+    snapshot: &LogicalDatabaseSnapshot,
+    limits: ArchiveLimits,
+) -> Result<u64> {
+    let limits = limits.validate()?;
+    validate_snapshot(snapshot, limits)?;
+    let (table_count, row_count) = snapshot_counts(snapshot)?;
+    let archive = LogicalArchive {
+        metadata: ArchiveMetadata {
+            archive_id: Uuid::nil(),
+            created_at: DateTime::from_timestamp(0, 0)
+                .ok_or_else(|| internal_time_error("Unix epoch is out of range"))?,
+            producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+            source_generation: snapshot.source_generation,
+            database_name: snapshot.catalog.database().name.to_string(),
+            table_count,
+            row_count,
+        },
+        snapshot: snapshot.clone(),
+    };
+    let payload_bytes = u64::try_from(
+        serde_json::to_vec(&archive)
+            .map_err(|error| archive_error("failed to estimate logical backup payload", error))?
+            .len(),
+    )
+    .map_err(|_| resource_limit("logical backup estimate exceeds u64"))?;
+    if payload_bytes > limits.max_archive_bytes {
+        return Err(resource_limit(format!(
+            "logical backup payload is {payload_bytes} bytes; limit is {}",
+            limits.max_archive_bytes
+        )));
+    }
+    payload_bytes
+        .checked_add(ARCHIVE_HEADER_BYTES)
+        .ok_or_else(|| resource_limit("logical backup archive size overflowed"))
 }
 
 pub fn read_archive(path: impl AsRef<Path>, limits: ArchiveLimits) -> Result<LogicalArchive> {
@@ -574,6 +631,10 @@ fn io_error(context: impl Into<String>, error: std::io::Error) -> DbError {
 
 fn archive_error(context: impl Into<String>, error: serde_json::Error) -> DbError {
     DbError::new("XX001", context).with_detail(error.to_string())
+}
+
+fn internal_time_error(message: impl Into<String>) -> DbError {
+    DbError::new("XX000", message)
 }
 
 #[cfg(test)]

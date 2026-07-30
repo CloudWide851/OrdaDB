@@ -3,6 +3,7 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use ordadb_backup::{MigrationRunOptionsV2, migrate_v1_to_v2, plan_v1_to_v2, rollback_v2_to_v1};
 use ordadb_protocol::{ClientConfig, PgClient};
 use ordadb_server::{ServerConfig, bootstrap_pipe_name, request_bootstrap};
 use ordadb_types::{DbError, Result};
@@ -45,6 +46,8 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "export" => start_transfer_operation(options, "exports").await?,
         "operations" => operations(options).await?,
         "service" => service(options).await?,
+        "storage-migrate" => storage_migrate(options)?,
+        "storage-rollback" => storage_rollback(options)?,
         "validate-config" => validate_config(options)?,
         _ => return Err(usage()),
     };
@@ -202,6 +205,41 @@ async fn service(mut options: BTreeMap<String, Option<String>>) -> Result<Value>
     get_json(&format!("{base}/v1/service"), Some(&token)).await
 }
 
+fn storage_migrate(mut options: BTreeMap<String, Option<String>>) -> Result<Value> {
+    let data_dir = PathBuf::from(
+        take(&mut options, "--data-dir")
+            .unwrap_or_else(|| ordadb_server::default_data_dir().display().to_string()),
+    );
+    let dry_run = options.remove("--dry-run").is_some();
+    ensure_empty(&options)?;
+    if dry_run {
+        serde_json::to_value(plan_v1_to_v2(&data_dir, MigrationRunOptionsV2::default())?)
+    } else {
+        serde_json::to_value(migrate_v1_to_v2(
+            &data_dir,
+            MigrationRunOptionsV2::default(),
+        )?)
+    }
+    .map_err(|error| {
+        internal(format!(
+            "failed to encode storage migration result: {error}"
+        ))
+    })
+}
+
+fn storage_rollback(mut options: BTreeMap<String, Option<String>>) -> Result<Value> {
+    let data_dir = PathBuf::from(
+        take(&mut options, "--data-dir")
+            .unwrap_or_else(|| ordadb_server::default_data_dir().display().to_string()),
+    );
+    ensure_empty(&options)?;
+    rollback_v2_to_v1(&data_dir)?;
+    Ok(json!({
+        "dataDir": data_dir,
+        "rolledBack": true,
+    }))
+}
+
 async fn management_session(
     options: &mut BTreeMap<String, Option<String>>,
     base: &str,
@@ -303,7 +341,10 @@ fn parse_options(arguments: &[String]) -> Result<BTreeMap<String, Option<String>
         if !option.starts_with("--") {
             return Err(invalid(format!("unexpected positional argument {option}")));
         }
-        if matches!(option.as_str(), "--password-stdin" | "--cancel") {
+        if matches!(
+            option.as_str(),
+            "--password-stdin" | "--cancel" | "--dry-run"
+        ) {
             if options.insert(option.clone(), None).is_some() {
                 return Err(invalid(format!("{option} was provided more than once")));
             }
@@ -374,7 +415,7 @@ fn ensure_empty(options: &BTreeMap<String, Option<String>>) -> Result<()> {
 
 fn usage() -> DbError {
     invalid(
-        "usage: ordadb-cli <bootstrap|sql|health|checkpoint|backup|restore|import|export|operations|service|validate-config> [options]",
+        "usage: ordadb-cli <bootstrap|sql|health|checkpoint|backup|restore|import|export|operations|service|storage-migrate|storage-rollback|validate-config> [options]",
     )
 }
 
@@ -426,5 +467,52 @@ mod tests {
             .is_err()
         );
         assert!(parse_options(&["dba".into()]).is_err());
+    }
+
+    #[test]
+    fn dry_run_is_parsed_as_a_flag_without_consuming_data_dir() {
+        let mut options = parse_options(&[
+            "--data-dir".into(),
+            "C:\\ordadb-data".into(),
+            "--dry-run".into(),
+        ])
+        .expect("parse");
+
+        assert!(options.remove("--dry-run").is_some());
+        assert_eq!(
+            take(&mut options, "--data-dir").as_deref(),
+            Some("C:\\ordadb-data")
+        );
+        ensure_empty(&options).expect("all options consumed");
+    }
+
+    #[test]
+    fn offline_storage_commands_plan_migrate_and_rollback_without_a_service() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().join("legacy");
+        drop(ordadb_storage::DatabaseStore::open(&root).expect("legacy v1 store"));
+        let data_dir = root.display().to_string();
+
+        let dry_run = storage_migrate(BTreeMap::from([
+            ("--data-dir".into(), Some(data_dir.clone())),
+            ("--dry-run".into(), None),
+        ]))
+        .expect("dry-run");
+        assert_eq!(dry_run["sourceFormatVersion"], 1);
+        assert_eq!(dry_run["targetFormatVersion"], 2);
+        assert!(!root.join("active-cluster-v2.json").exists());
+
+        let migrated = storage_migrate(BTreeMap::from([(
+            "--data-dir".into(),
+            Some(data_dir.clone()),
+        )]))
+        .expect("migrate");
+        assert_eq!(migrated["finalPhase"], "completed");
+        assert!(root.join("active-cluster-v2.json").is_file());
+
+        let rolled_back = storage_rollback(BTreeMap::from([("--data-dir".into(), Some(data_dir))]))
+            .expect("rollback");
+        assert_eq!(rolled_back["rolledBack"], true);
+        assert!(!root.join("active-cluster-v2.json").exists());
     }
 }

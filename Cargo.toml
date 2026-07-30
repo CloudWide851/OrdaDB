@@ -5,6 +5,7 @@ members = [
   "crates/ordadb-admin",
   "crates/ordadb-backup",
   "crates/ordadb-cli",
+  "crates/ordadb-cluster",
   "crates/ordadb-connector-mysql",
   "crates/ordadb-connector-postgresql",
   "crates/ordadb-connector-publisher",
