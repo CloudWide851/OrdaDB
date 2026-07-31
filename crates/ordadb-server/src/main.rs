@@ -12,6 +12,9 @@ fn main() {
         if let Some(detail) = error.detail {
             eprintln!("{detail}");
         }
+        if let Some(hint) = error.hint {
+            eprintln!("HINT: {hint}");
+        }
         std::process::exit(1);
     }
 }

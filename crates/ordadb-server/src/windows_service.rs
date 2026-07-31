@@ -1,7 +1,9 @@
 use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows_service::define_windows_service;
 use windows_service::service::{
@@ -33,6 +35,11 @@ const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 const ERROR_SERVICE_ALREADY_RUNNING: i32 = 1056;
 const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
 const ERROR_SERVICE_MARKED_FOR_DELETE: i32 = 1072;
+const SERVICE_SPECIFIC_STARTUP_FAILURE: u32 = 0x0DB0;
+const STARTUP_FAILURE_SCHEMA_VERSION: u32 = 1;
+const STARTUP_FAILURE_FILE: &str = "last-startup-failure-v1.json";
+const MAX_STARTUP_FAILURE_BYTES: u64 = 16 * 1024;
+const MAX_STARTUP_FAILURE_TEXT_BYTES: usize = 1024;
 
 define_windows_service!(ffi_service_main, service_main);
 
@@ -76,6 +83,65 @@ pub struct WindowsServiceStatus {
     pub failure_actions: &'static str,
     pub executable_path: PathBuf,
     pub data_dir: PathBuf,
+    #[serde(default)]
+    pub exit_code: Option<u32>,
+    #[serde(default)]
+    pub failure_phase: Option<String>,
+    #[serde(default)]
+    pub diagnostic_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServiceStartupPhase {
+    RegisterControlHandler,
+    ReportStartPending,
+    CreateRuntime,
+    StartServer,
+    ReportRunning,
+    WaitForStop,
+    ReportStopPending,
+    Shutdown,
+    ReportStopped,
+}
+
+impl ServiceStartupPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RegisterControlHandler => "registerControlHandler",
+            Self::ReportStartPending => "reportStartPending",
+            Self::CreateRuntime => "createRuntime",
+            Self::StartServer => "startServer",
+            Self::ReportRunning => "reportRunning",
+            Self::WaitForStop => "waitForStop",
+            Self::ReportStopPending => "reportStopPending",
+            Self::Shutdown => "shutdown",
+            Self::ReportStopped => "reportStopped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceStartupFailureV1 {
+    pub schema_version: u32,
+    pub occurred_at_unix_ms: u64,
+    pub sql_state: String,
+    pub phase: ServiceStartupPhase,
+    pub reason: String,
+    pub hint: Option<String>,
+    pub exit_code: u32,
+}
+
+struct ServiceRunFailure {
+    phase: ServiceStartupPhase,
+    error: DbError,
+}
+
+impl ServiceRunFailure {
+    fn new(phase: ServiceStartupPhase, error: DbError) -> Self {
+        Self { phase, error }
+    }
 }
 
 pub fn dispatch_windows_service() -> Result<()> {
@@ -153,7 +219,7 @@ pub fn manage_windows_service(
                         error,
                     ));
                 }
-                wait_for_state(&service, ServiceState::Running)?;
+                wait_for_state(&service, ServiceState::Running, Some(data_dir))?;
             }
         }
         ServiceCommand::Stop => {
@@ -276,12 +342,13 @@ fn stop_service(service: &windows_service::service::Service) -> Result<()> {
             error,
         ));
     }
-    wait_for_state(service, ServiceState::Stopped).map(|_| ())
+    wait_for_state(service, ServiceState::Stopped, None).map(|_| ())
 }
 
 fn wait_for_state(
     service: &windows_service::service::Service,
     target: ServiceState,
+    data_dir: Option<&Path>,
 ) -> Result<ServiceStatus> {
     let deadline = Instant::now()
         .checked_add(SERVICE_STATE_TIMEOUT)
@@ -292,6 +359,51 @@ fn wait_for_state(
             .map_err(|error| service_error("failed to query OrdaDB Windows service", error))?;
         if status.current_state == target {
             return Ok(status);
+        }
+        if status.current_state == ServiceState::Stopped {
+            let exit_code = service_exit_code_value(status.exit_code).unwrap_or_default();
+            let mut error = DbError::new(
+                "58030",
+                format!("OrdaDB Windows service stopped before reaching {target:?}"),
+            )
+            .with_detail(format!("service exit code: {exit_code}"));
+            if let Some(data_dir) = data_dir {
+                let path = service_startup_failure_path(data_dir);
+                error = if path.is_file() {
+                    match read_service_startup_failure(&path) {
+                        Ok(failure) => {
+                            let detail = format!(
+                                "service exit code: {exit_code}; phase: {}; reason: {}",
+                                failure.phase.as_str(),
+                                failure.reason
+                            );
+                            error.detail = Some(detail.into_boxed_str());
+                            let diagnostic_hint =
+                                format!("inspect the startup diagnostic at {}", path.display());
+                            error.with_hint(match failure.hint {
+                                Some(hint) => format!("{hint}; {diagnostic_hint}"),
+                                None => diagnostic_hint,
+                            })
+                        }
+                        Err(diagnostic_error) => append_error_context(
+                            error.with_hint(format!(
+                                "inspect the startup diagnostic at {}",
+                                path.display()
+                            )),
+                            format!(
+                                "startup diagnostic could not be decoded: {}",
+                                diagnostic_error.message
+                            ),
+                        ),
+                    }
+                } else {
+                    error.with_hint(format!(
+                        "startup diagnostic was not written; expected {}",
+                        path.display()
+                    ))
+                };
+            }
+            return Err(error);
         }
         if Instant::now() >= deadline {
             return Err(DbError::new(
@@ -318,11 +430,22 @@ fn service_status(
             failure_actions: SERVICE_FAILURE_ACTIONS,
             executable_path: executable_path.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
+            exit_code: None,
+            failure_phase: None,
+            diagnostic_path: None,
         });
     };
     let status = service
         .query_status()
         .map_err(|error| service_error("failed to query OrdaDB Windows service", error))?;
+    let exit_code = service_exit_code_value(status.exit_code);
+    let diagnostic_path = exit_code.map(|_| service_startup_failure_path(data_dir));
+    let failure_phase = diagnostic_path
+        .as_deref()
+        .filter(|path| path.is_file())
+        .map(read_service_startup_failure)
+        .transpose()?
+        .map(|failure| failure.phase.as_str().to_owned());
     Ok(WindowsServiceStatus {
         installed: true,
         state: service_state_name(status.current_state).into(),
@@ -332,6 +455,9 @@ fn service_status(
         failure_actions: SERVICE_FAILURE_ACTIONS,
         executable_path: executable_path.to_path_buf(),
         data_dir: data_dir.to_path_buf(),
+        exit_code,
+        failure_phase,
+        diagnostic_path,
     })
 }
 
@@ -353,30 +479,17 @@ fn is_winapi_error(error: &windows_service::Error, code: i32) -> bool {
 
 fn service_main(arguments: Vec<OsString>) {
     if let Err(error) = run_service(arguments) {
-        let _ = error;
+        eprintln!("{}: {}", error.sql_state, error.message);
+        if let Some(detail) = error.detail {
+            eprintln!("{detail}");
+        }
+        if let Some(hint) = error.hint {
+            eprintln!("HINT: {hint}");
+        }
     }
 }
 
 fn run_service(arguments: Vec<OsString>) -> Result<()> {
-    let (stop_sender, stop_receiver) = mpsc::channel::<()>();
-    let status_handle =
-        service_control_handler::register(SERVICE_NAME, move |control| match control {
-            ServiceControl::Stop | ServiceControl::Shutdown => {
-                let _ = stop_sender.send(());
-                ServiceControlHandlerResult::NoError
-            }
-            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-            _ => ServiceControlHandlerResult::NotImplemented,
-        })
-        .map_err(|error| service_error("failed to register service control handler", error))?;
-    set_status(
-        &status_handle,
-        ServiceState::StartPending,
-        ServiceControlAccept::empty(),
-        1,
-        Duration::from_secs(30),
-    )?;
-
     let data_dir = configured_process_data_dir()
         .or_else(|| {
             arguments
@@ -385,44 +498,111 @@ fn run_service(arguments: Vec<OsString>) -> Result<()> {
                 .map(std::path::PathBuf::from)
         })
         .unwrap_or_else(default_data_dir);
+    let (stop_sender, stop_receiver) = mpsc::channel::<()>();
+    let status_handle =
+        match service_control_handler::register(SERVICE_NAME, move |control| match control {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                if stop_sender.send(()).is_ok() {
+                    ServiceControlHandlerResult::NoError
+                } else {
+                    ServiceControlHandlerResult::Other(1062)
+                }
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                return report_unregistered_service_failure(
+                    &data_dir,
+                    ServiceRunFailure::new(
+                        ServiceStartupPhase::RegisterControlHandler,
+                        service_error("failed to register service control handler", error),
+                    ),
+                );
+            }
+        };
+    match run_registered_service(&status_handle, stop_receiver, data_dir.clone()) {
+        Ok(()) => Ok(()),
+        Err(failure) => report_registered_service_failure(&status_handle, &data_dir, failure),
+    }
+}
+
+fn run_registered_service(
+    status_handle: &ServiceStatusHandle,
+    stop_receiver: mpsc::Receiver<()>,
+    data_dir: PathBuf,
+) -> std::result::Result<(), ServiceRunFailure> {
+    set_status(
+        status_handle,
+        ServiceState::StartPending,
+        ServiceControlAccept::empty(),
+        1,
+        Duration::from_secs(30),
+        ServiceExitCode::Win32(0),
+    )
+    .map_err(|error| ServiceRunFailure::new(ServiceStartupPhase::ReportStartPending, error))?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| {
-            DbError::new("XX000", "failed to create service runtime").with_detail(error.to_string())
+            ServiceRunFailure::new(
+                ServiceStartupPhase::CreateRuntime,
+                DbError::new("XX000", "failed to create service runtime")
+                    .with_detail(error.to_string()),
+            )
         })?;
     runtime.block_on(async move {
-        let server = start_server(ServerConfig::new(data_dir)).await?;
+        let server = start_server(ServerConfig::new(data_dir))
+            .await
+            .map_err(|error| ServiceRunFailure::new(ServiceStartupPhase::StartServer, error))?;
         set_status(
-            &status_handle,
+            status_handle,
             ServiceState::Running,
             ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
             0,
             Duration::ZERO,
-        )?;
+            ServiceExitCode::Win32(0),
+        )
+        .map_err(|error| ServiceRunFailure::new(ServiceStartupPhase::ReportRunning, error))?;
         tokio::task::spawn_blocking(move || stop_receiver.recv())
             .await
             .map_err(|error| {
-                DbError::new("XX000", "service stop task failed").with_detail(error.to_string())
+                ServiceRunFailure::new(
+                    ServiceStartupPhase::WaitForStop,
+                    DbError::new("XX000", "service stop task failed")
+                        .with_detail(error.to_string()),
+                )
             })?
             .map_err(|error| {
-                DbError::new("XX000", "service stop channel closed").with_detail(error.to_string())
+                ServiceRunFailure::new(
+                    ServiceStartupPhase::WaitForStop,
+                    DbError::new("XX000", "service stop channel closed")
+                        .with_detail(error.to_string()),
+                )
             })?;
         set_status(
-            &status_handle,
+            status_handle,
             ServiceState::StopPending,
             ServiceControlAccept::empty(),
             1,
             Duration::from_secs(30),
-        )?;
-        server.shutdown().await?;
+            ServiceExitCode::Win32(0),
+        )
+        .map_err(|error| ServiceRunFailure::new(ServiceStartupPhase::ReportStopPending, error))?;
+        server
+            .shutdown()
+            .await
+            .map_err(|error| ServiceRunFailure::new(ServiceStartupPhase::Shutdown, error))?;
         set_status(
-            &status_handle,
+            status_handle,
             ServiceState::Stopped,
             ServiceControlAccept::empty(),
             0,
             Duration::ZERO,
+            ServiceExitCode::Win32(0),
         )
+        .map_err(|error| ServiceRunFailure::new(ServiceStartupPhase::ReportStopped, error))
     })
 }
 
@@ -439,18 +619,285 @@ fn set_status(
     controls_accepted: ServiceControlAccept,
     checkpoint: u32,
     wait_hint: Duration,
+    exit_code: ServiceExitCode,
 ) -> Result<()> {
     handle
         .set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state,
             controls_accepted,
-            exit_code: ServiceExitCode::Win32(0),
+            exit_code,
             checkpoint,
             wait_hint,
             process_id: None,
         })
         .map_err(|error| service_error("failed to update Windows service status", error))
+}
+
+fn report_unregistered_service_failure(data_dir: &Path, failure: ServiceRunFailure) -> Result<()> {
+    let error = attach_startup_diagnostic(data_dir, &failure);
+    Err(error)
+}
+
+fn report_registered_service_failure(
+    handle: &ServiceStatusHandle,
+    data_dir: &Path,
+    failure: ServiceRunFailure,
+) -> Result<()> {
+    let mut error = attach_startup_diagnostic(data_dir, &failure);
+    if let Err(status_error) = set_status(
+        handle,
+        ServiceState::Stopped,
+        ServiceControlAccept::empty(),
+        0,
+        Duration::ZERO,
+        ServiceExitCode::ServiceSpecific(SERVICE_SPECIFIC_STARTUP_FAILURE),
+    ) {
+        error = append_error_context(
+            error,
+            format!(
+                "failed to publish the service-specific startup exit: {}",
+                status_error.message
+            ),
+        );
+    }
+    Err(error)
+}
+
+fn attach_startup_diagnostic(data_dir: &Path, failure: &ServiceRunFailure) -> DbError {
+    let diagnostic = ServiceStartupFailureV1::from_error(failure.phase, &failure.error);
+    match write_service_startup_failure(data_dir, &diagnostic) {
+        Ok(path) => {
+            let diagnostic_hint = format!("inspect the startup diagnostic at {}", path.display());
+            let hint = match failure.error.hint.as_deref() {
+                Some(hint) => format!("{hint}; {diagnostic_hint}"),
+                None => diagnostic_hint,
+            };
+            failure.error.clone().with_hint(hint)
+        }
+        Err(diagnostic_error) => append_error_context(
+            failure.error.clone(),
+            format!(
+                "failed to persist startup diagnostic: {}",
+                diagnostic_error.message
+            ),
+        ),
+    }
+}
+
+impl ServiceStartupFailureV1 {
+    fn from_error(phase: ServiceStartupPhase, error: &DbError) -> Self {
+        Self {
+            schema_version: STARTUP_FAILURE_SCHEMA_VERSION,
+            occurred_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| {
+                    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+                }),
+            sql_state: bounded_one_line(&error.sql_state, 5),
+            phase,
+            reason: bounded_one_line(&error.message, MAX_STARTUP_FAILURE_TEXT_BYTES),
+            hint: error
+                .hint
+                .as_deref()
+                .map(|hint| bounded_one_line(hint, MAX_STARTUP_FAILURE_TEXT_BYTES)),
+            exit_code: SERVICE_SPECIFIC_STARTUP_FAILURE,
+        }
+    }
+}
+
+fn service_startup_failure_path(data_dir: &Path) -> PathBuf {
+    let parent = data_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    parent.join("diagnostics").join(STARTUP_FAILURE_FILE)
+}
+
+fn write_service_startup_failure(
+    data_dir: &Path,
+    failure: &ServiceStartupFailureV1,
+) -> Result<PathBuf> {
+    validate_service_startup_failure(failure)?;
+    let bytes = serde_json::to_vec_pretty(failure).map_err(|error| {
+        DbError::internal("failed to encode service startup diagnostic")
+            .with_detail(error.to_string())
+    })?;
+    if bytes.len() as u64 > MAX_STARTUP_FAILURE_BYTES {
+        return Err(DbError::new(
+            "54000",
+            "service startup diagnostic exceeds its size limit",
+        ));
+    }
+    let path = service_startup_failure_path(data_dir);
+    let parent = path
+        .parent()
+        .ok_or_else(|| DbError::internal("service startup diagnostic path has no parent"))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        io_error(
+            "failed to create service startup diagnostic directory",
+            error,
+        )
+    })?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let temporary = parent.join(format!(
+        ".{STARTUP_FAILURE_FILE}.{}.{}.tmp",
+        std::process::id(),
+        nonce
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| {
+                io_error(
+                    "failed to create service startup diagnostic temporary file",
+                    error,
+                )
+            })?;
+        file.write_all(&bytes).map_err(|error| {
+            io_error(
+                "failed to write service startup diagnostic temporary file",
+                error,
+            )
+        })?;
+        file.sync_all().map_err(|error| {
+            io_error(
+                "failed to synchronize service startup diagnostic temporary file",
+                error,
+            )
+        })?;
+        drop(file);
+        atomic_replace(&temporary, &path)
+    })();
+    if let Err(error) = result {
+        if let Err(cleanup_error) = fs::remove_file(&temporary)
+            && cleanup_error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(append_error_context(
+                error,
+                format!("also failed to remove temporary diagnostic: {cleanup_error}"),
+            ));
+        }
+        return Err(error);
+    }
+    Ok(path)
+}
+
+fn read_service_startup_failure(path: &Path) -> Result<ServiceStartupFailureV1> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| io_error("failed to inspect service startup diagnostic", error))?;
+    if metadata.len() > MAX_STARTUP_FAILURE_BYTES {
+        return Err(DbError::new(
+            "XX001",
+            "service startup diagnostic exceeds its size limit",
+        ));
+    }
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| DbError::new("54000", "service startup diagnostic is too large"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    File::open(path)
+        .and_then(|mut file| file.read_to_end(&mut bytes))
+        .map_err(|error| io_error("failed to read service startup diagnostic", error))?;
+    let failure: ServiceStartupFailureV1 = serde_json::from_slice(&bytes).map_err(|error| {
+        DbError::new("XX001", "service startup diagnostic is invalid JSON")
+            .with_detail(error.to_string())
+    })?;
+    validate_service_startup_failure(&failure)?;
+    Ok(failure)
+}
+
+fn validate_service_startup_failure(failure: &ServiceStartupFailureV1) -> Result<()> {
+    if failure.schema_version != STARTUP_FAILURE_SCHEMA_VERSION {
+        return Err(DbError::new(
+            "0A000",
+            format!(
+                "service startup diagnostic schema version {} is unsupported",
+                failure.schema_version
+            ),
+        ));
+    }
+    if failure.sql_state.len() != 5
+        || failure.reason.is_empty()
+        || failure.reason.len() > MAX_STARTUP_FAILURE_TEXT_BYTES
+        || failure
+            .hint
+            .as_ref()
+            .is_some_and(|hint| hint.len() > MAX_STARTUP_FAILURE_TEXT_BYTES)
+        || failure.exit_code == 0
+    {
+        return Err(DbError::new(
+            "XX001",
+            "service startup diagnostic violates its bounded schema",
+        ));
+    }
+    Ok(())
+}
+
+fn bounded_one_line(value: &str, maximum_bytes: usize) -> String {
+    let mut output = String::with_capacity(value.len().min(maximum_bytes));
+    for character in value.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if output.len().saturating_add(character.len_utf8()) > maximum_bytes {
+            break;
+        }
+        output.push(character);
+    }
+    output
+}
+
+fn service_exit_code_value(exit_code: ServiceExitCode) -> Option<u32> {
+    match exit_code {
+        ServiceExitCode::Win32(0) | ServiceExitCode::ServiceSpecific(0) => None,
+        ServiceExitCode::Win32(code) | ServiceExitCode::ServiceSpecific(code) => Some(code),
+    }
+}
+
+fn append_error_context(mut error: DbError, context: impl AsRef<str>) -> DbError {
+    let context = bounded_one_line(context.as_ref(), MAX_STARTUP_FAILURE_TEXT_BYTES);
+    error.detail = Some(
+        match error.detail.take() {
+            Some(detail) => format!("{detail}; {context}"),
+            None => context,
+        }
+        .into_boxed_str(),
+    );
+    error
+}
+
+fn io_error(context: &str, error: std::io::Error) -> DbError {
+    DbError::new("58030", context).with_detail(error.to_string())
+}
+
+#[cfg(windows)]
+fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let mut source: Vec<u16> = source.as_os_str().encode_wide().collect();
+    source.push(0);
+    let mut destination: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    destination.push(0);
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    // SAFETY: both owned buffers are valid NUL-terminated UTF-16 paths for the
+    // duration of this same-volume, write-through replacement.
+    let moved = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) };
+    if moved == 0 {
+        return Err(io_error(
+            "failed to atomically replace service startup diagnostic",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
 }
 
 fn service_error(context: &str, error: windows_service::Error) -> DbError {
@@ -497,6 +944,68 @@ mod tests {
                 .expect_err("invalid")
                 .sql_state,
             "22023"
+        );
+    }
+
+    #[test]
+    fn startup_failure_diagnostic_is_bounded_atomic_and_outside_data_authority() {
+        let root = tempfile::tempdir().expect("root");
+        let data_dir = root.path().join("data");
+        fs::create_dir_all(&data_dir).expect("data");
+        let error = DbError::new(
+            "58030",
+            format!(
+                "failed\r\nto start {}",
+                "x".repeat(MAX_STARTUP_FAILURE_TEXT_BYTES * 2)
+            ),
+        )
+        .with_hint(format!(
+            "repair\r\n{}",
+            "y".repeat(MAX_STARTUP_FAILURE_TEXT_BYTES * 2)
+        ));
+        let mut failure =
+            ServiceStartupFailureV1::from_error(ServiceStartupPhase::StartServer, &error);
+        let path = write_service_startup_failure(&data_dir, &failure).expect("first write");
+        assert_eq!(
+            path,
+            root.path().join("diagnostics").join(STARTUP_FAILURE_FILE)
+        );
+        assert!(!path.starts_with(&data_dir));
+
+        failure.phase = ServiceStartupPhase::CreateRuntime;
+        write_service_startup_failure(&data_dir, &failure).expect("atomic replace");
+        let decoded = read_service_startup_failure(&path).expect("read");
+        assert_eq!(decoded.phase, ServiceStartupPhase::CreateRuntime);
+        assert!(decoded.reason.len() <= MAX_STARTUP_FAILURE_TEXT_BYTES);
+        assert!(!decoded.reason.contains('\r'));
+        assert!(!decoded.reason.contains('\n'));
+        assert!(
+            decoded
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.len() <= MAX_STARTUP_FAILURE_TEXT_BYTES)
+        );
+        assert!(fs::metadata(path).expect("metadata").len() <= MAX_STARTUP_FAILURE_BYTES);
+    }
+
+    #[test]
+    fn startup_failure_schema_and_service_exit_codes_are_strict() {
+        let error = DbError::new("XX000", "runtime failed");
+        let mut failure =
+            ServiceStartupFailureV1::from_error(ServiceStartupPhase::CreateRuntime, &error);
+        assert_eq!(
+            service_exit_code_value(ServiceExitCode::ServiceSpecific(
+                SERVICE_SPECIFIC_STARTUP_FAILURE
+            )),
+            Some(SERVICE_SPECIFIC_STARTUP_FAILURE)
+        );
+        assert_eq!(service_exit_code_value(ServiceExitCode::Win32(0)), None);
+        failure.schema_version += 1;
+        assert_eq!(
+            validate_service_startup_failure(&failure)
+                .expect_err("unknown schema")
+                .sql_state,
+            "0A000"
         );
     }
 }

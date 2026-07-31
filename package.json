@@ -10,6 +10,8 @@
     "test": "pnpm --filter @ordadb/console test",
     "test:e2e": "pnpm --filter @ordadb/console test:e2e",
     "build": "pnpm --filter @ordadb/console build",
+    "installer:hooks:test": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-installer-hooks.ps1",
+    "installer:hooks:compile": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-installer-hooks.ps1 -Compile",
     "package:stage:x64": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stage-windows-x64.ps1",
     "scale:smoke:x64": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-final-scale.ps1 -Profile Smoke",
     "scale:full:x64": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-final-scale.ps1 -Profile Full -ConfirmFullScale -RetainData",
