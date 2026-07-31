@@ -3271,6 +3271,7 @@ name = "ordadb-cli"
 version = "0.1.0"
 dependencies = [
  "ordadb-backup",
+ "ordadb-cluster",
  "ordadb-protocol",
  "ordadb-server",
  "ordadb-storage",

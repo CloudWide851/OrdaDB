@@ -27,6 +27,7 @@ pub const TRANSACTION_STATE_FILE: &str = "transaction-state-v2.json";
 pub const MIGRATION_JOURNAL_FILE: &str = "migration-v2.json";
 pub const LEGACY_DATA_FILE: &str = "ordadb.data";
 pub const LEGACY_WAL_FILE: &str = "ordadb.wal";
+pub const INSTALLER_STORAGE_CLASSIFICATION_VERSION: u32 = 1;
 
 const MAX_POINTER_BYTES: u64 = 64 * 1024;
 const MAX_CLUSTER_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
@@ -179,6 +180,346 @@ pub enum RootAuthority {
     Empty,
     LegacyV1(Box<StorageInspection>),
     V2(Box<ResolvedClusterV2>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InstallerStorageDisposition {
+    Empty,
+    LegacyV1,
+    ActiveV2,
+    Mixed,
+    Corrupt,
+    IncompleteMigration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstallerStorageMarkersV1 {
+    pub legacy_data: bool,
+    pub legacy_wal: bool,
+    pub legacy_auth: bool,
+    pub active_pointer: bool,
+    pub clusters_directory: bool,
+    pub migration_directory: bool,
+    pub migration_journal: bool,
+    pub top_level_entries: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstallerStorageClassificationV1 {
+    pub schema_version: u32,
+    pub disposition: InstallerStorageDisposition,
+    pub data_dir: PathBuf,
+    pub markers: InstallerStorageMarkersV1,
+    pub authority: Option<RootAuthority>,
+    pub issue: Option<DbError>,
+}
+
+pub fn normalize_installer_data_dir(path: impl AsRef<Path>) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path.as_ref())
+        .map_err(|error| io_error("failed to normalize installer data directory", error))?;
+    if absolute.exists() {
+        let canonical = absolute
+            .canonicalize()
+            .map_err(|error| io_error("failed to resolve installer data directory", error))?;
+        if !canonical.is_dir() {
+            return Err(invalid("installer data directory path is not a directory"));
+        }
+        return Ok(canonical);
+    }
+
+    let existing_ancestor = absolute
+        .ancestors()
+        .find(|candidate| candidate.exists())
+        .ok_or_else(|| invalid("installer data directory has no existing ancestor"))?;
+    let canonical_ancestor = existing_ancestor
+        .canonicalize()
+        .map_err(|error| io_error("failed to resolve installer data directory ancestor", error))?;
+    if !canonical_ancestor.is_dir() {
+        return Err(invalid(
+            "installer data directory ancestor is not a directory",
+        ));
+    }
+    let suffix = absolute
+        .strip_prefix(existing_ancestor)
+        .map_err(|_| internal("normalized installer data directory lost its ancestor"))?;
+    if suffix
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(invalid(
+            "installer data directory contains an unsafe path component",
+        ));
+    }
+    Ok(canonical_ancestor.join(suffix))
+}
+
+pub fn classify_installer_storage(
+    root: impl AsRef<Path>,
+) -> Result<InstallerStorageClassificationV1> {
+    let data_dir = normalize_installer_data_dir(root)?;
+    if !data_dir.exists() {
+        return Ok(installer_classification(
+            InstallerStorageDisposition::Empty,
+            data_dir,
+            InstallerStorageMarkersV1 {
+                legacy_data: false,
+                legacy_wal: false,
+                legacy_auth: false,
+                active_pointer: false,
+                clusters_directory: false,
+                migration_directory: false,
+                migration_journal: false,
+                top_level_entries: 0,
+            },
+            None,
+            None,
+        ));
+    }
+
+    let markers = installer_storage_markers(&data_dir)?;
+    let journal_completed = match installer_journal_completed(&data_dir, &markers) {
+        Ok(completed) => completed,
+        Err(error) => {
+            return Ok(installer_classification(
+                InstallerStorageDisposition::Corrupt,
+                data_dir,
+                markers,
+                None,
+                Some(error),
+            ));
+        }
+    };
+
+    if markers.active_pointer {
+        return match resolve_active_v2(&data_dir) {
+            Ok(cluster) => {
+                let disposition =
+                    if markers.legacy_data && cluster.database_manifest.migration.is_none() {
+                        InstallerStorageDisposition::Mixed
+                    } else {
+                        InstallerStorageDisposition::ActiveV2
+                    };
+                let issue = (disposition == InstallerStorageDisposition::Mixed).then(|| {
+                    DbError::new(
+                        "55000",
+                        "legacy and independently initialized v2 authorities are both present",
+                    )
+                    .with_hint("select one authoritative source before retrying the installer")
+                });
+                Ok(installer_classification(
+                    disposition,
+                    data_dir,
+                    markers,
+                    Some(RootAuthority::V2(Box::new(cluster))),
+                    issue,
+                ))
+            }
+            Err(error) => Ok(installer_classification(
+                if markers.legacy_data {
+                    InstallerStorageDisposition::Mixed
+                } else {
+                    InstallerStorageDisposition::Corrupt
+                },
+                data_dir,
+                markers,
+                None,
+                Some(error),
+            )),
+        };
+    }
+
+    if markers.migration_journal && !journal_completed {
+        return Ok(installer_classification(
+            InstallerStorageDisposition::IncompleteMigration,
+            data_dir,
+            markers,
+            None,
+            Some(
+                DbError::new("55000", "a storage migration did not reach completion")
+                    .with_hint("retain the authoritative source and inspect the migration journal"),
+            ),
+        ));
+    }
+
+    if markers.legacy_data {
+        return match inspect_root(&data_dir) {
+            Ok(RootAuthority::LegacyV1(inspection)) => {
+                let mixed = markers.clusters_directory && !journal_completed;
+                let disposition = if mixed {
+                    InstallerStorageDisposition::Mixed
+                } else {
+                    InstallerStorageDisposition::LegacyV1
+                };
+                let issue = mixed.then(|| {
+                    DbError::new(
+                        "55000",
+                        "legacy authority and untracked v2 cluster files are both present",
+                    )
+                    .with_hint("remove abandoned staging files only after preserving the v1 source")
+                });
+                Ok(installer_classification(
+                    disposition,
+                    data_dir,
+                    markers,
+                    Some(RootAuthority::LegacyV1(inspection)),
+                    issue,
+                ))
+            }
+            Ok(_) => Ok(installer_classification(
+                InstallerStorageDisposition::Corrupt,
+                data_dir,
+                markers,
+                None,
+                Some(corrupt(
+                    "the legacy data path does not contain database format v1",
+                )),
+            )),
+            Err(error) => Ok(installer_classification(
+                InstallerStorageDisposition::Corrupt,
+                data_dir,
+                markers,
+                None,
+                Some(error),
+            )),
+        };
+    }
+
+    if markers.migration_directory || markers.clusters_directory {
+        return Ok(installer_classification(
+            InstallerStorageDisposition::IncompleteMigration,
+            data_dir,
+            markers,
+            None,
+            Some(
+                DbError::new(
+                    "55000",
+                    "storage migration artifacts exist without an authoritative source",
+                )
+                .with_hint("restore a verified authority before retrying the installer"),
+            ),
+        ));
+    }
+
+    if markers.top_level_entries == 0 {
+        Ok(installer_classification(
+            InstallerStorageDisposition::Empty,
+            data_dir,
+            markers,
+            Some(RootAuthority::Empty),
+            None,
+        ))
+    } else {
+        Ok(installer_classification(
+            InstallerStorageDisposition::Corrupt,
+            data_dir,
+            markers,
+            None,
+            Some(
+                corrupt("data directory is non-empty but has no authoritative database")
+                    .with_hint("move unrelated files away or restore a verified database"),
+            ),
+        ))
+    }
+}
+
+fn installer_storage_markers(root: &Path) -> Result<InstallerStorageMarkersV1> {
+    for path in [
+        root.join(LEGACY_DATA_FILE),
+        root.join(LEGACY_WAL_FILE),
+        root.join(AUTH_FILE_NAME),
+        root.join(ACTIVE_POINTER_FILE),
+        root.join("clusters"),
+        root.join("migration"),
+        root.join("migration").join(MIGRATION_JOURNAL_FILE),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid(format!(
+                    "installer storage path {} is a symbolic link",
+                    path.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(io_error(
+                    "failed to inspect installer storage marker",
+                    error,
+                ));
+            }
+        }
+    }
+    let mut top_level_entries = 0_u64;
+    for entry in
+        fs::read_dir(root).map_err(|error| io_error("failed to inspect data directory", error))?
+    {
+        entry.map_err(|error| io_error("failed to inspect data directory entry", error))?;
+        top_level_entries = top_level_entries
+            .checked_add(1)
+            .ok_or_else(|| invalid("data directory entry count overflowed"))?;
+        if top_level_entries > 4096 {
+            return Err(DbError::new(
+                "54000",
+                "data directory contains more than 4096 top-level entries",
+            ));
+        }
+    }
+    Ok(InstallerStorageMarkersV1 {
+        legacy_data: root.join(LEGACY_DATA_FILE).is_file(),
+        legacy_wal: root.join(LEGACY_WAL_FILE).is_file(),
+        legacy_auth: root.join(AUTH_FILE_NAME).is_file(),
+        active_pointer: root.join(ACTIVE_POINTER_FILE).is_file(),
+        clusters_directory: root.join("clusters").is_dir(),
+        migration_directory: root.join("migration").is_dir(),
+        migration_journal: root
+            .join("migration")
+            .join(MIGRATION_JOURNAL_FILE)
+            .is_file(),
+        top_level_entries,
+    })
+}
+
+fn installer_journal_completed(root: &Path, markers: &InstallerStorageMarkersV1) -> Result<bool> {
+    if !markers.migration_journal {
+        return Ok(false);
+    }
+    let document: serde_json::Value = read_json_bounded(
+        &root.join("migration").join(MIGRATION_JOURNAL_FILE),
+        MAX_JOURNAL_BYTES,
+    )?;
+    let version = document
+        .get("formatVersion")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| corrupt("migration journal has no formatVersion"))?;
+    if version != u64::from(CLUSTER_FORMAT_V2) {
+        return Err(unsupported(format!(
+            "migration journal format version {version}"
+        )));
+    }
+    let phase = document
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| corrupt("migration journal has no phase"))?;
+    Ok(phase == "completed")
+}
+
+fn installer_classification(
+    disposition: InstallerStorageDisposition,
+    data_dir: PathBuf,
+    markers: InstallerStorageMarkersV1,
+    authority: Option<RootAuthority>,
+    issue: Option<DbError>,
+) -> InstallerStorageClassificationV1 {
+    InstallerStorageClassificationV1 {
+        schema_version: INSTALLER_STORAGE_CLASSIFICATION_VERSION,
+        disposition,
+        data_dir,
+        markers,
+        authority,
+        issue,
+    }
 }
 
 pub fn estimate_cluster_documents_v2(
@@ -1253,6 +1594,86 @@ mod tests {
                 .expect_err("migration required")
                 .sql_state,
             "0A000"
+        );
+    }
+
+    #[test]
+    fn installer_classification_covers_all_six_dispositions_without_mutation() {
+        let directory = tempdir().expect("tempdir");
+
+        let empty = directory.path().join("empty");
+        let classified = classify_installer_storage(&empty).expect("empty classification");
+        assert_eq!(classified.disposition, InstallerStorageDisposition::Empty);
+        assert!(!empty.exists());
+
+        let legacy = directory.path().join("legacy");
+        drop(DatabaseStore::open(&legacy).expect("legacy store"));
+        let legacy_before = fs::read(legacy.join(LEGACY_DATA_FILE)).expect("legacy before");
+        let classified = classify_installer_storage(&legacy).expect("legacy classification");
+        assert_eq!(
+            classified.disposition,
+            InstallerStorageDisposition::LegacyV1
+        );
+        assert_eq!(
+            fs::read(legacy.join(LEGACY_DATA_FILE)).expect("legacy after"),
+            legacy_before
+        );
+
+        let active = directory.path().join("active");
+        initialize_empty_v2(&active).expect("active cluster");
+        let active_pointer_before =
+            fs::read(active.join(ACTIVE_POINTER_FILE)).expect("active pointer before");
+        let classified = classify_installer_storage(&active).expect("active classification");
+        assert_eq!(
+            classified.disposition,
+            InstallerStorageDisposition::ActiveV2
+        );
+        assert_eq!(
+            fs::read(active.join(ACTIVE_POINTER_FILE)).expect("active pointer after"),
+            active_pointer_before
+        );
+
+        let mixed = directory.path().join("mixed");
+        initialize_empty_v2(&mixed).expect("mixed cluster");
+        drop(DatabaseStore::open(&mixed).expect("mixed legacy store"));
+        let classified = classify_installer_storage(&mixed).expect("mixed classification");
+        assert_eq!(classified.disposition, InstallerStorageDisposition::Mixed);
+
+        let corrupt_root = directory.path().join("corrupt");
+        fs::create_dir_all(&corrupt_root).expect("corrupt root");
+        fs::write(corrupt_root.join(LEGACY_DATA_FILE), b"not a database").expect("corrupt data");
+        let corrupt_before = fs::read(corrupt_root.join(LEGACY_DATA_FILE)).expect("corrupt before");
+        let classified = classify_installer_storage(&corrupt_root).expect("corrupt classification");
+        assert_eq!(classified.disposition, InstallerStorageDisposition::Corrupt);
+        assert_eq!(
+            fs::read(corrupt_root.join(LEGACY_DATA_FILE)).expect("corrupt after"),
+            corrupt_before
+        );
+
+        let incomplete = directory.path().join("incomplete");
+        drop(DatabaseStore::open(&incomplete).expect("incomplete legacy store"));
+        fs::create_dir_all(incomplete.join("migration")).expect("migration directory");
+        fs::write(
+            incomplete.join("migration").join(MIGRATION_JOURNAL_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "formatVersion": 2,
+                "phase": "candidateBuilt"
+            }))
+            .expect("journal json"),
+        )
+        .expect("journal");
+        let journal_before = fs::read(incomplete.join("migration").join(MIGRATION_JOURNAL_FILE))
+            .expect("journal before");
+        let classified =
+            classify_installer_storage(&incomplete).expect("incomplete classification");
+        assert_eq!(
+            classified.disposition,
+            InstallerStorageDisposition::IncompleteMigration
+        );
+        assert_eq!(
+            fs::read(incomplete.join("migration").join(MIGRATION_JOURNAL_FILE))
+                .expect("journal after"),
+            journal_before
         );
     }
 

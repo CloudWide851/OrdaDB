@@ -574,6 +574,22 @@ pub fn migrate_v1_to_v2_with_faults(
     faults: &dyn MigrationFaultInjector,
 ) -> Result<MigrationReportV2> {
     let plan = plan_v1_to_v2(root, options)?;
+    apply_migration_plan_v2_with_faults(plan, options, faults)
+}
+
+pub fn apply_migration_plan_v2(
+    plan: MigrationPlanV2,
+    options: MigrationRunOptionsV2,
+) -> Result<MigrationReportV2> {
+    apply_migration_plan_v2_with_faults(plan, options, &NoMigrationFaults)
+}
+
+fn apply_migration_plan_v2_with_faults(
+    plan: MigrationPlanV2,
+    options: MigrationRunOptionsV2,
+    faults: &dyn MigrationFaultInjector,
+) -> Result<MigrationReportV2> {
+    validate_migration_plan(&plan)?;
     if !plan.incompatibilities.is_empty() {
         return Err(
             DbError::new("0A000", "legacy database has migration incompatibilities")
@@ -589,6 +605,19 @@ pub fn migrate_v1_to_v2_with_faults(
                     plan.bytes.required_bytes, plan.bytes.available_bytes
                 ))
                 .with_hint("free space on the cluster volume and rerun the dry-run"),
+        );
+    }
+    let current_available_bytes = options
+        .available_bytes_override
+        .unwrap_or(available_space(&plan.paths.cluster_root)?);
+    if current_available_bytes < plan.bytes.required_bytes {
+        return Err(
+            DbError::new("53100", "insufficient disk space for storage migration")
+                .with_detail(format!(
+                    "required {} bytes, currently available {} bytes",
+                    plan.bytes.required_bytes, current_available_bytes
+                ))
+                .with_hint("free space on the cluster volume and rerun installer preflight"),
         );
     }
     let root = &plan.paths.cluster_root;
@@ -748,6 +777,89 @@ pub fn migrate_v1_to_v2_with_faults(
         paths: plan.paths,
         final_phase: MigrationPhaseV2::Completed,
     })
+}
+
+pub(crate) fn validate_migration_plan(plan: &MigrationPlanV2) -> Result<()> {
+    if plan.format_version != MIGRATION_FORMAT_VERSION {
+        return Err(DbError::new(
+            "0A000",
+            format!(
+                "migration plan format version {} is not supported",
+                plan.format_version
+            ),
+        )
+        .with_hint("rerun installer storage preflight with this OrdaDB build"));
+    }
+    if plan.source_format_version != 1 || plan.target_format_version != 2 {
+        return Err(DbError::new(
+            "0A000",
+            "migration plan source or target format is not supported",
+        ));
+    }
+    if plan.phases != MigrationPhaseV2::ordered() {
+        return Err(corrupt("migration plan phase sequence is invalid"));
+    }
+    let root = absolute_existing_root(&plan.paths.cluster_root)?;
+    if root != plan.paths.cluster_root {
+        return Err(invalid(
+            "migration plan cluster root is not the exact normalized data directory",
+        ));
+    }
+    let migration_root = root.join("migration");
+    let expected = MigrationPathsV2 {
+        cluster_root: root.clone(),
+        logical_backup: migration_root
+            .join("backups")
+            .join(format!("{}.ordbak", plan.migration_id)),
+        candidate_cluster: migration_root
+            .join("candidates")
+            .join(plan.migration_id.to_string())
+            .join("cluster"),
+        published_cluster: root.join("clusters").join(plan.cluster_id.to_string()),
+        rollback_directory: root
+            .join("rollback")
+            .join(format!("v1-{}", plan.migration_id)),
+        journal: migration_journal_path(&root)?,
+        active_pointer: root.join(ACTIVE_POINTER_FILE),
+    };
+    if plan.paths != expected {
+        return Err(invalid(
+            "migration plan contains a path outside its canonical installer layout",
+        ));
+    }
+    if plan.candidate_storage.data_format != DataFormat::V2 {
+        return Err(corrupt(
+            "migration plan candidate storage does not use database format v2",
+        ));
+    }
+    for (label, digest) in [
+        ("data", Some(plan.inventory.data_file_sha256.as_str())),
+        ("WAL", plan.inventory.wal_file_sha256.as_deref()),
+        ("auth", plan.inventory.auth_file_sha256.as_deref()),
+    ] {
+        if let Some(digest) = digest
+            && (digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        {
+            return Err(corrupt(format!(
+                "migration plan {label} fingerprint is invalid"
+            )));
+        }
+    }
+    if plan.incompatibilities.len() > 64
+        || plan
+            .incompatibilities
+            .iter()
+            .any(|value| value.len() > 1024)
+    {
+        return Err(DbError::new(
+            "54000",
+            "migration plan incompatibility list exceeds installer bounds",
+        ));
+    }
+    Ok(())
 }
 
 pub fn rollback_v2_to_v1(root: impl AsRef<Path>) -> Result<()> {
@@ -958,7 +1070,7 @@ fn copy_file_durable(source: &Path, destination: &Path) -> Result<()> {
         .map_err(|error| io_error("failed to synchronize copied file", error))
 }
 
-fn optional_file_bytes(path: &Path) -> Result<u64> {
+pub(crate) fn optional_file_bytes(path: &Path) -> Result<u64> {
     match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => Ok(metadata.len()),
         Ok(_) => Err(invalid(format!(
@@ -970,7 +1082,7 @@ fn optional_file_bytes(path: &Path) -> Result<u64> {
     }
 }
 
-fn optional_file_sha256(path: &Path) -> Result<Option<String>> {
+pub(crate) fn optional_file_sha256(path: &Path) -> Result<Option<String>> {
     match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => hash_file(path).map(Some),
         Ok(_) => Err(DbError::new(
@@ -982,7 +1094,7 @@ fn optional_file_sha256(path: &Path) -> Result<Option<String>> {
     }
 }
 
-fn hash_file(path: &Path) -> Result<String> {
+pub(crate) fn hash_file(path: &Path) -> Result<String> {
     let mut file =
         File::open(path).map_err(|error| io_error("failed to open migration file", error))?;
     let mut digest = Sha256::new();

@@ -10,6 +10,8 @@ use ordadb_types::{DbError, Result};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
+mod installer_storage;
+
 const MAX_STDIN_SECRET_BYTES: u64 = 1024;
 
 #[tokio::main]
@@ -48,6 +50,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "service" => service(options).await?,
         "storage-migrate" => storage_migrate(options)?,
         "storage-rollback" => storage_rollback(options)?,
+        "installer-storage" => installer_storage::run(options)?,
         "validate-config" => validate_config(options)?,
         _ => return Err(usage()),
     };
@@ -415,7 +418,7 @@ fn ensure_empty(options: &BTreeMap<String, Option<String>>) -> Result<()> {
 
 fn usage() -> DbError {
     invalid(
-        "usage: ordadb-cli <bootstrap|sql|health|checkpoint|backup|restore|import|export|operations|service|storage-migrate|storage-rollback|validate-config> [options]",
+        "usage: ordadb-cli <bootstrap|sql|health|checkpoint|backup|restore|import|export|operations|service|storage-migrate|storage-rollback|installer-storage|validate-config> [options]",
     )
 }
 

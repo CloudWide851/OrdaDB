@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 ordadb-backup = { path = "../ordadb-backup" }
+ordadb-cluster = { path = "../ordadb-cluster" }
 ordadb-server = { path = "../ordadb-server" }
 ordadb-types = { path = "../ordadb-types" }
 ordadb-protocol = { path = "../ordadb-protocol" }
