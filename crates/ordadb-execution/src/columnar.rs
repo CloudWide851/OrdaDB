@@ -306,7 +306,9 @@ impl ColumnVector {
             }};
         }
         match (self, literal) {
-            (Self::RowBacked { view, .. }, literal) => {
+            (Self::RowBacked { kind, view }, literal)
+                if row_backed_literal_supported(*kind, literal) =>
+            {
                 compare_value_literal(view.value(index), literal, operator)
             }
             (Self::Boolean(values), Value::Boolean(literal)) => compare!(values, literal),
@@ -835,6 +837,26 @@ impl DataChunk {
             self.physical_rows = 0;
             return Ok(rows);
         }
+        if let Some((snapshot, start, end)) = identity_row_snapshot(&self.columns) {
+            for physical_index in indexes {
+                let physical_index = physical_index as usize;
+                if physical_index >= end.saturating_sub(start) {
+                    return Err(DbError::internal(
+                        "row-backed selection index is out of bounds",
+                    ));
+                }
+                rows.push(
+                    snapshot
+                        .get(start + physical_index)
+                        .cloned()
+                        .ok_or_else(|| {
+                            DbError::internal("row-backed snapshot row is unavailable")
+                        })?,
+                );
+            }
+            self.physical_rows = 0;
+            return Ok(rows);
+        }
         if self.columns.len() == 1 {
             take_single_column_rows(&mut self.columns[0], indexes, &mut rows)?;
             self.physical_rows = 0;
@@ -902,6 +924,14 @@ impl DataChunk {
     ) -> Result<bool> {
         if !self.can_project_columns(projections)? {
             return Ok(false);
+        }
+        if projections.len() == self.columns.len()
+            && projections
+                .iter()
+                .enumerate()
+                .all(|(position, (index, _))| position == *index)
+        {
+            return Ok(true);
         }
         let mut source = std::mem::take(&mut self.columns)
             .into_iter()
@@ -1013,6 +1043,33 @@ impl DataChunk {
         self.physical_rows = rows.len();
         Ok(true)
     }
+}
+
+fn identity_row_snapshot(columns: &[ColumnVector]) -> Option<(Arc<Vec<Row>>, usize, usize)> {
+    let ColumnVector::RowBacked { view: first, .. } = columns.first()? else {
+        return None;
+    };
+    if first.column != 0
+        || first
+            .rows
+            .get(first.start)
+            .is_some_and(|row| row.values.len() != columns.len())
+        || columns
+            .iter()
+            .enumerate()
+            .any(|(column, vector)| match vector {
+                ColumnVector::RowBacked { view, .. } => {
+                    view.column != column
+                        || view.start != first.start
+                        || view.end != first.end
+                        || !Arc::ptr_eq(&view.rows, &first.rows)
+                }
+                _ => true,
+            })
+    {
+        return None;
+    }
+    Some((Arc::clone(&first.rows), first.start, first.end))
 }
 
 fn take_single_column_rows(
@@ -1384,6 +1441,18 @@ mod tests {
     }
 
     #[test]
+    fn row_backed_comparison_defers_mismatched_physical_literal_types() {
+        let snapshot = Arc::new(vec![Row::new(vec![Value::Int64(7)])]);
+        let chunk = DataChunk::from_row_snapshot(snapshot, 0, 1).expect("row-backed data chunk");
+
+        assert!(
+            chunk
+                .compare_literal(0, 0, &Value::Int32(7), BinaryOperator::Eq)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn selected_row_estimate_combines_fixed_and_variable_width_columns() {
         let mut chunk = DataChunk::from_rows(&[
             Row::new(vec![Value::Int64(1), Value::Text("alpha".into())]),
@@ -1410,6 +1479,50 @@ mod tests {
         assert_eq!(chunk.into_rows().expect("rows"), rows);
         drop(reservation);
         assert_eq!(grant.current_bytes(), 0);
+    }
+
+    #[test]
+    fn identity_row_snapshot_materializes_selected_rows_without_column_rebuild() {
+        let snapshot = Arc::new(vec![
+            Row::new(vec![Value::Int64(1), Value::Text("one".into())]),
+            Row::new(vec![Value::Int64(2), Value::Text("two".into())]),
+            Row::new(vec![Value::Int64(3), Value::Text("three".into())]),
+        ]);
+        let mut chunk = DataChunk::from_row_snapshot(Arc::clone(&snapshot), 0, snapshot.len())
+            .expect("row-backed chunk");
+        let columns = chunk.columns.as_ptr();
+        assert!(
+            chunk
+                .project_columns_in_place(&[(0, ScalarType::Int64), (1, ScalarType::Text)])
+                .expect("identity projection")
+        );
+        assert_eq!(chunk.columns.as_ptr(), columns);
+        chunk.selection.indexes = vec![2, 0];
+
+        assert_eq!(
+            chunk.into_rows().expect("selected rows"),
+            vec![snapshot[2].clone(), snapshot[0].clone()]
+        );
+    }
+
+    #[test]
+    fn projected_row_snapshot_materializes_only_the_requested_columns() {
+        let snapshot = Arc::new(vec![Row::new(vec![
+            Value::Int64(1),
+            Value::Text("one".into()),
+        ])]);
+        let mut chunk = DataChunk::from_row_snapshot(Arc::clone(&snapshot), 0, snapshot.len())
+            .expect("row-backed chunk");
+        assert!(
+            chunk
+                .project_columns_in_place(&[(1, ScalarType::Text)])
+                .expect("projection")
+        );
+
+        assert_eq!(
+            chunk.into_rows().expect("projected rows"),
+            vec![Row::new(vec![Value::Text("one".into())])]
+        );
     }
 
     #[test]

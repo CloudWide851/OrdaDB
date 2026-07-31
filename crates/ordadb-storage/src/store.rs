@@ -91,6 +91,46 @@ pub struct TableManifest {
     pub heap_pages: Vec<PageId>,
 }
 
+/// Resumable, generation-bound cursor over one authoritative v2 heap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageTableCursorV2 {
+    table_id: TableId,
+    generation: u64,
+    heap_pages: Vec<PageId>,
+    expected_rows: u64,
+    emitted_rows: u64,
+    page_index: usize,
+    slot_index: u16,
+    exhausted: bool,
+}
+
+impl StorageTableCursorV2 {
+    #[must_use]
+    pub const fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn emitted_rows(&self) -> u64 {
+        self.emitted_rows
+    }
+
+    #[must_use]
+    pub const fn expected_rows(&self) -> u64 {
+        self.expected_rows
+    }
+
+    #[must_use]
+    pub const fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexManifest {
     pub index_id: IndexId,
@@ -590,6 +630,174 @@ impl DatabaseStore {
         &self.committed_indexes
     }
 
+    pub fn open_table_cursor_v2(
+        &self,
+        table_id: TableId,
+        expected_generation: u64,
+    ) -> Result<StorageTableCursorV2> {
+        if self.data_format != DataFormat::V2 {
+            return Err(DbError::new(
+                "0A000",
+                "persistent table cursors require database format v2",
+            )
+            .with_hint("migrate the v1 database before using storage-backed scans"));
+        }
+        if self.committed_state.generation != expected_generation {
+            return Err(stale_scan_generation(
+                expected_generation,
+                self.committed_state.generation,
+            ));
+        }
+        let manifest = self
+            .committed_tables
+            .iter()
+            .find(|manifest| manifest.table_id == table_id)
+            .ok_or_else(|| {
+                DbError::new(
+                    "42P01",
+                    format!(
+                        "table {} does not exist in the v2 heap directory",
+                        table_id.get()
+                    ),
+                )
+            })?;
+        let rows = self
+            .committed_state
+            .tables
+            .get(&table_id)
+            .ok_or_else(|| corruption("v2 table directory has no matching row state"))?;
+        let expected_rows = u64::try_from(rows.len())
+            .map_err(|_| corruption("v2 table row count exceeds the storage format limit"))?;
+        let page_count = self.pool.page_count()?;
+        let mut previous = None;
+        for page_id in &manifest.heap_pages {
+            if page_id.get() == 0
+                || page_id.get() >= page_count
+                || previous.is_some_and(|previous| previous >= *page_id)
+            {
+                return Err(corruption(
+                    "v2 table cursor page directory is not a sorted in-file heap sequence",
+                ));
+            }
+            previous = Some(*page_id);
+        }
+        if expected_rows == 0 && !manifest.heap_pages.is_empty() {
+            return Err(corruption(
+                "empty v2 table references one or more heap pages",
+            ));
+        }
+        if expected_rows > 0 && manifest.heap_pages.is_empty() {
+            return Err(corruption("non-empty v2 table has no heap pages"));
+        }
+        Ok(StorageTableCursorV2 {
+            table_id,
+            generation: expected_generation,
+            heap_pages: manifest.heap_pages.clone(),
+            expected_rows,
+            emitted_rows: 0,
+            page_index: 0,
+            slot_index: 0,
+            exhausted: expected_rows == 0,
+        })
+    }
+
+    pub fn read_table_cursor_v2(
+        &self,
+        cursor: &mut StorageTableCursorV2,
+        max_rows: usize,
+    ) -> Result<Vec<Row>> {
+        if max_rows == 0 {
+            return Err(DbError::new(
+                "22023",
+                "persistent table scan chunk size must be positive",
+            ));
+        }
+        if cursor.exhausted {
+            return Ok(Vec::new());
+        }
+        if self.data_format != DataFormat::V2 {
+            return Err(DbError::new(
+                "0A000",
+                "persistent table cursor cannot read a non-v2 database",
+            ));
+        }
+        if self.committed_state.generation != cursor.generation {
+            return Err(stale_scan_generation(
+                cursor.generation,
+                self.committed_state.generation,
+            ));
+        }
+        if !self
+            .committed_tables
+            .iter()
+            .any(|manifest| manifest.table_id == cursor.table_id)
+        {
+            return Err(corruption(
+                "v2 table cursor owner disappeared from the heap directory",
+            ));
+        }
+
+        let mut rows = Vec::with_capacity(max_rows.min(1024));
+        while rows.len() < max_rows && cursor.page_index < cursor.heap_pages.len() {
+            let page_id = cursor.heap_pages[cursor.page_index];
+            let page = self.pool.fetch(page_id)?.snapshot()?;
+            if page.page_type()? != PageType::Heap {
+                return Err(corruption(format!(
+                    "v2 table {} cursor references non-heap page {}",
+                    cursor.table_id.get(),
+                    page_id.get()
+                )));
+            }
+            let slot_count = page.slot_count();
+            if cursor.slot_index > slot_count {
+                return Err(corruption(
+                    "v2 table cursor slot position exceeds its heap page",
+                ));
+            }
+            while rows.len() < max_rows && cursor.slot_index < slot_count {
+                let record = page.record(cursor.slot_index)?;
+                let (header, row) = decode_row_v2(record)?;
+                if usize::from(header.column_count) != row.values.len() {
+                    return Err(corruption(
+                        "v2 tuple header column count does not match the decoded row",
+                    ));
+                }
+                cursor.slot_index = cursor
+                    .slot_index
+                    .checked_add(1)
+                    .ok_or_else(|| corruption("v2 table cursor slot position overflowed"))?;
+                cursor.emitted_rows = cursor
+                    .emitted_rows
+                    .checked_add(1)
+                    .ok_or_else(|| corruption("v2 table cursor emitted-row count overflowed"))?;
+                if cursor.emitted_rows > cursor.expected_rows {
+                    return Err(corruption(
+                        "v2 table cursor decoded more rows than the manifest state declares",
+                    ));
+                }
+                rows.push(row);
+            }
+            if cursor.slot_index == slot_count {
+                cursor.page_index = cursor
+                    .page_index
+                    .checked_add(1)
+                    .ok_or_else(|| corruption("v2 table cursor page position overflowed"))?;
+                cursor.slot_index = 0;
+            }
+        }
+
+        if cursor.page_index == cursor.heap_pages.len() {
+            if cursor.emitted_rows != cursor.expected_rows {
+                return Err(corruption(format!(
+                    "v2 table cursor decoded {} rows; expected {}",
+                    cursor.emitted_rows, cursor.expected_rows
+                )));
+            }
+            cursor.exhausted = true;
+        }
+        Ok(rows)
+    }
+
     pub fn commit(&mut self, candidate: &PersistentState) -> Result<()> {
         self.ensure_writable()?;
         let prepared = self.prepare_commit(candidate)?;
@@ -708,6 +916,17 @@ impl DatabaseStore {
         }
         Ok(())
     }
+}
+
+fn stale_scan_generation(expected: u64, actual: u64) -> DbError {
+    DbError::new(
+        "55000",
+        "persistent table cursor no longer matches the committed generation",
+    )
+    .with_detail(format!(
+        "cursor generation {expected}, committed generation {actual}"
+    ))
+    .with_hint("restart the statement against a fresh committed snapshot")
 }
 
 fn validate_prepared(pool: &BufferPool, prepared: &PreparedCommit) -> Result<()> {
@@ -1976,6 +2195,131 @@ mod tests {
             DatabaseStore::open_with_format(directory.path(), DataFormat::V2).expect("reopen v2");
         assert_eq!(reopened.committed_state(), &inspection.persistent_state);
         assert!(reopened.index_manifests().is_empty());
+    }
+
+    #[test]
+    fn v2_table_cursor_streams_bounded_rows_across_pages_and_stays_exhausted() {
+        let directory = tempdir().expect("tempdir");
+        let state = populated_state();
+        let table_id = *state.tables.keys().next().expect("table id");
+        let expected = state.tables[&table_id].clone();
+        let mut store =
+            DatabaseStore::open_with_format(directory.path(), DataFormat::V2).expect("open v2");
+        store.commit(&state).expect("commit v2");
+        assert!(
+            store.table_manifests()[0].heap_pages.len() > 1,
+            "fixture must span v2 heap pages"
+        );
+
+        let mut cursor = store
+            .open_table_cursor_v2(table_id, state.generation)
+            .expect("cursor");
+        assert_eq!(cursor.table_id(), table_id);
+        assert_eq!(cursor.generation(), state.generation);
+        assert_eq!(cursor.expected_rows(), expected.len() as u64);
+        assert_eq!(
+            store
+                .read_table_cursor_v2(&mut cursor, 0)
+                .expect_err("zero chunk rejected")
+                .sql_state,
+            "22023"
+        );
+
+        let mut actual = Vec::new();
+        loop {
+            let rows = store
+                .read_table_cursor_v2(&mut cursor, 7)
+                .expect("cursor chunk");
+            assert!(rows.len() <= 7);
+            if rows.is_empty() {
+                break;
+            }
+            actual.extend(rows);
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(cursor.emitted_rows(), cursor.expected_rows());
+        assert!(cursor.is_exhausted());
+        assert!(
+            store
+                .read_table_cursor_v2(&mut cursor, 7)
+                .expect("post exhaustion")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn v2_table_cursor_rejects_stale_generation_and_inconsistent_directory_state() {
+        let directory = tempdir().expect("tempdir");
+        let state = populated_state();
+        let table_id = *state.tables.keys().next().expect("table id");
+        let mut store =
+            DatabaseStore::open_with_format(directory.path(), DataFormat::V2).expect("open v2");
+        store.commit(&state).expect("commit v2");
+
+        let mut stale = store
+            .open_table_cursor_v2(table_id, state.generation)
+            .expect("stale candidate");
+        let mut next = state.clone();
+        next.generation += 1;
+        store.commit(&next).expect("next generation");
+        assert_eq!(
+            store
+                .read_table_cursor_v2(&mut stale, 1)
+                .expect_err("stale generation")
+                .sql_state,
+            "55000"
+        );
+        assert_eq!(
+            store
+                .open_table_cursor_v2(TableId::new(u64::MAX), next.generation)
+                .expect_err("unknown table")
+                .sql_state,
+            "42P01"
+        );
+
+        let mut wrong_page = store
+            .open_table_cursor_v2(table_id, next.generation)
+            .expect("wrong-page cursor");
+        wrong_page.heap_pages[0] = PageId::new(0);
+        assert_eq!(
+            store
+                .read_table_cursor_v2(&mut wrong_page, 1)
+                .expect_err("metadata page is not heap")
+                .sql_state,
+            "XX001"
+        );
+
+        let mut wrong_count = store
+            .open_table_cursor_v2(table_id, next.generation)
+            .expect("wrong-count cursor");
+        wrong_count.expected_rows += 1;
+        while !wrong_count.is_exhausted() {
+            match store.read_table_cursor_v2(&mut wrong_count, 64) {
+                Ok(_) => {}
+                Err(error) => {
+                    assert_eq!(error.sql_state, "XX001");
+                    return;
+                }
+            }
+        }
+        panic!("row-count mismatch must fail before exhaustion");
+    }
+
+    #[test]
+    fn v2_table_cursor_is_not_a_legacy_format_fallback() {
+        let directory = tempdir().expect("tempdir");
+        let state = populated_state();
+        let table_id = *state.tables.keys().next().expect("table id");
+        let mut store =
+            DatabaseStore::open_with_format(directory.path(), DataFormat::V1).expect("open v1");
+        store.commit(&state).expect("commit v1");
+        assert_eq!(
+            store
+                .open_table_cursor_v2(table_id, state.generation)
+                .expect_err("v1 cursor rejected")
+                .sql_state,
+            "0A000"
+        );
     }
 
     #[test]

@@ -58,6 +58,7 @@ export function appendResultRows(
   };
 
   let offset = 0;
+  let activePage: ResultPage | undefined;
   while (offset < incoming.length) {
     if (next.rowCount >= limits.maxRows || next.bytes >= limits.maxBytes) {
       next.droppedRows += incoming.length - offset;
@@ -71,22 +72,26 @@ export function appendResultRows(
       break;
     }
 
-    const last = next.pages.at(-1);
-    if (last && last.rows.length < limits.pageRows) {
-      const rows = last.rows.slice();
-      rows.push(source);
-      next.pages[next.pages.length - 1] = {
-        start: last.start,
-        rows,
-        bytes: last.bytes + bytes,
-      };
-    } else {
-      next.pages.push({
-        start: next.rowCount,
-        rows: [source],
-        bytes,
-      });
+    if (!activePage || activePage.rows.length >= limits.pageRows) {
+      const last = next.pages.at(-1);
+      if (last && last.rows.length < limits.pageRows) {
+        activePage = {
+          start: last.start,
+          rows: last.rows.slice(),
+          bytes: last.bytes,
+        };
+        next.pages[next.pages.length - 1] = activePage;
+      } else {
+        activePage = {
+          start: next.rowCount,
+          rows: [],
+          bytes: 0,
+        };
+        next.pages.push(activePage);
+      }
     }
+    activePage.rows.push(source);
+    activePage.bytes += bytes;
     next.rowCount += 1;
     next.bytes += bytes;
     offset += 1;

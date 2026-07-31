@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, hash_map::Entry};
 use std::fs::OpenOptions;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,9 +16,10 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     BatchPool, ExecutionContext, ExecutionOptions, ExpressionProgram, ExpressionStack,
-    QueryMemoryContext, Reservation, SpillManager, SpillRun, compare_rows, create_spill_writer,
+    QueryMemoryContext, Reservation, SpillManager, SpillMergeCursor, create_spill_writer,
     estimated_row_bytes, estimated_value_bytes, evaluate_binary, evaluate_unary, open_spill_reader,
-    program_limit_error, read_spill_record, sort_rows, spill_io_error, write_spill_record,
+    program_limit_error, read_spill_record, reserve_spill_writer, sort_rows, spill_io_error,
+    write_spill_record,
 };
 
 const HASH_PARTITIONS: usize = 32;
@@ -1539,11 +1540,11 @@ impl RowsOutputBuilder {
             self.reservation.resize(0)?;
         }
         let run_paths = spill.compact_sorted_runs(self.run_paths, &self.order_by, memory)?;
-        let runs = run_paths
-            .iter()
-            .map(|path| SpillRun::open(path, memory))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(RowsOutput::Runs(runs))
+        Ok(RowsOutput::Runs(SpillMergeCursor::open(
+            &run_paths,
+            &self.order_by,
+            memory,
+        )?))
     }
 }
 
@@ -1553,7 +1554,7 @@ enum RowsOutput {
         offset: usize,
         reservation: Option<Reservation>,
     },
-    Runs(Vec<SpillRun>),
+    Runs(SpillMergeCursor),
 }
 
 impl RowsOutput {
@@ -1575,36 +1576,7 @@ impl RowsOutput {
                 }
                 Ok(row)
             }
-            Self::Runs(runs) => {
-                let mut selected: Option<usize> = None;
-                for (index, run) in runs.iter().enumerate() {
-                    let Some(candidate) = &run.current else {
-                        continue;
-                    };
-                    let replace = match selected {
-                        None => true,
-                        Some(selected_index) => {
-                            let current = runs[selected_index]
-                                .current
-                                .as_ref()
-                                .ok_or_else(|| DbError::internal("spill merge row disappeared"))?;
-                            compare_rows(candidate, current, order_by)? == Ordering::Less
-                        }
-                    };
-                    if replace {
-                        selected = Some(index);
-                    }
-                }
-                let Some(selected) = selected else {
-                    return Ok(None);
-                };
-                let row = runs[selected]
-                    .current
-                    .take()
-                    .ok_or_else(|| DbError::internal("spill merge row disappeared"))?;
-                runs[selected].advance(memory)?;
-                Ok(Some(row))
-            }
+            Self::Runs(merge) => merge.pop_next(order_by, memory),
         }
     }
 }
@@ -1633,7 +1605,7 @@ impl SpillManager {
         let paths = self.partition_paths(label, count)?;
         let mut writers = paths
             .iter()
-            .map(|path| create_spill_writer(path))
+            .map(|path| create_spill_writer(path, memory))
             .collect::<Result<Vec<_>>>()?;
         for row in rows {
             let value = row
@@ -1668,7 +1640,7 @@ impl SpillManager {
             });
         }
         let mut rows = Vec::new();
-        let mut reader = open_spill_reader(path)?;
+        let mut reader = open_spill_reader(path, memory)?;
         while let Some(record) = read_spill_record::<Row>(&mut reader, memory)? {
             let row = record.value;
             let value = row
@@ -1702,9 +1674,9 @@ impl SpillManager {
                         .open(path)
                         .map_err(spill_io_error)?;
                     writer.seek(SeekFrom::End(0)).map_err(spill_io_error)?;
-                    Ok(BufWriter::new(writer))
+                    reserve_spill_writer(writer, memory)
                 } else {
-                    create_spill_writer(path)
+                    create_spill_writer(path, memory)
                 }
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1728,7 +1700,7 @@ impl SpillManager {
         memory: &QueryMemoryContext,
         specs: &[AggregateSpec],
     ) -> Result<ReservedValues<GroupAccumulator>> {
-        let mut reader = open_spill_reader(path)?;
+        let mut reader = open_spill_reader(path, memory)?;
         let mut groups = Vec::<GroupAccumulator>::new();
         let mut reservation = memory.try_reserve(0)?;
         while let Some(record) = read_spill_record::<GroupAccumulator>(&mut reader, memory)? {

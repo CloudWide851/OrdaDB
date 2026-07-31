@@ -105,7 +105,7 @@ fn failed_unique_index_build_is_atomic_through_public_api() {
             session
                 .execute(
                     "SELECT id FROM valueset WHERE category = 7 ORDER BY id",
-                    &[]
+                    &[],
                 )
                 .expect("query"),
         )

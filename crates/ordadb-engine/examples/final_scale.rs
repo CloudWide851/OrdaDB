@@ -284,10 +284,13 @@ fn required_column(name: &str, data_type: ScalarType) -> NewColumn {
 
 fn validate_stream(engine: &Engine, target: &Target) -> HarnessResult<StreamObservation> {
     let mut session = stage("stream connection", engine.connect())?;
-    let mut stream = stage(
-        "stream query",
-        session.execute_stream("SELECT id, payload FROM scale_rows", &[]),
-    )?;
+    let project_id_only = env::var_os("ORDADB_SCALE_PROJECT_ID_ONLY").is_some();
+    let sql = if project_id_only {
+        "SELECT id FROM scale_rows"
+    } else {
+        "SELECT id, payload FROM scale_rows"
+    };
+    let mut stream = stage("stream query", session.execute_stream(sql, &[]))?;
     let mut rows = 0_u64;
     let mut id_sum = 0_i128;
     let mut min_id = None;
@@ -297,18 +300,24 @@ fn validate_stream(engine: &Engine, target: &Target) -> HarnessResult<StreamObse
         match stage("stream event", event)? {
             QueryEvent::Batch(batch) => {
                 for row in batch.rows {
-                    let [Value::Int64(row_id), Value::Text(payload)] = row.values.as_slice() else {
-                        return Err(HarnessError::new(
-                            "stream validation",
-                            "scale row did not contain BIGINT and TEXT",
-                        ));
+                    let (row_id, payload) = match row.values.as_slice() {
+                        [Value::Int64(row_id)] if project_id_only => (row_id, None),
+                        [Value::Int64(row_id), Value::Text(payload)] if !project_id_only => {
+                            (row_id, Some(payload))
+                        }
+                        _ => {
+                            return Err(HarnessError::new(
+                                "stream validation",
+                                "scale row did not match the configured projection",
+                            ));
+                        }
                     };
-                    if payload.len() != target.payload_bytes {
+                    if payload.is_some_and(|payload| payload.len() != target.payload_bytes) {
                         return Err(HarnessError::new(
                             "stream validation",
                             format!(
                                 "row {row_id} payload was {} bytes, expected {}",
-                                payload.len(),
+                                payload.map_or(0, String::len),
                                 target.payload_bytes
                             ),
                         ));
