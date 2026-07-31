@@ -75,7 +75,9 @@ struct BenchmarkReport {
     profile: &'static str,
     input_rows: usize,
     advanced_input_rows: usize,
+    bounded_rows: usize,
     batch_rows: usize,
+    spill_soft_memory_bytes: usize,
     iterations: usize,
     scenarios: Vec<ScenarioResult>,
 }
@@ -103,6 +105,11 @@ fn main() {
     let row_count = environment_usize("ORDADB_BENCH_ROWS").unwrap_or(DEFAULT_ROWS);
     let batch_rows = environment_usize("ORDADB_BENCH_BATCH_ROWS").unwrap_or(DEFAULT_BATCH_ROWS);
     let advanced_rows = row_count.min(ADVANCED_MAX_ROWS);
+    let bounded_rows = environment_usize("ORDADB_BENCH_BOUNDED_ROWS")
+        .unwrap_or_else(|| row_count.min(10_000))
+        .min(row_count);
+    let spill_soft_memory_bytes =
+        environment_usize("ORDADB_BENCH_SPILL_SOFT_BYTES").unwrap_or(1 << 20);
     let (catalog, item_table, lookup_table) = catalog(row_count);
     let tables = tables(item_table, lookup_table, row_count, advanced_rows);
 
@@ -111,7 +118,6 @@ fn main() {
         &format!("SELECT payload FROM items WHERE id >= {threshold}"),
         &catalog,
     );
-    let bounded_rows = row_count.min(10_000);
     let sort_limit = bind_plan(
         &format!("SELECT payload FROM items WHERE id < {bounded_rows} ORDER BY id DESC LIMIT 1000"),
         &catalog,
@@ -204,7 +210,7 @@ fn main() {
             drain(
                 &spill_sort,
                 &context,
-                options(batch_rows, 1 << 20, 256 << 20),
+                options(batch_rows, spill_soft_memory_bytes, 256 << 20),
             )
         }));
     }
@@ -218,7 +224,9 @@ fn main() {
         profile: "release",
         input_rows: row_count,
         advanced_input_rows: advanced_rows,
+        bounded_rows,
         batch_rows,
+        spill_soft_memory_bytes,
         iterations: ITERATIONS,
         scenarios,
     };

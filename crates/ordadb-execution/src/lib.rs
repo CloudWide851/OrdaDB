@@ -41,6 +41,9 @@ pub const DEFAULT_MAX_EXPRESSION_DEPTH: usize = 256;
 static NEXT_QUERY_ID: AtomicU64 = AtomicU64::new(1);
 const SPILL_MAGIC: [u8; 8] = *b"ORDBSPL1";
 const SPILL_VERSION: u16 = 1;
+const MAX_SPILL_MERGE_FAN_IN: usize = 8;
+const DEFAULT_SPILL_IO_BUFFER_BYTES: usize = 8 * 1024;
+const MAX_CONCURRENT_SPILL_STREAMS: usize = 32;
 
 pub struct ExecutionContext<'a> {
     pub tables: &'a BTreeMap<TableId, Arc<Vec<Row>>>,
@@ -364,14 +367,14 @@ impl SourceCursor {
 }
 
 struct SpillRun {
-    reader: BufReader<File>,
+    reader: ReservedSpillReader,
     current: Option<Row>,
     current_reservation: Option<Reservation>,
 }
 
 impl SpillRun {
     fn open(path: &Path, memory: &MemoryGrant) -> Result<Self> {
-        let reader = open_spill_reader(path)?;
+        let reader = open_spill_reader(path, memory)?;
         let mut run = Self {
             reader,
             current: None,
@@ -391,6 +394,156 @@ impl SpillRun {
         }
         Ok(())
     }
+}
+
+struct SpillMergeCursor {
+    runs: Vec<SpillRun>,
+    heap: Vec<usize>,
+    _heap_reservation: Reservation,
+}
+
+impl SpillMergeCursor {
+    fn open(paths: &[PathBuf], order_by: &[BoundOrder], memory: &MemoryGrant) -> Result<Self> {
+        if paths.len() > MAX_SPILL_MERGE_FAN_IN {
+            return Err(DbError::new(
+                "54000",
+                "spill merge fan-in exceeds the configured implementation limit",
+            )
+            .with_detail(format!(
+                "{} runs requested; maximum is {MAX_SPILL_MERGE_FAN_IN}",
+                paths.len()
+            )));
+        }
+        let runs = paths
+            .iter()
+            .map(|path| SpillRun::open(path, memory))
+            .collect::<Result<Vec<_>>>()?;
+        let requested_bytes = paths
+            .len()
+            .checked_mul(std::mem::size_of::<usize>())
+            .ok_or_else(|| {
+                DbError::new("53200", "query memory limit exceeded")
+                    .with_detail("spill merge heap capacity overflow")
+            })?;
+        let mut heap_reservation = memory.try_reserve(requested_bytes)?;
+        let mut heap = Vec::new();
+        if let Err(error) = heap.try_reserve_exact(paths.len()) {
+            return Err(DbError::new("53200", "query memory limit exceeded")
+                .with_detail(format!("failed to allocate spill merge heap: {error}")));
+        }
+        heap_reservation.resize(
+            heap.capacity()
+                .checked_mul(std::mem::size_of::<usize>())
+                .ok_or_else(|| {
+                    DbError::new("53200", "query memory limit exceeded")
+                        .with_detail("spill merge heap capacity overflow")
+                })?,
+        )?;
+        for index in 0..runs.len() {
+            if runs[index].current.is_some() {
+                spill_heap_push(&mut heap, &runs, index, order_by)?;
+            }
+        }
+        Ok(Self {
+            runs,
+            heap,
+            _heap_reservation: heap_reservation,
+        })
+    }
+
+    fn pop_next(&mut self, order_by: &[BoundOrder], memory: &MemoryGrant) -> Result<Option<Row>> {
+        let Some(index) = spill_heap_pop(&mut self.heap, &self.runs, order_by)? else {
+            return Ok(None);
+        };
+        let row = self.runs[index]
+            .current
+            .take()
+            .ok_or_else(|| DbError::internal("spill merge row disappeared"))?;
+        self.runs[index].advance(memory)?;
+        if self.runs[index].current.is_some() {
+            spill_heap_push(&mut self.heap, &self.runs, index, order_by)?;
+        }
+        Ok(Some(row))
+    }
+
+    #[cfg(test)]
+    fn run_count(&self) -> usize {
+        self.runs.len()
+    }
+}
+
+fn spill_heap_push(
+    heap: &mut Vec<usize>,
+    runs: &[SpillRun],
+    index: usize,
+    order_by: &[BoundOrder],
+) -> Result<()> {
+    heap.push(index);
+    let mut child = heap.len().saturating_sub(1);
+    while child > 0 {
+        let parent = (child - 1) / 2;
+        if !spill_run_precedes(runs, heap[child], heap[parent], order_by)? {
+            break;
+        }
+        heap.swap(child, parent);
+        child = parent;
+    }
+    Ok(())
+}
+
+fn spill_heap_pop(
+    heap: &mut Vec<usize>,
+    runs: &[SpillRun],
+    order_by: &[BoundOrder],
+) -> Result<Option<usize>> {
+    let Some(last) = heap.pop() else {
+        return Ok(None);
+    };
+    if heap.is_empty() {
+        return Ok(Some(last));
+    }
+    let minimum = std::mem::replace(&mut heap[0], last);
+    let mut parent = 0;
+    loop {
+        let left = parent * 2 + 1;
+        if left >= heap.len() {
+            break;
+        }
+        let right = left + 1;
+        let child =
+            if right < heap.len() && spill_run_precedes(runs, heap[right], heap[left], order_by)? {
+                right
+            } else {
+                left
+            };
+        if !spill_run_precedes(runs, heap[child], heap[parent], order_by)? {
+            break;
+        }
+        heap.swap(parent, child);
+        parent = child;
+    }
+    Ok(Some(minimum))
+}
+
+fn spill_run_precedes(
+    runs: &[SpillRun],
+    left: usize,
+    right: usize,
+    order_by: &[BoundOrder],
+) -> Result<bool> {
+    let left_row = runs
+        .get(left)
+        .and_then(|run| run.current.as_ref())
+        .ok_or_else(|| DbError::internal("spill merge heap references an exhausted run"))?;
+    let right_row = runs
+        .get(right)
+        .and_then(|run| run.current.as_ref())
+        .ok_or_else(|| DbError::internal("spill merge heap references an exhausted run"))?;
+    Ok(match compare_rows(left_row, right_row, order_by)? {
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        Ordering::Equal => left < right,
+    })
 }
 
 struct SpillManager {
@@ -431,7 +584,7 @@ impl SpillManager {
 
     fn write_sorted_run(&mut self, rows: &[Row], memory: &MemoryGrant) -> Result<PathBuf> {
         let path = self.next_run_path()?;
-        let mut writer = create_spill_writer(&path)?;
+        let mut writer = create_spill_writer(&path, memory)?;
         for row in rows {
             write_spill_record(&mut writer, row, memory)?;
         }
@@ -445,47 +598,27 @@ impl SpillManager {
         order_by: &[BoundOrder],
         memory: &MemoryGrant,
     ) -> Result<Vec<PathBuf>> {
-        while paths.len() > 2 {
-            let mut merged = Vec::with_capacity(paths.len().div_ceil(2));
-            let mut pairs = paths.chunks_exact(2);
-            for pair in &mut pairs {
-                merged.push(self.merge_sorted_pair(&pair[0], &pair[1], order_by, memory)?);
-            }
-            if let Some(path) = pairs.remainder().first() {
-                merged.push((*path).clone());
+        while paths.len() > MAX_SPILL_MERGE_FAN_IN {
+            let mut merged = Vec::with_capacity(paths.len().div_ceil(MAX_SPILL_MERGE_FAN_IN));
+            for group in paths.chunks(MAX_SPILL_MERGE_FAN_IN) {
+                merged.push(self.merge_sorted_group(group, order_by, memory)?);
             }
             paths = merged;
         }
         Ok(paths)
     }
 
-    fn merge_sorted_pair(
+    fn merge_sorted_group(
         &mut self,
-        left_path: &Path,
-        right_path: &Path,
+        paths: &[PathBuf],
         order_by: &[BoundOrder],
         memory: &MemoryGrant,
     ) -> Result<PathBuf> {
-        let mut left = SpillRun::open(left_path, memory)?;
-        let mut right = SpillRun::open(right_path, memory)?;
+        let mut merge = SpillMergeCursor::open(paths, order_by, memory)?;
         let output_path = self.next_run_path()?;
-        let mut writer = create_spill_writer(&output_path)?;
-        loop {
-            let take_left = match (&left.current, &right.current) {
-                (None, None) => break,
-                (Some(_), None) => true,
-                (None, Some(_)) => false,
-                (Some(left_row), Some(right_row)) => {
-                    compare_rows(left_row, right_row, order_by)? != Ordering::Greater
-                }
-            };
-            let run = if take_left { &mut left } else { &mut right };
-            let row = run
-                .current
-                .take()
-                .ok_or_else(|| DbError::internal("spill merge row disappeared"))?;
+        let mut writer = create_spill_writer(&output_path, memory)?;
+        while let Some(row) = merge.pop_next(order_by, memory)? {
             write_spill_record(&mut writer, &row, memory)?;
-            run.advance(memory)?;
         }
         writer.flush().map_err(spill_io_error)?;
         Ok(output_path)
@@ -505,7 +638,7 @@ enum SortOutput {
         rows: std::vec::IntoIter<Row>,
         _reservation: Reservation,
     },
-    Runs(Vec<SpillRun>),
+    Runs(SpillMergeCursor),
 }
 
 pub struct ExecutionCursor {
@@ -530,14 +663,39 @@ impl ExecutionCursor {
         Self::with_options(plan, context, schema, ExecutionOptions::default())
     }
 
+    pub fn new_with_table_provider(
+        plan: &PlanNode,
+        context: &ExecutionContext<'_>,
+        schema: Schema,
+        provider: &dyn TableProvider,
+    ) -> Result<Self> {
+        Self::with_options_and_table_provider(
+            plan,
+            context,
+            schema,
+            ExecutionOptions::default(),
+            Some(provider),
+        )
+    }
+
     pub fn with_options(
         plan: &PlanNode,
         context: &ExecutionContext<'_>,
         schema: Schema,
         options: ExecutionOptions,
     ) -> Result<Self> {
+        Self::with_options_and_table_provider(plan, context, schema, options, None)
+    }
+
+    fn with_options_and_table_provider(
+        plan: &PlanNode,
+        context: &ExecutionContext<'_>,
+        schema: Schema,
+        options: ExecutionOptions,
+        table_provider: Option<&dyn TableProvider>,
+    ) -> Result<Self> {
         options.validate()?;
-        let (source, arena, frames) = build_pipeline(plan, context, &options)?;
+        let (source, arena, frames) = build_pipeline(plan, context, &options, table_provider)?;
         let sort_positions = frames
             .as_slice()
             .iter()
@@ -636,16 +794,18 @@ impl ExecutionCursor {
                 &mut self.expression_stack,
                 &mut leased,
             )? {
+                leased.recycle()?;
                 continue;
             }
             if leased.chunk().is_empty() {
+                leased.recycle()?;
                 continue;
             }
             let output_reservation = self
                 .memory
                 .try_reserve(leased.chunk().estimated_selected_row_bytes()?)?;
             let rows = leased.take_rows()?;
-            drop(leased);
+            leased.recycle()?;
             if rows.is_empty() {
                 continue;
             }
@@ -687,6 +847,7 @@ impl ExecutionCursor {
                 &mut self.expression_stack,
                 &mut input,
             )? {
+                input.recycle()?;
                 continue;
             }
             for logical_row in 0..input.chunk().len() {
@@ -711,7 +872,7 @@ impl ExecutionCursor {
                 rows_reservation.grow(row_bytes)?;
                 rows.push(row);
             }
-            drop(input);
+            input.recycle()?;
         }
 
         if run_paths.is_empty() {
@@ -729,11 +890,11 @@ impl ExecutionCursor {
             let run_paths = self
                 .spill
                 .compact_sorted_runs(run_paths, &order_by, &self.memory)?;
-            let runs = run_paths
-                .iter()
-                .map(|path| SpillRun::open(path, &self.memory))
-                .collect::<Result<Vec<_>>>()?;
-            self.sort_output = Some(SortOutput::Runs(runs));
+            self.sort_output = Some(SortOutput::Runs(SpillMergeCursor::open(
+                &run_paths,
+                &order_by,
+                &self.memory,
+            )?));
         }
         Ok(())
     }
@@ -747,7 +908,7 @@ impl ExecutionCursor {
                 rows,
                 _reservation: _,
             } => Ok(rows.next()),
-            SortOutput::Runs(runs) => {
+            SortOutput::Runs(merge) => {
                 let sort_position = self
                     .sort_position
                     .ok_or_else(|| DbError::internal("Sort output has no frame"))?;
@@ -759,34 +920,7 @@ impl ExecutionCursor {
                 let OperatorFrame::Sort(order_by) = self.arena.get(sort_id)? else {
                     return Err(DbError::internal("Sort output frame is invalid"));
                 };
-                let mut selected: Option<usize> = None;
-                for (index, run) in runs.iter().enumerate() {
-                    let Some(candidate) = &run.current else {
-                        continue;
-                    };
-                    let replace = match selected {
-                        None => true,
-                        Some(selected_index) => {
-                            let selected_row = runs[selected_index]
-                                .current
-                                .as_ref()
-                                .ok_or_else(|| DbError::internal("Sort merge row disappeared"))?;
-                            compare_rows(candidate, selected_row, order_by)? == Ordering::Less
-                        }
-                    };
-                    if replace {
-                        selected = Some(index);
-                    }
-                }
-                let Some(selected) = selected else {
-                    return Ok(None);
-                };
-                let row = runs[selected]
-                    .current
-                    .take()
-                    .ok_or_else(|| DbError::internal("Sort merge row disappeared"))?;
-                runs[selected].advance(&self.memory)?;
-                Ok(Some(row))
+                merge.pop_next(order_by, &self.memory)
             }
         }
     }
@@ -931,6 +1065,7 @@ fn build_pipeline(
     plan: &PlanNode,
     context: &ExecutionContext<'_>,
     options: &ExecutionOptions,
+    table_provider: Option<&dyn TableProvider>,
 ) -> Result<(SourceCursor, OperatorArena, FrameStack)> {
     let mut node = plan;
     let mut arena = OperatorArena::default();
@@ -945,7 +1080,15 @@ fn build_pipeline(
         match &node.kind {
             PlanKind::Scan {
                 table_id, access, ..
-            } => break build_source(*table_id, access, context, options.max_expression_depth)?,
+            } => {
+                break build_source(
+                    *table_id,
+                    access,
+                    context,
+                    options.max_expression_depth,
+                    table_provider,
+                )?;
+            }
             PlanKind::Filter { predicate, input } => {
                 let id = arena.insert(OperatorFrame::Filter(
                     ExpressionProgram::compile_with_limit(
@@ -995,12 +1138,16 @@ fn build_source(
     access: &AccessPath,
     context: &ExecutionContext<'_>,
     max_expression_depth: usize,
+    table_provider: Option<&dyn TableProvider>,
 ) -> Result<SourceCursor> {
     match access {
         AccessPath::Empty => Ok(SourceCursor::Empty),
-        AccessPath::Sequential => SnapshotTableProvider::new(context.tables)
-            .scan(table_id)
-            .map(SourceCursor::Sequential),
+        AccessPath::Sequential => match table_provider {
+            Some(provider) => provider.scan(table_id).map(SourceCursor::Sequential),
+            None => SnapshotTableProvider::new(context.tables)
+                .scan(table_id)
+                .map(SourceCursor::Sequential),
+        },
         AccessPath::Index {
             index_id,
             operator,
@@ -1073,9 +1220,52 @@ fn spill_io_error(error: std::io::Error) -> DbError {
         .with_hint("Check free disk space and permissions for the configured spill directory.")
 }
 
-fn create_spill_writer(path: &Path) -> Result<BufWriter<File>> {
+struct ReservedSpillWriter {
+    writer: BufWriter<File>,
+    _reservation: Reservation,
+}
+
+impl Write for ReservedSpillWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.writer.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+struct ReservedSpillReader {
+    reader: BufReader<File>,
+    _reservation: Reservation,
+}
+
+impl Read for ReservedSpillReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read(buffer)
+    }
+}
+
+fn spill_io_buffer_bytes(memory: &MemoryGrant) -> usize {
+    memory
+        .hard_limit_bytes()
+        .checked_div(MAX_CONCURRENT_SPILL_STREAMS.saturating_mul(4))
+        .unwrap_or(0)
+        .clamp(1, DEFAULT_SPILL_IO_BUFFER_BYTES)
+}
+
+fn reserve_spill_writer(file: File, memory: &MemoryGrant) -> Result<ReservedSpillWriter> {
+    let capacity = spill_io_buffer_bytes(memory);
+    let reservation = memory.try_reserve(capacity)?;
+    Ok(ReservedSpillWriter {
+        writer: BufWriter::with_capacity(capacity, file),
+        _reservation: reservation,
+    })
+}
+
+fn create_spill_writer(path: &Path, memory: &MemoryGrant) -> Result<ReservedSpillWriter> {
     let file = File::create(path).map_err(spill_io_error)?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = reserve_spill_writer(file, memory)?;
     writer.write_all(&SPILL_MAGIC).map_err(spill_io_error)?;
     writer
         .write_all(&SPILL_VERSION.to_le_bytes())
@@ -1083,9 +1273,14 @@ fn create_spill_writer(path: &Path) -> Result<BufWriter<File>> {
     Ok(writer)
 }
 
-fn open_spill_reader(path: &Path) -> Result<BufReader<File>> {
+fn open_spill_reader(path: &Path, memory: &MemoryGrant) -> Result<ReservedSpillReader> {
     let file = File::open(path).map_err(spill_io_error)?;
-    let mut reader = BufReader::new(file);
+    let capacity = spill_io_buffer_bytes(memory);
+    let reservation = memory.try_reserve(capacity)?;
+    let mut reader = ReservedSpillReader {
+        reader: BufReader::with_capacity(capacity, file),
+        _reservation: reservation,
+    };
     let mut magic = [0_u8; SPILL_MAGIC.len()];
     reader
         .read_exact(&mut magic)
@@ -1175,7 +1370,7 @@ impl Write for ReservedSpillBuffer {
 }
 
 fn write_spill_record<T: Serialize>(
-    writer: &mut BufWriter<File>,
+    writer: &mut impl Write,
     value: &T,
     memory: &MemoryGrant,
 ) -> Result<()> {
@@ -1198,7 +1393,7 @@ fn write_spill_record<T: Serialize>(
 }
 
 fn read_spill_record<T: DeserializeOwned>(
-    reader: &mut BufReader<File>,
+    reader: &mut impl Read,
     memory: &MemoryGrant,
 ) -> Result<Option<SpillRecord<T>>> {
     let mut length = [0_u8; 4];
@@ -2013,15 +2208,16 @@ mod tests {
     use ordadb_catalog::{Catalog, NewColumn};
     use ordadb_optimizer::{AccessPath, PlanKind, PlanNode, optimize_select};
     use ordadb_sql::{
-        BinaryOperator, BoundExpr, BoundExprKind, BoundStatement, UnaryOperator, bind, parse,
+        BinaryOperator, BoundExpr, BoundExprKind, BoundOrder, BoundStatement, UnaryOperator, bind,
+        parse,
     };
     use ordadb_types::{Identifier, Row, ScalarType, Schema, TableId, Value};
     use tempfile::TempDir;
 
     use super::{
         DEFAULT_MAX_EXPRESSION_DEPTH, DEFAULT_MAX_PLAN_DEPTH, ExecutionContext, ExecutionCursor,
-        ExecutionOptions, ExpressionProgram, ExpressionStack, MemoryGrant, SPILL_MAGIC,
-        SPILL_VERSION, SpillManager, SpillRun, execute,
+        ExecutionOptions, ExpressionProgram, ExpressionStack, MAX_SPILL_MERGE_FAN_IN, MemoryGrant,
+        SPILL_MAGIC, SPILL_VERSION, SpillManager, SpillMergeCursor, SpillRun, execute,
     };
 
     type TestTables = BTreeMap<TableId, Arc<Vec<Row>>>;
@@ -2127,7 +2323,7 @@ mod tests {
         let options = ExecutionOptions {
             batch_rows: 32,
             soft_memory_bytes: 256,
-            hard_memory_bytes: 4_096,
+            hard_memory_bytes: 16_384,
             spill_root: spill_root.clone(),
             ..ExecutionOptions::default()
         };
@@ -2186,6 +2382,121 @@ mod tests {
                 1
             );
             query_dir
+        };
+        assert!(!query_dir.exists());
+    }
+
+    #[test]
+    fn spill_heap_merge_compacts_multiple_levels_and_preserves_stable_ties() {
+        let temp = TempDir::new().expect("temp");
+        let spill_root = temp.path().join("spill");
+        std::fs::create_dir(&spill_root).expect("spill root");
+        let query_dir = {
+            let memory = MemoryGrant::new(1024 * 1024, 8 * 1024 * 1024).expect("memory");
+            let order_by = vec![BoundOrder {
+                column_index: 0,
+                ascending: true,
+                nulls_first: None,
+            }];
+            let mut spill = SpillManager::new(spill_root);
+            let run_count = MAX_SPILL_MERGE_FAN_IN * MAX_SPILL_MERGE_FAN_IN + 1;
+            let mut paths = Vec::new();
+            for run in 0..run_count {
+                paths.push(
+                    spill
+                        .write_sorted_run(
+                            &[Row::new(vec![
+                                Value::Int64(1),
+                                Value::Int64(i64::try_from(run).expect("run index")),
+                            ])],
+                            &memory,
+                        )
+                        .expect("write run"),
+                );
+            }
+            let paths = spill
+                .compact_sorted_runs(paths, &order_by, &memory)
+                .expect("compact runs");
+            assert!(paths.len() <= MAX_SPILL_MERGE_FAN_IN);
+            let mut merge =
+                SpillMergeCursor::open(&paths, &order_by, &memory).expect("merge cursor");
+            assert!(merge.run_count() <= MAX_SPILL_MERGE_FAN_IN);
+            let mut actual = Vec::new();
+            while let Some(row) = merge.pop_next(&order_by, &memory).expect("merge row") {
+                actual.push(row.values[1].clone());
+            }
+            assert_eq!(
+                actual,
+                (0..run_count)
+                    .map(|run| Value::Int64(i64::try_from(run).expect("run index")))
+                    .collect::<Vec<_>>()
+            );
+            drop(merge);
+            assert_eq!(memory.current_bytes(), 0);
+            let query_dir = spill.query_dir.clone().expect("query directory");
+            assert!(
+                std::fs::read_dir(&query_dir)
+                    .expect("query directory")
+                    .count()
+                    > run_count
+            );
+            query_dir
+        };
+        assert!(!query_dir.exists());
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("spill"))
+                .expect("clean spill root")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn spill_heap_merge_propagates_compare_errors_and_hard_limits() {
+        let temp = TempDir::new().expect("temp");
+        let spill_root = temp.path().join("spill");
+        std::fs::create_dir(&spill_root).expect("spill root");
+        let memory = MemoryGrant::new(1024, 16 * 1024).expect("memory");
+        let order_by = vec![BoundOrder {
+            column_index: 0,
+            ascending: true,
+            nulls_first: None,
+        }];
+        let query_dir = {
+            let mut spill = SpillManager::new(spill_root);
+            let json_paths = vec![
+                spill
+                    .write_sorted_run(
+                        &[Row::new(vec![Value::Json(serde_json::json!({"run": 1}))])],
+                        &memory,
+                    )
+                    .expect("first JSON run"),
+                spill
+                    .write_sorted_run(
+                        &[Row::new(vec![Value::Json(serde_json::json!({"run": 2}))])],
+                        &memory,
+                    )
+                    .expect("second JSON run"),
+            ];
+            let error = match SpillMergeCursor::open(&json_paths, &order_by, &memory) {
+                Ok(_) => panic!("JSON spill ordering must fail"),
+                Err(error) => error,
+            };
+            assert_eq!(error.sql_state, "42883");
+            assert_eq!(memory.current_bytes(), 0);
+
+            let empty_paths = vec![
+                spill.write_sorted_run(&[], &memory).expect("empty run 1"),
+                spill.write_sorted_run(&[], &memory).expect("empty run 2"),
+            ];
+            let tiny = MemoryGrant::new(8, 8).expect("tiny memory");
+            let error = match SpillMergeCursor::open(&empty_paths, &order_by, &tiny) {
+                Ok(_) => panic!("heap reservation must respect the hard limit"),
+                Err(error) => error,
+            };
+            assert_eq!(error.sql_state, "53200");
+            assert_eq!(tiny.current_bytes(), 0);
+            spill.query_dir.clone().expect("query directory")
         };
         assert!(!query_dir.exists());
     }

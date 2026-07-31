@@ -114,6 +114,10 @@ impl LeasedDataChunk {
         )
     }
 
+    pub fn recycle(mut self) -> Result<()> {
+        self.recycle_chunk()
+    }
+
     fn recycle_chunk(&mut self) -> Result<()> {
         let (Some(pool), Some(chunk), Some(reservation)) = (
             self.pool.as_ref().map(Arc::clone),
@@ -252,6 +256,51 @@ mod tests {
         );
         assert!(scan.next_chunk(2, &grant).expect("done").is_none());
         drop(scan);
+        assert_eq!(grant.current_bytes(), 0);
+    }
+
+    #[test]
+    fn poisoned_pool_releases_chunk_reservations_on_explicit_recycle_and_drop() {
+        fn poison(pool: &Arc<Mutex<ChunkPool>>) {
+            let pool = Arc::clone(pool);
+            let poisoned = std::panic::catch_unwind(move || {
+                let _guard = pool.lock().expect("pool lock before poison");
+                panic!("poison chunk pool");
+            });
+            assert!(poisoned.is_err());
+        }
+
+        let rows = Arc::new(vec![Row::new(vec![Value::Int64(1)])]);
+
+        let mut scan = SnapshotTableScan {
+            rows: Arc::clone(&rows),
+            offset: 0,
+            pool: None,
+        };
+        let grant = MemoryGrant::new(1024, 4096).expect("grant");
+        let leased = scan.next_chunk(1, &grant).expect("chunk").expect("leased");
+        let pool = scan
+            .pool
+            .clone()
+            .expect("snapshot scan pool is initialized");
+        poison(&pool);
+        let error = leased.recycle().expect_err("poisoned recycle");
+        assert_eq!(error.sql_state, "XX000");
+        assert_eq!(grant.current_bytes(), 0);
+
+        let mut scan = SnapshotTableScan {
+            rows,
+            offset: 0,
+            pool: None,
+        };
+        let grant = MemoryGrant::new(1024, 4096).expect("grant");
+        let leased = scan.next_chunk(1, &grant).expect("chunk").expect("leased");
+        let pool = scan
+            .pool
+            .clone()
+            .expect("snapshot scan pool is initialized");
+        poison(&pool);
+        drop(leased);
         assert_eq!(grant.current_bytes(), 0);
     }
 }

@@ -7,7 +7,7 @@ test.describe("OrdaDB SQL workbench", () => {
     page,
   }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
-    await page.goto("/");
+    await gotoWorkbench(page);
 
     await expect(page.getByText("OrdaDB", { exact: true })).toBeVisible();
     await expect(page.getByText("界面预览", { exact: true })).toBeVisible();
@@ -290,7 +290,7 @@ test.describe("OrdaDB SQL workbench", () => {
       { width: 1920, height: 1080 },
     ]) {
       await page.setViewportSize(viewport);
-      await page.goto("/");
+      await gotoWorkbench(page);
       const hasHorizontalOverflow = await page.evaluate(
         () => document.documentElement.scrollWidth > window.innerWidth,
       );
@@ -310,7 +310,7 @@ test.describe("OrdaDB SQL workbench", () => {
     page,
   }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
-    await page.goto("/");
+    await gotoWorkbench(page);
     await page.addScriptTag({
       type: "module",
       content: `
@@ -376,7 +376,7 @@ test.describe("OrdaDB SQL workbench", () => {
   }) => {
     await page.emulateMedia({ reducedMotion: "reduce" });
     await page.setViewportSize({ width: 1440, height: 900 });
-    await page.goto("/");
+    await gotoWorkbench(page);
     await openPreviewWorkspace(page);
     await connectPreviewDatabase(page);
 
@@ -420,6 +420,11 @@ test.describe("OrdaDB SQL workbench", () => {
     await expect(page.getByText("5 行 · 36 ms")).toBeVisible();
   });
 });
+
+async function gotoWorkbench(page: Page) {
+  await page.goto("/", { waitUntil: "commit" });
+  await expect(page.locator(".app-shell")).toBeVisible({ timeout: 45_000 });
+}
 
 async function openPreviewWorkspace(page: Page) {
   await page.getByRole("tab", { name: "项目" }).click();

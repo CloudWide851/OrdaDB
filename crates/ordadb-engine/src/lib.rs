@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use ordadb_catalog::{
     Catalog, CatalogExpression, CatalogObjectRef, ColumnStatistics, ConstraintKind, DropBehavior,
@@ -17,8 +17,8 @@ use ordadb_catalog::{
 };
 use ordadb_execution::{
     AdvancedExecutionCursor, AdvancedExecutionPlan, ExecutionContext, ExecutionCursor,
-    coerce_value as coerce_execution_value, evaluate as evaluate_scalar,
-    predicate_matches as execution_predicate_matches,
+    LeasedDataChunk, MemoryGrant, TableProvider, TableScan, coerce_value as coerce_execution_value,
+    evaluate as evaluate_scalar, predicate_matches as execution_predicate_matches,
 };
 use ordadb_index::{BPlusTree, IndexEntry, IndexKey, RowId};
 use ordadb_optimizer::{
@@ -38,7 +38,8 @@ use ordadb_sql::{
     bind_catalog_expression_with_parameter_types, parse, parse_with_dialect,
 };
 use ordadb_storage::{
-    ApplyPoint, DataFormat, DatabaseStore, DurabilityBarrier, PersistentState, encode_row,
+    ApplyPoint, DataFormat, DatabaseStore, DurabilityBarrier, PersistentState,
+    StorageTableCursorV2, encode_row,
 };
 use ordadb_transaction::{
     CheckpointState, FaultInjector, FaultPoint, NoFaultInjector, TransactionId, WalManager,
@@ -136,11 +137,109 @@ impl EngineConfig {
     }
 }
 
+#[derive(Debug, Default)]
+struct StorageAccessGate {
+    state: Mutex<StorageAccessState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct StorageAccessState {
+    active_readers: usize,
+    waiting_writers: usize,
+    writer_active: bool,
+}
+
+impl StorageAccessGate {
+    fn acquire_read(self: &Arc<Self>) -> Result<StorageReadLease> {
+        let mut state = self.lock_state()?;
+        while state.writer_active || state.waiting_writers > 0 {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|_| internal_error("storage access gate is poisoned"))?;
+        }
+        state.active_readers = state.active_readers.checked_add(1).ok_or_else(|| {
+            DbError::new("54000", "storage reader lease count overflowed")
+                .with_hint("restart the database service before retrying")
+        })?;
+        drop(state);
+        Ok(StorageReadLease {
+            gate: Arc::clone(self),
+        })
+    }
+
+    fn acquire_write(self: &Arc<Self>) -> Result<StorageWriteLease> {
+        let mut state = self.lock_state()?;
+        state.waiting_writers = state.waiting_writers.checked_add(1).ok_or_else(|| {
+            DbError::new("54000", "storage writer wait count overflowed")
+                .with_hint("restart the database service before retrying")
+        })?;
+        while state.writer_active || state.active_readers > 0 {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|_| internal_error("storage access gate is poisoned"))?;
+        }
+        state.waiting_writers = state.waiting_writers.saturating_sub(1);
+        state.writer_active = true;
+        drop(state);
+        Ok(StorageWriteLease {
+            gate: Arc::clone(self),
+        })
+    }
+
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, StorageAccessState>> {
+        self.state
+            .lock()
+            .map_err(|_| internal_error("storage access gate is poisoned"))
+    }
+
+    #[cfg(test)]
+    fn active_readers(&self) -> Result<usize> {
+        Ok(self.lock_state()?.active_readers)
+    }
+
+    #[cfg(test)]
+    fn waiting_writers(&self) -> Result<usize> {
+        Ok(self.lock_state()?.waiting_writers)
+    }
+}
+
+#[derive(Debug)]
+struct StorageReadLease {
+    gate: Arc<StorageAccessGate>,
+}
+
+impl Drop for StorageReadLease {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.gate.state.lock() {
+            state.active_readers = state.active_readers.saturating_sub(1);
+            self.gate.changed.notify_all();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StorageWriteLease {
+    gate: Arc<StorageAccessGate>,
+}
+
+impl Drop for StorageWriteLease {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.gate.state.lock() {
+            state.writer_active = false;
+            self.gate.changed.notify_all();
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Engine {
     config: Arc<EngineConfig>,
     state: Arc<RwLock<DatabaseState>>,
     store: Arc<Mutex<DatabaseStore>>,
+    storage_access: Arc<StorageAccessGate>,
     wal: Arc<WalManager>,
     writer: Arc<WriterCoordinator>,
     commits_since_checkpoint: Arc<AtomicU64>,
@@ -189,6 +288,7 @@ impl Engine {
             config: Arc::new(config),
             state: Arc::new(RwLock::new(state)),
             store: Arc::new(Mutex::new(store)),
+            storage_access: Arc::new(StorageAccessGate::default()),
             wal,
             writer,
             commits_since_checkpoint: Arc::new(AtomicU64::new(0)),
@@ -203,6 +303,7 @@ impl Engine {
         Ok(Session {
             state: Arc::clone(&self.state),
             store: Arc::clone(&self.store),
+            storage_access: Arc::clone(&self.storage_access),
             wal: Arc::clone(&self.wal),
             writer: Arc::clone(&self.writer),
             commits_since_checkpoint: Arc::clone(&self.commits_since_checkpoint),
@@ -270,6 +371,7 @@ impl Engine {
         persist_candidate(
             &mut state,
             &self.store,
+            &self.storage_access,
             &self.wal,
             transaction_id,
             candidate,
@@ -360,6 +462,7 @@ impl Engine {
 pub struct Session {
     state: Arc<RwLock<DatabaseState>>,
     store: Arc<Mutex<DatabaseStore>>,
+    storage_access: Arc<StorageAccessGate>,
     wal: Arc<WalManager>,
     writer: Arc<WriterCoordinator>,
     commits_since_checkpoint: Arc<AtomicU64>,
@@ -516,6 +619,7 @@ impl Session {
         Ok(Transaction {
             state: &self.state,
             store: &self.store,
+            storage_access: &self.storage_access,
             wal: &self.wal,
             writer: &self.writer,
             commits_since_checkpoint: &self.commits_since_checkpoint,
@@ -685,6 +789,7 @@ impl Session {
                     if let Err(error) = persist_candidate(
                         &mut state,
                         &self.store,
+                        &self.storage_access,
                         &self.wal,
                         transaction_id,
                         candidate,
@@ -723,7 +828,15 @@ impl Session {
         snapshot: DatabaseState,
         statement: BoundStatement,
     ) -> Result<TryQueryStream> {
-        if let Some(stream) = prepare_read_stream(&snapshot, statement.clone(), params)? {
+        let table_provider = StorageTableProviderV2::new(
+            Arc::clone(&self.store),
+            Arc::clone(&self.storage_access),
+            snapshot.generation,
+            &snapshot.rows,
+        );
+        if let Some(stream) =
+            prepare_read_stream(&snapshot, statement.clone(), params, Some(&table_provider))?
+        {
             return Ok(stream);
         }
         let sequence_id = sequence_mutation_id(&statement);
@@ -749,6 +862,7 @@ impl Session {
             persist_candidate(
                 &mut state,
                 &self.store,
+                &self.storage_access,
                 &self.wal,
                 transaction_id,
                 candidate,
@@ -777,7 +891,7 @@ impl Session {
         snapshot: DatabaseState,
         statement: BoundStatement,
     ) -> Result<TryQueryStream> {
-        if let Some(stream) = prepare_read_stream(&snapshot, statement.clone(), params)? {
+        if let Some(stream) = prepare_read_stream(&snapshot, statement.clone(), params, None)? {
             return Ok(stream);
         }
         let sequence_id = sequence_mutation_id(&statement);
@@ -910,6 +1024,7 @@ fn bound_statement_schema(statement: &BoundStatement) -> Schema {
 pub struct Transaction<'session> {
     state: &'session Arc<RwLock<DatabaseState>>,
     store: &'session Arc<Mutex<DatabaseStore>>,
+    storage_access: &'session Arc<StorageAccessGate>,
     wal: &'session Arc<WalManager>,
     writer: &'session Arc<WriterCoordinator>,
     commits_since_checkpoint: &'session Arc<AtomicU64>,
@@ -951,6 +1066,7 @@ impl Transaction<'_> {
         persist_candidate(
             &mut state,
             self.store,
+            self.storage_access,
             self.wal,
             self.transaction_id,
             candidate,
@@ -989,7 +1105,7 @@ impl Transaction<'_> {
             )
             .with_hint("use Transaction::commit or Transaction::rollback"));
         }
-        if let Some(stream) = prepare_read_stream(&snapshot, statement.clone(), params)? {
+        if let Some(stream) = prepare_read_stream(&snapshot, statement.clone(), params, None)? {
             return stream.collect::<Result<Vec<_>>>().map(QueryStream::new);
         }
         let sequence_id = sequence_mutation_id(&statement);
@@ -1034,6 +1150,7 @@ pub struct TryQueryStream {
     state: TryQueryStreamState,
     failed: bool,
     failure_flag: Option<Arc<AtomicBool>>,
+    cancellation: Option<Arc<AtomicBool>>,
     execution_memory_peak_bytes: Option<usize>,
 }
 
@@ -1099,11 +1216,16 @@ impl TryQueryStream {
             ),
             failed: false,
             failure_flag: None,
+            cancellation: None,
             execution_memory_peak_bytes: None,
         }
     }
 
-    fn select(schema: Schema, cursor: StreamBatchCursor) -> Self {
+    fn select(
+        schema: Schema,
+        cursor: StreamBatchCursor,
+        cancellation: Option<Arc<AtomicBool>>,
+    ) -> Self {
         Self {
             state: TryQueryStreamState::Select(Box::new(SelectStreamState {
                 schema,
@@ -1114,6 +1236,7 @@ impl TryQueryStream {
             })),
             failed: false,
             failure_flag: None,
+            cancellation,
             execution_memory_peak_bytes: Some(0),
         }
     }
@@ -1137,6 +1260,18 @@ impl Iterator for TryQueryStream {
     fn next(&mut self) -> Option<Self::Item> {
         if self.failed {
             return None;
+        }
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(|cancellation| cancellation.load(Ordering::Acquire))
+        {
+            self.failed = true;
+            if let Some(failure_flag) = &self.failure_flag {
+                failure_flag.store(true, Ordering::Release);
+            }
+            self.state = TryQueryStreamState::Done;
+            return Some(Err(DbError::new("57014", "query was cancelled")));
         }
         let event = match &mut self.state {
             TryQueryStreamState::Events(events) => events.next().transpose(),
@@ -1459,10 +1594,114 @@ fn committed_snapshot(state: &Arc<RwLock<DatabaseState>>) -> Result<DatabaseStat
         .map_err(|_| internal_error("engine state lock is poisoned"))
 }
 
+/// Bridges the execution scan contract to authoritative v2 heap pages.
+pub struct StorageTableProviderV2<'a> {
+    store: Arc<Mutex<DatabaseStore>>,
+    storage_access: Arc<StorageAccessGate>,
+    generation: u64,
+    rows: &'a BTreeMap<TableId, Arc<Vec<Row>>>,
+}
+
+impl<'a> StorageTableProviderV2<'a> {
+    fn new(
+        store: Arc<Mutex<DatabaseStore>>,
+        storage_access: Arc<StorageAccessGate>,
+        generation: u64,
+        rows: &'a BTreeMap<TableId, Arc<Vec<Row>>>,
+    ) -> Self {
+        Self {
+            store,
+            storage_access,
+            generation,
+            rows,
+        }
+    }
+}
+
+impl TableProvider for StorageTableProviderV2<'_> {
+    fn scan(&self, table_id: TableId) -> Result<Box<dyn TableScan>> {
+        let lease = self.storage_access.acquire_read()?;
+        let cursor = self
+            .store
+            .lock()
+            .map_err(|_| internal_error("database store lock is poisoned"))?
+            .open_table_cursor_v2(table_id, self.generation)?;
+        let rows = self
+            .rows
+            .get(&table_id)
+            .cloned()
+            .ok_or_else(|| internal_error("v2 table is absent from the resident snapshot"))?;
+        let resident_rows = u64::try_from(rows.len()).map_err(|_| {
+            DbError::new("54000", "resident table row count exceeds storage limits")
+        })?;
+        if resident_rows != cursor.expected_rows() {
+            return Err(DbError::new(
+                "XX001",
+                "resident table row count does not match v2 heap metadata",
+            )
+            .with_detail(format!(
+                "table {} has {resident_rows} resident rows but the v2 manifest declares {}",
+                table_id.get(),
+                cursor.expected_rows()
+            )));
+        }
+        Ok(Box::new(StorageTableScanV2 {
+            cursor,
+            rows,
+            offset: 0,
+            lease: Some(lease),
+        }))
+    }
+}
+
+struct StorageTableScanV2 {
+    cursor: StorageTableCursorV2,
+    rows: Arc<Vec<Row>>,
+    offset: usize,
+    lease: Option<StorageReadLease>,
+}
+
+impl TableScan for StorageTableScanV2 {
+    fn next_chunk(
+        &mut self,
+        max_rows: usize,
+        grant: &MemoryGrant,
+    ) -> Result<Option<LeasedDataChunk>> {
+        if max_rows == 0 {
+            self.lease = None;
+            return Err(DbError::new(
+                "22023",
+                "table scan chunk size must be positive",
+            ));
+        }
+        let expected_rows = usize::try_from(self.cursor.expected_rows())
+            .map_err(|_| DbError::new("54000", "v2 table row count exceeds execution limits"))?;
+        if self.offset >= expected_rows {
+            self.lease = None;
+            return Ok(None);
+        }
+        let end = self.offset.saturating_add(max_rows).min(expected_rows);
+        match LeasedDataChunk::from_snapshot(Arc::clone(&self.rows), self.offset, end, grant) {
+            Ok(chunk) => {
+                self.offset = end;
+                if self.offset == expected_rows {
+                    self.lease = None;
+                }
+                Ok(Some(chunk))
+            }
+            Err(error) => {
+                self.lease = None;
+                Err(error)
+            }
+        }
+    }
+}
+
 fn prepare_read_stream(
     state: &DatabaseState,
     statement: BoundStatement,
     params: &[Value],
+    table_provider: Option<&dyn TableProvider>,
 ) -> Result<Option<TryQueryStream>> {
     match statement {
         BoundStatement::Select {
@@ -1484,10 +1723,12 @@ fn prepare_read_stream(
                     limit,
                 },
                 params,
+                table_provider,
             )?;
             Ok(Some(TryQueryStream::select(
                 schema,
                 StreamBatchCursor::Simple(Box::new(cursor)),
+                state.cancellation.clone(),
             )))
         }
         BoundStatement::AdvancedSelect {
@@ -1521,6 +1762,7 @@ fn prepare_read_stream(
             Ok(Some(TryQueryStream::select(
                 schema,
                 StreamBatchCursor::Advanced(Box::new(cursor)),
+                state.cancellation.clone(),
             )))
         }
         _ => Ok(None),
@@ -1561,6 +1803,7 @@ fn execute_candidate(
 fn persist_candidate(
     state: &mut DatabaseState,
     store: &Arc<Mutex<DatabaseStore>>,
+    storage_access: &Arc<StorageAccessGate>,
     wal: &Arc<WalManager>,
     transaction_id: TransactionId,
     mut candidate: DatabaseState,
@@ -1570,6 +1813,7 @@ fn persist_candidate(
             .with_hint("create a logical backup before retrying on a fresh database")
     })?;
     let persistent = PersistentState::from(&candidate);
+    let _storage_write_lease = storage_access.acquire_write()?;
     let mut store = store
         .lock()
         .map_err(|_| internal_error("database store lock is poisoned"))?;
@@ -3131,7 +3375,7 @@ fn execute_select(
     execution: SelectExecution,
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
-    let (schema, mut cursor) = prepare_select_cursor(state, execution, params)?;
+    let (schema, mut cursor) = prepare_select_cursor(state, execution, params, None)?;
     let mut events = vec![QueryEvent::Schema(schema.clone())];
     let mut count = 0_u64;
     let mut emitted_batch = false;
@@ -3160,6 +3404,7 @@ fn prepare_select_cursor(
     state: &DatabaseState,
     execution: SelectExecution,
     params: &[Value],
+    table_provider: Option<&dyn TableProvider>,
 ) -> Result<(Schema, ExecutionCursor)> {
     let SelectExecution {
         table_id,
@@ -3181,7 +3426,15 @@ fn prepare_select_cursor(
         indexes: &state.indexes,
         params,
     };
-    let cursor = ExecutionCursor::new(&plan, &context, schema.clone())?;
+    let cursor = match table_provider {
+        Some(table_provider) => ExecutionCursor::new_with_table_provider(
+            &plan,
+            &context,
+            schema.clone(),
+            table_provider,
+        )?,
+        None => ExecutionCursor::new(&plan, &context, schema.clone())?,
+    };
     Ok((schema, cursor))
 }
 
@@ -4572,7 +4825,7 @@ mod tests {
     }
 
     #[test]
-    fn fallible_stream_owns_a_lazy_arc_snapshot() {
+    fn storage_backed_stream_holds_one_generation_until_exhaustion() {
         let (_directory, engine) = engine();
         let mut session = engine.connect().expect("connect");
         execute(
@@ -4585,7 +4838,45 @@ mod tests {
         let snapshot = session
             .execute_stream("SELECT id FROM lazy_items ORDER BY id", &[])
             .expect("lazy stream");
-        execute(&mut session, "INSERT INTO lazy_items VALUES (3)", &[]);
+        assert_eq!(
+            engine
+                .storage_access
+                .active_readers()
+                .expect("active readers"),
+            1
+        );
+
+        let writer_engine = engine.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(0);
+        let writer = std::thread::spawn(move || {
+            let mut writer_session = writer_engine.connect().expect("writer connect");
+            started_tx.send(()).expect("signal writer start");
+            let result = writer_session
+                .execute("INSERT INTO lazy_items VALUES (3)", &[])
+                .map(|_| ());
+            finished_tx.send(result).expect("send writer result");
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("writer started");
+        let waiting_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while engine
+            .storage_access
+            .waiting_writers()
+            .expect("waiting writers")
+            == 0
+        {
+            assert!(
+                std::time::Instant::now() < waiting_deadline,
+                "writer did not reach the storage gate"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            finished_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
 
         let events = snapshot
             .collect::<Result<Vec<_>>>()
@@ -4598,6 +4889,18 @@ mod tests {
             ]
         );
         assert_eq!(
+            engine
+                .storage_access
+                .active_readers()
+                .expect("active readers"),
+            0
+        );
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("writer finished after stream exhaustion")
+            .expect("writer commit");
+        writer.join().expect("writer thread");
+        assert_eq!(
             rows(&execute(
                 &mut session,
                 "SELECT id FROM lazy_items ORDER BY id",
@@ -4608,6 +4911,194 @@ mod tests {
                 Row::new(vec![Value::Int64(2)]),
                 Row::new(vec![Value::Int64(3)]),
             ]
+        );
+    }
+
+    #[test]
+    fn storage_access_gate_prefers_a_waiting_writer_over_new_readers() {
+        let gate = Arc::new(StorageAccessGate::default());
+        let first_reader = gate.acquire_read().expect("first reader");
+        let writer_gate = Arc::clone(&gate);
+        let (writer_acquired_tx, writer_acquired_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_writer_tx, release_writer_rx) = std::sync::mpsc::sync_channel(0);
+        let writer = std::thread::spawn(move || {
+            let lease = writer_gate.acquire_write().expect("writer lease");
+            writer_acquired_tx.send(()).expect("writer acquired");
+            release_writer_rx.recv().expect("release writer");
+            drop(lease);
+        });
+
+        let waiting_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while gate.waiting_writers().expect("waiting writers") == 0 {
+            assert!(
+                std::time::Instant::now() < waiting_deadline,
+                "writer did not reach the storage gate"
+            );
+            std::thread::yield_now();
+        }
+
+        let second_reader_gate = Arc::clone(&gate);
+        let (reader_acquired_tx, reader_acquired_rx) = std::sync::mpsc::sync_channel(0);
+        let second_reader = std::thread::spawn(move || {
+            let lease = second_reader_gate.acquire_read().expect("second reader");
+            reader_acquired_tx.send(()).expect("reader acquired");
+            drop(lease);
+        });
+
+        drop(first_reader);
+        writer_acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("writer wins after readers drain");
+        assert!(matches!(
+            reader_acquired_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        release_writer_tx.send(()).expect("release writer");
+        reader_acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("reader proceeds after writer");
+        writer.join().expect("writer thread");
+        second_reader.join().expect("reader thread");
+    }
+
+    #[test]
+    fn storage_scan_open_error_and_stream_drop_release_the_read_lease() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE lease_items (id BIGINT PRIMARY KEY)",
+            &[],
+        );
+        execute(&mut session, "INSERT INTO lease_items VALUES (1)", &[]);
+
+        let generation = session.state.read().expect("state").generation;
+        let snapshot = session.state.read().expect("state").clone();
+        let provider = StorageTableProviderV2::new(
+            Arc::clone(&engine.store),
+            Arc::clone(&engine.storage_access),
+            generation,
+            &snapshot.rows,
+        );
+        let error = match provider.scan(TableId::new(u64::MAX)) {
+            Ok(_) => panic!("unknown table scan must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.sql_state, "42P01");
+        assert_eq!(
+            engine
+                .storage_access
+                .active_readers()
+                .expect("active readers"),
+            0
+        );
+
+        let stream = session
+            .execute_stream("SELECT id FROM lease_items", &[])
+            .expect("stream");
+        assert_eq!(
+            engine
+                .storage_access
+                .active_readers()
+                .expect("active readers"),
+            1
+        );
+        drop(stream);
+        assert_eq!(
+            engine
+                .storage_access
+                .active_readers()
+                .expect("active readers"),
+            0
+        );
+    }
+
+    #[test]
+    fn storage_scan_rejects_resident_row_count_mismatch_and_releases_lease() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE resident_items (id BIGINT PRIMARY KEY)",
+            &[],
+        );
+        execute(&mut session, "INSERT INTO resident_items VALUES (1)", &[]);
+
+        let snapshot = session.state.read().expect("state").clone();
+        let table_id = *snapshot.rows.keys().next().expect("resident table");
+        let mismatched_rows = BTreeMap::from([(table_id, Arc::new(Vec::<Row>::new()))]);
+        let provider = StorageTableProviderV2::new(
+            Arc::clone(&engine.store),
+            Arc::clone(&engine.storage_access),
+            snapshot.generation,
+            &mismatched_rows,
+        );
+
+        let error = match provider.scan(table_id) {
+            Ok(_) => panic!("row-count mismatch must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.sql_state, "XX001");
+        assert_eq!(
+            engine
+                .storage_access
+                .active_readers()
+                .expect("active readers"),
+            0
+        );
+    }
+
+    #[test]
+    fn cancelled_storage_stream_releases_resources_without_terminal_success_events() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE cancelled_items (id BIGINT PRIMARY KEY)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO cancelled_items VALUES (1), (2), (3)",
+            &[],
+        );
+
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let mut stream = session
+            .execute_stream_with_cancellation(
+                "SELECT id FROM cancelled_items",
+                &[],
+                Arc::clone(&cancellation),
+            )
+            .expect("stream");
+        assert!(matches!(
+            stream.next().expect("schema").expect("schema event"),
+            QueryEvent::Schema(_)
+        ));
+        assert_eq!(
+            engine
+                .storage_access
+                .active_readers()
+                .expect("active readers"),
+            1
+        );
+
+        cancellation.store(true, Ordering::Release);
+        assert_eq!(
+            stream
+                .next()
+                .expect("cancellation error")
+                .expect_err("cancelled")
+                .sql_state,
+            "57014"
+        );
+        assert!(stream.next().is_none());
+        assert_eq!(
+            engine
+                .storage_access
+                .active_readers()
+                .expect("active readers"),
+            0
         );
     }
 
@@ -4709,6 +5200,7 @@ mod tests {
             ),
             failed: false,
             failure_flag: Some(failure_flag),
+            cancellation: None,
             execution_memory_peak_bytes: None,
         };
 
