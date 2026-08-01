@@ -136,6 +136,7 @@ impl WalManager {
         let checkpoint_lsn = self.checkpoint(CheckpointState {
             active_transactions: BTreeMap::new(),
             dirty_pages: BTreeMap::new(),
+            visibility_horizon: None,
             durable_data_generation,
             durable_wal_lsn: self.durable_lsn()?,
             data_file_page_count: final_page_count,
@@ -675,6 +676,7 @@ mod tests {
             WalPayload::CheckpointBegin(CheckpointBegin {
                 active_transactions: BTreeMap::new(),
                 dirty_pages: BTreeMap::new(),
+                visibility_horizon: None,
             }),
         )
         .expect("checkpoint begin");

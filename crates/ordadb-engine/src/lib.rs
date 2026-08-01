@@ -9,6 +9,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::Duration;
 
 use ordadb_catalog::{
     Catalog, CatalogExpression, CatalogObjectRef, ColumnStatistics, ConstraintKind, DropBehavior,
@@ -34,22 +35,27 @@ use ordadb_search::{SearchCatalog, SearchLimits};
 use ordadb_sql::{
     BinaryOperator, BoundAlterTableOperation, BoundExpr, BoundExprKind, BoundJoin, BoundOrder,
     BoundProjection, BoundSequenceOperation, BoundStatement, BoundTable, DdlObjectKind, JoinKind,
-    ParsedStatement, SqlDialect, bind, bind_catalog_expression,
+    ParsedStatement, SqlDialect, TransactionChain, bind, bind_catalog_expression,
     bind_catalog_expression_with_parameter_types, parse, parse_with_dialect,
 };
 use ordadb_storage::{
-    ApplyPoint, DataFormat, DatabaseStore, DurabilityBarrier, PersistentState,
-    StorageTableCursorV2, encode_row,
+    ApplyPoint, DataFormat, DatabaseStore, DurabilityBarrier, FROZEN_TRANSACTION_ID,
+    PersistentState, StorageTableCursorV2, TupleHeaderV2, VersionedRow, encode_row,
 };
 use ordadb_transaction::{
-    CheckpointState, FaultInjector, FaultPoint, NoFaultInjector, TransactionId, WalManager,
-    WriterCoordinator, WriterLease,
+    CheckpointState, DurableTransaction, FaultInjector, FaultPoint, IsolationLevel, LockGuard,
+    LockKey, LockManager, LockManagerOptions, LockMode, LockSnapshot, LockWaitSnapshot,
+    NoFaultInjector, PredicateLock, SavepointId, SavepointStack, SsiManager, SsiManagerOptions,
+    SsiSavepoint, TransactionAccessMode, TransactionCharacteristics, TransactionId,
+    TransactionManager, TransactionOutcome, TransactionSnapshot, TransactionStatusProvider,
+    TransactionStatusStore, WalManager, WriterCoordinator, WriterLease, tuple_visible,
 };
 use ordadb_types::{
     Batch, CommandComplete, DbError, Field, Identifier, IndexId, QueryEvent, QueryProgress, Result,
     Row, ScalarType, Schema, SequenceId, TableId, Value, ViewId,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const AUTOMATIC_CHECKPOINT_INTERVAL: u64 = 64;
 const MAX_REFERENTIAL_ACTIONS: usize = 16_384;
@@ -241,6 +247,10 @@ pub struct Engine {
     store: Arc<Mutex<DatabaseStore>>,
     storage_access: Arc<StorageAccessGate>,
     wal: Arc<WalManager>,
+    transaction_status: Arc<TransactionStatusStore>,
+    transactions: Arc<TransactionManager>,
+    locks: Arc<LockManager>,
+    ssi: Arc<SsiManager>,
     writer: Arc<WriterCoordinator>,
     commits_since_checkpoint: Arc<AtomicU64>,
 }
@@ -278,18 +288,40 @@ impl Engine {
             .minimum_next_transaction_id
             .unwrap_or(1)
             .max(wal_next_transaction_id);
-        let writer = WriterCoordinator::from_next_transaction_id(next_transaction_id)?;
+        let transaction_status = Arc::new(TransactionStatusStore::open(
+            &config.data_dir,
+            next_transaction_id,
+        )?);
+        transaction_status.reconcile_with_wal(&wal.transaction_outcomes()?)?;
+        let transaction_status_snapshot = transaction_status.snapshot()?;
+        let transactions = TransactionManager::from_status_snapshot(
+            transaction_status_snapshot.next_transaction_id,
+            transaction_status_snapshot.statuses,
+        )?;
+        let writer = WriterCoordinator::from_next_transaction_id(
+            transaction_status_snapshot.next_transaction_id,
+        )?;
+        let locks = LockManager::new(LockManagerOptions::default())?;
+        let ssi = SsiManager::new(SsiManagerOptions::default())?;
         let barrier: Arc<dyn DurabilityBarrier> = wal.clone();
         let store =
             DatabaseStore::open_with_barrier_and_format(&config.data_dir, barrier, DataFormat::V2)?;
-        let state =
-            DatabaseState::from_persistent(store.committed_state().clone(), store.data_format())?;
+        let state = DatabaseState::from_persistent(
+            store.committed_state().clone(),
+            store.data_format(),
+            transaction_status.as_ref(),
+            transaction_status_snapshot.next_transaction_id,
+        )?;
         Ok(Self {
             config: Arc::new(config),
             state: Arc::new(RwLock::new(state)),
             store: Arc::new(Mutex::new(store)),
             storage_access: Arc::new(StorageAccessGate::default()),
             wal,
+            transaction_status,
+            transactions,
+            locks,
+            ssi,
             writer,
             commits_since_checkpoint: Arc::new(AtomicU64::new(0)),
         })
@@ -305,6 +337,10 @@ impl Engine {
             store: Arc::clone(&self.store),
             storage_access: Arc::clone(&self.storage_access),
             wal: Arc::clone(&self.wal),
+            transaction_status: Arc::clone(&self.transaction_status),
+            transactions: Arc::clone(&self.transactions),
+            locks: Arc::clone(&self.locks),
+            ssi: Arc::clone(&self.ssi),
             writer: Arc::clone(&self.writer),
             commits_since_checkpoint: Arc::clone(&self.commits_since_checkpoint),
             sql_transaction: SqlTransactionState::Idle,
@@ -314,9 +350,21 @@ impl Engine {
     }
 
     pub fn checkpoint(&self) -> Result<()> {
-        checkpoint_shared(&self.state, &self.store, &self.wal, &self.writer)?;
+        checkpoint_shared(&self.state, &self.store, &self.wal, &self.transactions)?;
         self.commits_since_checkpoint.store(0, Ordering::Release);
         Ok(())
+    }
+
+    pub fn lock_snapshot(&self) -> Result<(Vec<LockSnapshot>, Vec<LockWaitSnapshot>)> {
+        self.locks.snapshot()
+    }
+
+    pub fn set_maximum_snapshot_age(&self, maximum_age: Duration) -> Result<()> {
+        self.transactions.set_maximum_snapshot_age(maximum_age)
+    }
+
+    pub fn set_default_lock_timeout(&self, timeout: Duration) -> Result<()> {
+        self.locks.set_default_timeout(timeout)
     }
 
     #[must_use]
@@ -362,8 +410,13 @@ impl Engine {
 
     pub fn replace_logical_snapshot(&self, snapshot: LogicalDatabaseSnapshot) -> Result<()> {
         let candidate = DatabaseState::from_logical_snapshot(snapshot)?;
-        let transaction_id = self.writer.next_transaction_id()?;
-        let mut lease = self.writer.try_acquire(transaction_id)?;
+        let mut transaction = DurableTransaction::begin(
+            &self.transactions,
+            Arc::clone(&self.transaction_status),
+            Arc::clone(&self.wal),
+            TransactionCharacteristics::default(),
+        )?;
+        let mut lease = self.writer.try_acquire(transaction.transaction_id())?;
         let mut state = self
             .state
             .write()
@@ -373,7 +426,7 @@ impl Engine {
             &self.store,
             &self.storage_access,
             &self.wal,
-            transaction_id,
+            &mut transaction,
             candidate,
         )?;
         drop(state);
@@ -382,7 +435,7 @@ impl Engine {
             &self.state,
             &self.store,
             &self.wal,
-            &self.writer,
+            &self.transactions,
             &self.commits_since_checkpoint,
         )
     }
@@ -464,6 +517,10 @@ pub struct Session {
     store: Arc<Mutex<DatabaseStore>>,
     storage_access: Arc<StorageAccessGate>,
     wal: Arc<WalManager>,
+    transaction_status: Arc<TransactionStatusStore>,
+    transactions: Arc<TransactionManager>,
+    locks: Arc<LockManager>,
+    ssi: Arc<SsiManager>,
     writer: Arc<WriterCoordinator>,
     commits_since_checkpoint: Arc<AtomicU64>,
     sql_transaction: SqlTransactionState,
@@ -481,16 +538,107 @@ pub enum TransactionStatus {
 #[derive(Debug)]
 enum SqlTransactionState {
     Idle,
-    Active(ActiveSqlTransaction),
-    Failed,
+    Active(Box<ActiveSqlTransaction>),
+    Failed(TransactionCharacteristics),
 }
 
 #[derive(Debug)]
 struct ActiveSqlTransaction {
-    transaction_id: TransactionId,
+    transaction: DurableTransaction,
+    base: Option<DatabaseState>,
     working: Option<DatabaseState>,
+    locks: Vec<LockGuard>,
     lease: Option<WriterLease>,
+    dml_only: bool,
+    ssi: Option<SsiTransactionGuard>,
+    savepoints: SavepointStack,
+    savepoint_states: BTreeMap<SavepointId, SqlSavepointState>,
+    failed: bool,
     stream_failed: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone)]
+struct SqlSavepointState {
+    base: Option<DatabaseState>,
+    working: Option<DatabaseState>,
+    sequence_currvals: BTreeMap<SequenceId, i64>,
+    lock_len: usize,
+    dml_only: bool,
+    ssi: Option<SsiSavepoint>,
+}
+
+#[derive(Debug)]
+struct SsiTransactionGuard {
+    manager: Arc<SsiManager>,
+    transaction_id: TransactionId,
+    validated: bool,
+    finished: bool,
+}
+
+impl SsiTransactionGuard {
+    fn begin(manager: Arc<SsiManager>, transaction: &DurableTransaction) -> Result<Option<Self>> {
+        let Some(characteristics) = transaction.characteristics() else {
+            return Err(DbError::new("25P01", "transaction is no longer active"));
+        };
+        if characteristics.isolation_level != IsolationLevel::Serializable {
+            return Ok(None);
+        }
+        let snapshot = transaction
+            .snapshot()
+            .ok_or_else(|| DbError::new("25P01", "transaction is no longer active"))?;
+        manager.begin(
+            transaction.transaction_id(),
+            snapshot,
+            characteristics.access_mode == TransactionAccessMode::ReadOnly,
+        )?;
+        Ok(Some(Self {
+            manager,
+            transaction_id: transaction.transaction_id(),
+            validated: false,
+            finished: false,
+        }))
+    }
+
+    fn record_read(&self, predicate: PredicateLock) -> Result<()> {
+        self.manager.record_read(self.transaction_id, predicate)
+    }
+
+    fn record_write(&self, predicate: PredicateLock) -> Result<()> {
+        self.manager.record_write(self.transaction_id, predicate)
+    }
+
+    fn refresh_snapshot(&self, snapshot: &TransactionSnapshot) -> Result<()> {
+        self.manager.refresh_snapshot(self.transaction_id, snapshot)
+    }
+
+    fn savepoint(&self) -> Result<SsiSavepoint> {
+        self.manager.savepoint(self.transaction_id)
+    }
+
+    fn rollback_to(&self, savepoint: &SsiSavepoint) -> Result<()> {
+        self.manager.rollback_to(self.transaction_id, savepoint)
+    }
+
+    fn validate_commit(&mut self, cleanup_horizon: TransactionId) -> Result<()> {
+        if !self.validated {
+            self.manager.commit(self.transaction_id)?;
+            self.manager.cleanup_before(cleanup_horizon)?;
+            self.validated = true;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for SsiTransactionGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.manager.abort(self.transaction_id);
+        }
+    }
 }
 
 impl Session {
@@ -557,9 +705,16 @@ impl Session {
         };
         if transaction_was_failed {
             return match parsed {
-                ParsedStatement::Rollback => self.rollback_sql_transaction(),
+                ParsedStatement::Rollback { chain } => self.rollback_sql_transaction(chain),
+                ParsedStatement::RollbackTo { name } => self.rollback_to_sql_savepoint(&name.name),
                 _ => Err(failed_transaction_error()),
             };
+        }
+        if !parsed_is_transaction_control(&parsed)
+            && let Err(error) = self.begin_active_statement(cancellation.as_deref())
+        {
+            self.fail_sql_transaction();
+            return Err(error);
         }
         let mut snapshot = self.statement_snapshot()?;
         snapshot.cancellation = cancellation;
@@ -574,9 +729,16 @@ impl Session {
         };
 
         match &statement {
-            BoundStatement::Begin => return self.begin_sql_transaction(),
-            BoundStatement::Commit => return self.commit_sql_transaction(),
-            BoundStatement::Rollback => return self.rollback_sql_transaction(),
+            BoundStatement::Begin { characteristics } => {
+                return self.begin_sql_transaction(*characteristics);
+            }
+            BoundStatement::Commit { chain } => return self.commit_sql_transaction(*chain),
+            BoundStatement::Rollback { chain } => return self.rollback_sql_transaction(*chain),
+            BoundStatement::Savepoint { name } => return self.create_sql_savepoint(name),
+            BoundStatement::RollbackTo { name } => return self.rollback_to_sql_savepoint(name),
+            BoundStatement::ReleaseSavepoint { name } => {
+                return self.release_sql_savepoint(name);
+            }
             _ => {}
         }
         match mem::replace(&mut self.sql_transaction, SqlTransactionState::Idle) {
@@ -590,19 +752,25 @@ impl Session {
                     statement,
                 ) {
                     Ok(stream) => {
+                        if let Err(error) = transaction.transaction.finish_statement() {
+                            transaction.failed = true;
+                            self.sql_transaction = SqlTransactionState::Active(transaction);
+                            return Err(error);
+                        }
                         let stream =
                             stream.with_failure_flag(Arc::clone(&transaction.stream_failed));
                         self.sql_transaction = SqlTransactionState::Active(transaction);
                         Ok(stream)
                     }
                     Err(error) => {
-                        self.sql_transaction = SqlTransactionState::Failed;
+                        transaction.failed = true;
+                        self.sql_transaction = SqlTransactionState::Active(transaction);
                         Err(error)
                     }
                 }
             }
-            SqlTransactionState::Failed => {
-                self.sql_transaction = SqlTransactionState::Failed;
+            SqlTransactionState::Failed(characteristics) => {
+                self.sql_transaction = SqlTransactionState::Failed(characteristics);
                 Err(failed_transaction_error())
             }
         }
@@ -616,18 +784,30 @@ impl Session {
             )
             .with_hint("commit or roll back the SQL transaction before using Session::begin"));
         }
+        let transaction = DurableTransaction::begin(
+            &self.transactions,
+            Arc::clone(&self.transaction_status),
+            Arc::clone(&self.wal),
+            TransactionCharacteristics::default(),
+        )?;
         Ok(Transaction {
             state: &self.state,
             store: &self.store,
             storage_access: &self.storage_access,
             wal: &self.wal,
+            transaction_status: &self.transaction_status,
+            transactions: &self.transactions,
+            locks: &self.locks,
             writer: &self.writer,
             commits_since_checkpoint: &self.commits_since_checkpoint,
             sequence_currvals: &mut self.sequence_currvals,
             dialect: self.options.dialect,
-            transaction_id: self.writer.next_transaction_id()?,
+            transaction,
+            base: None,
             working: None,
+            lock_guards: Vec::new(),
             lease: None,
+            dml_only: true,
             failed: false,
         })
     }
@@ -637,12 +817,12 @@ impl Session {
         match &self.sql_transaction {
             SqlTransactionState::Idle => TransactionStatus::Idle,
             SqlTransactionState::Active(transaction)
-                if transaction.stream_failed.load(Ordering::Acquire) =>
+                if transaction.failed || transaction.stream_failed.load(Ordering::Acquire) =>
             {
                 TransactionStatus::Failed
             }
             SqlTransactionState::Active(_) => TransactionStatus::Active,
-            SqlTransactionState::Failed => TransactionStatus::Failed,
+            SqlTransactionState::Failed(_) => TransactionStatus::Failed,
         }
     }
 
@@ -745,23 +925,59 @@ impl Session {
     }
 
     fn statement_snapshot(&self) -> Result<DatabaseState> {
-        if let SqlTransactionState::Active(transaction) = &self.sql_transaction
-            && let Some(working) = &transaction.working
-        {
-            return Ok(working.clone());
+        if let SqlTransactionState::Active(transaction) = &self.sql_transaction {
+            if let Some(working) = &transaction.working {
+                return Ok(working.clone());
+            }
+            let committed = committed_snapshot(&self.state)?;
+            let snapshot = transaction
+                .transaction
+                .snapshot()
+                .ok_or_else(|| no_active_transaction_error("take a statement snapshot"))?;
+            return project_database_visibility(
+                committed,
+                snapshot,
+                transaction.transaction.transaction_id(),
+                self.transaction_status.as_ref(),
+            );
         }
         committed_snapshot(&self.state)
     }
 
-    fn begin_sql_transaction(&mut self) -> Result<TryQueryStream> {
+    fn begin_active_statement(&mut self, cancellation: Option<&AtomicBool>) -> Result<()> {
+        let state = Arc::clone(&self.state);
+        let transaction_status = Arc::clone(&self.transaction_status);
+        if let SqlTransactionState::Active(transaction) = &mut self.sql_transaction {
+            let snapshot = match cancellation {
+                Some(cancellation) => transaction
+                    .transaction
+                    .begin_statement_with_cancellation(cancellation)?,
+                None => transaction.transaction.begin_statement()?,
+            }
+            .clone();
+            if let Some(ssi) = &transaction.ssi {
+                ssi.refresh_snapshot(&snapshot)?;
+            }
+            refresh_read_committed_candidate(
+                &state,
+                transaction_status.as_ref(),
+                &transaction.transaction,
+                &mut transaction.base,
+                &mut transaction.working,
+                transaction.dml_only,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn begin_sql_transaction(
+        &mut self,
+        characteristics: TransactionCharacteristics,
+    ) -> Result<TryQueryStream> {
         match self.transaction_status() {
             TransactionStatus::Idle => {
-                self.sql_transaction = SqlTransactionState::Active(ActiveSqlTransaction {
-                    transaction_id: self.writer.next_transaction_id()?,
-                    working: None,
-                    lease: None,
-                    stream_failed: Arc::new(AtomicBool::new(false)),
-                });
+                self.sql_transaction =
+                    SqlTransactionState::Active(self.new_active_sql_transaction(characteristics)?);
                 Ok(TryQueryStream::new(transaction_events("BEGIN")))
             }
             TransactionStatus::Active => {
@@ -772,53 +988,334 @@ impl Session {
         }
     }
 
-    fn commit_sql_transaction(&mut self) -> Result<TryQueryStream> {
-        match mem::replace(&mut self.sql_transaction, SqlTransactionState::Idle) {
-            SqlTransactionState::Idle => Err(no_active_transaction_error("commit")),
-            SqlTransactionState::Failed => {
-                self.sql_transaction = SqlTransactionState::Failed;
-                Err(failed_transaction_error())
-            }
-            SqlTransactionState::Active(transaction) => {
-                let transaction_id = transaction.transaction_id;
-                if let Some(candidate) = transaction.working {
-                    let mut state = self
-                        .state
-                        .write()
-                        .map_err(|_| internal_error("engine state lock is poisoned"))?;
-                    if let Err(error) = persist_candidate(
-                        &mut state,
-                        &self.store,
-                        &self.storage_access,
-                        &self.wal,
-                        transaction_id,
-                        candidate,
-                    ) {
-                        self.sql_transaction = SqlTransactionState::Failed;
-                        return Err(error);
-                    }
-                    drop(state);
-                    drop(transaction.lease);
-                    record_commit_and_maybe_checkpoint(
-                        &self.state,
-                        &self.store,
-                        &self.wal,
-                        &self.writer,
-                        &self.commits_since_checkpoint,
-                    )?;
-                }
-                Ok(TryQueryStream::new(transaction_events("COMMIT")))
-            }
-        }
+    fn new_active_sql_transaction(
+        &self,
+        characteristics: TransactionCharacteristics,
+    ) -> Result<Box<ActiveSqlTransaction>> {
+        let transaction = DurableTransaction::begin(
+            &self.transactions,
+            Arc::clone(&self.transaction_status),
+            Arc::clone(&self.wal),
+            characteristics,
+        )?;
+        let ssi = SsiTransactionGuard::begin(Arc::clone(&self.ssi), &transaction)?;
+        Ok(Box::new(ActiveSqlTransaction {
+            transaction,
+            base: None,
+            working: None,
+            locks: Vec::new(),
+            lease: None,
+            dml_only: true,
+            ssi,
+            savepoints: SavepointStack::new(),
+            savepoint_states: BTreeMap::new(),
+            failed: false,
+            stream_failed: Arc::new(AtomicBool::new(false)),
+        }))
     }
 
-    fn rollback_sql_transaction(&mut self) -> Result<TryQueryStream> {
-        match mem::replace(&mut self.sql_transaction, SqlTransactionState::Idle) {
-            SqlTransactionState::Idle => Err(no_active_transaction_error("roll back")),
-            SqlTransactionState::Active(_) | SqlTransactionState::Failed => {
-                Ok(TryQueryStream::new(transaction_events("ROLLBACK")))
+    fn commit_sql_transaction(&mut self, chain: TransactionChain) -> Result<TryQueryStream> {
+        let transaction = match mem::replace(&mut self.sql_transaction, SqlTransactionState::Idle) {
+            SqlTransactionState::Idle => return Err(no_active_transaction_error("commit")),
+            SqlTransactionState::Failed(characteristics) => {
+                self.sql_transaction = SqlTransactionState::Failed(characteristics);
+                return Err(failed_transaction_error());
+            }
+            SqlTransactionState::Active(transaction)
+                if transaction.failed || transaction.stream_failed.load(Ordering::Acquire) =>
+            {
+                self.sql_transaction = SqlTransactionState::Active(transaction);
+                return Err(failed_transaction_error());
+            }
+            SqlTransactionState::Active(transaction) => transaction,
+        };
+        let characteristics = transaction
+            .transaction
+            .characteristics()
+            .ok_or_else(|| no_active_transaction_error("commit"))?;
+        let ActiveSqlTransaction {
+            transaction: mut durable,
+            base,
+            working,
+            mut locks,
+            lease,
+            dml_only,
+            mut ssi,
+            ..
+        } = *transaction;
+        if let Some(ssi) = &mut ssi
+            && let Err(error) = self
+                .transactions
+                .global_xmin_excluding(durable.transaction_id())
+                .and_then(|horizon| ssi.validate_commit(horizon))
+        {
+            self.sql_transaction = SqlTransactionState::Failed(characteristics);
+            return Err(error);
+        }
+        if let Some(candidate) = working {
+            let mut state = match self.state.write() {
+                Ok(state) => state,
+                Err(_) => {
+                    self.sql_transaction = SqlTransactionState::Failed(characteristics);
+                    return Err(internal_error("engine state lock is poisoned"));
+                }
+            };
+            let candidate = if dml_only {
+                let base = base.as_ref().ok_or_else(|| {
+                    internal_error("DML transaction is missing its base snapshot")
+                })?;
+                match merge_dml_candidate(
+                    &state,
+                    base,
+                    &candidate,
+                    &durable,
+                    self.transaction_status.as_ref(),
+                ) {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        self.sql_transaction = SqlTransactionState::Failed(characteristics);
+                        return Err(error);
+                    }
+                }
+            } else {
+                candidate
+            };
+            if let Err(error) = persist_candidate(
+                &mut state,
+                &self.store,
+                &self.storage_access,
+                &self.wal,
+                &mut durable,
+                candidate,
+            ) {
+                self.sql_transaction = SqlTransactionState::Failed(characteristics);
+                return Err(error);
+            }
+            if let Some(ssi) = &mut ssi {
+                ssi.finish();
+            }
+            drop(state);
+            locks.clear();
+            drop(lease);
+            record_commit_and_maybe_checkpoint(
+                &self.state,
+                &self.store,
+                &self.wal,
+                &self.transactions,
+                &self.commits_since_checkpoint,
+            )?;
+        } else {
+            if let Err(error) = durable.commit_empty() {
+                self.sql_transaction = SqlTransactionState::Failed(characteristics);
+                return Err(error);
+            }
+            if let Some(ssi) = &mut ssi {
+                ssi.finish();
             }
         }
+        self.start_chained_sql_transaction(chain, characteristics)?;
+        Ok(TryQueryStream::new(transaction_events("COMMIT")))
+    }
+
+    fn rollback_sql_transaction(&mut self, chain: TransactionChain) -> Result<TryQueryStream> {
+        let characteristics =
+            match mem::replace(&mut self.sql_transaction, SqlTransactionState::Idle) {
+                SqlTransactionState::Idle => return Err(no_active_transaction_error("roll back")),
+                SqlTransactionState::Active(transaction) => {
+                    let characteristics = transaction
+                        .transaction
+                        .characteristics()
+                        .ok_or_else(|| no_active_transaction_error("roll back"))?;
+                    transaction.transaction.abort()?;
+                    characteristics
+                }
+                SqlTransactionState::Failed(characteristics) => characteristics,
+            };
+        self.start_chained_sql_transaction(chain, characteristics)?;
+        Ok(TryQueryStream::new(transaction_events("ROLLBACK")))
+    }
+
+    fn start_chained_sql_transaction(
+        &mut self,
+        chain: TransactionChain,
+        characteristics: TransactionCharacteristics,
+    ) -> Result<()> {
+        if chain == TransactionChain::Chain {
+            self.sql_transaction =
+                SqlTransactionState::Active(self.new_active_sql_transaction(characteristics)?);
+        }
+        Ok(())
+    }
+
+    fn create_sql_savepoint(&mut self, name: &Identifier) -> Result<TryQueryStream> {
+        let mut transaction =
+            match mem::replace(&mut self.sql_transaction, SqlTransactionState::Idle) {
+                SqlTransactionState::Idle => {
+                    return Err(no_active_transaction_error("create a savepoint"));
+                }
+                SqlTransactionState::Failed(characteristics) => {
+                    self.sql_transaction = SqlTransactionState::Failed(characteristics);
+                    return Err(failed_transaction_error());
+                }
+                SqlTransactionState::Active(transaction) => transaction,
+            };
+        if transaction.failed || transaction.stream_failed.load(Ordering::Acquire) {
+            self.sql_transaction = SqlTransactionState::Active(transaction);
+            return Err(failed_transaction_error());
+        }
+        let command_id = transaction
+            .transaction
+            .snapshot()
+            .ok_or_else(|| no_active_transaction_error("create a savepoint"))?
+            .command_id;
+        let ssi = match transaction
+            .ssi
+            .as_ref()
+            .map(SsiTransactionGuard::savepoint)
+            .transpose()
+        {
+            Ok(ssi) => ssi,
+            Err(error) => {
+                transaction.failed = true;
+                self.sql_transaction = SqlTransactionState::Active(transaction);
+                return Err(error);
+            }
+        };
+        let id =
+            match transaction
+                .savepoints
+                .push(name.as_str(), command_id, 0, transaction.locks.len())
+            {
+                Ok(id) => id,
+                Err(error) => {
+                    self.sql_transaction = SqlTransactionState::Active(transaction);
+                    return Err(error);
+                }
+            };
+        transaction.savepoint_states.insert(
+            id,
+            SqlSavepointState {
+                base: transaction.base.clone(),
+                working: transaction.working.clone(),
+                sequence_currvals: self.sequence_currvals.clone(),
+                lock_len: transaction.locks.len(),
+                dml_only: transaction.dml_only,
+                ssi,
+            },
+        );
+        if let Err(error) = transaction.transaction.finish_statement() {
+            transaction.failed = true;
+            self.sql_transaction = SqlTransactionState::Active(transaction);
+            return Err(error);
+        }
+        self.sql_transaction = SqlTransactionState::Active(transaction);
+        Ok(TryQueryStream::new(transaction_events("SAVEPOINT")))
+    }
+
+    fn rollback_to_sql_savepoint(&mut self, name: &Identifier) -> Result<TryQueryStream> {
+        let mut transaction =
+            match mem::replace(&mut self.sql_transaction, SqlTransactionState::Idle) {
+                SqlTransactionState::Idle => {
+                    return Err(no_active_transaction_error("roll back to a savepoint"));
+                }
+                SqlTransactionState::Failed(characteristics) => {
+                    self.sql_transaction = SqlTransactionState::Failed(characteristics);
+                    return Err(DbError::new(
+                        "3B001",
+                        format!("savepoint \"{name}\" does not exist"),
+                    ));
+                }
+                SqlTransactionState::Active(transaction) => transaction,
+            };
+        let savepoint = match transaction.savepoints.rollback_to(name.as_str()) {
+            Ok(savepoint) => savepoint,
+            Err(error) => {
+                self.sql_transaction = SqlTransactionState::Active(transaction);
+                return Err(error);
+            }
+        };
+        let saved = match transaction.savepoint_states.get(&savepoint.id).cloned() {
+            Some(saved) => saved,
+            None => {
+                transaction.failed = true;
+                self.sql_transaction = SqlTransactionState::Active(transaction);
+                return Err(internal_error("savepoint state is missing"));
+            }
+        };
+        let ssi_rollback = match (&transaction.ssi, &saved.ssi) {
+            (Some(ssi), Some(savepoint)) => ssi.rollback_to(savepoint),
+            (None, None) => Ok(()),
+            _ => Err(internal_error("savepoint SSI state is inconsistent")),
+        };
+        if let Err(error) = ssi_rollback {
+            transaction.failed = true;
+            self.sql_transaction = SqlTransactionState::Active(transaction);
+            return Err(error);
+        }
+        transaction.base = saved.base;
+        transaction.working = saved.working;
+        transaction.locks.truncate(saved.lock_len);
+        transaction.dml_only = saved.dml_only;
+        if transaction.working.is_none() {
+            transaction.lease = None;
+        }
+        self.sequence_currvals = saved.sequence_currvals;
+        let retained = transaction
+            .savepoints
+            .frames()
+            .iter()
+            .map(|frame| frame.id)
+            .collect::<BTreeSet<_>>();
+        transaction
+            .savepoint_states
+            .retain(|id, _| retained.contains(id));
+        transaction.failed = false;
+        transaction.stream_failed.store(false, Ordering::Release);
+        if let Err(error) = transaction.transaction.finish_statement() {
+            transaction.failed = true;
+            self.sql_transaction = SqlTransactionState::Active(transaction);
+            return Err(error);
+        }
+        self.sql_transaction = SqlTransactionState::Active(transaction);
+        Ok(TryQueryStream::new(transaction_events("ROLLBACK")))
+    }
+
+    fn release_sql_savepoint(&mut self, name: &Identifier) -> Result<TryQueryStream> {
+        let mut transaction =
+            match mem::replace(&mut self.sql_transaction, SqlTransactionState::Idle) {
+                SqlTransactionState::Idle => {
+                    return Err(no_active_transaction_error("release a savepoint"));
+                }
+                SqlTransactionState::Failed(characteristics) => {
+                    self.sql_transaction = SqlTransactionState::Failed(characteristics);
+                    return Err(failed_transaction_error());
+                }
+                SqlTransactionState::Active(transaction) => transaction,
+            };
+        if transaction.failed || transaction.stream_failed.load(Ordering::Acquire) {
+            self.sql_transaction = SqlTransactionState::Active(transaction);
+            return Err(failed_transaction_error());
+        }
+        if let Err(error) = transaction.savepoints.release(name.as_str()) {
+            self.sql_transaction = SqlTransactionState::Active(transaction);
+            return Err(error);
+        }
+        let retained = transaction
+            .savepoints
+            .frames()
+            .iter()
+            .map(|frame| frame.id)
+            .collect::<BTreeSet<_>>();
+        transaction
+            .savepoint_states
+            .retain(|id, _| retained.contains(id));
+        if let Err(error) = transaction.transaction.finish_statement() {
+            transaction.failed = true;
+            self.sql_transaction = SqlTransactionState::Active(transaction);
+            return Err(error);
+        }
+        self.sql_transaction = SqlTransactionState::Active(transaction);
+        Ok(TryQueryStream::new(transaction_events("RELEASE")))
     }
 
     fn execute_auto_commit(
@@ -839,22 +1336,75 @@ impl Session {
         {
             return Ok(stream);
         }
+        let compacts_transaction_status =
+            matches!(&statement, BoundStatement::Vacuum { table_id: None, .. });
         let sequence_id = sequence_mutation_id(&statement);
-        let (_, events, dirty) = execute_bound_candidate(&snapshot, statement, params)?;
+        let write_scope = statement_write_scope(&statement);
+        let maintenance =
+            maintenance_context(self.transactions.as_ref(), self.transaction_status.as_ref())?;
+        let (_, events, dirty) =
+            execute_bound_candidate(&snapshot, statement, params, None, maintenance)?;
         if !dirty {
             return Ok(TryQueryStream::new(events));
         }
 
-        let transaction_id = self.writer.next_transaction_id()?;
-        let lease = self.writer.try_acquire(transaction_id)?;
+        let mut transaction = DurableTransaction::begin(
+            &self.transactions,
+            Arc::clone(&self.transaction_status),
+            Arc::clone(&self.wal),
+            TransactionCharacteristics::default(),
+        )?;
+        let mut lease = None;
+        let mut write_locks = Vec::new();
+        match write_scope {
+            StatementWriteScope::Dml => {
+                let (lock_candidate, _, lock_dirty) = execute_candidate(
+                    &snapshot,
+                    sql,
+                    params,
+                    self.options.dialect,
+                    Some(version_mutation_context(&transaction)?),
+                    maintenance,
+                )?;
+                if lock_dirty {
+                    write_locks = acquire_dml_locks(
+                        &self.locks,
+                        &transaction,
+                        &snapshot,
+                        &lock_candidate,
+                        &[],
+                        snapshot.cancellation.as_deref(),
+                    )?;
+                }
+            }
+            StatementWriteScope::Exclusive => {
+                lease = Some(self.writer.try_acquire(transaction.transaction_id())?);
+                write_locks.push(acquire_compatibility_write_lock(
+                    &self.locks,
+                    &transaction,
+                    snapshot.cancellation.as_deref(),
+                )?);
+            }
+            StatementWriteScope::ReadOnly => {
+                return Err(internal_error(
+                    "read-only statement unexpectedly produced a dirty candidate",
+                ));
+            }
+        }
         let mut state = self
             .state
             .write()
             .map_err(|_| internal_error("engine state lock is poisoned"))?;
         let mut committed = state.clone();
         committed.cancellation = snapshot.cancellation.clone();
-        let (candidate, events, dirty) =
-            execute_candidate(&committed, sql, params, self.options.dialect)?;
+        let (candidate, events, dirty) = execute_candidate(
+            &committed,
+            sql,
+            params,
+            self.options.dialect,
+            Some(version_mutation_context(&transaction)?),
+            maintenance,
+        )?;
         if dirty {
             let sequence_value = sequence_id
                 .map(|sequence_id| candidate_sequence_value(&candidate, sequence_id))
@@ -864,18 +1414,24 @@ impl Session {
                 &self.store,
                 &self.storage_access,
                 &self.wal,
-                transaction_id,
+                &mut transaction,
                 candidate,
             )?;
             drop(state);
-            drop(lease);
+            drop(write_locks);
+            drop(lease.take());
             record_commit_and_maybe_checkpoint(
                 &self.state,
                 &self.store,
                 &self.wal,
-                &self.writer,
+                &self.transactions,
                 &self.commits_since_checkpoint,
             )?;
+            if compacts_transaction_status {
+                self.transaction_status
+                    .compact_before(maintenance.horizon)?;
+                self.transactions.compact_before(maintenance.horizon)?;
+            }
             if let Some((sequence_id, value)) = sequence_id.zip(sequence_value) {
                 self.sequence_currvals.insert(sequence_id, value);
             }
@@ -891,15 +1447,139 @@ impl Session {
         snapshot: DatabaseState,
         statement: BoundStatement,
     ) -> Result<TryQueryStream> {
+        if matches!(&statement, BoundStatement::Vacuum { .. }) {
+            return Err(DbError::new(
+                "25001",
+                "VACUUM cannot run inside a transaction block",
+            ));
+        }
+        if let Some(ssi) = &transaction.ssi {
+            for predicate in statement_read_predicates(&statement) {
+                ssi.record_read(predicate)?;
+            }
+        }
         if let Some(stream) = prepare_read_stream(&snapshot, statement.clone(), params, None)? {
             return Ok(stream);
         }
         let sequence_id = sequence_mutation_id(&statement);
-        let (candidate, events, dirty) = execute_bound_candidate(&snapshot, statement, params)?;
+        let write_scope = statement_write_scope(&statement);
+        let maintenance =
+            maintenance_context(self.transactions.as_ref(), self.transaction_status.as_ref())?;
+        let (candidate, events, dirty) = execute_bound_candidate(
+            &snapshot,
+            statement,
+            params,
+            Some(version_mutation_context(&transaction.transaction)?),
+            maintenance,
+        )?;
         if !dirty {
             return Ok(TryQueryStream::new(events));
         }
-        if transaction.working.is_some() {
+        if transaction
+            .transaction
+            .characteristics()
+            .is_some_and(|characteristics| {
+                characteristics.access_mode == TransactionAccessMode::ReadOnly
+            })
+        {
+            return Err(DbError::new(
+                "25006",
+                "cannot execute a write in a read-only transaction",
+            ));
+        }
+        match write_scope {
+            StatementWriteScope::Dml => {
+                let mut acquired = acquire_dml_locks(
+                    &self.locks,
+                    &transaction.transaction,
+                    &snapshot,
+                    &candidate,
+                    &transaction.locks,
+                    snapshot.cancellation.as_deref(),
+                )?;
+                if let Some(ssi) = &transaction.ssi {
+                    for table_id in changed_table_ids(&snapshot, &candidate) {
+                        ssi.record_write(PredicateLock::Table {
+                            table_id: table_id.get(),
+                        })?;
+                    }
+                }
+                transaction.locks.append(&mut acquired);
+                if transaction.base.is_none() {
+                    transaction.base = Some(snapshot.clone());
+                }
+            }
+            StatementWriteScope::Exclusive => {
+                if transaction.working.is_some() && transaction.dml_only {
+                    transaction.locks.clear();
+                    let base = transaction.base.as_ref().ok_or_else(|| {
+                        internal_error("DML transaction is missing its base snapshot")
+                    })?;
+                    let working = transaction.working.as_ref().ok_or_else(|| {
+                        internal_error("DML transaction is missing its working state")
+                    })?;
+                    let (upgraded_base, upgraded_working, lease, lock) =
+                        upgrade_dml_candidate_to_exclusive(
+                            DmlUpgradeAuthorities {
+                                state: &self.state,
+                                statuses: self.transaction_status.as_ref(),
+                                locks: &self.locks,
+                                writer: &self.writer,
+                            },
+                            &transaction.transaction,
+                            base,
+                            working,
+                            snapshot.cancellation.clone(),
+                        )?;
+                    let (candidate, events, dirty) = execute_candidate(
+                        &upgraded_working,
+                        sql,
+                        params,
+                        self.options.dialect,
+                        Some(version_mutation_context(&transaction.transaction)?),
+                        maintenance,
+                    )?;
+                    if !dirty {
+                        return Err(internal_error(
+                            "exclusive statement unexpectedly produced a clean candidate",
+                        ));
+                    }
+                    if let Some(sequence_id) = sequence_id {
+                        self.sequence_currvals.insert(
+                            sequence_id,
+                            candidate_sequence_value(&candidate, sequence_id)?,
+                        );
+                    }
+                    transaction.base = Some(upgraded_base);
+                    transaction.working = Some(candidate);
+                    transaction.lease = Some(lease);
+                    transaction.locks.push(lock);
+                    transaction.dml_only = false;
+                    return Ok(TryQueryStream::new(events));
+                }
+                if transaction.lease.is_none() {
+                    transaction.lease = Some(
+                        self.writer
+                            .try_acquire(transaction.transaction.transaction_id())?,
+                    );
+                    transaction.locks.push(acquire_compatibility_write_lock(
+                        &self.locks,
+                        &transaction.transaction,
+                        snapshot.cancellation.as_deref(),
+                    )?);
+                }
+                transaction.dml_only = false;
+                if transaction.base.is_none() {
+                    transaction.base = Some(snapshot.clone());
+                }
+            }
+            StatementWriteScope::ReadOnly => {
+                return Err(internal_error(
+                    "read-only statement unexpectedly produced a dirty candidate",
+                ));
+            }
+        }
+        if transaction.working.is_some() || write_scope == StatementWriteScope::Dml {
             if let Some(sequence_id) = sequence_id {
                 self.sequence_currvals.insert(
                     sequence_id,
@@ -910,11 +1590,16 @@ impl Session {
             return Ok(TryQueryStream::new(events));
         }
 
-        let lease = self.writer.try_acquire(transaction.transaction_id)?;
         let mut committed = committed_snapshot(&self.state)?;
         committed.cancellation = snapshot.cancellation.clone();
-        let (candidate, events, dirty) =
-            execute_candidate(&committed, sql, params, self.options.dialect)?;
+        let (candidate, events, dirty) = execute_candidate(
+            &committed,
+            sql,
+            params,
+            self.options.dialect,
+            Some(version_mutation_context(&transaction.transaction)?),
+            maintenance,
+        )?;
         if dirty {
             if let Some(sequence_id) = sequence_id {
                 self.sequence_currvals.insert(
@@ -923,22 +1608,21 @@ impl Session {
                 );
             }
             transaction.working = Some(candidate);
-            transaction.lease = Some(lease);
         }
         Ok(TryQueryStream::new(events))
     }
 
     fn fail_sql_transaction(&mut self) {
-        if matches!(&self.sql_transaction, SqlTransactionState::Active(_)) {
-            self.sql_transaction = SqlTransactionState::Failed;
+        if let SqlTransactionState::Active(transaction) = &mut self.sql_transaction {
+            transaction.failed = true;
         }
     }
 
     fn normalize_sql_transaction_failure(&mut self) {
-        if self.transaction_status() == TransactionStatus::Failed
-            && matches!(&self.sql_transaction, SqlTransactionState::Active(_))
+        if let SqlTransactionState::Active(transaction) = &mut self.sql_transaction
+            && transaction.stream_failed.load(Ordering::Acquire)
         {
-            self.sql_transaction = SqlTransactionState::Failed;
+            transaction.failed = true;
         }
     }
 }
@@ -992,9 +1676,14 @@ fn bound_statement_schema(statement: &BoundStatement) -> Schema {
         BoundStatement::Explain { .. } => {
             Schema::new(vec![Field::new("QUERY PLAN", ScalarType::Text, false)])
         }
-        BoundStatement::Begin
-        | BoundStatement::Commit
-        | BoundStatement::Rollback
+        BoundStatement::Begin { .. }
+        | BoundStatement::Commit { .. }
+        | BoundStatement::Rollback { .. }
+        | BoundStatement::Savepoint { .. }
+        | BoundStatement::RollbackTo { .. }
+        | BoundStatement::ReleaseSavepoint { .. }
+        | BoundStatement::Analyze { .. }
+        | BoundStatement::Vacuum { .. }
         | BoundStatement::NoOp { .. }
         | BoundStatement::CreateSchema { .. }
         | BoundStatement::AlterSchemaRename { .. }
@@ -1026,13 +1715,19 @@ pub struct Transaction<'session> {
     store: &'session Arc<Mutex<DatabaseStore>>,
     storage_access: &'session Arc<StorageAccessGate>,
     wal: &'session Arc<WalManager>,
+    transaction_status: &'session Arc<TransactionStatusStore>,
+    transactions: &'session Arc<TransactionManager>,
+    locks: &'session Arc<LockManager>,
     writer: &'session Arc<WriterCoordinator>,
     commits_since_checkpoint: &'session Arc<AtomicU64>,
     sequence_currvals: &'session mut BTreeMap<SequenceId, i64>,
     dialect: SqlDialect,
-    transaction_id: TransactionId,
+    transaction: DurableTransaction,
+    base: Option<DatabaseState>,
     working: Option<DatabaseState>,
+    lock_guards: Vec<LockGuard>,
     lease: Option<WriterLease>,
+    dml_only: bool,
     failed: bool,
 }
 
@@ -1041,10 +1736,29 @@ impl Transaction<'_> {
         if self.failed {
             return Err(failed_transaction_error());
         }
+        self.transaction.begin_statement()?;
+        if let Err(error) = refresh_read_committed_candidate(
+            self.state,
+            self.transaction_status.as_ref(),
+            &self.transaction,
+            &mut self.base,
+            &mut self.working,
+            self.dml_only,
+        ) {
+            self.working = None;
+            self.lock_guards.clear();
+            self.lease = None;
+            self.failed = true;
+            return Err(error);
+        }
         match self.execute_inner(sql, params) {
-            Ok(stream) => Ok(stream),
+            Ok(stream) => {
+                self.transaction.finish_statement()?;
+                Ok(stream)
+            }
             Err(error) => {
                 self.working = None;
+                self.lock_guards.clear();
                 self.lease = None;
                 self.failed = true;
                 Err(error)
@@ -1057,39 +1771,67 @@ impl Transaction<'_> {
             return Err(failed_transaction_error());
         }
         let Some(candidate) = self.working else {
-            return Ok(());
+            return self.transaction.commit_empty();
         };
         let mut state = self
             .state
             .write()
             .map_err(|_| internal_error("engine state lock is poisoned"))?;
+        let candidate = if self.dml_only {
+            let base = self
+                .base
+                .as_ref()
+                .ok_or_else(|| internal_error("DML transaction is missing its base snapshot"))?;
+            merge_dml_candidate(
+                &state,
+                base,
+                &candidate,
+                &self.transaction,
+                self.transaction_status.as_ref(),
+            )?
+        } else {
+            candidate
+        };
         persist_candidate(
             &mut state,
             self.store,
             self.storage_access,
             self.wal,
-            self.transaction_id,
+            &mut self.transaction,
             candidate,
         )?;
         drop(state);
+        self.lock_guards.clear();
         self.lease = None;
         record_commit_and_maybe_checkpoint(
             self.state,
             self.store,
             self.wal,
-            self.writer,
+            self.transactions,
             self.commits_since_checkpoint,
         )
     }
 
     pub fn rollback(self) -> Result<()> {
-        Ok(())
+        self.transaction.abort()
     }
 
     fn execute_inner(&mut self, sql: &str, params: &[Value]) -> Result<QueryStream> {
         let snapshot = match &self.working {
             Some(working) => working.clone(),
-            None => committed_snapshot(self.state)?,
+            None => {
+                let committed = committed_snapshot(self.state)?;
+                let transaction_snapshot = self
+                    .transaction
+                    .snapshot()
+                    .ok_or_else(|| no_active_transaction_error("take a statement snapshot"))?;
+                project_database_visibility(
+                    committed,
+                    transaction_snapshot,
+                    self.transaction.transaction_id(),
+                    self.transaction_status.as_ref(),
+                )?
+            }
         };
         let statement = resolve_sequence_currval(
             bind(parse_with_dialect(sql, self.dialect)?, &snapshot.catalog)?,
@@ -1097,7 +1839,12 @@ impl Transaction<'_> {
         )?;
         if matches!(
             &statement,
-            BoundStatement::Begin | BoundStatement::Commit | BoundStatement::Rollback
+            BoundStatement::Begin { .. }
+                | BoundStatement::Commit { .. }
+                | BoundStatement::Rollback { .. }
+                | BoundStatement::Savepoint { .. }
+                | BoundStatement::RollbackTo { .. }
+                | BoundStatement::ReleaseSavepoint { .. }
         ) {
             return Err(DbError::new(
                 "25001",
@@ -1105,15 +1852,112 @@ impl Transaction<'_> {
             )
             .with_hint("use Transaction::commit or Transaction::rollback"));
         }
+        if matches!(&statement, BoundStatement::Vacuum { .. }) {
+            return Err(DbError::new(
+                "25001",
+                "VACUUM cannot run inside a transaction block",
+            ));
+        }
         if let Some(stream) = prepare_read_stream(&snapshot, statement.clone(), params, None)? {
             return stream.collect::<Result<Vec<_>>>().map(QueryStream::new);
         }
         let sequence_id = sequence_mutation_id(&statement);
-        let (candidate, events, dirty) = execute_bound_candidate(&snapshot, statement, params)?;
+        let write_scope = statement_write_scope(&statement);
+        let maintenance =
+            maintenance_context(self.transactions.as_ref(), self.transaction_status.as_ref())?;
+        let (candidate, events, dirty) = execute_bound_candidate(
+            &snapshot,
+            statement,
+            params,
+            Some(version_mutation_context(&self.transaction)?),
+            maintenance,
+        )?;
         if !dirty {
             return Ok(QueryStream::new(events));
         }
-        if self.working.is_some() {
+        match write_scope {
+            StatementWriteScope::Dml => {
+                let mut acquired = acquire_dml_locks(
+                    self.locks,
+                    &self.transaction,
+                    &snapshot,
+                    &candidate,
+                    &self.lock_guards,
+                    None,
+                )?;
+                self.lock_guards.append(&mut acquired);
+                if self.base.is_none() {
+                    self.base = Some(snapshot.clone());
+                }
+            }
+            StatementWriteScope::Exclusive => {
+                if self.working.is_some() && self.dml_only {
+                    self.lock_guards.clear();
+                    let base = self.base.as_ref().ok_or_else(|| {
+                        internal_error("DML transaction is missing its base snapshot")
+                    })?;
+                    let working = self.working.as_ref().ok_or_else(|| {
+                        internal_error("DML transaction is missing its working state")
+                    })?;
+                    let (upgraded_base, upgraded_working, lease, lock) =
+                        upgrade_dml_candidate_to_exclusive(
+                            DmlUpgradeAuthorities {
+                                state: self.state,
+                                statuses: self.transaction_status.as_ref(),
+                                locks: self.locks,
+                                writer: self.writer,
+                            },
+                            &self.transaction,
+                            base,
+                            working,
+                            None,
+                        )?;
+                    let (candidate, events, dirty) = execute_candidate(
+                        &upgraded_working,
+                        sql,
+                        params,
+                        self.dialect,
+                        Some(version_mutation_context(&self.transaction)?),
+                        maintenance,
+                    )?;
+                    if !dirty {
+                        return Err(internal_error(
+                            "exclusive statement unexpectedly produced a clean candidate",
+                        ));
+                    }
+                    if let Some(sequence_id) = sequence_id {
+                        self.sequence_currvals.insert(
+                            sequence_id,
+                            candidate_sequence_value(&candidate, sequence_id)?,
+                        );
+                    }
+                    self.base = Some(upgraded_base);
+                    self.working = Some(candidate);
+                    self.lease = Some(lease);
+                    self.lock_guards.push(lock);
+                    self.dml_only = false;
+                    return Ok(QueryStream::new(events));
+                }
+                if self.lease.is_none() {
+                    self.lease = Some(self.writer.try_acquire(self.transaction.transaction_id())?);
+                    self.lock_guards.push(acquire_compatibility_write_lock(
+                        self.locks,
+                        &self.transaction,
+                        None,
+                    )?);
+                }
+                self.dml_only = false;
+                if self.base.is_none() {
+                    self.base = Some(snapshot.clone());
+                }
+            }
+            StatementWriteScope::ReadOnly => {
+                return Err(internal_error(
+                    "read-only statement unexpectedly produced a dirty candidate",
+                ));
+            }
+        }
+        if self.working.is_some() || write_scope == StatementWriteScope::Dml {
             if let Some(sequence_id) = sequence_id {
                 self.sequence_currvals.insert(
                     sequence_id,
@@ -1124,9 +1968,15 @@ impl Transaction<'_> {
             return Ok(QueryStream::new(events));
         }
 
-        let lease = self.writer.try_acquire(self.transaction_id)?;
         let committed = committed_snapshot(self.state)?;
-        let (candidate, events, dirty) = execute_candidate(&committed, sql, params, self.dialect)?;
+        let (candidate, events, dirty) = execute_candidate(
+            &committed,
+            sql,
+            params,
+            self.dialect,
+            Some(version_mutation_context(&self.transaction)?),
+            maintenance,
+        )?;
         if dirty {
             if let Some(sequence_id) = sequence_id {
                 self.sequence_currvals.insert(
@@ -1135,7 +1985,6 @@ impl Transaction<'_> {
                 );
             }
             self.working = Some(candidate);
-            self.lease = Some(lease);
         }
         Ok(QueryStream::new(events))
     }
@@ -1367,6 +2216,8 @@ impl Iterator for QueryStream {
 struct DatabaseState {
     catalog: Arc<Catalog>,
     rows: BTreeMap<TableId, Arc<Vec<Row>>>,
+    versions: BTreeMap<TableId, Arc<Vec<VersionedRow>>>,
+    visible_versions: BTreeMap<TableId, Arc<Vec<u32>>>,
     indexes: BTreeMap<IndexId, Arc<BPlusTree>>,
     searches: Arc<SearchCatalog>,
     generation: u64,
@@ -1425,11 +2276,17 @@ struct AdvancedExecution {
 }
 
 impl DatabaseState {
-    fn from_persistent(state: PersistentState, data_format: DataFormat) -> Result<Self> {
+    fn from_persistent(
+        state: PersistentState,
+        data_format: DataFormat,
+        statuses: &impl TransactionStatusProvider,
+        next_transaction_id: u64,
+    ) -> Result<Self> {
         let PersistentState {
             generation,
             catalog,
             tables,
+            mut versions,
             indexes,
         } = state;
         if data_format == DataFormat::V2 {
@@ -1447,6 +2304,7 @@ impl DatabaseState {
                 .collect::<BTreeSet<_>>();
             if tables
                 .keys()
+                .chain(versions.keys())
                 .any(|table_id| !catalog_table_ids.contains(table_id))
             {
                 return Err(DbError::new(
@@ -1454,18 +2312,83 @@ impl DatabaseState {
                     "database v2 contains rows for a table absent from its catalog",
                 ));
             }
-            let rows = catalog_table_ids
-                .iter()
-                .map(|table_id| {
-                    (
-                        *table_id,
-                        Arc::new(tables.get(table_id).cloned().unwrap_or_default()),
-                    )
-                })
-                .collect();
+            let snapshot_transaction = TransactionId::new(next_transaction_id)
+                .ok_or_else(|| internal_error("transaction high-water mark is zero"))?;
+            let visibility_snapshot = TransactionSnapshot {
+                xmin: snapshot_transaction,
+                xmax: snapshot_transaction,
+                in_progress: Arc::new(BTreeSet::new()),
+                command_id: u32::MAX,
+            };
+            let mut rows = BTreeMap::new();
+            let mut version_rows = BTreeMap::new();
+            let mut visible_versions = BTreeMap::new();
+            for table_id in &catalog_table_ids {
+                let table_versions = match versions.remove(table_id) {
+                    Some(versions) => versions,
+                    None => tables
+                        .get(table_id)
+                        .into_iter()
+                        .flatten()
+                        .enumerate()
+                        .map(|(index, row)| {
+                            let version_id = u32::try_from(index)
+                                .ok()
+                                .and_then(|index| index.checked_add(1))
+                                .ok_or_else(|| {
+                                    DbError::new(
+                                        "54000",
+                                        "table exceeds the u32 version ordinal limit",
+                                    )
+                                })?;
+                            Ok(VersionedRow {
+                                version_id,
+                                header: TupleHeaderV2::frozen(row)?,
+                                row: row.clone(),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                };
+                let mut visible_rows = Vec::new();
+                let mut visible_ids = Vec::new();
+                for (index, version) in table_versions.iter().enumerate() {
+                    let expected_version = u32::try_from(index)
+                        .ok()
+                        .and_then(|index| index.checked_add(1))
+                        .ok_or_else(|| {
+                            DbError::new("54000", "table exceeds the u32 version ordinal limit")
+                        })?;
+                    if version.version_id != expected_version
+                        || version.header.previous_version >= version.version_id
+                    {
+                        return Err(DbError::new(
+                            "XX001",
+                            format!(
+                                "table {} has an invalid version chain at ordinal {}",
+                                table_id.get(),
+                                version.version_id
+                            ),
+                        ));
+                    }
+                    if tuple_visible(
+                        version.header,
+                        &visibility_snapshot,
+                        snapshot_transaction,
+                        statuses,
+                    )? {
+                        visible_rows.push(version.row.clone());
+                        visible_ids.push(version.version_id);
+                    }
+                }
+                rows.insert(*table_id, Arc::new(visible_rows));
+                version_rows.insert(*table_id, Arc::new(table_versions));
+                visible_versions.insert(*table_id, Arc::new(visible_ids));
+            }
             let mut state = Self {
                 catalog: Arc::new(catalog),
                 rows,
+                versions: version_rows,
+                visible_versions,
                 indexes: BTreeMap::new(),
                 searches: Arc::new(SearchCatalog::default()),
                 generation,
@@ -1494,10 +2417,13 @@ impl DatabaseState {
             .into_iter()
             .map(|(table_id, rows)| (table_id, Arc::new(rows)))
             .collect::<BTreeMap<_, _>>();
+        let (versions, visible_versions) = frozen_version_state(&rows)?;
         let searches = SearchCatalog::build(&catalog, &rows, SearchLimits::default())?;
         Ok(Self {
             catalog: Arc::new(catalog),
             rows,
+            versions,
+            visible_versions,
             indexes,
             searches: Arc::new(searches),
             generation,
@@ -1552,6 +2478,8 @@ impl DatabaseState {
         let mut state = Self {
             catalog: snapshot.catalog,
             rows,
+            versions: BTreeMap::new(),
+            visible_versions: BTreeMap::new(),
             indexes: BTreeMap::new(),
             searches: Arc::new(SearchCatalog::default()),
             generation: snapshot.source_generation,
@@ -1560,12 +2488,44 @@ impl DatabaseState {
             routine_depth: 0,
             cancellation: None,
         };
+        (state.versions, state.visible_versions) = frozen_version_state(&state.rows)?;
         validate_database_rows(&state)?;
         for table_id in catalog_table_ids {
             rebuild_table_derived(&mut state, table_id)?;
         }
         Ok(state)
     }
+}
+
+type VersionRowsByTable = BTreeMap<TableId, Arc<Vec<VersionedRow>>>;
+type VisibleVersionsByTable = BTreeMap<TableId, Arc<Vec<u32>>>;
+
+fn frozen_version_state(
+    rows: &BTreeMap<TableId, Arc<Vec<Row>>>,
+) -> Result<(VersionRowsByTable, VisibleVersionsByTable)> {
+    let mut versions = BTreeMap::new();
+    let mut visible_versions = BTreeMap::new();
+    for (table_id, table_rows) in rows {
+        let mut table_versions = Vec::with_capacity(table_rows.len());
+        let mut visible_ids = Vec::with_capacity(table_rows.len());
+        for (index, row) in table_rows.iter().enumerate() {
+            let version_id = u32::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .ok_or_else(|| {
+                    DbError::new("54000", "table exceeds the u32 version ordinal limit")
+                })?;
+            table_versions.push(VersionedRow {
+                version_id,
+                header: TupleHeaderV2::frozen(row)?,
+                row: row.clone(),
+            });
+            visible_ids.push(version_id);
+        }
+        versions.insert(*table_id, Arc::new(table_versions));
+        visible_versions.insert(*table_id, Arc::new(visible_ids));
+    }
+    Ok((versions, visible_versions))
 }
 
 impl From<&DatabaseState> for PersistentState {
@@ -1577,6 +2537,11 @@ impl From<&DatabaseState> for PersistentState {
                 .rows
                 .iter()
                 .map(|(table_id, rows)| (*table_id, (**rows).clone()))
+                .collect(),
+            versions: state
+                .versions
+                .iter()
+                .map(|(table_id, versions)| (*table_id, (**versions).clone()))
                 .collect(),
             indexes: state
                 .indexes
@@ -1592,6 +2557,61 @@ fn committed_snapshot(state: &Arc<RwLock<DatabaseState>>) -> Result<DatabaseStat
         .read()
         .map(|state| state.clone())
         .map_err(|_| internal_error("engine state lock is poisoned"))
+}
+
+fn project_database_visibility(
+    mut state: DatabaseState,
+    snapshot: &TransactionSnapshot,
+    current_transaction: TransactionId,
+    statuses: &impl TransactionStatusProvider,
+) -> Result<DatabaseState> {
+    let table_ids = state
+        .catalog
+        .database()
+        .schemas()
+        .flat_map(|schema| schema.tables())
+        .map(|table| table.id)
+        .collect::<Vec<_>>();
+    state.rows.clear();
+    state.visible_versions.clear();
+    state.indexes.clear();
+    state.searches = Arc::new(SearchCatalog::default());
+    for table_id in &table_ids {
+        let versions = state
+            .versions
+            .get(table_id)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(Vec::new()));
+        let mut rows = Vec::new();
+        let mut visible_versions = Vec::new();
+        for version in versions.iter() {
+            if tuple_visible(version.header, snapshot, current_transaction, statuses)? {
+                rows.push(version.row.clone());
+                visible_versions.push(version.version_id);
+            }
+        }
+        state.rows.insert(*table_id, Arc::new(rows));
+        state
+            .visible_versions
+            .insert(*table_id, Arc::new(visible_versions));
+    }
+    validate_database_rows(&state)?;
+    for table_id in table_ids {
+        rebuild_table_derived(&mut state, table_id)?;
+    }
+    Ok(state)
+}
+
+fn parsed_is_transaction_control(statement: &ParsedStatement) -> bool {
+    matches!(
+        statement,
+        ParsedStatement::Begin { .. }
+            | ParsedStatement::Commit { .. }
+            | ParsedStatement::Rollback { .. }
+            | ParsedStatement::Savepoint { .. }
+            | ParsedStatement::RollbackTo { .. }
+            | ParsedStatement::ReleaseSavepoint { .. }
+    )
 }
 
 /// Bridges the execution scan contract to authoritative v2 heap pages.
@@ -1634,19 +2654,19 @@ impl TableProvider for StorageTableProviderV2<'_> {
         let resident_rows = u64::try_from(rows.len()).map_err(|_| {
             DbError::new("54000", "resident table row count exceeds storage limits")
         })?;
-        if resident_rows != cursor.expected_rows() {
+        if resident_rows != cursor.expected_visible_rows() {
             return Err(DbError::new(
                 "XX001",
-                "resident table row count does not match v2 heap metadata",
+                "resident visible row count does not match v2 heap metadata",
             )
             .with_detail(format!(
-                "table {} has {resident_rows} resident rows but the v2 manifest declares {}",
+                "table {} has {resident_rows} visible rows but the v2 heap declares {}",
                 table_id.get(),
-                cursor.expected_rows()
+                cursor.expected_visible_rows()
             )));
         }
         Ok(Box::new(StorageTableScanV2 {
-            cursor,
+            _cursor: cursor,
             rows,
             offset: 0,
             lease: Some(lease),
@@ -1655,7 +2675,7 @@ impl TableProvider for StorageTableProviderV2<'_> {
 }
 
 struct StorageTableScanV2 {
-    cursor: StorageTableCursorV2,
+    _cursor: StorageTableCursorV2,
     rows: Arc<Vec<Row>>,
     offset: usize,
     lease: Option<StorageReadLease>,
@@ -1674,8 +2694,7 @@ impl TableScan for StorageTableScanV2 {
                 "table scan chunk size must be positive",
             ));
         }
-        let expected_rows = usize::try_from(self.cursor.expected_rows())
-            .map_err(|_| DbError::new("54000", "v2 table row count exceeds execution limits"))?;
+        let expected_rows = self.rows.len();
         if self.offset >= expected_rows {
             self.lease = None;
             return Ok(None);
@@ -1769,16 +2788,248 @@ fn prepare_read_stream(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct VersionMutationContext {
+    transaction_id: TransactionId,
+    command_id: u32,
+}
+
+#[derive(Clone, Copy)]
+struct MaintenanceContext<'a> {
+    horizon: TransactionId,
+    expired_snapshot: Option<TransactionId>,
+    statuses: &'a TransactionStatusStore,
+}
+
+fn maintenance_context<'a>(
+    transactions: &TransactionManager,
+    statuses: &'a TransactionStatusStore,
+) -> Result<MaintenanceContext<'a>> {
+    Ok(MaintenanceContext {
+        horizon: transactions.global_xmin()?,
+        expired_snapshot: transactions.expired_snapshot()?,
+        statuses,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatementWriteScope {
+    ReadOnly,
+    Dml,
+    Exclusive,
+}
+
+fn statement_write_scope(statement: &BoundStatement) -> StatementWriteScope {
+    match statement {
+        BoundStatement::Insert { .. }
+        | BoundStatement::Update { .. }
+        | BoundStatement::Delete { .. } => StatementWriteScope::Dml,
+        BoundStatement::Select { .. }
+        | BoundStatement::AdvancedSelect { .. }
+        | BoundStatement::ViewSelect { .. }
+        | BoundStatement::RoutineSelect { .. }
+        | BoundStatement::Explain { .. }
+        | BoundStatement::NoOp { .. } => StatementWriteScope::ReadOnly,
+        _ => StatementWriteScope::Exclusive,
+    }
+}
+
+fn statement_read_predicates(statement: &BoundStatement) -> Vec<PredicateLock> {
+    let mut table_ids = BTreeSet::new();
+    let mut pending = vec![statement];
+    while let Some(statement) = pending.pop() {
+        match statement {
+            BoundStatement::Select { table_id, .. } => {
+                table_ids.insert(*table_id);
+            }
+            BoundStatement::AdvancedSelect { table, joins, .. } => {
+                table_ids.insert(table.table_id);
+                table_ids.extend(joins.iter().map(|join| join.table.table_id));
+            }
+            BoundStatement::ViewSelect { source, .. }
+            | BoundStatement::Explain { statement: source } => {
+                pending.push(source);
+            }
+            _ => {}
+        }
+    }
+    table_ids
+        .into_iter()
+        .map(|table_id| PredicateLock::Table {
+            table_id: table_id.get(),
+        })
+        .collect()
+}
+
+fn changed_table_ids(before: &DatabaseState, after: &DatabaseState) -> BTreeSet<TableId> {
+    before
+        .versions
+        .keys()
+        .chain(after.versions.keys())
+        .copied()
+        .filter(|table_id| {
+            before.versions.get(table_id) != after.versions.get(table_id)
+                || before.visible_versions.get(table_id) != after.visible_versions.get(table_id)
+        })
+        .collect()
+}
+
+fn acquire_compatibility_write_lock(
+    locks: &Arc<LockManager>,
+    transaction: &DurableTransaction,
+    cancelled: Option<&AtomicBool>,
+) -> Result<LockGuard> {
+    locks.acquire(
+        transaction.transaction_id(),
+        LockKey::Database,
+        LockMode::Exclusive,
+        None,
+        cancelled,
+    )
+}
+
+fn acquire_dml_locks(
+    locks: &Arc<LockManager>,
+    transaction: &DurableTransaction,
+    before: &DatabaseState,
+    after: &DatabaseState,
+    existing: &[LockGuard],
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<LockGuard>> {
+    let mut keys = BTreeSet::from([LockKey::Database]);
+    let transaction_id = transaction.transaction_id();
+    let table_ids = before
+        .versions
+        .keys()
+        .chain(after.versions.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for table_id in table_ids {
+        let before_versions = before
+            .versions
+            .get(&table_id)
+            .map_or(&[][..], |versions| versions.as_slice());
+        let after_versions = after
+            .versions
+            .get(&table_id)
+            .map_or(&[][..], |versions| versions.as_slice());
+        let changed = before_versions != after_versions
+            || before.visible_versions.get(&table_id) != after.visible_versions.get(&table_id);
+        if !changed {
+            continue;
+        }
+        keys.insert(LockKey::Table {
+            table_id: table_id.get(),
+        });
+        for (before_version, after_version) in before_versions.iter().zip(after_versions) {
+            if before_version.header.xmax == 0 && after_version.header.xmax == transaction_id.get()
+            {
+                keys.insert(LockKey::Row {
+                    table_id: table_id.get(),
+                    version_id: u64::from(before_version.version_id),
+                });
+            }
+        }
+        let before_visible = before
+            .visible_versions
+            .get(&table_id)
+            .map_or(&[][..], |versions| versions.as_slice())
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let Some(table) = after.catalog.table_by_id(table_id) else {
+            continue;
+        };
+        let after_rows = after
+            .rows
+            .get(&table_id)
+            .map_or(&[][..], |rows| rows.as_slice());
+        let after_visible = after
+            .visible_versions
+            .get(&table_id)
+            .map_or(&[][..], |versions| versions.as_slice());
+        for (row, version_id) in after_rows.iter().zip(after_visible) {
+            if before_visible.contains(version_id) {
+                continue;
+            }
+            for index in table.indexes().filter(|index| index.unique) {
+                let key_values = index
+                    .key_columns
+                    .iter()
+                    .map(|column_id| {
+                        table
+                            .column_index_by_id(*column_id)
+                            .and_then(|position| row.values.get(position))
+                            .cloned()
+                            .ok_or_else(|| {
+                                internal_error("unique-index lock column is outside its row")
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if key_values.iter().any(Value::is_null) {
+                    continue;
+                }
+                let encoded = serde_json::to_vec(&key_values)
+                    .map_err(|error| internal_error(error.to_string()))?;
+                let fingerprint: [u8; 32] = Sha256::digest(encoded).into();
+                keys.insert(LockKey::IndexKey {
+                    index_id: index.id.get(),
+                    fingerprint,
+                });
+            }
+        }
+    }
+    let existing = existing
+        .iter()
+        .map(|guard| guard.key().clone())
+        .collect::<BTreeSet<_>>();
+    let mut acquired = Vec::new();
+    for key in keys {
+        if existing.contains(&key) {
+            continue;
+        }
+        let mode = if key == LockKey::Database || matches!(key, LockKey::Table { .. }) {
+            LockMode::Shared
+        } else {
+            LockMode::Exclusive
+        };
+        acquired.push(locks.acquire(transaction_id, key, mode, None, cancelled)?);
+    }
+    Ok(acquired)
+}
+
+fn version_mutation_context(transaction: &DurableTransaction) -> Result<VersionMutationContext> {
+    Ok(VersionMutationContext {
+        transaction_id: transaction.transaction_id(),
+        command_id: transaction
+            .snapshot()
+            .ok_or_else(|| DbError::new("25P01", "transaction is no longer active"))?
+            .command_id,
+    })
+}
+
 fn execute_bound_candidate(
     state: &DatabaseState,
     statement: BoundStatement,
     params: &[Value],
+    version_context: Option<VersionMutationContext>,
+    maintenance: MaintenanceContext<'_>,
 ) -> Result<(DatabaseState, Vec<QueryEvent>, bool)> {
     let mut candidate = state.clone();
     candidate.trigger_depth = 0;
     candidate.triggers_fired = 0;
     candidate.routine_depth = 0;
-    let (events, dirty) = execute_bound(&mut candidate, statement, params)?;
+    let reconciles_versions = !matches!(
+        &statement,
+        BoundStatement::Analyze { .. } | BoundStatement::Vacuum { .. }
+    );
+    let (events, dirty) = execute_root_bound(&mut candidate, statement, params, maintenance)?;
+    if dirty
+        && reconciles_versions
+        && let Some(version_context) = version_context
+    {
+        reconcile_version_changes(state, &mut candidate, version_context)?;
+    }
     candidate.cancellation = None;
     Ok((candidate, events, dirty))
 }
@@ -1788,6 +3039,8 @@ fn execute_candidate(
     sql: &str,
     params: &[Value],
     dialect: SqlDialect,
+    version_context: Option<VersionMutationContext>,
+    maintenance: MaintenanceContext<'_>,
 ) -> Result<(DatabaseState, Vec<QueryEvent>, bool)> {
     let parsed = parse_with_dialect(sql, dialect)?;
     let statement = bind(parsed, &state.catalog)?;
@@ -1795,9 +3048,424 @@ fn execute_candidate(
     candidate.trigger_depth = 0;
     candidate.triggers_fired = 0;
     candidate.routine_depth = 0;
-    let (events, dirty) = execute_bound(&mut candidate, statement, params)?;
+    let reconciles_versions = !matches!(
+        &statement,
+        BoundStatement::Analyze { .. } | BoundStatement::Vacuum { .. }
+    );
+    let (events, dirty) = execute_root_bound(&mut candidate, statement, params, maintenance)?;
+    if dirty
+        && reconciles_versions
+        && let Some(version_context) = version_context
+    {
+        reconcile_version_changes(state, &mut candidate, version_context)?;
+    }
     candidate.cancellation = None;
     Ok((candidate, events, dirty))
+}
+
+fn reconcile_version_changes(
+    before: &DatabaseState,
+    after: &mut DatabaseState,
+    context: VersionMutationContext,
+) -> Result<()> {
+    let table_ids = before
+        .rows
+        .keys()
+        .chain(after.rows.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for table_id in table_ids {
+        let Some(after_rows) = after.rows.get(&table_id).map(|rows| (**rows).clone()) else {
+            after.versions.remove(&table_id);
+            after.visible_versions.remove(&table_id);
+            continue;
+        };
+        let before_rows = before
+            .rows
+            .get(&table_id)
+            .map(|rows| (**rows).clone())
+            .unwrap_or_default();
+        let before_ids = before
+            .visible_versions
+            .get(&table_id)
+            .map(|versions| (**versions).clone())
+            .unwrap_or_default();
+        if before_rows.len() != before_ids.len() {
+            return Err(internal_error(format!(
+                "table {} visible row/version state is not aligned",
+                table_id.get()
+            )));
+        }
+        let mut versions = before
+            .versions
+            .get(&table_id)
+            .map(|versions| (**versions).clone())
+            .unwrap_or_default();
+        let visible_ids = reconcile_table_version_changes(
+            &before_rows,
+            &before_ids,
+            &after_rows,
+            &mut versions,
+            context,
+        )?;
+        after.versions.insert(table_id, Arc::new(versions));
+        after
+            .visible_versions
+            .insert(table_id, Arc::new(visible_ids));
+    }
+    Ok(())
+}
+
+fn reconcile_table_version_changes(
+    before_rows: &[Row],
+    before_ids: &[u32],
+    after_rows: &[Row],
+    versions: &mut Vec<VersionedRow>,
+    context: VersionMutationContext,
+) -> Result<Vec<u32>> {
+    if before_rows.len() == after_rows.len() {
+        return before_rows
+            .iter()
+            .zip(before_ids)
+            .zip(after_rows)
+            .map(|((before, version_id), after)| {
+                if before == after {
+                    Ok(*version_id)
+                } else {
+                    update_version(versions, *version_id, after, context)
+                }
+            })
+            .collect();
+    }
+    if is_subsequence(before_rows, after_rows) {
+        let mut before_index = 0_usize;
+        let mut visible = Vec::with_capacity(after_rows.len());
+        for row in after_rows {
+            if before_index < before_rows.len() && row == &before_rows[before_index] {
+                visible.push(before_ids[before_index]);
+                before_index += 1;
+            } else {
+                visible.push(append_version(versions, row, 0, context)?);
+            }
+        }
+        return Ok(visible);
+    }
+    if is_subsequence(after_rows, before_rows) {
+        let mut before_index = 0_usize;
+        let mut visible = Vec::with_capacity(after_rows.len());
+        for row in after_rows {
+            while before_index < before_rows.len() && &before_rows[before_index] != row {
+                delete_version(versions, before_ids[before_index], context)?;
+                before_index += 1;
+            }
+            if before_index == before_rows.len() {
+                return Err(internal_error(
+                    "row subsequence changed while deriving version deletes",
+                ));
+            }
+            visible.push(before_ids[before_index]);
+            before_index += 1;
+        }
+        for version_id in &before_ids[before_index..] {
+            delete_version(versions, *version_id, context)?;
+        }
+        return Ok(visible);
+    }
+
+    let shared = before_rows.len().min(after_rows.len());
+    let mut visible = Vec::with_capacity(after_rows.len());
+    for index in 0..shared {
+        if before_rows[index] == after_rows[index] {
+            visible.push(before_ids[index]);
+        } else {
+            visible.push(update_version(
+                versions,
+                before_ids[index],
+                &after_rows[index],
+                context,
+            )?);
+        }
+    }
+    for version_id in &before_ids[shared..] {
+        delete_version(versions, *version_id, context)?;
+    }
+    for row in &after_rows[shared..] {
+        visible.push(append_version(versions, row, 0, context)?);
+    }
+    Ok(visible)
+}
+
+fn is_subsequence(needle: &[Row], haystack: &[Row]) -> bool {
+    let mut index = 0_usize;
+    for row in haystack {
+        if index < needle.len() && row == &needle[index] {
+            index += 1;
+        }
+    }
+    index == needle.len()
+}
+
+fn update_version(
+    versions: &mut Vec<VersionedRow>,
+    previous_version: u32,
+    row: &Row,
+    context: VersionMutationContext,
+) -> Result<u32> {
+    delete_version(versions, previous_version, context)?;
+    append_version(versions, row, previous_version, context)
+}
+
+fn delete_version(
+    versions: &mut [VersionedRow],
+    version_id: u32,
+    context: VersionMutationContext,
+) -> Result<()> {
+    let version = version_id
+        .checked_sub(1)
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| versions.get_mut(index))
+        .ok_or_else(|| internal_error("visible version ID is outside its table version state"))?;
+    if version.header.xmax != 0 {
+        return Err(DbError::new(
+            "40001",
+            "tuple version changed since the transaction snapshot",
+        )
+        .with_hint("retry the transaction with a fresh snapshot"));
+    }
+    version.header.xmax = context.transaction_id.get();
+    version.header.command_id = context.command_id;
+    Ok(())
+}
+
+fn append_version(
+    versions: &mut Vec<VersionedRow>,
+    row: &Row,
+    previous_version: u32,
+    context: VersionMutationContext,
+) -> Result<u32> {
+    let version_id = u32::try_from(versions.len())
+        .ok()
+        .and_then(|version_id| version_id.checked_add(1))
+        .ok_or_else(|| DbError::new("54000", "table version ordinal space is exhausted"))?;
+    if previous_version >= version_id {
+        return Err(internal_error(
+            "new tuple predecessor is not earlier than its version ordinal",
+        ));
+    }
+    let mut header = TupleHeaderV2::frozen(row)?;
+    header.xmin = context.transaction_id.get();
+    header.command_id = context.command_id;
+    header.previous_version = previous_version;
+    versions.push(VersionedRow {
+        version_id,
+        header,
+        row: row.clone(),
+    });
+    Ok(version_id)
+}
+
+fn merge_dml_candidate(
+    latest: &DatabaseState,
+    base: &DatabaseState,
+    candidate: &DatabaseState,
+    transaction: &DurableTransaction,
+    statuses: &TransactionStatusStore,
+) -> Result<DatabaseState> {
+    let transaction_id = transaction.transaction_id();
+    let mut merged = latest.clone();
+    let table_ids = base
+        .versions
+        .keys()
+        .chain(candidate.versions.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for table_id in table_ids {
+        let base_versions = base
+            .versions
+            .get(&table_id)
+            .map_or(&[][..], |versions| versions.as_slice());
+        let candidate_versions = candidate
+            .versions
+            .get(&table_id)
+            .map_or(&[][..], |versions| versions.as_slice());
+        if base_versions == candidate_versions
+            && base.visible_versions.get(&table_id) == candidate.visible_versions.get(&table_id)
+        {
+            continue;
+        }
+        if candidate_versions.len() < base_versions.len() {
+            return Err(internal_error(
+                "DML candidate removed authoritative tuple versions",
+            ));
+        }
+        let mut latest_versions = merged
+            .versions
+            .get(&table_id)
+            .map(|versions| (**versions).clone())
+            .ok_or_else(|| {
+                DbError::new(
+                    "40001",
+                    format!("table {} changed during the transaction", table_id.get()),
+                )
+            })?;
+        if latest_versions.len() < base_versions.len() {
+            return Err(internal_error(
+                "latest tuple-version state is shorter than the transaction base",
+            ));
+        }
+        for (index, (base_version, candidate_version)) in
+            base_versions.iter().zip(candidate_versions).enumerate()
+        {
+            if base_version == candidate_version {
+                continue;
+            }
+            if base_version.row != candidate_version.row
+                || base_version.version_id != candidate_version.version_id
+                || base_version.header.xmax != 0
+                || candidate_version.header.xmax != transaction_id.get()
+            {
+                return Err(internal_error(
+                    "DML candidate changed an existing tuple outside its deletion header",
+                ));
+            }
+            let latest_version = latest_versions
+                .get_mut(index)
+                .ok_or_else(|| internal_error("latest tuple version disappeared during merge"))?;
+            if latest_version != base_version {
+                return Err(DbError::new(
+                    "40001",
+                    "tuple version changed since the transaction snapshot",
+                )
+                .with_hint("retry the transaction with a fresh snapshot"));
+            }
+            latest_version.header = candidate_version.header;
+        }
+        let mut remapped = BTreeMap::<u32, u32>::new();
+        for candidate_version in &candidate_versions[base_versions.len()..] {
+            if candidate_version.header.xmin != transaction_id.get() {
+                return Err(internal_error(
+                    "DML candidate appended a version owned by another transaction",
+                ));
+            }
+            let version_id = u32::try_from(latest_versions.len())
+                .ok()
+                .and_then(|version_id| version_id.checked_add(1))
+                .ok_or_else(|| DbError::new("54000", "table version ordinal space is exhausted"))?;
+            let mut appended = candidate_version.clone();
+            let previous = appended.header.previous_version;
+            if previous > u32::try_from(base_versions.len()).unwrap_or(u32::MAX) {
+                appended.header.previous_version = *remapped
+                    .get(&previous)
+                    .ok_or_else(|| internal_error("DML candidate predecessor was not remapped"))?;
+            }
+            appended.version_id = version_id;
+            remapped.insert(candidate_version.version_id, version_id);
+            latest_versions.push(appended);
+        }
+        merged.versions.insert(table_id, Arc::new(latest_versions));
+    }
+    project_current_database_visibility(merged, transaction_id, statuses)
+}
+
+fn refresh_read_committed_candidate(
+    state: &Arc<RwLock<DatabaseState>>,
+    statuses: &TransactionStatusStore,
+    transaction: &DurableTransaction,
+    base: &mut Option<DatabaseState>,
+    working: &mut Option<DatabaseState>,
+    dml_only: bool,
+) -> Result<()> {
+    if !dml_only
+        || transaction.characteristics().is_none_or(|characteristics| {
+            characteristics.isolation_level != IsolationLevel::ReadCommitted
+        })
+        || working.is_none()
+    {
+        return Ok(());
+    }
+    let previous_base = base
+        .as_ref()
+        .ok_or_else(|| internal_error("DML transaction is missing its base snapshot"))?;
+    let previous_working = working
+        .as_ref()
+        .ok_or_else(|| internal_error("DML transaction is missing its working state"))?;
+    let transaction_snapshot = transaction
+        .snapshot()
+        .ok_or_else(|| no_active_transaction_error("refresh a statement snapshot"))?;
+    let refreshed_base = project_database_visibility(
+        committed_snapshot(state)?,
+        transaction_snapshot,
+        transaction.transaction_id(),
+        statuses,
+    )?;
+    let refreshed_working = merge_dml_candidate(
+        &refreshed_base,
+        previous_base,
+        previous_working,
+        transaction,
+        statuses,
+    )?;
+    *base = Some(refreshed_base);
+    *working = Some(refreshed_working);
+    Ok(())
+}
+
+struct DmlUpgradeAuthorities<'a> {
+    state: &'a Arc<RwLock<DatabaseState>>,
+    statuses: &'a TransactionStatusStore,
+    locks: &'a Arc<LockManager>,
+    writer: &'a Arc<WriterCoordinator>,
+}
+
+fn upgrade_dml_candidate_to_exclusive(
+    authorities: DmlUpgradeAuthorities<'_>,
+    transaction: &DurableTransaction,
+    base: &DatabaseState,
+    working: &DatabaseState,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> Result<(DatabaseState, DatabaseState, WriterLease, LockGuard)> {
+    let lease = authorities
+        .writer
+        .try_acquire(transaction.transaction_id())?;
+    let lock =
+        acquire_compatibility_write_lock(authorities.locks, transaction, cancellation.as_deref())?;
+    let mut latest = committed_snapshot(authorities.state)?;
+    latest.cancellation = cancellation;
+    let characteristics = transaction
+        .characteristics()
+        .ok_or_else(|| no_active_transaction_error("upgrade transaction locks"))?;
+    let upgraded = if characteristics.isolation_level == IsolationLevel::ReadCommitted {
+        merge_dml_candidate(&latest, base, working, transaction, authorities.statuses)?
+    } else {
+        if latest.generation != base.generation {
+            return Err(DbError::new(
+                "40001",
+                "could not serialize DDL after concurrent database changes",
+            )
+            .with_hint("retry the transaction"));
+        }
+        let mut working = working.clone();
+        working.cancellation = latest.cancellation.clone();
+        working
+    };
+    Ok((latest, upgraded, lease, lock))
+}
+
+fn project_current_database_visibility(
+    state: DatabaseState,
+    current_transaction: TransactionId,
+    statuses: &TransactionStatusStore,
+) -> Result<DatabaseState> {
+    let status = statuses.snapshot()?;
+    let xmax = TransactionId::new(status.next_transaction_id)
+        .ok_or_else(|| internal_error("transaction status high-water mark is zero"))?;
+    let snapshot = TransactionSnapshot {
+        xmin: xmax,
+        xmax,
+        in_progress: Arc::new(BTreeSet::new()),
+        command_id: u32::MAX,
+    };
+    project_database_visibility(state, &snapshot, current_transaction, statuses)
 }
 
 fn persist_candidate(
@@ -1805,7 +3473,7 @@ fn persist_candidate(
     store: &Arc<Mutex<DatabaseStore>>,
     storage_access: &Arc<StorageAccessGate>,
     wal: &Arc<WalManager>,
-    transaction_id: TransactionId,
+    transaction: &mut DurableTransaction,
     mut candidate: DatabaseState,
 ) -> Result<()> {
     candidate.generation = state.generation.checked_add(1).ok_or_else(|| {
@@ -1818,7 +3486,9 @@ fn persist_candidate(
         .lock()
         .map_err(|_| internal_error("database store lock is poisoned"))?;
     let mut prepared = store.prepare_commit(&persistent)?;
+    let transaction_id = transaction.transaction_id();
     let logged = wal.log_prepared(transaction_id, &mut prepared)?;
+    transaction.mark_status_committed()?;
     store.apply_prepared_with_observer(&prepared, |point| {
         wal.check_fault(match point {
             ApplyPoint::BeforePageWrite(_) => FaultPoint::BeforeDataPageWrite,
@@ -1831,6 +3501,7 @@ fn persist_candidate(
     })?;
     wal.commit(&logged)?;
     store.publish_prepared(prepared)?;
+    transaction.finish_commit()?;
     *state = candidate;
     Ok(())
 }
@@ -1839,7 +3510,7 @@ fn checkpoint_shared(
     state: &Arc<RwLock<DatabaseState>>,
     store: &Arc<Mutex<DatabaseStore>>,
     wal: &Arc<WalManager>,
-    writer: &Arc<WriterCoordinator>,
+    transactions: &Arc<TransactionManager>,
 ) -> Result<()> {
     let durable_data_generation = state
         .read()
@@ -1850,14 +3521,15 @@ fn checkpoint_shared(
         .map_err(|_| internal_error("database store lock is poisoned"))?
         .page_count()?;
     let mut active_transactions = BTreeMap::new();
-    if let Some(transaction_id) = writer.active_transaction()?
-        && let Some(last_lsn) = wal.last_lsn(transaction_id)?
-    {
-        active_transactions.insert(transaction_id, last_lsn);
+    for transaction_id in transactions.active_transactions()? {
+        if let Some(last_lsn) = wal.last_lsn(transaction_id)? {
+            active_transactions.insert(transaction_id, last_lsn);
+        }
     }
     wal.checkpoint(CheckpointState {
         active_transactions,
         dirty_pages: wal.dirty_pages()?,
+        visibility_horizon: Some(transactions.global_xmin()?),
         durable_data_generation,
         durable_wal_lsn: wal.durable_lsn()?,
         data_file_page_count,
@@ -1869,7 +3541,7 @@ fn record_commit_and_maybe_checkpoint(
     state: &Arc<RwLock<DatabaseState>>,
     store: &Arc<Mutex<DatabaseStore>>,
     wal: &Arc<WalManager>,
-    writer: &Arc<WriterCoordinator>,
+    transactions: &Arc<TransactionManager>,
     commits_since_checkpoint: &AtomicU64,
 ) -> Result<()> {
     let count = commits_since_checkpoint
@@ -1879,7 +3551,7 @@ fn record_commit_and_maybe_checkpoint(
     if count < AUTOMATIC_CHECKPOINT_INTERVAL {
         return Ok(());
     }
-    checkpoint_shared(state, store, wal, writer)?;
+    checkpoint_shared(state, store, wal, transactions)?;
     commits_since_checkpoint.store(0, Ordering::Release);
     Ok(())
 }
@@ -1901,6 +3573,216 @@ fn failed_transaction_error() -> DbError {
         "the current transaction is aborted; commands are ignored until ROLLBACK",
     )
     .with_hint("issue ROLLBACK before starting new work")
+}
+
+fn execute_root_bound(
+    state: &mut DatabaseState,
+    statement: BoundStatement,
+    params: &[Value],
+    maintenance: MaintenanceContext<'_>,
+) -> Result<(Vec<QueryEvent>, bool)> {
+    match statement {
+        BoundStatement::Analyze { table_id } => execute_analyze(state, table_id),
+        BoundStatement::Vacuum { table_id, analyze } => {
+            execute_vacuum(state, table_id, analyze, maintenance)
+        }
+        statement => execute_bound(state, statement, params),
+    }
+}
+
+fn execute_analyze(
+    state: &mut DatabaseState,
+    table_id: Option<TableId>,
+) -> Result<(Vec<QueryEvent>, bool)> {
+    let table_ids = maintenance_table_ids(state, table_id)?;
+    for table_id in &table_ids {
+        rebuild_table_derived(state, *table_id)?;
+    }
+    Ok((
+        command_events(
+            Schema::empty(),
+            "ANALYZE",
+            u64::try_from(table_ids.len()).unwrap_or(u64::MAX),
+            None,
+        ),
+        true,
+    ))
+}
+
+fn execute_vacuum(
+    state: &mut DatabaseState,
+    table_id: Option<TableId>,
+    _analyze: bool,
+    maintenance: MaintenanceContext<'_>,
+) -> Result<(Vec<QueryEvent>, bool)> {
+    if let Some(transaction_id) = maintenance.expired_snapshot {
+        return Err(DbError::new(
+            "55000",
+            format!(
+                "VACUUM cannot proceed while transaction {transaction_id} holds an expired snapshot"
+            ),
+        )
+        .with_hint("commit or roll back the long-running transaction before retrying VACUUM"));
+    }
+    let table_ids = maintenance_table_ids(state, table_id)?;
+    let mut reclaimed = 0_u64;
+    for table_id in &table_ids {
+        reclaimed = reclaimed
+            .checked_add(vacuum_table_versions(state, *table_id, maintenance)?)
+            .ok_or_else(|| DbError::new("54000", "VACUUM reclaimed-row count overflow"))?;
+        rebuild_table_derived(state, *table_id)?;
+    }
+    Ok((
+        command_events(Schema::empty(), "VACUUM", reclaimed, None),
+        true,
+    ))
+}
+
+fn maintenance_table_ids(state: &DatabaseState, table_id: Option<TableId>) -> Result<Vec<TableId>> {
+    if let Some(table_id) = table_id {
+        table_definition(state, table_id)?;
+        return Ok(vec![table_id]);
+    }
+    Ok(state
+        .catalog
+        .database()
+        .schemas()
+        .flat_map(|schema| schema.tables())
+        .map(|table| table.id)
+        .collect())
+}
+
+fn vacuum_table_versions(
+    state: &mut DatabaseState,
+    table_id: TableId,
+    maintenance: MaintenanceContext<'_>,
+) -> Result<u64> {
+    let original = state
+        .versions
+        .get(&table_id)
+        .map(|versions| (**versions).clone())
+        .unwrap_or_default();
+    let mut retained = Vec::with_capacity(original.len());
+    let mut id_map = BTreeMap::new();
+    for version in &original {
+        if version_reclaimable(version, maintenance)? {
+            continue;
+        }
+        let new_id = u32::try_from(retained.len())
+            .ok()
+            .and_then(|id| id.checked_add(1))
+            .ok_or_else(|| DbError::new("54000", "table version ordinal space is exhausted"))?;
+        let mut retained_version = version.clone();
+        freeze_retained_version(&mut retained_version, maintenance)?;
+        id_map.insert(version.version_id, new_id);
+        retained.push((version.version_id, retained_version));
+    }
+    for (old_id, version) in &mut retained {
+        let mut predecessor = version.header.previous_version;
+        let mut traversed = 0_usize;
+        while predecessor != 0 && !id_map.contains_key(&predecessor) {
+            traversed = traversed
+                .checked_add(1)
+                .ok_or_else(|| DbError::new("54001", "tuple predecessor depth overflow"))?;
+            if traversed > original.len() {
+                return Err(DbError::new(
+                    "XX001",
+                    "tuple predecessor chain is cyclic during VACUUM",
+                ));
+            }
+            predecessor = original
+                .get(usize::try_from(predecessor.saturating_sub(1)).unwrap_or(usize::MAX))
+                .ok_or_else(|| {
+                    DbError::new(
+                        "XX001",
+                        "tuple predecessor points outside the version sequence",
+                    )
+                })?
+                .header
+                .previous_version;
+        }
+        version.version_id = *id_map
+            .get(old_id)
+            .ok_or_else(|| internal_error("retained tuple version was not remapped"))?;
+        version.header.previous_version = if predecessor == 0 {
+            0
+        } else {
+            *id_map
+                .get(&predecessor)
+                .ok_or_else(|| internal_error("retained tuple predecessor was not remapped"))?
+        };
+    }
+    let visible = state
+        .visible_versions
+        .get(&table_id)
+        .map_or(&[][..], |versions| versions.as_slice())
+        .iter()
+        .map(|old_id| {
+            id_map.get(old_id).copied().ok_or_else(|| {
+                internal_error("VACUUM attempted to reclaim a currently visible tuple")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let reclaimed = original.len().saturating_sub(retained.len());
+    state.versions.insert(
+        table_id,
+        Arc::new(retained.into_iter().map(|(_, version)| version).collect()),
+    );
+    state.visible_versions.insert(table_id, Arc::new(visible));
+    u64::try_from(reclaimed).map_err(|_| DbError::new("54000", "VACUUM count overflow"))
+}
+
+fn version_reclaimable(
+    version: &VersionedRow,
+    maintenance: MaintenanceContext<'_>,
+) -> Result<bool> {
+    let creator = TransactionId::new(version.header.xmin)
+        .ok_or_else(|| DbError::new("XX001", "tuple creator transaction ID is zero"))?;
+    let creator_outcome = if version.header.xmin == FROZEN_TRANSACTION_ID {
+        TransactionOutcome::Committed
+    } else {
+        maintenance.statuses.transaction_outcome(creator)?
+    };
+    if creator < maintenance.horizon && creator_outcome == TransactionOutcome::Aborted {
+        return Ok(true);
+    }
+    if creator_outcome != TransactionOutcome::Committed || version.header.xmax == 0 {
+        return Ok(false);
+    }
+    let deleter = TransactionId::new(version.header.xmax)
+        .ok_or_else(|| DbError::new("XX001", "tuple deleter transaction ID is zero"))?;
+    Ok(deleter < maintenance.horizon
+        && maintenance.statuses.transaction_outcome(deleter)? == TransactionOutcome::Committed)
+}
+
+fn freeze_retained_version(
+    version: &mut VersionedRow,
+    maintenance: MaintenanceContext<'_>,
+) -> Result<()> {
+    if version.header.xmin != FROZEN_TRANSACTION_ID {
+        let creator = TransactionId::new(version.header.xmin)
+            .ok_or_else(|| DbError::new("XX001", "tuple creator transaction ID is zero"))?;
+        if creator < maintenance.horizon
+            && maintenance.statuses.transaction_outcome(creator)? == TransactionOutcome::Committed
+        {
+            version.header.xmin = FROZEN_TRANSACTION_ID;
+        }
+    }
+    let Some(deleter) = TransactionId::new(version.header.xmax) else {
+        return Ok(());
+    };
+    if deleter < maintenance.horizon {
+        match maintenance.statuses.transaction_outcome(deleter)? {
+            TransactionOutcome::Aborted => version.header.xmax = 0,
+            TransactionOutcome::Committed => {
+                return Err(internal_error(
+                    "VACUUM retained a tuple deleted before the safe horizon",
+                ));
+            }
+            TransactionOutcome::InProgress => {}
+        }
+    }
+    Ok(())
 }
 
 fn execute_bound(
@@ -2353,13 +4235,19 @@ fn execute_bound(
         BoundStatement::Delete { table_id, filter } => {
             execute_delete(state, table_id, filter, params)
         }
-        BoundStatement::Begin | BoundStatement::Commit | BoundStatement::Rollback => {
-            Err(DbError::new(
-                "25000",
-                "transaction control was not routed through the session",
-            )
-            .with_hint("execute transaction control through Session"))
-        }
+        BoundStatement::Analyze { .. } | BoundStatement::Vacuum { .. } => Err(internal_error(
+            "maintenance statement was not routed through the root executor",
+        )),
+        BoundStatement::Begin { .. }
+        | BoundStatement::Commit { .. }
+        | BoundStatement::Rollback { .. }
+        | BoundStatement::Savepoint { .. }
+        | BoundStatement::RollbackTo { .. }
+        | BoundStatement::ReleaseSavepoint { .. } => Err(DbError::new(
+            "25000",
+            "transaction control was not routed through the session",
+        )
+        .with_hint("execute transaction control through Session")),
     }
 }
 
@@ -3084,7 +4972,12 @@ impl PlpgsqlHost for EnginePlpgsqlHost<'_> {
         let statement = bind(parse(&sql)?, &self.state.catalog)?;
         if matches!(
             statement,
-            BoundStatement::Begin | BoundStatement::Commit | BoundStatement::Rollback
+            BoundStatement::Begin { .. }
+                | BoundStatement::Commit { .. }
+                | BoundStatement::Rollback { .. }
+                | BoundStatement::Savepoint { .. }
+                | BoundStatement::RollbackTo { .. }
+                | BoundStatement::ReleaseSavepoint { .. }
         ) {
             return Err(DbError::new(
                 "0A000",
@@ -4486,6 +6379,149 @@ mod tests {
     }
 
     #[test]
+    fn committed_versions_reopen_with_stable_predecessors_and_visible_storage_scan() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let engine = Engine::open(EngineConfig::new(directory.path())).expect("open");
+            let mut session = engine.connect().expect("connect");
+            create_documents(&mut session);
+            execute(
+                &mut session,
+                "INSERT INTO documents VALUES (1, 'original', 10), (2, 'deleted', 20)",
+                &[],
+            );
+            execute(
+                &mut session,
+                "UPDATE documents SET title = 'updated' WHERE id = 1",
+                &[],
+            );
+            execute(&mut session, "DELETE FROM documents WHERE id = 2", &[]);
+
+            let state = engine.state.read().expect("state");
+            let table_id = state
+                .catalog
+                .table(
+                    &Identifier::unquoted("public"),
+                    &Identifier::unquoted("documents"),
+                )
+                .expect("documents")
+                .id;
+            let versions = state.versions.get(&table_id).expect("versions");
+            let visible = state
+                .visible_versions
+                .get(&table_id)
+                .expect("visible versions");
+            assert_eq!(versions.len(), 3);
+            assert_eq!(visible.as_slice(), &[3]);
+            assert_eq!(versions[0].version_id, 1);
+            assert_eq!(versions[0].header.previous_version, 0);
+            assert_ne!(versions[0].header.xmax, 0);
+            assert_eq!(versions[1].version_id, 2);
+            assert_eq!(versions[1].header.previous_version, 0);
+            assert_ne!(versions[1].header.xmax, 0);
+            assert_eq!(versions[2].version_id, 3);
+            assert_eq!(versions[2].header.previous_version, 1);
+            assert_eq!(versions[2].header.xmin, versions[0].header.xmax);
+            assert_eq!(versions[2].header.xmax, 0);
+            assert_eq!(
+                engine
+                    .transaction_status
+                    .transaction_outcome(
+                        TransactionId::new(versions[2].header.xmin).expect("creator transaction")
+                    )
+                    .expect("creator outcome"),
+                ordadb_transaction::TransactionOutcome::Committed
+            );
+        }
+
+        let engine = Engine::open(EngineConfig::new(directory.path())).expect("reopen");
+        let mut session = engine.connect().expect("connect");
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT id, title FROM documents ORDER BY id",
+                &[],
+            )),
+            vec![Row::new(vec![
+                Value::Int64(1),
+                Value::Text("updated".into())
+            ])]
+        );
+        let state = engine.state.read().expect("state");
+        let table_id = state
+            .catalog
+            .table(
+                &Identifier::unquoted("public"),
+                &Identifier::unquoted("documents"),
+            )
+            .expect("documents")
+            .id;
+        assert_eq!(state.versions.get(&table_id).expect("versions").len(), 3);
+        assert_eq!(
+            state
+                .visible_versions
+                .get(&table_id)
+                .expect("visible versions")
+                .as_slice(),
+            &[3]
+        );
+    }
+
+    #[test]
+    fn aborted_update_keeps_the_original_version_visible_after_reopen() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let engine = Engine::open(EngineConfig::new(directory.path())).expect("open");
+            let mut session = engine.connect().expect("connect");
+            create_documents(&mut session);
+            execute(
+                &mut session,
+                "INSERT INTO documents VALUES (1, 'original', 10)",
+                &[],
+            );
+            let mut transaction = session.begin().expect("begin");
+            transaction
+                .execute("UPDATE documents SET title = 'aborted' WHERE id = 1", &[])
+                .expect("update");
+            transaction.rollback().expect("rollback");
+        }
+
+        let engine = Engine::open(EngineConfig::new(directory.path())).expect("reopen");
+        let mut session = engine.connect().expect("connect");
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT id, title FROM documents",
+                &[],
+            )),
+            vec![Row::new(vec![
+                Value::Int64(1),
+                Value::Text("original".into())
+            ])]
+        );
+        let state = engine.state.read().expect("state");
+        let table_id = state
+            .catalog
+            .table(
+                &Identifier::unquoted("public"),
+                &Identifier::unquoted("documents"),
+            )
+            .expect("documents")
+            .id;
+        let versions = state.versions.get(&table_id).expect("versions");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].header.xmax, 0);
+        assert_eq!(
+            state
+                .visible_versions
+                .get(&table_id)
+                .expect("visible versions")
+                .as_slice(),
+            &[1]
+        );
+    }
+
+    #[test]
     fn compares_jsonb_parameters_by_equality_without_requiring_ordering() {
         let (_directory, engine) = engine();
         let mut session = engine.connect().expect("connect");
@@ -4550,7 +6586,7 @@ mod tests {
     }
 
     #[test]
-    fn commits_rolls_back_and_rejects_competing_writers() {
+    fn commits_rolls_back_and_allows_disjoint_writers() {
         let (_directory, engine) = engine();
         let mut first = engine.connect().expect("first");
         let mut second = engine.connect().expect("second");
@@ -4581,16 +6617,1118 @@ mod tests {
         transaction
             .execute("INSERT INTO documents VALUES (2, 'rolled back', 2)", &[])
             .expect("transaction insert");
-        let error = second
-            .execute("INSERT INTO documents VALUES (3, 'blocked', 3)", &[])
-            .expect_err("competing writer");
-        assert_eq!(error.sql_state, "55P03");
-        transaction.rollback().expect("rollback writer");
         execute(
             &mut second,
-            "INSERT INTO documents VALUES (3, 'after release', 3)",
+            "INSERT INTO documents VALUES (3, 'concurrent', 3)",
             &[],
         );
+        transaction.rollback().expect("rollback writer");
+        assert_eq!(
+            rows(&execute(
+                &mut second,
+                "SELECT id FROM documents ORDER BY id",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(3)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn dml_locks_are_scoped_and_released_on_transaction_rollback() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("session");
+        create_documents(&mut session);
+        let mut transaction = session.begin().expect("begin");
+        transaction
+            .execute("INSERT INTO documents VALUES (1, 'locked', 1)", &[])
+            .expect("insert");
+
+        let (granted, waiting) = engine.locks.snapshot().expect("lock snapshot");
+        assert!(waiting.is_empty());
+        assert!(
+            granted
+                .iter()
+                .any(|lock| { lock.key == LockKey::Database && lock.mode == LockMode::Shared })
+        );
+        assert!(granted.iter().any(|lock| {
+            matches!(lock.key, LockKey::Table { .. }) && lock.mode == LockMode::Shared
+        }));
+        assert!(granted.iter().any(|lock| {
+            matches!(lock.key, LockKey::IndexKey { .. }) && lock.mode == LockMode::Exclusive
+        }));
+
+        transaction.rollback().expect("rollback");
+        let (granted, waiting) = engine.locks.snapshot().expect("released snapshot");
+        assert!(granted.is_empty());
+        assert!(waiting.is_empty());
+    }
+
+    #[test]
+    fn concurrent_disjoint_writers_merge_without_lost_updates() {
+        let (_directory, engine) = engine();
+        let mut first = engine.connect().expect("first");
+        let mut second = engine.connect().expect("second");
+        create_documents(&mut first);
+
+        let mut first_transaction = first.begin().expect("first begin");
+        let mut second_transaction = second.begin().expect("second begin");
+        first_transaction
+            .execute("INSERT INTO documents VALUES (1, 'first', 1)", &[])
+            .expect("first insert");
+        second_transaction
+            .execute("INSERT INTO documents VALUES (2, 'second', 2)", &[])
+            .expect("second insert");
+        first_transaction.commit().expect("first commit");
+        second_transaction.commit().expect("second commit");
+
+        assert_eq!(
+            rows(&execute(
+                &mut first,
+                "SELECT id FROM documents ORDER BY id",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(2)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn row_and_unique_conflicts_timeout_then_report_committed_duplicates() {
+        let (_directory, engine) = engine();
+        engine
+            .set_default_lock_timeout(Duration::from_millis(20))
+            .expect("configure lock timeout");
+        let mut first = engine.connect().expect("first");
+        let mut second = engine.connect().expect("second");
+        create_documents(&mut first);
+        execute(
+            &mut first,
+            "INSERT INTO documents VALUES (1, 'base', 1)",
+            &[],
+        );
+
+        execute(&mut first, "BEGIN", &[]);
+        execute(&mut second, "BEGIN", &[]);
+        execute(
+            &mut first,
+            "UPDATE documents SET title = 'first' WHERE id = 1",
+            &[],
+        );
+        assert_eq!(
+            second
+                .execute("UPDATE documents SET title = 'second' WHERE id = 1", &[],)
+                .expect_err("row lock timeout")
+                .sql_state,
+            "55P03"
+        );
+        execute(&mut second, "ROLLBACK", &[]);
+        execute(&mut first, "COMMIT", &[]);
+
+        execute(&mut first, "BEGIN", &[]);
+        execute(&mut second, "BEGIN", &[]);
+        execute(
+            &mut first,
+            "INSERT INTO documents VALUES (2, 'first unique', 2)",
+            &[],
+        );
+        assert_eq!(
+            second
+                .execute("INSERT INTO documents VALUES (2, 'second unique', 3)", &[],)
+                .expect_err("unique key lock timeout")
+                .sql_state,
+            "55P03"
+        );
+        execute(&mut second, "ROLLBACK", &[]);
+        execute(&mut first, "COMMIT", &[]);
+        assert_eq!(
+            second
+                .execute(
+                    "INSERT INTO documents VALUES (2, 'committed duplicate', 4)",
+                    &[],
+                )
+                .expect_err("committed duplicate")
+                .sql_state,
+            "23505"
+        );
+    }
+
+    #[test]
+    fn engine_deadlock_aborts_the_youngest_transaction_and_releases_waiters() {
+        let (_directory, engine) = engine();
+        engine
+            .set_default_lock_timeout(Duration::from_secs(1))
+            .expect("configure lock timeout");
+        let mut first = engine.connect().expect("first");
+        let mut second = engine.connect().expect("second");
+        create_documents(&mut first);
+        execute(
+            &mut first,
+            "INSERT INTO documents VALUES (1, 'one', 1), (2, 'two', 2)",
+            &[],
+        );
+        execute(&mut first, "BEGIN", &[]);
+        execute(&mut second, "BEGIN", &[]);
+        execute(
+            &mut first,
+            "UPDATE documents SET title = 'first' WHERE id = 1",
+            &[],
+        );
+        execute(
+            &mut second,
+            "UPDATE documents SET title = 'second' WHERE id = 2",
+            &[],
+        );
+
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = first
+                .execute("UPDATE documents SET title = 'first' WHERE id = 2", &[])
+                .map(|_| ());
+            if result.is_ok() {
+                execute(&mut first, "COMMIT", &[]);
+            }
+            send.send(result).expect("send first result");
+        });
+        let mut waiting_observed = false;
+        for _ in 0..100 {
+            if !engine.lock_snapshot().expect("lock snapshot").1.is_empty() {
+                waiting_observed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            waiting_observed,
+            "first transaction did not enter lock wait"
+        );
+        assert_eq!(
+            second
+                .execute("UPDATE documents SET title = 'second' WHERE id = 1", &[],)
+                .expect_err("deadlock victim")
+                .sql_state,
+            "40P01"
+        );
+        execute(&mut second, "ROLLBACK", &[]);
+        receive
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first result")
+            .expect("surviving transaction");
+        worker.join().expect("first transaction join");
+        assert!(
+            engine
+                .lock_snapshot()
+                .expect("released lock snapshot")
+                .0
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn read_committed_refreshes_and_repeatable_read_retains_visibility() {
+        let (_directory, engine) = engine();
+        let mut reader = engine.connect().expect("reader");
+        let mut writer = engine.connect().expect("writer");
+        create_documents(&mut reader);
+        execute(
+            &mut writer,
+            "INSERT INTO documents VALUES (1, 'v1', 1)",
+            &[],
+        );
+
+        execute(&mut reader, "BEGIN ISOLATION LEVEL REPEATABLE READ", &[]);
+        assert_eq!(
+            rows(&execute(
+                &mut reader,
+                "SELECT title FROM documents WHERE id = 1",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Text("v1".to_owned())])]
+        );
+        execute(
+            &mut writer,
+            "UPDATE documents SET title = 'v2' WHERE id = 1",
+            &[],
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut reader,
+                "SELECT title FROM documents WHERE id = 1",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Text("v1".to_owned())])]
+        );
+        execute(&mut reader, "COMMIT", &[]);
+
+        execute(&mut reader, "BEGIN ISOLATION LEVEL READ COMMITTED", &[]);
+        assert_eq!(
+            rows(&execute(
+                &mut reader,
+                "SELECT title FROM documents WHERE id = 1",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Text("v2".to_owned())])]
+        );
+        execute(
+            &mut writer,
+            "UPDATE documents SET title = 'v3' WHERE id = 1",
+            &[],
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut reader,
+                "SELECT title FROM documents WHERE id = 1",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Text("v3".to_owned())])]
+        );
+        execute(&mut reader, "COMMIT", &[]);
+    }
+
+    #[test]
+    fn read_committed_rebases_private_writes_over_disjoint_commits() {
+        let (_directory, engine) = engine();
+        let mut reader = engine.connect().expect("reader");
+        let mut writer = engine.connect().expect("writer");
+        create_documents(&mut reader);
+
+        execute(&mut reader, "BEGIN ISOLATION LEVEL READ COMMITTED", &[]);
+        execute(
+            &mut reader,
+            "INSERT INTO documents VALUES (1, 'private', 1)",
+            &[],
+        );
+        execute(
+            &mut writer,
+            "INSERT INTO documents VALUES (2, 'concurrent', 2)",
+            &[],
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut reader,
+                "SELECT id FROM documents ORDER BY id",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(2)]),
+            ]
+        );
+        execute(
+            &mut reader,
+            "INSERT INTO documents VALUES (3, 'after-refresh', 3)",
+            &[],
+        );
+        execute(&mut reader, "COMMIT", &[]);
+
+        assert_eq!(
+            rows(&execute(
+                &mut writer,
+                "SELECT id FROM documents ORDER BY id",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(2)]),
+                Row::new(vec![Value::Int64(3)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn programmatic_read_committed_rebases_private_writes() {
+        let (_directory, engine) = engine();
+        let mut reader = engine.connect().expect("reader");
+        let mut writer = engine.connect().expect("writer");
+        create_documents(&mut reader);
+
+        let mut transaction = reader.begin().expect("begin");
+        transaction
+            .execute("INSERT INTO documents VALUES (1, 'private', 1)", &[])
+            .expect("private insert");
+        execute(
+            &mut writer,
+            "INSERT INTO documents VALUES (2, 'concurrent', 2)",
+            &[],
+        );
+        let selected = transaction
+            .execute("SELECT id FROM documents ORDER BY id", &[])
+            .expect("refreshed select")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows(&selected),
+            vec![
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(2)]),
+            ]
+        );
+        transaction.commit().expect("commit");
+    }
+
+    #[test]
+    fn sql_transaction_upgrades_staged_dml_before_ddl() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("session");
+        let mut writer = engine.connect().expect("writer");
+        create_documents(&mut session);
+
+        execute(&mut session, "BEGIN ISOLATION LEVEL READ COMMITTED", &[]);
+        execute(
+            &mut session,
+            "INSERT INTO documents VALUES (1, 'private', 1)",
+            &[],
+        );
+        execute(
+            &mut writer,
+            "INSERT INTO documents VALUES (2, 'concurrent', 2)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "CREATE INDEX documents_score_idx ON documents (score)",
+            &[],
+        );
+        execute(&mut session, "COMMIT", &[]);
+
+        assert_eq!(
+            rows(&execute(
+                &mut writer,
+                "SELECT id FROM documents ORDER BY id",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(2)]),
+            ]
+        );
+        execute(&mut writer, "DROP INDEX documents_score_idx", &[]);
+    }
+
+    #[test]
+    fn programmatic_transaction_upgrades_staged_dml_before_ddl() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("session");
+        create_documents(&mut session);
+
+        let mut transaction = session.begin().expect("begin");
+        transaction
+            .execute("INSERT INTO documents VALUES (1, 'private', 1)", &[])
+            .expect("insert");
+        transaction
+            .execute("CREATE INDEX documents_score_idx ON documents (score)", &[])
+            .expect("create index after DML");
+        transaction.commit().expect("commit");
+
+        execute(&mut session, "DROP INDEX documents_score_idx", &[]);
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT id FROM documents ORDER BY id",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Int64(1)])]
+        );
+    }
+
+    #[test]
+    fn sql_savepoint_restores_candidate_and_recovers_failed_transaction() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("session");
+        create_documents(&mut session);
+        execute(&mut session, "BEGIN", &[]);
+        execute(
+            &mut session,
+            "INSERT INTO documents VALUES (1, 'before', 1)",
+            &[],
+        );
+        execute(&mut session, "SAVEPOINT keep_before", &[]);
+        execute(
+            &mut session,
+            "INSERT INTO documents VALUES (2, 'after', 2)",
+            &[],
+        );
+        let duplicate = session
+            .execute("INSERT INTO documents VALUES (1, 'duplicate', 3)", &[])
+            .expect_err("duplicate");
+        assert_eq!(duplicate.sql_state, "23505");
+        assert_eq!(session.transaction_status(), TransactionStatus::Failed);
+        assert_eq!(
+            session
+                .execute("SELECT id FROM documents", &[])
+                .expect_err("failed transaction")
+                .sql_state,
+            "25P02"
+        );
+
+        execute(&mut session, "ROLLBACK TO SAVEPOINT keep_before", &[]);
+        assert_eq!(session.transaction_status(), TransactionStatus::Active);
+        execute(
+            &mut session,
+            "INSERT INTO documents VALUES (3, 'recovered', 3)",
+            &[],
+        );
+        execute(&mut session, "COMMIT", &[]);
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT id FROM documents ORDER BY id",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(3)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn sql_savepoint_rollback_restores_ssi_predicates() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("session");
+        create_documents(&mut session);
+        execute(&mut session, "BEGIN ISOLATION LEVEL SERIALIZABLE", &[]);
+        execute(&mut session, "SAVEPOINT before_read", &[]);
+        execute(&mut session, "SELECT id FROM documents", &[]);
+
+        let before = engine.ssi.snapshot().expect("SSI before rollback");
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].read_predicates, 1);
+        execute(&mut session, "ROLLBACK TO SAVEPOINT before_read", &[]);
+
+        let after = engine.ssi.snapshot().expect("SSI after rollback");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].read_predicates, 0);
+        execute(&mut session, "ROLLBACK", &[]);
+    }
+
+    #[test]
+    fn serializable_ssi_rejects_write_skew() {
+        let (_directory, engine) = engine();
+        let mut first = engine.connect().expect("first session");
+        let mut second = engine.connect().expect("second session");
+        execute(
+            &mut first,
+            "CREATE TABLE doctors (id INT PRIMARY KEY, on_call BOOLEAN NOT NULL)",
+            &[],
+        );
+        execute(
+            &mut first,
+            "INSERT INTO doctors VALUES (1, TRUE), (2, TRUE)",
+            &[],
+        );
+        execute(&mut first, "BEGIN ISOLATION LEVEL SERIALIZABLE", &[]);
+        execute(&mut second, "BEGIN ISOLATION LEVEL SERIALIZABLE", &[]);
+        assert_eq!(
+            rows(&execute(
+                &mut first,
+                "SELECT id FROM doctors WHERE on_call = TRUE ORDER BY id",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int32(1)]),
+                Row::new(vec![Value::Int32(2)]),
+            ]
+        );
+        execute(
+            &mut second,
+            "SELECT id FROM doctors WHERE on_call = TRUE ORDER BY id",
+            &[],
+        );
+        execute(
+            &mut first,
+            "UPDATE doctors SET on_call = FALSE WHERE id = 1",
+            &[],
+        );
+        execute(&mut first, "COMMIT", &[]);
+        execute(
+            &mut second,
+            "UPDATE doctors SET on_call = FALSE WHERE id = 2",
+            &[],
+        );
+        let error = second.execute("COMMIT", &[]).expect_err("write skew");
+        assert_eq!(error.sql_state, "40001");
+
+        let mut verifier = engine.connect().expect("verifier");
+        assert_eq!(
+            rows(&execute(
+                &mut verifier,
+                "SELECT id FROM doctors WHERE on_call = TRUE ORDER BY id",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Int32(2)])]
+        );
+    }
+
+    #[test]
+    fn isolation_snapshots_prevent_dirty_reads_and_repeatable_read_phantoms() {
+        let (_directory, engine) = engine();
+        let mut writer = engine.connect().expect("writer");
+        let mut reader = engine.connect().expect("reader");
+        create_documents(&mut writer);
+
+        execute(&mut writer, "BEGIN", &[]);
+        execute(
+            &mut writer,
+            "INSERT INTO documents VALUES (1, 'uncommitted', 1)",
+            &[],
+        );
+        assert!(rows(&execute(&mut reader, "SELECT id FROM documents", &[])).is_empty());
+        execute(&mut writer, "COMMIT", &[]);
+
+        execute(&mut reader, "BEGIN ISOLATION LEVEL REPEATABLE READ", &[]);
+        assert_eq!(
+            rows(&execute(
+                &mut reader,
+                "SELECT id FROM documents ORDER BY id",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Int64(1)])]
+        );
+        execute(
+            &mut writer,
+            "INSERT INTO documents VALUES (2, 'phantom', 2)",
+            &[],
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut reader,
+                "SELECT id FROM documents ORDER BY id",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Int64(1)])]
+        );
+        execute(&mut reader, "COMMIT", &[]);
+        assert_eq!(
+            rows(&execute(
+                &mut reader,
+                "SELECT id FROM documents ORDER BY id",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(2)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn repeatable_read_rejects_stale_update_and_delete_targets() {
+        let (_directory, engine) = engine();
+        let mut stale = engine.connect().expect("stale session");
+        let mut concurrent = engine.connect().expect("concurrent session");
+        create_documents(&mut stale);
+        execute(
+            &mut stale,
+            "INSERT INTO documents VALUES (1, 'first', 1), (2, 'second', 2)",
+            &[],
+        );
+
+        execute(&mut stale, "BEGIN ISOLATION LEVEL REPEATABLE READ", &[]);
+        execute(&mut stale, "SELECT title FROM documents WHERE id = 1", &[]);
+        execute(
+            &mut concurrent,
+            "UPDATE documents SET title = 'concurrent' WHERE id = 1",
+            &[],
+        );
+        assert_eq!(
+            stale
+                .execute("UPDATE documents SET title = 'stale' WHERE id = 1", &[],)
+                .expect_err("stale update conflict")
+                .sql_state,
+            "40001"
+        );
+        execute(&mut stale, "ROLLBACK", &[]);
+
+        execute(&mut stale, "BEGIN ISOLATION LEVEL REPEATABLE READ", &[]);
+        execute(&mut stale, "SELECT title FROM documents WHERE id = 2", &[]);
+        execute(
+            &mut concurrent,
+            "UPDATE documents SET title = 'changed' WHERE id = 2",
+            &[],
+        );
+        assert_eq!(
+            stale
+                .execute("DELETE FROM documents WHERE id = 2", &[])
+                .expect_err("stale delete conflict")
+                .sql_state,
+            "40001"
+        );
+        execute(&mut stale, "ROLLBACK", &[]);
+    }
+
+    #[test]
+    fn repeatable_read_writers_merge_unrelated_row_changes() {
+        let (_directory, engine) = engine();
+        let mut first = engine.connect().expect("first session");
+        let mut second = engine.connect().expect("second session");
+        create_documents(&mut first);
+        execute(
+            &mut first,
+            "INSERT INTO documents VALUES (1, 'first', 1), (2, 'second', 2)",
+            &[],
+        );
+        execute(&mut first, "BEGIN ISOLATION LEVEL REPEATABLE READ", &[]);
+        execute(&mut second, "BEGIN ISOLATION LEVEL REPEATABLE READ", &[]);
+        execute(
+            &mut first,
+            "UPDATE documents SET title = 'first-committed' WHERE id = 1",
+            &[],
+        );
+        execute(
+            &mut second,
+            "UPDATE documents SET title = 'second-committed' WHERE id = 2",
+            &[],
+        );
+        execute(&mut first, "COMMIT", &[]);
+        execute(&mut second, "COMMIT", &[]);
+
+        let mut verifier = engine.connect().expect("verifier");
+        assert_eq!(
+            rows(&execute(
+                &mut verifier,
+                "SELECT title FROM documents ORDER BY id",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Text("first-committed".to_owned())]),
+                Row::new(vec![Value::Text("second-committed".to_owned())]),
+            ]
+        );
+    }
+
+    #[test]
+    fn vacuum_protects_active_snapshots_then_reclaims_and_analyzes() {
+        let (_directory, engine) = engine();
+        let mut reader = engine.connect().expect("reader");
+        let mut writer = engine.connect().expect("writer");
+        create_documents(&mut writer);
+        execute(
+            &mut writer,
+            "INSERT INTO documents VALUES (1, 'v1', 1)",
+            &[],
+        );
+        execute(&mut reader, "BEGIN ISOLATION LEVEL REPEATABLE READ", &[]);
+        execute(&mut reader, "SELECT title FROM documents WHERE id = 1", &[]);
+        execute(
+            &mut writer,
+            "UPDATE documents SET title = 'v2' WHERE id = 1",
+            &[],
+        );
+        let table_id = {
+            let state = engine.state.read().expect("state");
+            state
+                .catalog
+                .table(
+                    &Identifier::unquoted("public"),
+                    &Identifier::unquoted("documents"),
+                )
+                .expect("documents")
+                .id
+        };
+        execute(&mut writer, "VACUUM documents", &[]);
+        assert_eq!(
+            engine
+                .state
+                .read()
+                .expect("protected state")
+                .versions
+                .get(&table_id)
+                .expect("versions")
+                .len(),
+            2
+        );
+
+        execute(&mut reader, "ROLLBACK", &[]);
+        execute(&mut writer, "VACUUM ANALYZE documents", &[]);
+        let state = engine.state.read().expect("vacuumed state");
+        let versions = state.versions.get(&table_id).expect("versions");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version_id, 1);
+        assert_eq!(versions[0].header.previous_version, 0);
+        assert_eq!(
+            state
+                .catalog
+                .table_by_id(table_id)
+                .expect("documents")
+                .statistics()
+                .row_count,
+            1
+        );
+        drop(state);
+        assert_eq!(
+            rows(&execute(
+                &mut writer,
+                "SELECT title FROM documents WHERE id = 1",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Text("v2".to_owned())])]
+        );
+    }
+
+    #[test]
+    fn vacuum_rejects_an_expired_protected_snapshot() {
+        let (_directory, engine) = engine();
+        engine
+            .set_maximum_snapshot_age(Duration::from_millis(1))
+            .expect("configure snapshot age");
+        let mut reader = engine.connect().expect("reader");
+        let mut writer = engine.connect().expect("writer");
+        create_documents(&mut writer);
+        execute(
+            &mut writer,
+            "INSERT INTO documents VALUES (1, 'visible', 1)",
+            &[],
+        );
+        execute(&mut reader, "BEGIN ISOLATION LEVEL REPEATABLE READ", &[]);
+        execute(&mut reader, "SELECT id FROM documents", &[]);
+        std::thread::sleep(Duration::from_millis(5));
+        let error = writer
+            .execute("VACUUM documents", &[])
+            .expect_err("expired snapshot");
+        assert_eq!(error.sql_state, "55000");
+        assert!(error.message.contains("expired snapshot"));
+        execute(&mut reader, "ROLLBACK", &[]);
+        execute(&mut writer, "VACUUM documents", &[]);
+    }
+
+    #[test]
+    fn full_vacuum_freezes_live_versions_and_compacts_transaction_status() {
+        let (directory, engine) = engine();
+        let mut session = engine.connect().expect("session");
+        create_documents(&mut session);
+        execute(
+            &mut session,
+            "INSERT INTO documents VALUES (1, 'v1', 1)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "UPDATE documents SET title = 'v2' WHERE id = 1",
+            &[],
+        );
+        let before = engine
+            .transaction_status
+            .snapshot()
+            .expect("status before vacuum");
+        execute(&mut session, "VACUUM", &[]);
+        let after = engine
+            .transaction_status
+            .snapshot()
+            .expect("status after vacuum");
+        assert!(after.retained_transaction_floor > before.retained_transaction_floor);
+        assert!(after.statuses.len() < before.statuses.len());
+        let table_id = engine
+            .catalog_snapshot()
+            .expect("catalog")
+            .table(
+                &Identifier::unquoted("public"),
+                &Identifier::unquoted("documents"),
+            )
+            .expect("documents")
+            .id;
+        assert!(
+            engine
+                .state
+                .read()
+                .expect("state")
+                .versions
+                .get(&table_id)
+                .expect("versions")
+                .iter()
+                .all(|version| version.header.xmin == FROZEN_TRANSACTION_ID)
+        );
+        drop(session);
+        drop(engine);
+
+        let reopened = Engine::open(EngineConfig::new(directory.path())).expect("reopen");
+        let mut session = reopened.connect().expect("reopened session");
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT title FROM documents WHERE id = 1",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Text("v2".to_owned())])]
+        );
+    }
+
+    #[test]
+    fn vacuum_is_rejected_inside_sql_and_programmatic_transactions() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("session");
+        create_documents(&mut session);
+        execute(&mut session, "BEGIN", &[]);
+        assert_eq!(
+            session
+                .execute("VACUUM", &[])
+                .expect_err("SQL transaction VACUUM")
+                .sql_state,
+            "25001"
+        );
+        execute(&mut session, "ROLLBACK", &[]);
+
+        let mut transaction = session.begin().expect("programmatic transaction");
+        assert_eq!(
+            transaction
+                .execute("VACUUM", &[])
+                .expect_err("programmatic transaction VACUUM")
+                .sql_state,
+            "25001"
+        );
+        transaction.rollback().expect("rollback");
+    }
+
+    #[test]
+    fn failed_vacuum_and_analyze_reopen_without_publishing_candidates() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let engine =
+                Engine::open(EngineConfig::new(directory.path())).expect("baseline engine");
+            let mut session = engine.connect().expect("baseline session");
+            create_documents(&mut session);
+            execute(
+                &mut session,
+                "INSERT INTO documents VALUES (1, 'v1', 1)",
+                &[],
+            );
+            execute(
+                &mut session,
+                "UPDATE documents SET title = 'v2' WHERE id = 1",
+                &[],
+            );
+        }
+
+        let vacuum_fault = ordadb_transaction::DeterministicFaultInjector::new();
+        let vacuum_injector: Arc<dyn FaultInjector> = vacuum_fault.clone();
+        let engine =
+            Engine::open_with_fault_injector(EngineConfig::new(directory.path()), vacuum_injector)
+                .expect("vacuum engine");
+        let baseline_generation = engine
+            .status_snapshot()
+            .expect("baseline status")
+            .generation;
+        let mut session = engine.connect().expect("vacuum session");
+        vacuum_fault
+            .arm(FaultPoint::AfterDataSync, 1)
+            .expect("arm vacuum fault");
+        assert_eq!(
+            session
+                .execute("VACUUM documents", &[])
+                .expect_err("vacuum fault")
+                .sql_state,
+            "58030"
+        );
+        drop(session);
+        drop(engine);
+
+        let recovered = Engine::open(EngineConfig::new(directory.path())).expect("recover vacuum");
+        assert_eq!(
+            recovered
+                .status_snapshot()
+                .expect("recovered status")
+                .generation,
+            baseline_generation
+        );
+        let table_id = recovered
+            .catalog_snapshot()
+            .expect("catalog")
+            .table(
+                &Identifier::unquoted("public"),
+                &Identifier::unquoted("documents"),
+            )
+            .expect("documents")
+            .id;
+        assert_eq!(
+            recovered
+                .state
+                .read()
+                .expect("recovered state")
+                .versions
+                .get(&table_id)
+                .expect("version chain")
+                .len(),
+            2
+        );
+        drop(recovered);
+
+        let analyze_fault = ordadb_transaction::DeterministicFaultInjector::new();
+        let analyze_injector: Arc<dyn FaultInjector> = analyze_fault.clone();
+        let engine =
+            Engine::open_with_fault_injector(EngineConfig::new(directory.path()), analyze_injector)
+                .expect("analyze engine");
+        let baseline_generation = engine
+            .status_snapshot()
+            .expect("baseline status")
+            .generation;
+        let mut session = engine.connect().expect("analyze session");
+        analyze_fault
+            .arm(FaultPoint::AfterDataSync, 1)
+            .expect("arm analyze fault");
+        assert_eq!(
+            session
+                .execute("ANALYZE documents", &[])
+                .expect_err("analyze fault")
+                .sql_state,
+            "58030"
+        );
+        drop(session);
+        drop(engine);
+
+        let recovered = Engine::open(EngineConfig::new(directory.path())).expect("recover analyze");
+        assert_eq!(
+            recovered
+                .status_snapshot()
+                .expect("recovered status")
+                .generation,
+            baseline_generation
+        );
+        let mut session = recovered.connect().expect("final session");
+        execute(&mut session, "VACUUM ANALYZE documents", &[]);
+        assert_eq!(
+            recovered
+                .state
+                .read()
+                .expect("vacuumed state")
+                .versions
+                .get(&table_id)
+                .expect("compacted version chain")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn repeated_savepoint_names_use_the_nearest_frame_and_release_it() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("session");
+        create_documents(&mut session);
+        execute(&mut session, "BEGIN", &[]);
+        execute(
+            &mut session,
+            "INSERT INTO documents VALUES (1, 'base', 1)",
+            &[],
+        );
+        execute(&mut session, "SAVEPOINT repeated", &[]);
+        execute(
+            &mut session,
+            "INSERT INTO documents VALUES (2, 'middle', 2)",
+            &[],
+        );
+        execute(&mut session, "SAVEPOINT repeated", &[]);
+        execute(
+            &mut session,
+            "INSERT INTO documents VALUES (3, 'latest', 3)",
+            &[],
+        );
+
+        execute(&mut session, "ROLLBACK TO repeated", &[]);
+        execute(&mut session, "RELEASE SAVEPOINT repeated", &[]);
+        execute(&mut session, "ROLLBACK TO repeated", &[]);
+        execute(&mut session, "COMMIT", &[]);
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT id FROM documents ORDER BY id",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Int64(1)])]
+        );
+    }
+
+    #[test]
+    fn read_only_and_chained_transactions_preserve_characteristics() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("session");
+        create_documents(&mut session);
+        execute(
+            &mut session,
+            "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE",
+            &[],
+        );
+        let first_id = match &session.sql_transaction {
+            SqlTransactionState::Active(transaction) => {
+                assert_eq!(
+                    transaction.transaction.characteristics(),
+                    Some(TransactionCharacteristics {
+                        isolation_level: ordadb_transaction::IsolationLevel::Serializable,
+                        access_mode: TransactionAccessMode::ReadOnly,
+                        deferrable: true,
+                    })
+                );
+                transaction.transaction.transaction_id()
+            }
+            _ => panic!("expected active transaction"),
+        };
+        assert_eq!(
+            session
+                .execute("INSERT INTO documents VALUES (1, 'blocked', 1)", &[])
+                .expect_err("read only")
+                .sql_state,
+            "25006"
+        );
+        execute(&mut session, "ROLLBACK AND CHAIN", &[]);
+        let second_id = match &session.sql_transaction {
+            SqlTransactionState::Active(transaction) => {
+                assert_eq!(
+                    transaction.transaction.characteristics(),
+                    Some(TransactionCharacteristics {
+                        isolation_level: ordadb_transaction::IsolationLevel::Serializable,
+                        access_mode: TransactionAccessMode::ReadOnly,
+                        deferrable: true,
+                    })
+                );
+                transaction.transaction.transaction_id()
+            }
+            _ => panic!("expected chained transaction"),
+        };
+        assert!(second_id > first_id);
+        execute(&mut session, "ROLLBACK AND NO CHAIN", &[]);
+        assert_eq!(session.transaction_status(), TransactionStatus::Idle);
+    }
+
+    #[test]
+    fn deferrable_safe_snapshot_wait_cancels_through_the_session_boundary() {
+        let (_directory, engine) = engine();
+        let mut writer = engine.connect().expect("writer");
+        let mut reader = engine.connect().expect("reader");
+        create_documents(&mut writer);
+        execute(&mut writer, "BEGIN ISOLATION LEVEL SERIALIZABLE", &[]);
+        execute(
+            &mut reader,
+            "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE",
+            &[],
+        );
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = reader
+                .execute_stream_with_cancellation(
+                    "SELECT id FROM documents",
+                    &[],
+                    worker_cancellation,
+                )
+                .map(|_| ());
+            send.send((result, reader.transaction_status()))
+                .expect("send cancellation result");
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        cancellation.store(true, Ordering::Release);
+
+        let (result, status) = receive
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled statement result");
+        assert_eq!(
+            result.expect_err("safe snapshot cancellation").sql_state,
+            "57014"
+        );
+        assert_eq!(status, TransactionStatus::Failed);
+        execute(&mut writer, "ROLLBACK", &[]);
+        worker.join().expect("reader worker");
     }
 
     #[test]
@@ -5243,6 +8381,13 @@ mod tests {
                 .iter()
                 .any(|record| { record.kind() == ordadb_transaction::RecordKind::CheckpointEnd })
         );
+        assert!(records.iter().any(|record| {
+            matches!(
+                record.payload(),
+                ordadb_transaction::WalPayload::CheckpointBegin(checkpoint)
+                    if checkpoint.visibility_horizon.is_some()
+            )
+        }));
         assert_eq!(
             engine.writer.active_transaction().expect("writer state"),
             None

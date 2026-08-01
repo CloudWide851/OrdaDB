@@ -2,8 +2,10 @@ use std::fmt;
 use std::num::NonZeroU64;
 
 use ordadb_types::{DbError, Result};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Lsn(NonZeroU64);
 
 impl Lsn {
@@ -48,7 +50,8 @@ impl fmt::Display for Lsn {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct TransactionId(NonZeroU64);
 
 impl TransactionId {

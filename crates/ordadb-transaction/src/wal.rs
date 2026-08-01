@@ -10,7 +10,7 @@ use ordadb_types::{DbError, Result};
 use crate::record::{CheckpointBegin, CheckpointEnd, parse_header};
 use crate::{
     FaultInjector, FaultPoint, Lsn, NoFaultInjector, RecordKind, ScanResult, TransactionId,
-    WAL_HEADER_LEN, WalPayload, WalRecord, corruption, io_error,
+    TransactionOutcome, WAL_HEADER_LEN, WalPayload, WalRecord, corruption, io_error,
 };
 
 pub const WAL_FILE_NAME: &str = "ordadb.wal";
@@ -52,6 +52,7 @@ pub fn inspect_wal_read_only(data_dir: impl AsRef<Path>) -> Result<WalInspection
 pub struct CheckpointState {
     pub active_transactions: BTreeMap<TransactionId, Lsn>,
     pub dirty_pages: BTreeMap<PageId, Lsn>,
+    pub visibility_horizon: Option<TransactionId>,
     pub durable_data_generation: u64,
     pub durable_wal_lsn: Option<Lsn>,
     pub data_file_page_count: u64,
@@ -109,8 +110,10 @@ struct WalState {
     file: File,
     next_lsn: Lsn,
     durable_lsn: Option<Lsn>,
+    begin_by_transaction: BTreeMap<TransactionId, Lsn>,
     last_by_transaction: BTreeMap<TransactionId, Lsn>,
     terminal_transactions: BTreeSet<TransactionId>,
+    transaction_outcomes: BTreeMap<TransactionId, TransactionOutcome>,
     max_transaction_id: Option<TransactionId>,
     dirty_pages: BTreeMap<PageId, Lsn>,
     transaction_dirty_pages: BTreeMap<TransactionId, BTreeSet<PageId>>,
@@ -146,8 +149,10 @@ impl WalManager {
             file,
             next_lsn,
             durable_lsn: last_lsn,
+            begin_by_transaction: BTreeMap::new(),
             last_by_transaction: BTreeMap::new(),
             terminal_transactions: BTreeSet::new(),
+            transaction_outcomes: BTreeMap::new(),
             max_transaction_id: None,
             dirty_pages: BTreeMap::new(),
             transaction_dirty_pages: BTreeMap::new(),
@@ -189,6 +194,17 @@ impl WalManager {
         append_locked(&mut state, transaction_id, previous_lsn, payload)
     }
 
+    pub fn begin_transaction(&self, transaction_id: TransactionId) -> Result<LoggedTransaction> {
+        let begin_lsn = self.append(Some(transaction_id), None, WalPayload::Begin)?;
+        self.flush_lsn(begin_lsn)?;
+        Ok(LoggedTransaction {
+            transaction_id,
+            begin_lsn,
+            last_lsn: begin_lsn,
+            page_update_lsns: BTreeMap::new(),
+        })
+    }
+
     pub fn log_prepared(
         &self,
         transaction_id: TransactionId,
@@ -197,8 +213,19 @@ impl WalManager {
         let deltas = prepared.page_deltas().to_vec();
         validate_sorted_deltas(&deltas)?;
 
-        let begin_lsn = self.append(Some(transaction_id), None, WalPayload::Begin)?;
-        let mut previous_lsn = begin_lsn;
+        let (begin_lsn, mut previous_lsn) = match self.transaction_chain(transaction_id)? {
+            Some((begin_lsn, last_lsn)) if begin_lsn == last_lsn => (begin_lsn, last_lsn),
+            Some(_) => {
+                return Err(DbError::new(
+                    "25000",
+                    format!("transaction {transaction_id} already has prepared WAL changes"),
+                ));
+            }
+            None => {
+                let transaction = self.begin_transaction(transaction_id)?;
+                (transaction.begin_lsn, transaction.last_lsn)
+            }
+        };
         let mut page_update_lsns = BTreeMap::new();
         for delta in deltas {
             let lsn = self.append_prepared_page(
@@ -232,22 +259,40 @@ impl WalManager {
     }
 
     pub fn commit(&self, transaction: &LoggedTransaction) -> Result<Lsn> {
-        let current = self.last_lsn(transaction.transaction_id)?;
-        if current != Some(transaction.last_lsn) {
+        self.commit_transaction_at(transaction.transaction_id, transaction.last_lsn)
+    }
+
+    pub fn commit_transaction(&self, transaction_id: TransactionId) -> Result<Lsn> {
+        let (_, last_lsn) = self.transaction_chain(transaction_id)?.ok_or_else(|| {
+            DbError::new(
+                "25P01",
+                format!("transaction {transaction_id} has no WAL Begin record"),
+            )
+        })?;
+        self.commit_transaction_at(transaction_id, last_lsn)
+    }
+
+    fn commit_transaction_at(
+        &self,
+        transaction_id: TransactionId,
+        expected_last_lsn: Lsn,
+    ) -> Result<Lsn> {
+        let current = self.last_lsn(transaction_id)?;
+        if current != Some(expected_last_lsn) {
             return Err(corruption(format!(
                 "transaction {} WAL chain changed before Commit",
-                transaction.transaction_id
+                transaction_id
             )));
         }
         let commit_lsn = self.append(
-            Some(transaction.transaction_id),
-            Some(transaction.last_lsn),
+            Some(transaction_id),
+            Some(expected_last_lsn),
             WalPayload::Commit,
         )?;
         self.check_fault(FaultPoint::BeforeCommitFlush)?;
         self.flush_lsn(commit_lsn)?;
         self.check_fault(FaultPoint::AfterCommitFlush)?;
-        self.mark_transaction_clean(transaction.transaction_id)?;
+        self.mark_transaction_clean(transaction_id)?;
         Ok(commit_lsn)
     }
 
@@ -279,6 +324,7 @@ impl WalManager {
                 WalPayload::CheckpointBegin(CheckpointBegin {
                     active_transactions: checkpoint.active_transactions,
                     dirty_pages,
+                    visibility_horizon: checkpoint.visibility_horizon,
                 }),
             )?;
             self.check_fault(FaultPoint::BeforeWalFlush)?;
@@ -322,6 +368,10 @@ impl WalManager {
 
     pub fn last_transaction_id(&self) -> Result<Option<TransactionId>> {
         Ok(self.lock_state()?.max_transaction_id)
+    }
+
+    pub fn transaction_outcomes(&self) -> Result<BTreeMap<TransactionId, TransactionOutcome>> {
+        Ok(self.lock_state()?.transaction_outcomes.clone())
     }
 
     pub fn dirty_pages(&self) -> Result<BTreeMap<PageId, Lsn>> {
@@ -426,6 +476,28 @@ impl WalManager {
             DbError::internal("WAL manager lock is poisoned")
                 .with_hint("restart the process before retrying durable work")
         })
+    }
+
+    fn transaction_chain(&self, transaction_id: TransactionId) -> Result<Option<(Lsn, Lsn)>> {
+        let state = self.lock_state()?;
+        match (
+            state.begin_by_transaction.get(&transaction_id).copied(),
+            state.last_by_transaction.get(&transaction_id).copied(),
+        ) {
+            (Some(begin_lsn), Some(last_lsn))
+                if !state.terminal_transactions.contains(&transaction_id) =>
+            {
+                Ok(Some((begin_lsn, last_lsn)))
+            }
+            (Some(_), Some(_)) => Err(DbError::new(
+                "25000",
+                format!("transaction {transaction_id} is already terminal"),
+            )),
+            (None, None) => Ok(None),
+            _ => Err(corruption(format!(
+                "transaction {transaction_id} has an incomplete in-memory WAL chain"
+            ))),
+        }
     }
 }
 
@@ -659,11 +731,17 @@ fn apply_record_state(
         return Ok(());
     };
     if matches!(record.kind(), RecordKind::Begin) {
+        state
+            .begin_by_transaction
+            .insert(transaction_id, record.lsn());
         state.max_transaction_id = Some(
             state
                 .max_transaction_id
                 .map_or(transaction_id, |current| current.max(transaction_id)),
         );
+        state
+            .transaction_outcomes
+            .insert(transaction_id, TransactionOutcome::InProgress);
     }
     state
         .last_by_transaction
@@ -679,6 +757,14 @@ fn apply_record_state(
         }
         WalPayload::Commit | WalPayload::Abort => {
             state.terminal_transactions.insert(transaction_id);
+            state.transaction_outcomes.insert(
+                transaction_id,
+                if matches!(record.payload(), WalPayload::Commit) {
+                    TransactionOutcome::Committed
+                } else {
+                    TransactionOutcome::Aborted
+                },
+            );
             if clear_terminal
                 && let Some(page_ids) = state.transaction_dirty_pages.remove(&transaction_id)
             {

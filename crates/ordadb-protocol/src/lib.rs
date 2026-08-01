@@ -8,7 +8,8 @@ mod server;
 mod value;
 
 pub use client::{
-    ClientConfig, CopyOutResult, PgCancelToken, PgClient, PgQueryEvent, QueryResult, QuerySummary,
+    ClientConfig, CopyOutResult, PgCancelToken, PgClient, PgQueryEvent, PgTransactionStatus,
+    QueryResult, QuerySummary,
 };
 pub use server::{
     PgConnectionContext, PgServerConfig, TlsPaths, load_tls_config, serve_tcp_connection,

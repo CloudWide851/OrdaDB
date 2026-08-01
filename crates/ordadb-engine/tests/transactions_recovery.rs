@@ -25,7 +25,7 @@ fn execute(session: &mut ordadb_engine::Session, sql: &str) {
 }
 
 #[test]
-fn programmatic_transactions_use_read_committed_and_release_the_single_writer() {
+fn programmatic_transactions_use_read_committed_and_allow_disjoint_writers() {
     let directory = tempdir().expect("tempdir");
     let engine = Engine::open(EngineConfig::new(directory.path())).expect("open");
     let mut first = engine.connect().expect("first session");
@@ -74,19 +74,11 @@ fn programmatic_transactions_use_read_committed_and_release_the_single_writer() 
         ]
     );
 
-    assert_eq!(
-        second
-            .execute("INSERT INTO events VALUES (3, 'blocked')", &[])
-            .expect_err("single writer must reject a competitor")
-            .sql_state,
-        "55P03"
-    );
-    transaction.rollback().expect("rollback and release");
-
     execute(
         &mut second,
-        "INSERT INTO events VALUES (3, 'writer released')",
+        "INSERT INTO events VALUES (3, 'concurrent writer')",
     );
+    transaction.rollback().expect("rollback and release");
     assert_eq!(
         rows(
             second

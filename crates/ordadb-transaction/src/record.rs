@@ -48,6 +48,7 @@ impl TryFrom<u8> for RecordKind {
 pub struct CheckpointBegin {
     pub active_transactions: BTreeMap<TransactionId, Lsn>,
     pub dirty_pages: BTreeMap<PageId, Lsn>,
+    pub visibility_horizon: Option<TransactionId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +412,9 @@ fn encode_payload(lsn: Lsn, payload: &WalPayload) -> Result<Vec<u8>> {
                 push_u64(&mut bytes, page_id.get());
                 push_u64(&mut bytes, rec_lsn.get());
             }
+            if let Some(visibility_horizon) = begin.visibility_horizon {
+                push_u64(&mut bytes, visibility_horizon.get());
+            }
         }
         WalPayload::CheckpointEnd(end) => {
             push_u64(&mut bytes, end.begin_lsn.get());
@@ -484,9 +488,15 @@ fn decode_payload(kind: RecordKind, lsn: Lsn, bytes: &[u8]) -> Result<WalPayload
                     ));
                 }
             }
+            let visibility_horizon = if decoder.remaining() == 0 {
+                None
+            } else {
+                optional_transaction_id(decoder.read_u64()?)?
+            };
             WalPayload::CheckpointBegin(CheckpointBegin {
                 active_transactions,
                 dirty_pages,
+                visibility_horizon,
             })
         }
         RecordKind::CheckpointEnd => WalPayload::CheckpointEnd(CheckpointEnd {
@@ -661,6 +671,10 @@ impl<'a> Decoder<'a> {
         Ok(value)
     }
 
+    const fn remaining(&self) -> usize {
+        self.bytes.len() - self.offset
+    }
+
     fn finish(self) -> Result<()> {
         if self.offset != self.bytes.len() {
             return Err(corruption("WAL payload contains trailing bytes"));
@@ -671,9 +685,11 @@ impl<'a> Decoder<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use ordadb_storage::{PageId, PageType, SlottedPage};
 
-    use super::{WAL_HEADER_LEN, WalPayload, WalRecord};
+    use super::{CheckpointBegin, WAL_HEADER_LEN, WalPayload, WalRecord};
     use crate::{Lsn, TransactionId};
 
     fn lsn(value: u64) -> Lsn {
@@ -727,5 +743,28 @@ mod tests {
         bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
         let error = WalRecord::from_bytes(&bytes).expect_err("unsupported version");
         assert_eq!(error.sql_state, "0A000");
+    }
+
+    #[test]
+    fn checkpoint_visibility_horizon_round_trips_and_legacy_payload_remains_readable() {
+        for expected_horizon in [None, Some(transaction_id(9))] {
+            let record = WalRecord::new(
+                lsn(10),
+                None,
+                None,
+                WalPayload::CheckpointBegin(CheckpointBegin {
+                    active_transactions: BTreeMap::new(),
+                    dirty_pages: BTreeMap::new(),
+                    visibility_horizon: expected_horizon,
+                }),
+            )
+            .expect("checkpoint begin");
+            let bytes = record.encode().expect("encode checkpoint");
+            let decoded = WalRecord::from_bytes(&bytes).expect("decode checkpoint");
+            let WalPayload::CheckpointBegin(begin) = decoded.payload() else {
+                panic!("expected checkpoint begin");
+            };
+            assert_eq!(begin.visibility_horizon, expected_horizon);
+        }
     }
 }

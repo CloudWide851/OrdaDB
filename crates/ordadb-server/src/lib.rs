@@ -381,9 +381,11 @@ fn io_error(context: impl Into<String>, error: std::io::Error) -> DbError {
 mod tests {
     use ordadb_admin::AuthStore;
     use ordadb_backup::{MigrationRunOptionsV2, migrate_v1_to_v2};
-    use ordadb_cluster::resolve_active_v2;
+    use ordadb_cluster::{initialize_empty_v2, resolve_active_v2};
+    use ordadb_protocol::{ClientConfig, PgClient, PgTransactionStatus};
     use ordadb_storage::DatabaseStore;
     use tempfile::tempdir;
+    use zeroize::Zeroizing;
 
     use super::*;
 
@@ -408,6 +410,101 @@ mod tests {
         assert!(server.admin_address.port() > 0);
         assert!(server.bootstrap_pipe.is_some());
         server.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pgwire_ready_for_query_tracks_active_failed_and_recovered_transactions() {
+        let directory = tempdir().expect("tempdir");
+        let active = initialize_empty_v2(directory.path()).expect("initialize cluster");
+        AuthStore::open(&active.roles_dir)
+            .expect("auth store")
+            .bootstrap_admin("wire_admin", b"StrongWirePassword-29")
+            .expect("bootstrap administrator");
+        let mut config = ServerConfig::new(directory.path());
+        config.pg_bind = "127.0.0.1:0".parse().expect("pg");
+        config.admin_bind = "127.0.0.1:0".parse().expect("admin");
+        let server = start_server(config).await.expect("start");
+        let address = server.pg_address;
+
+        let client_result = tokio::task::spawn_blocking(move || -> ordadb_types::Result<()> {
+            let mut client = PgClient::connect(ClientConfig {
+                address,
+                user: "wire_admin".to_owned(),
+                database: "ordadb".to_owned(),
+                password: Zeroizing::new("StrongWirePassword-29".to_owned()),
+                application_name: "ready-status-test".to_owned(),
+            })?;
+            assert_eq!(client.transaction_status(), PgTransactionStatus::Idle);
+            client.query("BEGIN")?;
+            assert_eq!(
+                client.transaction_status(),
+                PgTransactionStatus::InTransaction
+            );
+            assert_eq!(
+                client
+                    .query("SELECT * FROM missing_ready_status_table")
+                    .expect_err("statement failure")
+                    .sql_state,
+                "42P01"
+            );
+            assert_eq!(
+                client.transaction_status(),
+                PgTransactionStatus::FailedTransaction
+            );
+            assert_eq!(
+                client
+                    .query("SELECT 1")
+                    .expect_err("failed transaction rejects work")
+                    .sql_state,
+                "25P02"
+            );
+            assert_eq!(
+                client
+                    .query_prepared("SELECT 1", &[], &[], 1)
+                    .expect_err("failed transaction rejects prepared describe")
+                    .sql_state,
+                "25P02"
+            );
+            assert_eq!(
+                client.transaction_status(),
+                PgTransactionStatus::FailedTransaction
+            );
+            client.query("ROLLBACK")?;
+            assert_eq!(client.transaction_status(), PgTransactionStatus::Idle);
+
+            client.query(
+                "CREATE TABLE wire_conflicts (id BIGINT PRIMARY KEY, value TEXT NOT NULL)",
+            )?;
+            client.query("INSERT INTO wire_conflicts VALUES (1, 'initial')")?;
+            let mut concurrent = PgClient::connect(ClientConfig {
+                address,
+                user: "wire_admin".to_owned(),
+                database: "ordadb".to_owned(),
+                password: Zeroizing::new("StrongWirePassword-29".to_owned()),
+                application_name: "ready-status-concurrent".to_owned(),
+            })?;
+            client.query("BEGIN ISOLATION LEVEL REPEATABLE READ")?;
+            client.query("SELECT value FROM wire_conflicts WHERE id = 1")?;
+            concurrent.query("UPDATE wire_conflicts SET value = 'new' WHERE id = 1")?;
+            assert_eq!(
+                client
+                    .query("UPDATE wire_conflicts SET value = 'stale' WHERE id = 1")
+                    .expect_err("serialization failure")
+                    .sql_state,
+                "40001"
+            );
+            assert_eq!(
+                client.transaction_status(),
+                PgTransactionStatus::FailedTransaction
+            );
+            client.query("ROLLBACK")?;
+            assert_eq!(client.transaction_status(), PgTransactionStatus::Idle);
+            Ok(())
+        })
+        .await
+        .expect("client task");
+        server.shutdown().await.expect("shutdown");
+        client_result.expect("PG Wire transaction status flow");
     }
 
     #[tokio::test]

@@ -331,9 +331,29 @@ async fn locks(
     headers: HeaderMap,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
     require(&state, &headers, Action::Monitor, DbObject::Server)?;
+    let (granted, waiting) = state.engine.lock_snapshot().map_err(ApiError::from)?;
+    let mut active_locks = Vec::with_capacity(granted.len() + waiting.len());
+    active_locks.extend(granted.into_iter().map(|lock| {
+        format!(
+            "granted transaction={} mode={:?} resource={:?}",
+            lock.transaction_id, lock.mode, lock.key
+        )
+    }));
+    active_locks.extend(waiting.into_iter().map(|lock| {
+        let blocked_by = lock
+            .blocked_by
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "waiting transaction={} mode={:?} resource={:?} blockedBy={blocked_by}",
+            lock.transaction_id, lock.mode, lock.key
+        )
+    }));
     Ok(Json(ApiEnvelope::new(LockStatus {
-        single_writer: true,
-        active_locks: Vec::new(),
+        single_writer: false,
+        active_locks,
     })))
 }
 
@@ -835,6 +855,51 @@ mod tests {
             .await
             .expect("metrics");
         assert_eq!(metrics.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn lock_route_projects_active_engine_locks() {
+        let (_directory, state) = state();
+        let token = state
+            .tokens
+            .issue(&state.auth, "dba", b"correct horse battery staple")
+            .expect("token")
+            .access_token;
+        let mut session = state.engine.connect().expect("session");
+        session
+            .execute("CREATE TABLE lock_probe (id INT PRIMARY KEY)", &[])
+            .expect("create table");
+        let mut transaction = session.begin().expect("transaction");
+        transaction
+            .execute("INSERT INTO lock_probe VALUES (1)", &[])
+            .expect("insert");
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/locks")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("locks");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["data"]["singleWriter"], false);
+        assert!(
+            body["data"]["activeLocks"]
+                .as_array()
+                .expect("active locks")
+                .iter()
+                .any(|lock| lock.as_str().is_some_and(|lock| {
+                    lock.starts_with("granted transaction=") && lock.contains("resource=")
+                }))
+        );
+        transaction.rollback().expect("rollback");
     }
 
     #[test]

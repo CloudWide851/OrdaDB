@@ -882,7 +882,9 @@ impl Connection {
             return Ok(Box::new(events.into_iter().map(Ok)));
         }
         let catalog = self.engine.catalog_snapshot()?;
-        if let Some(events) = virtual_query(sql, &self.principal.user, &self.database, &catalog) {
+        if !matches!(self.session.transaction_status(), TransactionStatus::Failed)
+            && let Some(events) = virtual_query(sql, &self.principal.user, &self.database, &catalog)
+        {
             return Ok(Box::new(events.into_iter().map(Ok)));
         }
         Ok(Box::new(self.session.execute_stream_with_cancellation(
@@ -893,6 +895,9 @@ impl Connection {
     }
 
     fn statement_schema(&mut self, sql: &str) -> Result<Schema> {
+        if matches!(self.session.transaction_status(), TransactionStatus::Failed) {
+            return self.session.describe(sql);
+        }
         if parse_security_statement(sql)?.is_some() {
             return Ok(Schema::empty());
         }

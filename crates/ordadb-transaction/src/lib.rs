@@ -1,16 +1,30 @@
 mod fault;
 mod ids;
+mod locks;
+mod mvcc;
 mod record;
 mod recovery;
+mod ssi;
+mod status;
 mod wal;
 mod writer;
 
 pub use ids::{Lsn, TransactionId};
+pub use locks::{
+    LockGuard, LockKey, LockManager, LockManagerOptions, LockMode, LockSnapshot, LockWaitSnapshot,
+};
+pub use mvcc::{
+    DurableTransaction, IsolationLevel, ManagedTransaction, Savepoint, SavepointId, SavepointStack,
+    TransactionAccessMode, TransactionCharacteristics, TransactionManager, TransactionOutcome,
+    TransactionSnapshot, TransactionStatusProvider, tuple_visible,
+};
 pub use record::{
     CheckpointBegin, CheckpointEnd, RecordKind, ScanResult, WAL_FORMAT_VERSION, WAL_HEADER_LEN,
     WAL_MAGIC, WAL_MAX_RECORD_LEN, WalPayload, WalRecord,
 };
 pub use recovery::RecoveryReport;
+pub use ssi::{PredicateLock, SsiManager, SsiManagerOptions, SsiSavepoint, SsiTransactionSnapshot};
+pub use status::{TRANSACTION_STATUS_FILE_NAME, TransactionStatusSnapshot, TransactionStatusStore};
 pub use wal::{
     CheckpointState, LoggedTransaction, WAL_FILE_NAME, WalInspection, WalManager,
     inspect_wal_read_only,
