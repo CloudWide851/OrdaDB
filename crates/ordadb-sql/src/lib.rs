@@ -18,6 +18,7 @@ use ordadb_catalog::{
     TriggerEvent as CatalogTriggerEvent, TriggerTiming, VectorDistanceMetric, ViewDefinition,
     ViewKind, indexable_type, text_search_type,
 };
+use ordadb_transaction::{IsolationLevel, TransactionAccessMode, TransactionCharacteristics};
 use ordadb_types::{
     ColumnId, ConstraintId, DbError, Field, Identifier, IndexId, Result, RoutineId, ScalarType,
     Schema, SchemaId, SequenceId, TableId, TriggerId, Value, ViewId,
@@ -37,6 +38,8 @@ use sqlparser::ast::{
     Query, ReferentialAction as SqlReferentialAction, RenameTableNameKind, SchemaName, Select,
     SelectItem, SequenceOptions, SetExpr, Spanned, Statement as SqlStatement, TableAlias,
     TableConstraint, TableFactor, TableObject, TableWithJoins, TimezoneInfo, TopQuantity,
+    TransactionAccessMode as SqlTransactionAccessMode,
+    TransactionIsolationLevel as SqlTransactionIsolationLevel, TransactionMode,
     TriggerEvent as SqlTriggerEvent, TriggerExecBodyType, TriggerObject, TriggerObjectKind,
     TriggerPeriod, UnaryOperator as SqlUnaryOperator, Value as SqlValue,
 };
@@ -360,6 +363,14 @@ pub enum JoinKind {
     Left,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TransactionChain {
+    #[default]
+    Default,
+    Chain,
+    NoChain,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedTable {
     pub name: ParsedObjectName,
@@ -375,9 +386,31 @@ pub struct ParsedJoin {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedStatement {
-    Begin,
-    Commit,
-    Rollback,
+    Begin {
+        characteristics: TransactionCharacteristics,
+    },
+    Commit {
+        chain: TransactionChain,
+    },
+    Rollback {
+        chain: TransactionChain,
+    },
+    Savepoint {
+        name: ParsedIdentifier,
+    },
+    RollbackTo {
+        name: ParsedIdentifier,
+    },
+    ReleaseSavepoint {
+        name: ParsedIdentifier,
+    },
+    Analyze {
+        table: Option<ParsedObjectName>,
+    },
+    Vacuum {
+        table: Option<ParsedObjectName>,
+        analyze: bool,
+    },
     CreateSchema {
         name: ParsedIdentifier,
         if_not_exists: bool,
@@ -607,9 +640,31 @@ pub enum BoundStatement {
     NoOp {
         tag: String,
     },
-    Begin,
-    Commit,
-    Rollback,
+    Begin {
+        characteristics: TransactionCharacteristics,
+    },
+    Commit {
+        chain: TransactionChain,
+    },
+    Rollback {
+        chain: TransactionChain,
+    },
+    Savepoint {
+        name: Identifier,
+    },
+    RollbackTo {
+        name: Identifier,
+    },
+    ReleaseSavepoint {
+        name: Identifier,
+    },
+    Analyze {
+        table_id: Option<TableId>,
+    },
+    Vacuum {
+        table_id: Option<TableId>,
+        analyze: bool,
+    },
     CreateSchema {
         name: Identifier,
         if_not_exists: bool,
@@ -786,6 +841,12 @@ pub fn parse(sql: &str) -> Result<ParsedStatement> {
 /// into OrdaDB's PostgreSQL-compatible syntax tree.
 pub fn parse_with_dialect(sql: &str, dialect: SqlDialect) -> Result<ParsedStatement> {
     if dialect == SqlDialect::PostgreSql {
+        if let Some(statement) = parse_vacuum_analyze(sql)? {
+            return Ok(statement);
+        }
+        if let Some(statement) = parse_transaction_begin(sql)? {
+            return Ok(statement);
+        }
         if let Some(statement) = parse_create_procedure(sql)? {
             return Ok(statement);
         }
@@ -802,9 +863,6 @@ pub fn parse_with_dialect(sql: &str, dialect: SqlDialect) -> Result<ParsedStatem
     let mut statements = match parse_source_statements(sql, dialect) {
         Ok(statements) => statements,
         Err(error) => {
-            if dialect == SqlDialect::PostgreSql && has_unrepresented_transaction_option(sql) {
-                return unsupported("transaction modes and options are not supported yet");
-            }
             let message = error.to_string();
             let position = parser_error_position(sql, &message);
             let mut error = DbError::new(SYNTAX_ERROR, message);
@@ -1509,9 +1567,27 @@ fn bind_with_view_depth(
         ));
     }
     match statement {
-        ParsedStatement::Begin => Ok(BoundStatement::Begin),
-        ParsedStatement::Commit => Ok(BoundStatement::Commit),
-        ParsedStatement::Rollback => Ok(BoundStatement::Rollback),
+        ParsedStatement::Begin { characteristics } => Ok(BoundStatement::Begin { characteristics }),
+        ParsedStatement::Commit { chain } => Ok(BoundStatement::Commit { chain }),
+        ParsedStatement::Rollback { chain } => Ok(BoundStatement::Rollback { chain }),
+        ParsedStatement::Savepoint { name } => Ok(BoundStatement::Savepoint { name: name.name }),
+        ParsedStatement::RollbackTo { name } => Ok(BoundStatement::RollbackTo { name: name.name }),
+        ParsedStatement::ReleaseSavepoint { name } => {
+            Ok(BoundStatement::ReleaseSavepoint { name: name.name })
+        }
+        ParsedStatement::Analyze { table } => Ok(BoundStatement::Analyze {
+            table_id: table
+                .as_ref()
+                .map(|table| resolve_table(table, catalog).map(|table| table.id))
+                .transpose()?,
+        }),
+        ParsedStatement::Vacuum { table, analyze } => Ok(BoundStatement::Vacuum {
+            table_id: table
+                .as_ref()
+                .map(|table| resolve_table(table, catalog).map(|table| table.id))
+                .transpose()?,
+            analyze,
+        }),
         ParsedStatement::CreateSchema {
             name,
             if_not_exists,
@@ -2170,8 +2246,7 @@ fn convert_statement(statement: SqlStatement, sql: &str) -> Result<ParsedStateme
             } else {
                 matches!(transaction, Some(BeginTransactionKind::Transaction))
             };
-            if !modes.is_empty()
-                || !supported_keyword
+            if !supported_keyword
                 || modifier.is_some()
                 || !statements.is_empty()
                 || exception.is_some()
@@ -2179,32 +2254,80 @@ fn convert_statement(statement: SqlStatement, sql: &str) -> Result<ParsedStateme
             {
                 return unsupported("transaction modes and options are not supported yet");
             }
-            Ok(ParsedStatement::Begin)
+            Ok(ParsedStatement::Begin {
+                characteristics: convert_transaction_modes(modes, false)?,
+            })
         }
         SqlStatement::Commit {
             chain,
             end,
             modifier,
         } => {
-            if chain
-                || end
-                || modifier.is_some()
-                || has_keyword_sequence(sql, &["AND", "NO", "CHAIN"])
-                || has_keyword_sequence(sql, &["COMMIT", "TRAN"])
-            {
+            if end || modifier.is_some() || has_keyword_sequence(sql, &["COMMIT", "TRAN"]) {
                 return unsupported("COMMIT options are not supported yet");
             }
-            Ok(ParsedStatement::Commit)
+            Ok(ParsedStatement::Commit {
+                chain: convert_transaction_chain(chain, sql),
+            })
         }
         SqlStatement::Rollback { chain, savepoint } => {
-            if chain
-                || savepoint.is_some()
-                || has_keyword_sequence(sql, &["AND", "NO", "CHAIN"])
-                || has_keyword_sequence(sql, &["ROLLBACK", "TRAN"])
-            {
-                return unsupported("ROLLBACK options and savepoints are not supported yet");
+            if has_keyword_sequence(sql, &["ROLLBACK", "TRAN"]) {
+                return unsupported("ROLLBACK TRAN is not supported");
             }
-            Ok(ParsedStatement::Rollback)
+            if let Some(name) = savepoint {
+                if chain || has_keyword_sequence(sql, &["AND", "NO", "CHAIN"]) {
+                    return unsupported("ROLLBACK TO SAVEPOINT cannot use AND CHAIN");
+                }
+                return Ok(ParsedStatement::RollbackTo {
+                    name: convert_ident(name, sql),
+                });
+            }
+            Ok(ParsedStatement::Rollback {
+                chain: convert_transaction_chain(chain, sql),
+            })
+        }
+        SqlStatement::Savepoint { name } => Ok(ParsedStatement::Savepoint {
+            name: convert_ident(name, sql),
+        }),
+        SqlStatement::ReleaseSavepoint { name } => Ok(ParsedStatement::ReleaseSavepoint {
+            name: convert_ident(name, sql),
+        }),
+        SqlStatement::Analyze(analyze) => {
+            if analyze.partitions.is_some()
+                || analyze.for_columns
+                || !analyze.columns.is_empty()
+                || analyze.cache_metadata
+                || analyze.noscan
+                || analyze.compute_statistics
+                || analyze.has_table_keyword
+            {
+                return unsupported("this ANALYZE form is not supported yet");
+            }
+            Ok(ParsedStatement::Analyze {
+                table: analyze
+                    .table_name
+                    .map(|table| convert_object_name(table, sql))
+                    .transpose()?,
+            })
+        }
+        SqlStatement::Vacuum(vacuum) => {
+            if vacuum.full
+                || vacuum.sort_only
+                || vacuum.delete_only
+                || vacuum.reindex
+                || vacuum.recluster
+                || vacuum.threshold.is_some()
+                || vacuum.boost
+            {
+                return unsupported("this VACUUM form is not supported yet");
+            }
+            Ok(ParsedStatement::Vacuum {
+                table: vacuum
+                    .table_name
+                    .map(|table| convert_object_name(table, sql))
+                    .transpose()?,
+                analyze: false,
+            })
         }
         SqlStatement::CreateSchema {
             schema_name,
@@ -6474,19 +6597,197 @@ fn unsupported_at<T>(message: impl Into<String>, position: Option<usize>) -> Res
     Err(DbError::new(FEATURE_NOT_SUPPORTED, message).with_position_opt(position))
 }
 
-fn has_unrepresented_transaction_option(sql: &str) -> bool {
-    let tokens = significant_tokens(sql);
-    let begins_transaction = tokens.first().is_some_and(|token| {
-        is_unquoted_word(token, "BEGIN")
-            || (is_unquoted_word(token, "START")
-                && tokens
-                    .get(1)
-                    .is_some_and(|token| is_unquoted_word(token, "TRANSACTION")))
-    });
-    begins_transaction
-        && tokens
-            .iter()
-            .any(|token| is_unquoted_word(token, "DEFERRABLE"))
+fn parse_transaction_begin(sql: &str) -> Result<Option<ParsedStatement>> {
+    let mut tokens = significant_tokens(sql);
+    if matches!(tokens.last(), Some(Token::SemiColon)) {
+        tokens.pop();
+    }
+    let mut index = 0_usize;
+    if consume_keyword(&tokens, &mut index, "BEGIN") {
+        if token_is_keyword(&tokens, index, "WORK")
+            || token_is_keyword(&tokens, index, "TRANSACTION")
+        {
+            index += 1;
+        }
+    } else if consume_keyword(&tokens, &mut index, "START") {
+        if !consume_keyword(&tokens, &mut index, "TRANSACTION") {
+            return Ok(None);
+        }
+    } else {
+        return Ok(None);
+    }
+
+    let mut characteristics = TransactionCharacteristics::default();
+    let mut isolation_seen = false;
+    let mut access_seen = false;
+    let mut deferrable_seen = false;
+    while index < tokens.len() {
+        if matches!(tokens.get(index), Some(Token::Comma)) {
+            return Err(transaction_syntax_error(
+                "transaction mode is missing before comma",
+            ));
+        }
+        if consume_keyword(&tokens, &mut index, "ISOLATION") {
+            if isolation_seen {
+                return Err(transaction_syntax_error(
+                    "transaction isolation level was specified more than once",
+                ));
+            }
+            isolation_seen = true;
+            expect_keyword(&tokens, &mut index, "LEVEL")?;
+            characteristics.isolation_level =
+                if consume_keyword_sequence(&tokens, &mut index, &["READ", "UNCOMMITTED"])
+                    || consume_keyword_sequence(&tokens, &mut index, &["READ", "COMMITTED"])
+                {
+                    IsolationLevel::ReadCommitted
+                } else if consume_keyword_sequence(&tokens, &mut index, &["REPEATABLE", "READ"]) {
+                    IsolationLevel::RepeatableRead
+                } else if consume_keyword(&tokens, &mut index, "SERIALIZABLE") {
+                    IsolationLevel::Serializable
+                } else if consume_keyword(&tokens, &mut index, "SNAPSHOT") {
+                    return unsupported("SNAPSHOT isolation is not supported");
+                } else {
+                    return Err(transaction_syntax_error(
+                        "expected READ COMMITTED, REPEATABLE READ, or SERIALIZABLE",
+                    ));
+                };
+        } else if consume_keyword_sequence(&tokens, &mut index, &["READ", "ONLY"]) {
+            if access_seen {
+                return Err(transaction_syntax_error(
+                    "transaction access mode was specified more than once",
+                ));
+            }
+            access_seen = true;
+            characteristics.access_mode = TransactionAccessMode::ReadOnly;
+        } else if consume_keyword_sequence(&tokens, &mut index, &["READ", "WRITE"]) {
+            if access_seen {
+                return Err(transaction_syntax_error(
+                    "transaction access mode was specified more than once",
+                ));
+            }
+            access_seen = true;
+            characteristics.access_mode = TransactionAccessMode::ReadWrite;
+        } else if consume_keyword(&tokens, &mut index, "DEFERRABLE") {
+            if deferrable_seen {
+                return Err(transaction_syntax_error(
+                    "transaction deferrability was specified more than once",
+                ));
+            }
+            deferrable_seen = true;
+            characteristics.deferrable = true;
+        } else if consume_keyword_sequence(&tokens, &mut index, &["NOT", "DEFERRABLE"]) {
+            if deferrable_seen {
+                return Err(transaction_syntax_error(
+                    "transaction deferrability was specified more than once",
+                ));
+            }
+            deferrable_seen = true;
+            characteristics.deferrable = false;
+        } else {
+            return Err(transaction_syntax_error(
+                "unrecognized transaction mode or trailing token",
+            ));
+        }
+        if matches!(tokens.get(index), Some(Token::Comma)) {
+            index += 1;
+            if index == tokens.len() || matches!(tokens.get(index), Some(Token::Comma)) {
+                return Err(transaction_syntax_error(
+                    "transaction mode is missing after comma",
+                ));
+            }
+        }
+    }
+    Ok(Some(ParsedStatement::Begin {
+        characteristics: characteristics.validate()?,
+    }))
+}
+
+fn convert_transaction_modes(
+    modes: Vec<TransactionMode>,
+    deferrable: bool,
+) -> Result<TransactionCharacteristics> {
+    let mut characteristics = TransactionCharacteristics {
+        deferrable,
+        ..TransactionCharacteristics::default()
+    };
+    let mut isolation_seen = false;
+    let mut access_seen = false;
+    for mode in modes {
+        match mode {
+            TransactionMode::IsolationLevel(level) => {
+                if isolation_seen {
+                    return Err(transaction_syntax_error(
+                        "transaction isolation level was specified more than once",
+                    ));
+                }
+                isolation_seen = true;
+                characteristics.isolation_level = match level {
+                    SqlTransactionIsolationLevel::ReadUncommitted
+                    | SqlTransactionIsolationLevel::ReadCommitted => IsolationLevel::ReadCommitted,
+                    SqlTransactionIsolationLevel::RepeatableRead => IsolationLevel::RepeatableRead,
+                    SqlTransactionIsolationLevel::Serializable => IsolationLevel::Serializable,
+                    SqlTransactionIsolationLevel::Snapshot => {
+                        return unsupported("SNAPSHOT isolation is not supported");
+                    }
+                };
+            }
+            TransactionMode::AccessMode(mode) => {
+                if access_seen {
+                    return Err(transaction_syntax_error(
+                        "transaction access mode was specified more than once",
+                    ));
+                }
+                access_seen = true;
+                characteristics.access_mode = match mode {
+                    SqlTransactionAccessMode::ReadOnly => TransactionAccessMode::ReadOnly,
+                    SqlTransactionAccessMode::ReadWrite => TransactionAccessMode::ReadWrite,
+                };
+            }
+        }
+    }
+    characteristics.validate()
+}
+
+fn convert_transaction_chain(chain: bool, sql: &str) -> TransactionChain {
+    if chain {
+        TransactionChain::Chain
+    } else if has_keyword_sequence(sql, &["AND", "NO", "CHAIN"]) {
+        TransactionChain::NoChain
+    } else {
+        TransactionChain::Default
+    }
+}
+
+fn consume_keyword(tokens: &[Token], index: &mut usize, keyword: &str) -> bool {
+    if token_is_keyword(tokens, *index, keyword) {
+        *index += 1;
+        true
+    } else {
+        false
+    }
+}
+
+fn consume_keyword_sequence(tokens: &[Token], index: &mut usize, keywords: &[&str]) -> bool {
+    if keywords
+        .iter()
+        .enumerate()
+        .all(|(offset, keyword)| token_is_keyword(tokens, *index + offset, keyword))
+    {
+        *index += keywords.len();
+        true
+    } else {
+        false
+    }
+}
+
+fn token_is_keyword(tokens: &[Token], index: usize, keyword: &str) -> bool {
+    tokens
+        .get(index)
+        .is_some_and(|token| is_unquoted_word(token, keyword))
+}
+
+fn transaction_syntax_error(message: impl Into<String>) -> DbError {
+    DbError::new(SYNTAX_ERROR, message)
 }
 
 fn has_keyword_sequence(sql: &str, sequence: &[&str]) -> bool {
@@ -6498,6 +6799,44 @@ fn has_keyword_sequence(sql: &str, sequence: &[&str]) -> bool {
                 .zip(sequence)
                 .all(|(token, keyword)| is_unquoted_word(token, keyword))
         })
+}
+
+fn parse_vacuum_analyze(sql: &str) -> Result<Option<ParsedStatement>> {
+    let tokens = significant_tokens(sql);
+    if tokens.len() < 2
+        || !is_unquoted_word(&tokens[0], "VACUUM")
+        || !is_unquoted_word(&tokens[1], "ANALYZE")
+    {
+        return Ok(None);
+    }
+    let mut normalized = String::from("VACUUM");
+    for token in &tokens[2..] {
+        normalized.push(' ');
+        normalized.push_str(&token.to_string());
+    }
+    let mut statements = parse_source_statements(&normalized, SqlDialect::PostgreSql)
+        .map_err(|error| DbError::new(SYNTAX_ERROR, error.to_string()))?;
+    if statements.len() != 1 {
+        return Err(DbError::new(
+            FEATURE_NOT_SUPPORTED,
+            "exactly one SQL statement must be executed at a time",
+        ));
+    }
+    let parsed = convert_statement(
+        statements
+            .pop()
+            .ok_or_else(|| DbError::new(SYNTAX_ERROR, "VACUUM statement is empty"))?,
+        &normalized,
+    )?;
+    let ParsedStatement::Vacuum { table, .. } = parsed else {
+        return Err(DbError::internal(
+            "VACUUM ANALYZE normalization produced a non-VACUUM statement",
+        ));
+    };
+    Ok(Some(ParsedStatement::Vacuum {
+        table,
+        analyze: true,
+    }))
 }
 
 fn significant_tokens(sql: &str) -> Vec<Token> {
@@ -6627,27 +6966,37 @@ mod tests {
     #[test]
     fn parses_and_binds_owned_transaction_control_variants() {
         let catalog = Catalog::default();
+        let begin = ParsedStatement::Begin {
+            characteristics: TransactionCharacteristics::default(),
+        };
+        let bound_begin = BoundStatement::Begin {
+            characteristics: TransactionCharacteristics::default(),
+        };
         for (sql, parsed, bound) in [
-            ("BEGIN", ParsedStatement::Begin, BoundStatement::Begin),
+            ("BEGIN", begin.clone(), bound_begin.clone()),
             (
                 "  bEgIn \n TrAnSaCtIoN ; ",
-                ParsedStatement::Begin,
-                BoundStatement::Begin,
+                begin.clone(),
+                bound_begin.clone(),
             ),
-            (
-                "\n StArT \t TrAnSaCtIoN ;",
-                ParsedStatement::Begin,
-                BoundStatement::Begin,
-            ),
+            ("\n StArT \t TrAnSaCtIoN ;", begin, bound_begin),
             (
                 "cOmMiT \n WoRk;",
-                ParsedStatement::Commit,
-                BoundStatement::Commit,
+                ParsedStatement::Commit {
+                    chain: TransactionChain::Default,
+                },
+                BoundStatement::Commit {
+                    chain: TransactionChain::Default,
+                },
             ),
             (
                 "\r\n RoLlBaCk \t TrAnSaCtIoN ;",
-                ParsedStatement::Rollback,
-                BoundStatement::Rollback,
+                ParsedStatement::Rollback {
+                    chain: TransactionChain::Default,
+                },
+                BoundStatement::Rollback {
+                    chain: TransactionChain::Default,
+                },
             ),
         ] {
             let actual = parse(sql).expect("parse transaction control");
@@ -6661,24 +7010,122 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_transaction_modes_chaining_and_savepoints() {
-        for sql in [
-            "BEGIN ISOLATION LEVEL SERIALIZABLE",
-            "START TRANSACTION ISOLATION LEVEL READ COMMITTED",
-            "BEGIN READ ONLY",
-            "START TRANSACTION READ WRITE",
-            "BEGIN DEFERRABLE",
-            "START TRANSACTION NOT DEFERRABLE",
-            "COMMIT AND CHAIN",
-            "COMMIT AND NO CHAIN",
-            "ROLLBACK AND CHAIN",
-            "ROLLBACK AND NO CHAIN",
-            "ROLLBACK TO SAVEPOINT before_update",
-            "ROLLBACK TO before_update",
-        ] {
-            let error = parse(sql).expect_err("unsupported transaction control");
-            assert_eq!(error.sql_state, FEATURE_NOT_SUPPORTED, "{sql}");
-        }
+    fn parses_transaction_modes_chaining_and_savepoints() {
+        assert_eq!(
+            parse("BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE").expect("begin"),
+            ParsedStatement::Begin {
+                characteristics: TransactionCharacteristics {
+                    isolation_level: IsolationLevel::Serializable,
+                    access_mode: TransactionAccessMode::ReadOnly,
+                    deferrable: true,
+                },
+            }
+        );
+        assert_eq!(
+            parse("START TRANSACTION ISOLATION LEVEL READ UNCOMMITTED, READ WRITE NOT DEFERRABLE")
+                .expect("start"),
+            ParsedStatement::Begin {
+                characteristics: TransactionCharacteristics::default(),
+            }
+        );
+        assert_eq!(
+            parse("COMMIT AND CHAIN").expect("commit chain"),
+            ParsedStatement::Commit {
+                chain: TransactionChain::Chain,
+            }
+        );
+        assert_eq!(
+            parse("ROLLBACK WORK AND NO CHAIN").expect("rollback no chain"),
+            ParsedStatement::Rollback {
+                chain: TransactionChain::NoChain,
+            }
+        );
+        assert_eq!(
+            parse("SAVEPOINT before_update").expect("savepoint"),
+            ParsedStatement::Savepoint {
+                name: ParsedIdentifier {
+                    name: Identifier::unquoted("before_update"),
+                    position: Some(11),
+                },
+            }
+        );
+        assert!(matches!(
+            parse("ROLLBACK TO SAVEPOINT before_update").expect("rollback to"),
+            ParsedStatement::RollbackTo { name }
+                if name.name == Identifier::unquoted("before_update")
+        ));
+        assert!(matches!(
+            parse("RELEASE SAVEPOINT before_update").expect("release"),
+            ParsedStatement::ReleaseSavepoint { name }
+                if name.name == Identifier::unquoted("before_update")
+        ));
+
+        assert_eq!(
+            parse("BEGIN READ WRITE DEFERRABLE")
+                .expect_err("invalid deferrable")
+                .sql_state,
+            "25001"
+        );
+        assert_eq!(
+            parse("BEGIN READ ONLY READ WRITE")
+                .expect_err("duplicate access mode")
+                .sql_state,
+            SYNTAX_ERROR
+        );
+        assert_eq!(
+            parse("BEGIN ISOLATION LEVEL SNAPSHOT")
+                .expect_err("snapshot")
+                .sql_state,
+            FEATURE_NOT_SUPPORTED
+        );
+    }
+
+    #[test]
+    fn parses_and_binds_transactional_maintenance() {
+        let catalog = catalog_with_documents();
+        let documents = catalog
+            .table(
+                &Identifier::unquoted("public"),
+                &Identifier::unquoted("documents"),
+            )
+            .expect("documents")
+            .id;
+        assert_eq!(
+            bind(parse("ANALYZE documents").expect("analyze"), &catalog).expect("bind analyze"),
+            BoundStatement::Analyze {
+                table_id: Some(documents),
+            }
+        );
+        assert_eq!(
+            bind(parse("VACUUM documents").expect("vacuum"), &catalog).expect("bind vacuum"),
+            BoundStatement::Vacuum {
+                table_id: Some(documents),
+                analyze: false,
+            }
+        );
+        assert_eq!(
+            bind(
+                parse("VACUUM ANALYZE documents").expect("vacuum analyze"),
+                &catalog,
+            )
+            .expect("bind vacuum analyze"),
+            BoundStatement::Vacuum {
+                table_id: Some(documents),
+                analyze: true,
+            }
+        );
+        assert_eq!(
+            parse("VACUUM FULL documents")
+                .expect_err("vacuum full")
+                .sql_state,
+            FEATURE_NOT_SUPPORTED
+        );
+        assert_eq!(
+            parse("ANALYZE documents (id)")
+                .expect_err("column analyze")
+                .sql_state,
+            FEATURE_NOT_SUPPORTED
+        );
     }
 
     #[test]

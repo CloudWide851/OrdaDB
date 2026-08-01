@@ -15,7 +15,7 @@ pub use store::{
     ApplyPoint, DATABASE_FILE_NAME, DATABASE_FORMAT_V1, DATABASE_FORMAT_V2, DataFormat,
     DatabaseStore, IndexManifest, IndexRebuildContractV2, IndexRebuildModeV2, PageDelta,
     PersistentState, PreparedCommit, StorageEstimate, StorageInspection, StorageTableCursorV2,
-    TableManifest,
+    TableManifest, VersionedRow,
 };
 pub use tuple::{
     FROZEN_TRANSACTION_ID, TUPLE_FORMAT_V1, TUPLE_FORMAT_V2, TUPLE_HEADER_V2_BYTES, TupleHeaderV2,

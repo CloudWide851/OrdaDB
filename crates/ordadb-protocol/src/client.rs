@@ -34,6 +34,7 @@ pub struct PgClient {
     address: SocketAddr,
     process_id: u32,
     secret_key: u32,
+    transaction_status: PgTransactionStatus,
 }
 
 #[derive(Clone)]
@@ -72,6 +73,14 @@ pub struct QueryResult {
     pub command_tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PgTransactionStatus {
+    #[default]
+    Idle,
+    InTransaction,
+    FailedTransaction,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PgQueryEvent {
     Schema(Vec<String>),
@@ -108,7 +117,7 @@ impl PgClient {
         let mut process_id = 0;
         let mut secret_key = 0;
         let mut scram = ClientScram::new(&config.user, config.password.as_bytes());
-        loop {
+        let transaction_status = loop {
             let message = read_backend(&mut stream)?;
             match message.tag {
                 b'R' => scram.handle_authentication(&mut stream, &message.payload)?,
@@ -122,7 +131,7 @@ impl PgClient {
                         u32::from_be_bytes(message.payload[4..].try_into().expect("checked"));
                 }
                 b'E' => return Err(decode_error(&message.payload)),
-                b'Z' => break,
+                b'Z' => break decode_ready_status(&message.payload)?,
                 b'S' | b'N' => {}
                 other => {
                     return Err(protocol(format!(
@@ -130,7 +139,7 @@ impl PgClient {
                     )));
                 }
             }
-        }
+        };
         if process_id == 0 {
             return Err(protocol("server did not send BackendKeyData"));
         }
@@ -139,7 +148,13 @@ impl PgClient {
             address: config.address,
             process_id,
             secret_key,
+            transaction_status,
         })
+    }
+
+    #[must_use]
+    pub const fn transaction_status(&self) -> PgTransactionStatus {
+        self.transaction_status
     }
 
     pub fn query(&mut self, sql: &str) -> Result<QueryResult> {
@@ -264,7 +279,10 @@ impl PgClient {
                     result.command_tag = decode_only_cstring(&message.payload, "CommandComplete")?;
                 }
                 b'E' => pending_error = Some(decode_error(&message.payload)),
-                b'Z' => return pending_error.map_or(Ok(result), Err),
+                b'Z' => {
+                    self.transaction_status = decode_ready_status(&message.payload)?;
+                    return pending_error.map_or(Ok(result), Err);
+                }
                 other => {
                     return Err(protocol(format!(
                         "unexpected backend message 0x{other:02x} during COPY OUT"
@@ -297,6 +315,7 @@ impl PgClient {
                 b'E' => pending_error = Some(decode_error(&message.payload)),
                 b'N' | b'I' => {}
                 b'Z' => {
+                    self.transaction_status = decode_ready_status(&message.payload)?;
                     if let Some(error) = pending_error {
                         return Err(error);
                     }
@@ -381,6 +400,7 @@ impl PgClient {
                 b'E' => pending_error = Some(decode_error(&message.payload)),
                 b's' => suspended = true,
                 b'Z' => {
+                    self.transaction_status = decode_ready_status(&message.payload)?;
                     flush_query_rows(on_event, &mut callback_error, &mut rows);
                     if let Some(error) = pending_error {
                         return Err(error);
@@ -401,6 +421,16 @@ impl PgClient {
                 }
             }
         }
+    }
+}
+
+fn decode_ready_status(payload: &[u8]) -> Result<PgTransactionStatus> {
+    match payload {
+        [b'I'] => Ok(PgTransactionStatus::Idle),
+        [b'T'] => Ok(PgTransactionStatus::InTransaction),
+        [b'E'] => Ok(PgTransactionStatus::FailedTransaction),
+        [_] => Err(protocol("ReadyForQuery transaction status is invalid")),
+        _ => Err(protocol("ReadyForQuery payload length is invalid")),
     }
 }
 
@@ -901,5 +931,29 @@ mod tests {
             vec![Some("42".into())]
         );
         assert!(decode_data_row(&payload, 2).is_err());
+    }
+
+    #[test]
+    fn ready_for_query_status_is_strict_and_typed() {
+        assert_eq!(
+            decode_ready_status(b"I").expect("idle"),
+            PgTransactionStatus::Idle
+        );
+        assert_eq!(
+            decode_ready_status(b"T").expect("active"),
+            PgTransactionStatus::InTransaction
+        );
+        assert_eq!(
+            decode_ready_status(b"E").expect("failed"),
+            PgTransactionStatus::FailedTransaction
+        );
+        assert_eq!(
+            decode_ready_status(b"X")
+                .expect_err("unknown status")
+                .sql_state,
+            "08P01"
+        );
+        assert!(decode_ready_status(b"").is_err());
+        assert!(decode_ready_status(b"II").is_err());
     }
 }

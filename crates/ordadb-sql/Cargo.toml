@@ -9,6 +9,7 @@ authors.workspace = true
 [dependencies]
 chrono.workspace = true
 ordadb-catalog = { path = "../ordadb-catalog" }
+ordadb-transaction = { path = "../ordadb-transaction" }
 ordadb-types = { path = "../ordadb-types" }
 rust_decimal.workspace = true
 serde.workspace = true

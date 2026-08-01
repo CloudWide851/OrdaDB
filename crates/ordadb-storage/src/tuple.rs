@@ -34,6 +34,7 @@ pub struct TupleHeaderV2 {
     pub xmin: u64,
     pub xmax: u64,
     pub command_id: u32,
+    pub previous_version: u32,
 }
 
 impl TupleHeaderV2 {
@@ -44,6 +45,7 @@ impl TupleHeaderV2 {
             xmin: FROZEN_TRANSACTION_ID,
             xmax: 0,
             command_id: 0,
+            previous_version: 0,
         })
     }
 
@@ -99,7 +101,7 @@ pub fn encode_row_v2(row: &Row, header: TupleHeaderV2) -> Result<Vec<u8>> {
     bytes.extend_from_slice(&header.xmin.to_le_bytes());
     bytes.extend_from_slice(&header.xmax.to_le_bytes());
     bytes.extend_from_slice(&header.command_id.to_le_bytes());
-    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&header.previous_version.to_le_bytes());
     encode_values(row, &mut bytes)?;
     Ok(bytes)
 }
@@ -122,12 +124,9 @@ pub fn decode_row_v2(bytes: &[u8]) -> Result<(TupleHeaderV2, Row)> {
         xmin: cursor.read_u64()?,
         xmax: cursor.read_u64()?,
         command_id: cursor.read_u32()?,
+        previous_version: cursor.read_u32()?,
     }
     .validate()?;
-    let reserved = cursor.read_u32()?;
-    if reserved != 0 {
-        return Err(corruption("tuple v2 reserved header bytes are not zero"));
-    }
     let mut values = Vec::with_capacity(usize::from(header.column_count));
     for _ in 0..header.column_count {
         values.push(decode_value(&mut cursor)?);
@@ -454,6 +453,7 @@ mod tests {
                 xmin: FROZEN_TRANSACTION_ID,
                 xmax: 0,
                 command_id: 7,
+                previous_version: 0x0102_0304,
             },
         )
         .expect("encode");
@@ -461,7 +461,7 @@ mod tests {
             &encoded[..TUPLE_HEADER_V2_BYTES as usize],
             &[
                 2, 0, 32, 0, 0, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0,
-                0, 0, 0, 0, 0,
+                0, 4, 3, 2, 1,
             ]
         );
         assert_eq!(
@@ -503,10 +503,9 @@ mod tests {
         let mut encoded =
             encode_row_v2(&row, TupleHeaderV2::frozen(&row).expect("header")).expect("encode");
         encoded[28] = 1;
-        assert_eq!(
-            decode_row_v2(&encoded).expect_err("reserved").sql_state,
-            "XX001"
-        );
+        let (header, decoded) = decode_row_v2(&encoded).expect("version predecessor");
+        assert_eq!(header.previous_version, 1);
+        assert_eq!(decoded, row);
     }
 
     #[test]

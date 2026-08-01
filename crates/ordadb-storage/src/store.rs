@@ -81,7 +81,15 @@ pub struct PersistentState {
     pub generation: u64,
     pub catalog: Catalog,
     pub tables: BTreeMap<TableId, Vec<Row>>,
+    pub versions: BTreeMap<TableId, Vec<VersionedRow>>,
     pub indexes: BTreeMap<IndexId, Vec<IndexEntry>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VersionedRow {
+    pub version_id: u32,
+    pub header: TupleHeaderV2,
+    pub row: Row,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +106,7 @@ pub struct StorageTableCursorV2 {
     generation: u64,
     heap_pages: Vec<PageId>,
     expected_rows: u64,
+    expected_visible_rows: u64,
     emitted_rows: u64,
     page_index: usize,
     slot_index: u16,
@@ -123,6 +132,11 @@ impl StorageTableCursorV2 {
     #[must_use]
     pub const fn expected_rows(&self) -> u64 {
         self.expected_rows
+    }
+
+    #[must_use]
+    pub const fn expected_visible_rows(&self) -> u64 {
+        self.expected_visible_rows
     }
 
     #[must_use]
@@ -661,13 +675,26 @@ impl DatabaseStore {
                     ),
                 )
             })?;
-        let rows = self
+        let expected_rows = self
+            .committed_state
+            .versions
+            .get(&table_id)
+            .map(Vec::len)
+            .or_else(|| self.committed_state.tables.get(&table_id).map(Vec::len))
+            .ok_or_else(|| corruption("v2 table directory has no matching row state"))?;
+        let expected_rows = u64::try_from(expected_rows)
+            .map_err(|_| corruption("v2 table row count exceeds the storage format limit"))?;
+        let expected_visible_rows = self
             .committed_state
             .tables
             .get(&table_id)
-            .ok_or_else(|| corruption("v2 table directory has no matching row state"))?;
-        let expected_rows = u64::try_from(rows.len())
-            .map_err(|_| corruption("v2 table row count exceeds the storage format limit"))?;
+            .map(Vec::len)
+            .ok_or_else(|| corruption("v2 table directory has no visible row state"))
+            .and_then(|rows| {
+                u64::try_from(rows).map_err(|_| {
+                    corruption("v2 visible row count exceeds the storage format limit")
+                })
+            })?;
         let page_count = self.pool.page_count()?;
         let mut previous = None;
         for page_id in &manifest.heap_pages {
@@ -694,6 +721,7 @@ impl DatabaseStore {
             generation: expected_generation,
             heap_pages: manifest.heap_pages.clone(),
             expected_rows,
+            expected_visible_rows,
             emitted_rows: 0,
             page_index: 0,
             slot_index: 0,
@@ -706,6 +734,15 @@ impl DatabaseStore {
         cursor: &mut StorageTableCursorV2,
         max_rows: usize,
     ) -> Result<Vec<Row>> {
+        self.read_versioned_table_cursor_v2(cursor, max_rows)
+            .map(|versions| versions.into_iter().map(|version| version.row).collect())
+    }
+
+    pub fn read_versioned_table_cursor_v2(
+        &self,
+        cursor: &mut StorageTableCursorV2,
+        max_rows: usize,
+    ) -> Result<Vec<VersionedRow>> {
         if max_rows == 0 {
             return Err(DbError::new(
                 "22023",
@@ -737,8 +774,8 @@ impl DatabaseStore {
             ));
         }
 
-        let mut rows = Vec::with_capacity(max_rows.min(1024));
-        while rows.len() < max_rows && cursor.page_index < cursor.heap_pages.len() {
+        let mut versions = Vec::with_capacity(max_rows.min(1024));
+        while versions.len() < max_rows && cursor.page_index < cursor.heap_pages.len() {
             let page_id = cursor.heap_pages[cursor.page_index];
             let page = self.pool.fetch(page_id)?.snapshot()?;
             if page.page_type()? != PageType::Heap {
@@ -754,7 +791,7 @@ impl DatabaseStore {
                     "v2 table cursor slot position exceeds its heap page",
                 ));
             }
-            while rows.len() < max_rows && cursor.slot_index < slot_count {
+            while versions.len() < max_rows && cursor.slot_index < slot_count {
                 let record = page.record(cursor.slot_index)?;
                 let (header, row) = decode_row_v2(record)?;
                 if usize::from(header.column_count) != row.values.len() {
@@ -766,6 +803,18 @@ impl DatabaseStore {
                     .slot_index
                     .checked_add(1)
                     .ok_or_else(|| corruption("v2 table cursor slot position overflowed"))?;
+                let version_id = cursor
+                    .emitted_rows
+                    .checked_add(1)
+                    .and_then(|version_id| u32::try_from(version_id).ok())
+                    .ok_or_else(|| {
+                        corruption("v2 table version ordinal exceeds the u32 format limit")
+                    })?;
+                if header.previous_version >= version_id {
+                    return Err(corruption(
+                        "v2 tuple predecessor is not earlier than its version ordinal",
+                    ));
+                }
                 cursor.emitted_rows = cursor
                     .emitted_rows
                     .checked_add(1)
@@ -775,7 +824,11 @@ impl DatabaseStore {
                         "v2 table cursor decoded more rows than the manifest state declares",
                     ));
                 }
-                rows.push(row);
+                versions.push(VersionedRow {
+                    version_id,
+                    header,
+                    row,
+                });
             }
             if cursor.slot_index == slot_count {
                 cursor.page_index = cursor
@@ -795,7 +848,7 @@ impl DatabaseStore {
             }
             cursor.exhausted = true;
         }
-        Ok(rows)
+        Ok(versions)
     }
 
     pub fn commit(&mut self, candidate: &PersistentState) -> Result<()> {
@@ -1148,6 +1201,14 @@ fn validate_table_directory(state: &PersistentState) -> Result<BTreeSet<TableId>
             )));
         }
     }
+    for table_id in state.versions.keys() {
+        if !catalog_table_ids.contains(table_id) {
+            return Err(corruption(format!(
+                "version state references unknown table {}",
+                table_id.get()
+            )));
+        }
+    }
     Ok(catalog_table_ids)
 }
 
@@ -1160,40 +1221,73 @@ fn build_v2_heap_pages(
     let mut heap_pages = Vec::new();
     let mut table_manifests = Vec::with_capacity(catalog_table_ids.len());
     for table_id in catalog_table_ids {
-        let rows = state.tables.get(table_id).map_or(&[][..], Vec::as_slice);
         let mut page_ids = Vec::new();
         let mut current_page: Option<SlottedPage> = None;
-        for row in rows {
-            let encoded = encode_row_v2(row, TupleHeaderV2::frozen(row)?)?;
-            if current_page
-                .as_ref()
-                .is_some_and(|page| !page.can_fit(encoded.len()))
-                && let Some(page) = current_page.take()
-            {
-                heap_pages.push(page);
-            }
-            if current_page.is_none() {
-                let page_id = PageId::new(next_page_id);
-                next_page_id = next_page_id
-                    .checked_add(1)
-                    .ok_or_else(|| corruption("v2 heap page ID overflow"))?;
-                page_ids.push(page_id);
-                current_page = Some(SlottedPage::new(page_id, PageType::Heap));
-            }
-            if current_page
-                .as_mut()
-                .ok_or_else(|| DbError::internal("v2 heap page was not initialized"))?
-                .insert(&encoded)?
-                .is_none()
-            {
-                return Err(DbError::new(
-                    "54000",
-                    format!(
-                        "v2 row for table {} is too large for an 8 KiB heap page",
-                        table_id.get()
-                    ),
-                )
-                .with_hint("reduce variable-width values before retrying"));
+        {
+            let mut append_version = |header: TupleHeaderV2, row: &Row| -> Result<()> {
+                let encoded = encode_row_v2(row, header)?;
+                if current_page
+                    .as_ref()
+                    .is_some_and(|page| !page.can_fit(encoded.len()))
+                    && let Some(page) = current_page.take()
+                {
+                    heap_pages.push(page);
+                }
+                if current_page.is_none() {
+                    let page_id = PageId::new(next_page_id);
+                    next_page_id = next_page_id
+                        .checked_add(1)
+                        .ok_or_else(|| corruption("v2 heap page ID overflow"))?;
+                    page_ids.push(page_id);
+                    current_page = Some(SlottedPage::new(page_id, PageType::Heap));
+                }
+                if current_page
+                    .as_mut()
+                    .ok_or_else(|| DbError::internal("v2 heap page was not initialized"))?
+                    .insert(&encoded)?
+                    .is_none()
+                {
+                    return Err(DbError::new(
+                        "54000",
+                        format!(
+                            "v2 row for table {} is too large for an 8 KiB heap page",
+                            table_id.get()
+                        ),
+                    )
+                    .with_hint("reduce variable-width values before retrying"));
+                }
+                Ok(())
+            };
+            if let Some(versions) = state.versions.get(table_id) {
+                for (index, version) in versions.iter().enumerate() {
+                    let expected_version = u32::try_from(index)
+                        .ok()
+                        .and_then(|index| index.checked_add(1))
+                        .ok_or_else(|| {
+                            DbError::new(
+                                "54000",
+                                format!(
+                                    "v2 table {} exceeds the u32 version ordinal limit",
+                                    table_id.get()
+                                ),
+                            )
+                        })?;
+                    if version.version_id != expected_version
+                        || version.header.previous_version >= version.version_id
+                    {
+                        return Err(corruption(format!(
+                            "v2 table {} has an invalid version chain at ordinal {}",
+                            table_id.get(),
+                            version.version_id
+                        )));
+                    }
+                    append_version(version.header, &version.row)?;
+                }
+            } else {
+                let rows = state.tables.get(table_id).map_or(&[][..], Vec::as_slice);
+                for row in rows {
+                    append_version(TupleHeaderV2::frozen(row)?, row)?;
+                }
             }
         }
         if let Some(page) = current_page {
@@ -1592,8 +1686,10 @@ fn load_state_v2(pool: &BufferPool) -> Result<LoadedState> {
     }
 
     let mut tables = BTreeMap::new();
+    let mut versions = BTreeMap::new();
     for table in &manifest.tables {
         let mut rows = Vec::new();
+        let mut table_versions = Vec::new();
         for page_id in &table.heap_pages {
             if page_id.get() == 0
                 || page_id.get() >= page_count
@@ -1619,10 +1715,31 @@ fn load_state_v2(pool: &BufferPool) -> Result<LoadedState> {
                         "v2 tuple header column count does not match the decoded row",
                     ));
                 }
-                rows.push(row);
+                let version_id = u32::try_from(table_versions.len())
+                    .ok()
+                    .and_then(|version_id| version_id.checked_add(1))
+                    .ok_or_else(|| {
+                        corruption("v2 table version ordinal exceeds the u32 format limit")
+                    })?;
+                if header.previous_version >= version_id {
+                    return Err(corruption(format!(
+                        "v2 table {} tuple {} has a non-backward predecessor",
+                        table.table_id.get(),
+                        version_id
+                    )));
+                }
+                if header.xmax == 0 {
+                    rows.push(row.clone());
+                }
+                table_versions.push(VersionedRow {
+                    version_id,
+                    header,
+                    row,
+                });
             }
         }
         tables.insert(table.table_id, rows);
+        versions.insert(table.table_id, table_versions);
     }
     if u64::try_from(referenced_pages.len()).ok() != Some(page_count)
         || (0..page_count).any(|page_id| !referenced_pages.contains(&PageId::new(page_id)))
@@ -1638,6 +1755,7 @@ fn load_state_v2(pool: &BufferPool) -> Result<LoadedState> {
             generation: manifest.generation,
             catalog: manifest.catalog,
             tables,
+            versions,
             indexes: BTreeMap::new(),
         },
         tables: manifest.tables,
@@ -1792,6 +1910,7 @@ fn load_state_v1(
             generation: manifest.generation,
             catalog: manifest.catalog,
             tables,
+            versions: BTreeMap::new(),
             indexes,
         },
         manifest.tables,
@@ -2072,6 +2191,7 @@ mod tests {
             generation: 9,
             catalog,
             tables: BTreeMap::from([(table_id, rows)]),
+            versions: BTreeMap::new(),
             indexes: BTreeMap::from([(index_id, entries)]),
         }
     }
@@ -2109,6 +2229,7 @@ mod tests {
             generation: 17,
             catalog,
             tables,
+            versions: BTreeMap::new(),
             indexes,
         }
     }
@@ -2245,6 +2366,82 @@ mod tests {
                 .expect("post exhaustion")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn v2_version_cursor_preserves_headers_and_stable_predecessor_ordinals() {
+        let directory = tempdir().expect("tempdir");
+        let mut state = PersistentState {
+            generation: 1,
+            ..PersistentState::default()
+        };
+        let table_id = state
+            .catalog
+            .create_table(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("versions"),
+                vec![NewColumn::new(
+                    Identifier::unquoted("value"),
+                    ScalarType::Int64,
+                )],
+            )
+            .expect("table");
+        let original = Row::new(vec![Value::Int64(1)]);
+        let updated = Row::new(vec![Value::Int64(2)]);
+        state.tables.insert(table_id, vec![updated.clone()]);
+        state.versions.insert(
+            table_id,
+            vec![
+                VersionedRow {
+                    version_id: 1,
+                    header: TupleHeaderV2 {
+                        flags: 0,
+                        column_count: 1,
+                        xmin: 10,
+                        xmax: 11,
+                        command_id: 0,
+                        previous_version: 0,
+                    },
+                    row: original.clone(),
+                },
+                VersionedRow {
+                    version_id: 2,
+                    header: TupleHeaderV2 {
+                        flags: 0,
+                        column_count: 1,
+                        xmin: 11,
+                        xmax: 0,
+                        command_id: 0,
+                        previous_version: 1,
+                    },
+                    row: updated.clone(),
+                },
+            ],
+        );
+
+        {
+            let mut store =
+                DatabaseStore::open_with_format(directory.path(), DataFormat::V2).expect("open");
+            store.commit(&state).expect("commit");
+        }
+        let store =
+            DatabaseStore::open_with_format(directory.path(), DataFormat::V2).expect("reopen");
+        assert_eq!(
+            store.committed_state().tables.get(&table_id),
+            Some(&vec![updated])
+        );
+        let mut cursor = store
+            .open_table_cursor_v2(table_id, state.generation)
+            .expect("cursor");
+        let versions = store
+            .read_versioned_table_cursor_v2(&mut cursor, 8)
+            .expect("versions");
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].version_id, 1);
+        assert_eq!(versions[0].row, original);
+        assert_eq!(versions[1].version_id, 2);
+        assert_eq!(versions[1].header.previous_version, 1);
+        assert!(cursor.is_exhausted());
     }
 
     #[test]

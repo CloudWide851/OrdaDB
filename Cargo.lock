@@ -3469,6 +3469,7 @@ dependencies = [
  "ordadb-types",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
 ]
 
@@ -3588,6 +3589,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "ordadb-catalog",
+ "ordadb-transaction",
  "ordadb-types",
  "rust_decimal",
  "serde",
@@ -3619,7 +3621,12 @@ dependencies = [
  "ordadb-catalog",
  "ordadb-storage",
  "ordadb-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "tempfile",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

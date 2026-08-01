@@ -18,7 +18,8 @@ ordadb-storage = { path = "../ordadb-storage" }
 ordadb-transaction = { path = "../ordadb-transaction" }
 ordadb-types = { path = "../ordadb-types" }
 serde = { workspace = true, features = ["rc"] }
+serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
