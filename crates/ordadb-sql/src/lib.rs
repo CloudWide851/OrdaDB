@@ -12,8 +12,8 @@ use std::str::FromStr;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use ordadb_catalog::{
-    Catalog, CatalogExpression, CatalogObjectRef, DropBehavior, FullTextAnalyzer, IndexMethod,
-    IndexOptions, NewColumn, NewConstraint, NewConstraintKind, NewIndex, NewSequence,
+    Catalog, CatalogExpression, CatalogObjectRef, ConstraintKind, DropBehavior, FullTextAnalyzer,
+    IndexMethod, IndexOptions, NewColumn, NewConstraint, NewConstraintKind, NewIndex, NewSequence,
     ReferentialAction, RoutineArgument, RoutineKind, TableDefinition,
     TriggerEvent as CatalogTriggerEvent, TriggerTiming, VectorDistanceMetric, ViewDefinition,
     ViewKind, indexable_type, text_search_type,
@@ -28,24 +28,34 @@ use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
     AlterColumnOperation as SqlAlterColumnOperation, AlterIndexOperation,
     AlterSchemaOperation as SqlAlterSchemaOperation, AlterTable,
-    AlterTableOperation as SqlAlterTableOperation, ArgMode, AssignmentTarget, BeginTransactionKind,
-    BinaryOperator as SqlBinaryOperator, CharacterLength, ColumnDef, ColumnOption,
+    AlterTableOperation as SqlAlterTableOperation, ArgMode, Assignment as SqlAssignment,
+    AssignmentTarget, BeginTransactionKind, BinaryOperator as SqlBinaryOperator, CharacterLength,
+    ColumnDef, ColumnOption, ConflictTarget as SqlConflictTarget,
     CreateFunction as SqlCreateFunction, CreateFunctionBody, CreateTable, CreateTableOptions,
-    CreateTrigger as SqlCreateTrigger, CreateView, DataType, DropBehavior as SqlDropBehavior,
-    ExactNumberInfo, Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, FunctionReturnType, FunctionSecurity, GroupByExpr, Ident, IndexType,
-    JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByKind,
-    Query, ReferentialAction as SqlReferentialAction, RenameTableNameKind, SchemaName, Select,
-    SelectItem, SequenceOptions, SetExpr, Spanned, Statement as SqlStatement, TableAlias,
-    TableConstraint, TableFactor, TableObject, TableWithJoins, TimezoneInfo, TopQuantity,
-    TransactionAccessMode as SqlTransactionAccessMode,
+    CreateTrigger as SqlCreateTrigger, CreateView, DataType, Distinct as SqlDistinct,
+    DropBehavior as SqlDropBehavior, DuplicateTreatment, ExactNumberInfo, Expr as SqlExpr,
+    FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, FunctionReturnType,
+    FunctionSecurity, GroupByExpr, Ident, IndexType, JoinConstraint, JoinOperator, LimitClause,
+    Merge as SqlMerge, MergeAction as SqlMergeAction, MergeClauseKind as SqlMergeClauseKind,
+    MergeInsertKind as SqlMergeInsertKind, NamedWindowExpr, ObjectName, ObjectNamePart, ObjectType,
+    OnConflictAction as SqlOnConflictAction, OnInsert as SqlOnInsert, OrderByKind,
+    OutputClause as SqlOutputClause, Query, ReferentialAction as SqlReferentialAction,
+    RenameTableNameKind, SchemaName, Select, SelectItem, SequenceOptions, SetExpr,
+    SetOperator as SqlSetOperator, SetQuantifier as SqlSetQuantifier, Spanned,
+    Statement as SqlStatement, TableAlias, TableConstraint, TableFactor, TableObject,
+    TableWithJoins, TimezoneInfo, TopQuantity, TransactionAccessMode as SqlTransactionAccessMode,
     TransactionIsolationLevel as SqlTransactionIsolationLevel, TransactionMode,
     TriggerEvent as SqlTriggerEvent, TriggerExecBodyType, TriggerObject, TriggerObjectKind,
     TriggerPeriod, UnaryOperator as SqlUnaryOperator, Value as SqlValue,
+    WindowFrame as SqlWindowFrame, WindowFrameBound as SqlWindowFrameBound,
+    WindowFrameUnits as SqlWindowFrameUnits, WindowSpec as SqlWindowSpec, WindowType,
+    With as SqlWith,
 };
-use sqlparser::dialect::{Dialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{
+    Dialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect,
+};
 use sqlparser::parser::{Parser, ParserError};
-use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer};
+use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer, Whitespace};
 
 const FEATURE_NOT_SUPPORTED: &str = "0A000";
 const SYNTAX_ERROR: &str = "42601";
@@ -144,11 +154,21 @@ pub struct ParsedExpr {
     pub position: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubqueryQuantifier {
+    Any,
+    All,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedExprKind {
     Column(ParsedObjectName),
     Literal(Value),
     Parameter(usize),
+    ResolvedParameter {
+        index: usize,
+        data_type: ScalarType,
+    },
     Unary {
         op: UnaryOperator,
         expr: Box<ParsedExpr>,
@@ -158,10 +178,107 @@ pub enum ParsedExprKind {
         op: BinaryOperator,
         right: Box<ParsedExpr>,
     },
+    InList {
+        expr: Box<ParsedExpr>,
+        list: Vec<ParsedExpr>,
+        negated: bool,
+    },
+    ScalarSubquery(Box<ParsedStatement>),
+    Exists {
+        subquery: Box<ParsedStatement>,
+        negated: bool,
+    },
+    InSubquery {
+        expr: Box<ParsedExpr>,
+        subquery: Box<ParsedStatement>,
+        negated: bool,
+    },
+    QuantifiedSubquery {
+        left: Box<ParsedExpr>,
+        op: BinaryOperator,
+        quantifier: SubqueryQuantifier,
+        subquery: Box<ParsedStatement>,
+    },
+    RowSubquery {
+        left: Vec<ParsedExpr>,
+        op: BinaryOperator,
+        quantifier: Option<SubqueryQuantifier>,
+        negated: bool,
+        subquery: Box<ParsedStatement>,
+    },
+    ApplyValue {
+        index: usize,
+        data_type: ScalarType,
+        nullable: bool,
+    },
     Aggregate {
         function: AggregateFunction,
         argument: Option<Box<ParsedExpr>>,
+        distinct: bool,
+        filter: Option<Box<ParsedExpr>>,
     },
+    Window {
+        call: Box<ParsedWindowCall>,
+        spec: Box<ParsedWindowSpec>,
+    },
+    NamedWindow {
+        call: Box<ParsedWindowCall>,
+        name: ParsedIdentifier,
+    },
+    WindowValue {
+        ordinal: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFunction {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    NthValue,
+    Aggregate(AggregateFunction),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedWindowCall {
+    pub function: WindowFunction,
+    pub arguments: Vec<ParsedExpr>,
+    pub count_star: bool,
+    pub filter: Option<Box<ParsedExpr>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedWindowSpec {
+    pub window_name: Option<ParsedIdentifier>,
+    pub partition_by: Vec<ParsedExpr>,
+    pub order_by: Vec<ParsedOrder>,
+    pub frame: Option<ParsedWindowFrame>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrameUnits {
+    Rows,
+    Range,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParsedWindowFrameBound {
+    UnboundedPreceding,
+    Preceding(Box<ParsedExpr>),
+    CurrentRow,
+    Following(Box<ParsedExpr>),
+    UnboundedFollowing,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedWindowFrame {
+    pub units: WindowFrameUnits,
+    pub start_bound: ParsedWindowFrameBound,
+    pub end_bound: ParsedWindowFrameBound,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +298,11 @@ pub enum UnaryOperator {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOperator {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
     Eq,
     NotEq,
     Lt,
@@ -205,6 +327,20 @@ pub struct ParsedOrder {
     pub expr: ParsedExpr,
     pub ascending: bool,
     pub nulls_first: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuerySetOperator {
+    Union,
+    Intersect,
+    Except,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedCte {
+    pub name: ParsedIdentifier,
+    pub columns: Vec<ParsedIdentifier>,
+    pub query: Box<ParsedStatement>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -378,10 +514,78 @@ pub struct ParsedTable {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum ParsedJoinSource {
+    Table(ParsedTable),
+    Derived {
+        lateral: bool,
+        query: Box<ParsedStatement>,
+        alias: ParsedIdentifier,
+        columns: Vec<ParsedIdentifier>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ParsedJoin {
-    pub table: ParsedTable,
+    pub source: ParsedJoinSource,
     pub kind: JoinKind,
     pub on: ParsedExpr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedOnConflict {
+    pub target: Option<ParsedConflictTarget>,
+    pub action: ParsedConflictAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedConflictTarget {
+    Columns(Vec<ParsedIdentifier>),
+    Constraint(ParsedObjectName),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParsedConflictAction {
+    DoNothing,
+    DoUpdate {
+        assignments: Vec<(ParsedIdentifier, ParsedExpr)>,
+        filter: Option<ParsedExpr>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedMerge {
+    pub target: ParsedTable,
+    pub source: ParsedTable,
+    pub on: ParsedExpr,
+    pub clauses: Vec<ParsedMergeClause>,
+    pub returning: Vec<ParsedProjection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsedMergeClauseKind {
+    Matched,
+    NotMatchedByTarget,
+    NotMatchedBySource,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedMergeClause {
+    pub kind: ParsedMergeClauseKind,
+    pub predicate: Option<ParsedExpr>,
+    pub action: ParsedMergeAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParsedMergeAction {
+    Update {
+        assignments: Vec<(ParsedIdentifier, ParsedExpr)>,
+    },
+    Delete,
+    Insert {
+        columns: Vec<ParsedIdentifier>,
+        values: Vec<ParsedExpr>,
+    },
+    DoNothing,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -526,22 +730,42 @@ pub enum ParsedStatement {
         table: ParsedObjectName,
         columns: Vec<ParsedIdentifier>,
         rows: Vec<Vec<ParsedExpr>>,
+        on_conflict: Option<ParsedOnConflict>,
+        returning: Vec<ParsedProjection>,
+    },
+    Merge(ParsedMerge),
+    With {
+        recursive: bool,
+        ctes: Vec<ParsedCte>,
+        body: Box<ParsedStatement>,
+    },
+    SetOperation {
+        left: Box<ParsedStatement>,
+        operator: QuerySetOperator,
+        all: bool,
+        right: Box<ParsedStatement>,
+        order_by: Vec<ParsedOrder>,
+        offset: Option<ParsedExpr>,
+        limit: Option<ParsedExpr>,
     },
     Select {
         table: ParsedObjectName,
         projection: Vec<ParsedProjection>,
         filter: Option<ParsedExpr>,
         order_by: Vec<ParsedOrder>,
+        offset: Option<ParsedExpr>,
         limit: Option<ParsedExpr>,
     },
     AdvancedSelect {
         table: ParsedTable,
         joins: Vec<ParsedJoin>,
         projection: Vec<ParsedProjection>,
+        distinct: bool,
         filter: Option<ParsedExpr>,
         group_by: Vec<ParsedExpr>,
         having: Option<ParsedExpr>,
         order_by: Vec<ParsedOrder>,
+        offset: Option<ParsedExpr>,
         limit: Option<ParsedExpr>,
     },
     Explain {
@@ -551,10 +775,12 @@ pub enum ParsedStatement {
         table: ParsedObjectName,
         assignments: Vec<(ParsedIdentifier, ParsedExpr)>,
         filter: Option<ParsedExpr>,
+        returning: Vec<ParsedProjection>,
     },
     Delete {
         table: ParsedObjectName,
         filter: Option<ParsedExpr>,
+        returning: Vec<ParsedProjection>,
     },
 }
 
@@ -591,6 +817,10 @@ pub enum BoundExprKind {
     Parameter {
         index: usize,
     },
+    Correlation {
+        depth: usize,
+        index: usize,
+    },
     Unary {
         op: UnaryOperator,
         expr: Box<BoundExpr>,
@@ -600,10 +830,55 @@ pub enum BoundExprKind {
         op: BinaryOperator,
         right: Box<BoundExpr>,
     },
+    InList {
+        expr: Box<BoundExpr>,
+        list: Vec<BoundExpr>,
+        negated: bool,
+    },
+    ApplyValue {
+        index: usize,
+    },
     Aggregate {
         function: AggregateFunction,
         argument: Option<Box<BoundExpr>>,
+        distinct: bool,
+        filter: Option<Box<BoundExpr>>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundApplyKind {
+    Scalar,
+    Exists {
+        negated: bool,
+    },
+    In {
+        left: BoundExpr,
+        negated: bool,
+    },
+    Quantified {
+        left: BoundExpr,
+        op: BinaryOperator,
+        quantifier: SubqueryQuantifier,
+    },
+    RowScalar {
+        left: Vec<BoundExpr>,
+        op: BinaryOperator,
+        operand_types: Vec<ScalarType>,
+    },
+    RowQuantified {
+        left: Vec<BoundExpr>,
+        op: BinaryOperator,
+        quantifier: SubqueryQuantifier,
+        negated: bool,
+        operand_types: Vec<ScalarType>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundApply {
+    pub kind: BoundApplyKind,
+    pub query: Box<BoundStatement>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -612,9 +887,97 @@ pub struct BoundProjection {
     pub field: Field,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundWindow {
+    pub function: WindowFunction,
+    pub value_index: usize,
+    pub arguments: Vec<BoundExpr>,
+    pub count_star: bool,
+    pub filter: Option<BoundExpr>,
+    pub partition_by: Vec<BoundExpr>,
+    pub order_by: Vec<BoundOrder>,
+    pub frame: Option<BoundWindowFrame>,
+    pub data_type: ScalarType,
+    pub nullable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundWindowFrameBound {
+    UnboundedPreceding,
+    Preceding(BoundExpr),
+    CurrentRow,
+    Following(BoundExpr),
+    UnboundedFollowing,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundWindowFrame {
+    pub units: WindowFrameUnits,
+    pub start_bound: BoundWindowFrameBound,
+    pub end_bound: BoundWindowFrameBound,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundReturning {
+    pub schema: Schema,
+    pub projection: Vec<BoundProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundOnConflict {
+    pub target_columns: Option<Vec<usize>>,
+    pub action: BoundConflictAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundConflictAction {
+    DoNothing,
+    DoUpdate {
+        assignments: Vec<(usize, BoundExpr)>,
+        filter: Option<BoundExpr>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundMerge {
+    pub target: BoundTable,
+    pub source: BoundTable,
+    pub on: BoundExpr,
+    pub clauses: Vec<BoundMergeClause>,
+    pub returning: Option<BoundReturning>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundMergeClauseKind {
+    Matched,
+    NotMatchedByTarget,
+    NotMatchedBySource,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundMergeClause {
+    pub kind: BoundMergeClauseKind,
+    pub predicate: Option<BoundExpr>,
+    pub action: BoundMergeAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundMergeAction {
+    Update {
+        assignments: Vec<(usize, BoundExpr)>,
+    },
+    Delete,
+    Insert {
+        column_indexes: Vec<usize>,
+        values: Vec<BoundExpr>,
+    },
+    DoNothing,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundOrder {
     pub column_index: usize,
+    pub expression: Option<BoundExpr>,
     pub ascending: bool,
     pub nulls_first: Option<bool>,
 }
@@ -629,8 +992,47 @@ pub struct BoundTable {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum BoundJoinSource {
+    Table(BoundTable),
+    Derived {
+        lateral: bool,
+        query: Box<BoundStatement>,
+        binding: Identifier,
+        offset: usize,
+        width: usize,
+        nullable: bool,
+    },
+}
+
+impl BoundJoinSource {
+    #[must_use]
+    pub const fn offset(&self) -> usize {
+        match self {
+            Self::Table(table) => table.offset,
+            Self::Derived { offset, .. } => *offset,
+        }
+    }
+
+    #[must_use]
+    pub const fn width(&self) -> usize {
+        match self {
+            Self::Table(table) => table.width,
+            Self::Derived { width, .. } => *width,
+        }
+    }
+
+    #[must_use]
+    pub fn binding(&self) -> &Identifier {
+        match self {
+            Self::Table(table) => &table.binding,
+            Self::Derived { binding, .. } => binding,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundJoin {
-    pub table: BoundTable,
+    pub source: BoundJoinSource,
     pub kind: JoinKind,
     pub on: BoundExpr,
 }
@@ -790,6 +1192,25 @@ pub enum BoundStatement {
         table_id: TableId,
         column_indexes: Vec<usize>,
         rows: Vec<Vec<BoundExpr>>,
+        on_conflict: Option<BoundOnConflict>,
+        returning: Option<BoundReturning>,
+    },
+    Merge(BoundMerge),
+    With {
+        ctes: Vec<BoundCte>,
+        body: Box<BoundStatement>,
+        catalog: Box<Catalog>,
+        schema: Schema,
+    },
+    SetOperation {
+        left: Box<BoundStatement>,
+        operator: QuerySetOperator,
+        all: bool,
+        right: Box<BoundStatement>,
+        schema: Schema,
+        order_by: Vec<BoundOrder>,
+        offset: Option<BoundExpr>,
+        limit: Option<BoundExpr>,
     },
     Select {
         table_id: TableId,
@@ -797,18 +1218,23 @@ pub enum BoundStatement {
         projection: Vec<BoundProjection>,
         filter: Option<BoundExpr>,
         order_by: Vec<BoundOrder>,
+        offset: Option<BoundExpr>,
         limit: Option<BoundExpr>,
     },
     AdvancedSelect {
         table: BoundTable,
         joins: Vec<BoundJoin>,
+        applies: Vec<BoundApply>,
+        windows: Vec<BoundWindow>,
         schema: Schema,
         projection: Vec<BoundProjection>,
+        distinct: bool,
         filter: Option<BoundExpr>,
         group_by: Vec<BoundExpr>,
         having: Option<BoundExpr>,
         order_by: Vec<BoundOrder>,
-        limit: Option<BoundExpr>,
+        offset: Option<BoundExpr>,
+        limit: Option<Box<BoundExpr>>,
         aggregate: bool,
     },
     Explain {
@@ -818,11 +1244,21 @@ pub enum BoundStatement {
         table_id: TableId,
         assignments: Vec<(usize, BoundExpr)>,
         filter: Option<BoundExpr>,
+        returning: Option<BoundReturning>,
     },
     Delete {
         table_id: TableId,
         filter: Option<BoundExpr>,
+        returning: Option<BoundReturning>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundCte {
+    pub table_id: TableId,
+    pub seed: Box<BoundStatement>,
+    pub recursive: Option<Box<BoundStatement>>,
+    pub union_all: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -893,6 +1329,11 @@ fn parse_source_statements(
 ) -> std::result::Result<Vec<SqlStatement>, ParserError> {
     match dialect {
         SqlDialect::PostgreSql => {
+            if let Some(tokens) = rewrite_postgres_merge_do_nothing(sql)? {
+                return Parser::new(&GenericDialect {})
+                    .with_tokens_with_locations(tokens)
+                    .parse_statements();
+            }
             let parser_sql = materialized_view_parser_sql(sql);
             Parser::parse_sql(&PostgreSqlDialect {}, &parser_sql)
         }
@@ -906,6 +1347,147 @@ fn parse_source_statements(
             parse_tokenized_source(sql, &MsSqlDialect {}, ParameterStyle::NamedAtP)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MergeClauseTokenInfo {
+    not_matched_by_target: bool,
+    do_nothing: Option<(usize, usize)>,
+}
+
+fn rewrite_postgres_merge_do_nothing(
+    sql: &str,
+) -> std::result::Result<Option<Vec<TokenWithSpan>>, ParserError> {
+    let dialect = PostgreSqlDialect {};
+    let mut tokens = Tokenizer::new(&dialect, sql).tokenize_with_location()?;
+    let significant_indices = tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token)| {
+            (!matches!(token.token, Token::Whitespace(_))).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let significant = significant_indices
+        .iter()
+        .map(|index| tokens[*index].token.clone())
+        .collect::<Vec<_>>();
+    let Some(clauses) = merge_clause_token_info(&significant) else {
+        return Ok(None);
+    };
+    let replacements = clauses
+        .into_iter()
+        .filter_map(|clause| {
+            clause.do_nothing.map(|(do_index, nothing_index)| {
+                (clause.not_matched_by_target, do_index, nothing_index)
+            })
+        })
+        .collect::<Vec<_>>();
+    if replacements.is_empty() {
+        return Ok(None);
+    }
+    for (not_matched_by_target, do_index, nothing_index) in replacements {
+        let do_index = significant_indices[do_index];
+        let nothing_index = significant_indices[nothing_index];
+        if not_matched_by_target {
+            tokens[do_index].token = Token::make_keyword("INSERT");
+            tokens[nothing_index].token = Token::make_keyword("ROW");
+        } else {
+            tokens[do_index].token = Token::make_keyword("DELETE");
+            tokens[nothing_index].token = Token::Whitespace(Whitespace::Space);
+        }
+    }
+    Ok(Some(tokens))
+}
+
+fn merge_clause_token_info(tokens: &[Token]) -> Option<Vec<MergeClauseTokenInfo>> {
+    if !tokens
+        .first()
+        .is_some_and(|token| is_unquoted_word(token, "MERGE"))
+    {
+        return None;
+    }
+    let mut starts = Vec::new();
+    let mut parenthesis_depth = 0_usize;
+    let mut case_depth = 0_usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::LParen => parenthesis_depth = parenthesis_depth.saturating_add(1),
+            Token::RParen => parenthesis_depth = parenthesis_depth.saturating_sub(1),
+            _ if parenthesis_depth == 0 && is_unquoted_word(token, "CASE") => {
+                case_depth = case_depth.saturating_add(1);
+            }
+            _ if parenthesis_depth == 0 && is_unquoted_word(token, "END") && case_depth > 0 => {
+                case_depth -= 1;
+            }
+            _ if parenthesis_depth == 0
+                && case_depth == 0
+                && is_merge_clause_start(tokens, index) =>
+            {
+                starts.push(index);
+            }
+            _ => {}
+        }
+    }
+    let mut clauses = Vec::with_capacity(starts.len());
+    for (ordinal, start) in starts.iter().copied().enumerate() {
+        let end = starts.get(ordinal + 1).copied().unwrap_or(tokens.len());
+        let not_matched = tokens
+            .get(start.saturating_add(1))
+            .is_some_and(|token| is_unquoted_word(token, "NOT"));
+        let by_source = tokens
+            .get(start.saturating_add(3))
+            .is_some_and(|token| is_unquoted_word(token, "BY"))
+            && tokens
+                .get(start.saturating_add(4))
+                .is_some_and(|token| is_unquoted_word(token, "SOURCE"));
+        let do_nothing = find_merge_do_nothing(tokens, start, end);
+        clauses.push(MergeClauseTokenInfo {
+            not_matched_by_target: not_matched && !by_source,
+            do_nothing,
+        });
+    }
+    Some(clauses)
+}
+
+fn is_merge_clause_start(tokens: &[Token], index: usize) -> bool {
+    is_unquoted_word(&tokens[index], "WHEN")
+        && (tokens
+            .get(index.saturating_add(1))
+            .is_some_and(|token| is_unquoted_word(token, "MATCHED"))
+            || (tokens
+                .get(index.saturating_add(1))
+                .is_some_and(|token| is_unquoted_word(token, "NOT"))
+                && tokens
+                    .get(index.saturating_add(2))
+                    .is_some_and(|token| is_unquoted_word(token, "MATCHED"))))
+}
+
+fn find_merge_do_nothing(tokens: &[Token], start: usize, end: usize) -> Option<(usize, usize)> {
+    let mut parenthesis_depth = 0_usize;
+    let mut case_depth = 0_usize;
+    for index in start..end.saturating_sub(2) {
+        let token = &tokens[index];
+        match token {
+            Token::LParen => parenthesis_depth = parenthesis_depth.saturating_add(1),
+            Token::RParen => parenthesis_depth = parenthesis_depth.saturating_sub(1),
+            _ if parenthesis_depth == 0 && is_unquoted_word(token, "CASE") => {
+                case_depth = case_depth.saturating_add(1);
+            }
+            _ if parenthesis_depth == 0 && is_unquoted_word(token, "END") && case_depth > 0 => {
+                case_depth -= 1;
+            }
+            _ if parenthesis_depth == 0
+                && case_depth == 0
+                && is_unquoted_word(token, "THEN")
+                && is_unquoted_word(&tokens[index + 1], "DO")
+                && is_unquoted_word(&tokens[index + 2], "NOTHING") =>
+            {
+                return Some((index + 1, index + 2));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1551,8 +2133,1430 @@ pub fn bind_catalog_expression_with_parameter_types(
 }
 
 /// Bind an OrdaDB-owned parsed statement against an immutable catalog view.
-pub fn bind(statement: ParsedStatement, catalog: &Catalog) -> Result<BoundStatement> {
+pub fn bind(mut statement: ParsedStatement, catalog: &Catalog) -> Result<BoundStatement> {
+    let parameter_types = ParameterTypeSolver::solve(&statement, catalog)?;
+    resolve_statement_parameter_types(&mut statement, &parameter_types, 0)?;
     bind_with_view_depth(statement, catalog, 0)
+}
+
+const MAX_PARAMETER_SOLVER_PASSES: usize = 128;
+const MAX_PARAMETER_SOLVER_DEPTH: usize = 64;
+
+#[derive(Default)]
+struct ParameterTypeSolver {
+    types: BTreeMap<usize, ScalarType>,
+    changed: bool,
+}
+
+impl ParameterTypeSolver {
+    fn solve(
+        statement: &ParsedStatement,
+        catalog: &Catalog,
+    ) -> Result<BTreeMap<usize, ScalarType>> {
+        let mut solver = Self::default();
+        for _ in 0..MAX_PARAMETER_SOLVER_PASSES {
+            solver.changed = false;
+            solver.collect_statement(statement, catalog, &[], None, 0)?;
+            if !solver.changed {
+                return Ok(solver.types);
+            }
+        }
+        Err(DbError::new(
+            "54001",
+            "parameter type inference exceeded its fixed-point pass limit",
+        ))
+    }
+
+    fn constrain(
+        &mut self,
+        index: usize,
+        data_type: &ScalarType,
+        position: Option<usize>,
+    ) -> Result<()> {
+        if let Some(existing) = self.types.get(&index) {
+            if existing != data_type {
+                return Err(DbError::new(
+                    DATATYPE_MISMATCH,
+                    format!("inconsistent types deduced for parameter ${index}"),
+                )
+                .with_detail(format!(
+                    "parameter ${index} was constrained as both {existing:?} and {data_type:?}"
+                ))
+                .with_position_opt(position));
+            }
+            return Ok(());
+        }
+        self.types.insert(index, data_type.clone());
+        self.changed = true;
+        Ok(())
+    }
+
+    fn collect_statement(
+        &mut self,
+        statement: &ParsedStatement,
+        catalog: &Catalog,
+        outer_inputs: &[InputColumn],
+        expected_output: Option<&[Option<ScalarType>]>,
+        depth: usize,
+    ) -> Result<Vec<Option<ScalarType>>> {
+        if depth >= MAX_PARAMETER_SOLVER_DEPTH {
+            return Err(DbError::new(
+                "54001",
+                "parameter type inference exceeded its statement depth limit",
+            ));
+        }
+        match statement {
+            ParsedStatement::Select {
+                table,
+                projection,
+                filter,
+                order_by,
+                offset,
+                limit,
+            } => {
+                let table = resolve_table(table, catalog)?;
+                let local_inputs = parameter_table_inputs(table, table.name.clone(), 0, false);
+                let inputs = inputs_with_outer(&local_inputs, outer_inputs)?;
+                if let Some(filter) = filter {
+                    self.collect_expr(filter, &inputs, Some(&ScalarType::Boolean), catalog, depth)?;
+                }
+                for order in order_by {
+                    self.collect_order_expr(&order.expr, &inputs, catalog, depth)?;
+                }
+                if let Some(offset) = offset {
+                    self.collect_expr(offset, &inputs, Some(&ScalarType::Int64), catalog, depth)?;
+                }
+                if let Some(limit) = limit {
+                    self.collect_expr(limit, &inputs, Some(&ScalarType::Int64), catalog, depth)?;
+                }
+                self.collect_projection(projection, &inputs, expected_output, catalog, depth)
+            }
+            ParsedStatement::AdvancedSelect {
+                table,
+                joins,
+                projection,
+                filter,
+                group_by,
+                having,
+                order_by,
+                offset,
+                limit,
+                ..
+            } => {
+                let definition = resolve_table(&table.name, catalog)?;
+                let binding = table
+                    .alias
+                    .as_ref()
+                    .map_or_else(|| definition.name.clone(), |alias| alias.name.clone());
+                let mut local_inputs = parameter_table_inputs(definition, binding, 0, false);
+                for join in joins {
+                    match &join.source {
+                        ParsedJoinSource::Table(table) => {
+                            let definition = resolve_table(&table.name, catalog)?;
+                            let binding = table.alias.as_ref().map_or_else(
+                                || definition.name.clone(),
+                                |alias| alias.name.clone(),
+                            );
+                            let offset = local_inputs.len();
+                            local_inputs.extend(parameter_table_inputs(
+                                definition,
+                                binding,
+                                offset,
+                                join.kind == JoinKind::Left,
+                            ));
+                        }
+                        ParsedJoinSource::Derived {
+                            lateral,
+                            query,
+                            alias,
+                            columns,
+                        } => {
+                            let visible = if *lateral {
+                                inputs_with_outer(&local_inputs, outer_inputs)?
+                            } else {
+                                Vec::new()
+                            };
+                            self.collect_statement(query, catalog, &visible, None, depth + 1)?;
+                            if let Some(schema) =
+                                self.try_statement_schema(query, catalog, &visible, depth + 1)
+                            {
+                                let offset = local_inputs.len();
+                                for (index, field) in schema.fields.iter().enumerate() {
+                                    let name = columns.get(index).map_or_else(
+                                        || Identifier::unquoted(&field.name),
+                                        |name| name.name.clone(),
+                                    );
+                                    local_inputs.push(InputColumn {
+                                        binding: alias.name.clone(),
+                                        name,
+                                        index: offset + index,
+                                        data_type: field.data_type.clone(),
+                                        nullable: join.kind == JoinKind::Left || field.nullable,
+                                        outer_depth: 0,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    let inputs = inputs_with_outer(&local_inputs, outer_inputs)?;
+                    self.collect_expr(
+                        &join.on,
+                        &inputs,
+                        Some(&ScalarType::Boolean),
+                        catalog,
+                        depth,
+                    )?;
+                }
+                let inputs = inputs_with_outer(&local_inputs, outer_inputs)?;
+                if let Some(filter) = filter {
+                    self.collect_expr(filter, &inputs, Some(&ScalarType::Boolean), catalog, depth)?;
+                }
+                for expression in group_by {
+                    self.collect_expr(expression, &inputs, None, catalog, depth)?;
+                }
+                if let Some(having) = having {
+                    self.collect_expr(having, &inputs, Some(&ScalarType::Boolean), catalog, depth)?;
+                }
+                for order in order_by {
+                    self.collect_order_expr(&order.expr, &inputs, catalog, depth)?;
+                }
+                if let Some(offset) = offset {
+                    self.collect_expr(offset, &inputs, Some(&ScalarType::Int64), catalog, depth)?;
+                }
+                if let Some(limit) = limit {
+                    self.collect_expr(limit, &inputs, Some(&ScalarType::Int64), catalog, depth)?;
+                }
+                self.collect_projection(projection, &local_inputs, expected_output, catalog, depth)
+            }
+            ParsedStatement::SetOperation {
+                left,
+                right,
+                order_by,
+                offset,
+                limit,
+                ..
+            } => {
+                let mut left_output = self.collect_statement(
+                    left,
+                    catalog,
+                    outer_inputs,
+                    expected_output,
+                    depth + 1,
+                )?;
+                let mut right_output = self.collect_statement(
+                    right,
+                    catalog,
+                    outer_inputs,
+                    expected_output,
+                    depth + 1,
+                )?;
+                if left_output.len() == right_output.len() {
+                    let reconciled = left_output
+                        .iter()
+                        .zip(&right_output)
+                        .map(|(left, right)| match (left, right) {
+                            (Some(left), Some(right)) => common_type(left, right),
+                            (Some(data_type), None) | (None, Some(data_type)) => {
+                                Some(data_type.clone())
+                            }
+                            (None, None) => None,
+                        })
+                        .collect::<Vec<_>>();
+                    left_output = self.collect_statement(
+                        left,
+                        catalog,
+                        outer_inputs,
+                        Some(&reconciled),
+                        depth + 1,
+                    )?;
+                    right_output = self.collect_statement(
+                        right,
+                        catalog,
+                        outer_inputs,
+                        Some(&reconciled),
+                        depth + 1,
+                    )?;
+                }
+                let _ = order_by;
+                if let Some(offset) = offset {
+                    self.collect_expr(offset, &[], Some(&ScalarType::Int64), catalog, depth)?;
+                }
+                if let Some(limit) = limit {
+                    self.collect_expr(limit, &[], Some(&ScalarType::Int64), catalog, depth)?;
+                }
+                Ok(left_output
+                    .into_iter()
+                    .zip(right_output)
+                    .map(|(left, right)| match (left, right) {
+                        (Some(left), Some(right)) => common_type(&left, &right),
+                        (Some(data_type), None) | (None, Some(data_type)) => Some(data_type),
+                        (None, None) => None,
+                    })
+                    .collect())
+            }
+            ParsedStatement::With {
+                recursive,
+                ctes,
+                body,
+            } => {
+                self.collect_with_statement(*recursive, ctes, body, catalog, expected_output, depth)
+            }
+            ParsedStatement::Insert {
+                table,
+                columns,
+                rows,
+                on_conflict,
+                returning,
+            } => {
+                let table = resolve_table(table, catalog)?;
+                let column_indexes = parameter_target_columns(columns, table)?;
+                for row in rows {
+                    for (expression, index) in row.iter().zip(&column_indexes) {
+                        self.collect_expr(
+                            expression,
+                            &[],
+                            Some(&table.columns()[*index].data_type),
+                            catalog,
+                            depth,
+                        )?;
+                    }
+                }
+                if let Some(on_conflict) = on_conflict {
+                    self.collect_on_conflict(on_conflict, table, catalog, depth)?;
+                }
+                let inputs = parameter_table_inputs(table, table.name.clone(), 0, false);
+                self.collect_projection(returning, &inputs, expected_output, catalog, depth)
+            }
+            ParsedStatement::Update {
+                table,
+                assignments,
+                filter,
+                returning,
+            } => {
+                let table = resolve_table(table, catalog)?;
+                let inputs = parameter_table_inputs(table, table.name.clone(), 0, false);
+                for (column, expression) in assignments {
+                    if let Some(index) = table.column_index(&column.name) {
+                        self.collect_expr(
+                            expression,
+                            &inputs,
+                            Some(&table.columns()[index].data_type),
+                            catalog,
+                            depth,
+                        )?;
+                    }
+                }
+                if let Some(filter) = filter {
+                    self.collect_expr(filter, &inputs, Some(&ScalarType::Boolean), catalog, depth)?;
+                }
+                self.collect_projection(returning, &inputs, expected_output, catalog, depth)
+            }
+            ParsedStatement::Delete {
+                table,
+                filter,
+                returning,
+            } => {
+                let table = resolve_table(table, catalog)?;
+                let inputs = parameter_table_inputs(table, table.name.clone(), 0, false);
+                if let Some(filter) = filter {
+                    self.collect_expr(filter, &inputs, Some(&ScalarType::Boolean), catalog, depth)?;
+                }
+                self.collect_projection(returning, &inputs, expected_output, catalog, depth)
+            }
+            ParsedStatement::Merge(merge) => {
+                self.collect_merge(merge, catalog, expected_output, depth)
+            }
+            ParsedStatement::Explain { statement }
+            | ParsedStatement::CreateView {
+                query: statement, ..
+            } => {
+                self.collect_statement(statement, catalog, outer_inputs, expected_output, depth + 1)
+            }
+            ParsedStatement::Call {
+                name, arguments, ..
+            }
+            | ParsedStatement::RoutineSelect {
+                name, arguments, ..
+            } => {
+                self.collect_routine_arguments(name, arguments, catalog, depth)?;
+                Ok(Vec::new())
+            }
+            ParsedStatement::SequenceValue { operation, .. } => {
+                if let ParsedSequenceOperation::SetValue { value, .. } = operation {
+                    self.collect_expr(value, &[], Some(&ScalarType::Int64), catalog, depth)?;
+                }
+                Ok(Vec::new())
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn collect_projection(
+        &mut self,
+        projection: &[ParsedProjection],
+        inputs: &[InputColumn],
+        expected_output: Option<&[Option<ScalarType>]>,
+        catalog: &Catalog,
+        depth: usize,
+    ) -> Result<Vec<Option<ScalarType>>> {
+        let mut output = Vec::new();
+        for item in projection {
+            match item {
+                ParsedProjection::Wildcard => {
+                    output.extend(
+                        inputs
+                            .iter()
+                            .filter(|input| input.outer_depth == 0)
+                            .map(|input| Some(input.data_type.clone())),
+                    );
+                }
+                ParsedProjection::Expression { expr, .. } => {
+                    let expected = expected_output
+                        .and_then(|expected| expected.get(output.len()))
+                        .and_then(Option::as_ref);
+                    output.push(self.collect_expr(expr, inputs, expected, catalog, depth)?);
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    fn collect_order_expr(
+        &mut self,
+        expression: &ParsedExpr,
+        inputs: &[InputColumn],
+        catalog: &Catalog,
+        depth: usize,
+    ) -> Result<()> {
+        match self.collect_expr(expression, inputs, None, catalog, depth) {
+            Ok(_) => Ok(()),
+            Err(error) if error.sql_state == UNDEFINED_COLUMN => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn collect_expr(
+        &mut self,
+        expression: &ParsedExpr,
+        inputs: &[InputColumn],
+        expected: Option<&ScalarType>,
+        catalog: &Catalog,
+        depth: usize,
+    ) -> Result<Option<ScalarType>> {
+        if depth >= MAX_PARAMETER_SOLVER_DEPTH {
+            return Err(DbError::new(
+                "54001",
+                "parameter type inference exceeded its expression depth limit",
+            ));
+        }
+        match &expression.kind {
+            ParsedExprKind::Column(name) => {
+                Ok(Some(resolve_input_column(name, inputs)?.data_type.clone()))
+            }
+            ParsedExprKind::Literal(value) => Ok(value.scalar_type().or_else(|| expected.cloned())),
+            ParsedExprKind::Parameter(index) => {
+                if let Some(expected) = expected {
+                    self.constrain(*index, expected, expression.position)?;
+                }
+                Ok(self.types.get(index).cloned())
+            }
+            ParsedExprKind::ResolvedParameter { index, data_type } => {
+                self.constrain(*index, data_type, expression.position)?;
+                if let Some(expected) = expected {
+                    self.constrain(*index, expected, expression.position)?;
+                }
+                Ok(Some(data_type.clone()))
+            }
+            ParsedExprKind::ApplyValue { data_type, .. } => Ok(Some(data_type.clone())),
+            ParsedExprKind::Unary { op, expr } => match op {
+                UnaryOperator::Not => {
+                    self.collect_expr(
+                        expr,
+                        inputs,
+                        Some(&ScalarType::Boolean),
+                        catalog,
+                        depth + 1,
+                    )?;
+                    Ok(Some(ScalarType::Boolean))
+                }
+                UnaryOperator::Negate => {
+                    self.collect_expr(expr, inputs, expected, catalog, depth + 1)
+                }
+            },
+            ParsedExprKind::Binary { left, op, right } => {
+                if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+                    self.collect_expr(
+                        left,
+                        inputs,
+                        Some(&ScalarType::Boolean),
+                        catalog,
+                        depth + 1,
+                    )?;
+                    self.collect_expr(
+                        right,
+                        inputs,
+                        Some(&ScalarType::Boolean),
+                        catalog,
+                        depth + 1,
+                    )?;
+                    return Ok(Some(ScalarType::Boolean));
+                }
+                let left_type = self.collect_expr(left, inputs, None, catalog, depth + 1)?;
+                let right_type = self.collect_expr(right, inputs, None, catalog, depth + 1)?;
+                if let (Some(index), Some(data_type)) =
+                    (parsed_parameter_index(left), right_type.as_ref())
+                {
+                    self.constrain(index, data_type, left.position)?;
+                }
+                if let (Some(index), Some(data_type)) =
+                    (parsed_parameter_index(right), left_type.as_ref())
+                {
+                    self.constrain(index, data_type, right.position)?;
+                }
+                let operand_type = match (left_type, right_type) {
+                    (Some(left), Some(right)) => common_type(&left, &right),
+                    (Some(data_type), None) | (None, Some(data_type)) => Some(data_type),
+                    (None, None) if is_arithmetic_operator(*op) => expected.cloned(),
+                    (None, None) => None,
+                };
+                if let Some(operand_type) = &operand_type {
+                    self.collect_expr(left, inputs, Some(operand_type), catalog, depth + 1)?;
+                    self.collect_expr(right, inputs, Some(operand_type), catalog, depth + 1)?;
+                }
+                Ok(if is_arithmetic_operator(*op) {
+                    operand_type
+                } else {
+                    Some(ScalarType::Boolean)
+                })
+            }
+            ParsedExprKind::InList { expr, list, .. } => {
+                let mut operand_type = self.collect_expr(expr, inputs, None, catalog, depth + 1)?;
+                for candidate in list {
+                    let candidate_type =
+                        self.collect_expr(candidate, inputs, None, catalog, depth + 1)?;
+                    operand_type = match (operand_type, candidate_type) {
+                        (Some(left), Some(right)) => common_type(&left, &right),
+                        (Some(data_type), None) | (None, Some(data_type)) => Some(data_type),
+                        (None, None) => None,
+                    };
+                }
+                if let Some(operand_type) = &operand_type {
+                    self.collect_expr(expr, inputs, Some(operand_type), catalog, depth + 1)?;
+                    for candidate in list {
+                        self.collect_expr(
+                            candidate,
+                            inputs,
+                            Some(operand_type),
+                            catalog,
+                            depth + 1,
+                        )?;
+                    }
+                }
+                Ok(Some(ScalarType::Boolean))
+            }
+            ParsedExprKind::ScalarSubquery(subquery) => {
+                let expected_output = expected.cloned().map(|data_type| vec![Some(data_type)]);
+                let output = self.collect_statement(
+                    subquery,
+                    catalog,
+                    inputs,
+                    expected_output.as_deref(),
+                    depth + 1,
+                )?;
+                Ok(output.first().cloned().flatten())
+            }
+            ParsedExprKind::Exists { subquery, .. } => {
+                self.collect_statement(subquery, catalog, inputs, None, depth + 1)?;
+                Ok(Some(ScalarType::Boolean))
+            }
+            ParsedExprKind::InSubquery { expr, subquery, .. }
+            | ParsedExprKind::QuantifiedSubquery {
+                left: expr,
+                subquery,
+                ..
+            } => {
+                let left_type = self.collect_expr(expr, inputs, None, catalog, depth + 1)?;
+                let expected_output = left_type.clone().map(|data_type| vec![Some(data_type)]);
+                let output = self.collect_statement(
+                    subquery,
+                    catalog,
+                    inputs,
+                    expected_output.as_deref(),
+                    depth + 1,
+                )?;
+                let operand_type = match (left_type, output.first().cloned().flatten()) {
+                    (Some(left), Some(right)) => common_type(&left, &right),
+                    (Some(data_type), None) | (None, Some(data_type)) => Some(data_type),
+                    (None, None) => None,
+                };
+                if let Some(operand_type) = &operand_type {
+                    self.collect_expr(expr, inputs, Some(operand_type), catalog, depth + 1)?;
+                    let expected = [Some(operand_type.clone())];
+                    self.collect_statement(subquery, catalog, inputs, Some(&expected), depth + 1)?;
+                }
+                Ok(Some(ScalarType::Boolean))
+            }
+            ParsedExprKind::RowSubquery { left, subquery, .. } => {
+                let mut left_types = Vec::with_capacity(left.len());
+                for expression in left {
+                    left_types.push(self.collect_expr(
+                        expression,
+                        inputs,
+                        None,
+                        catalog,
+                        depth + 1,
+                    )?);
+                }
+                let output = self.collect_statement(
+                    subquery,
+                    catalog,
+                    inputs,
+                    Some(&left_types),
+                    depth + 1,
+                )?;
+                for (expression, data_type) in left.iter().zip(output) {
+                    if let Some(data_type) = data_type {
+                        self.collect_expr(
+                            expression,
+                            inputs,
+                            Some(&data_type),
+                            catalog,
+                            depth + 1,
+                        )?;
+                    }
+                }
+                Ok(Some(ScalarType::Boolean))
+            }
+            ParsedExprKind::Aggregate {
+                function,
+                argument,
+                filter,
+                ..
+            } => {
+                if let Some(filter) = filter {
+                    self.collect_expr(
+                        filter,
+                        inputs,
+                        Some(&ScalarType::Boolean),
+                        catalog,
+                        depth + 1,
+                    )?;
+                }
+                let argument_type = argument
+                    .as_deref()
+                    .map(|argument| self.collect_expr(argument, inputs, None, catalog, depth + 1))
+                    .transpose()?
+                    .flatten();
+                Ok(parameter_aggregate_type(*function, argument_type))
+            }
+            ParsedExprKind::Window { call, spec } => {
+                self.collect_window(call, spec, inputs, catalog, depth)
+            }
+            ParsedExprKind::NamedWindow { call, .. } => self.collect_window(
+                call,
+                &ParsedWindowSpec {
+                    window_name: None,
+                    partition_by: Vec::new(),
+                    order_by: Vec::new(),
+                    frame: None,
+                },
+                inputs,
+                catalog,
+                depth,
+            ),
+            ParsedExprKind::WindowValue { .. } => Ok(None),
+        }
+    }
+
+    fn collect_window(
+        &mut self,
+        call: &ParsedWindowCall,
+        spec: &ParsedWindowSpec,
+        inputs: &[InputColumn],
+        catalog: &Catalog,
+        depth: usize,
+    ) -> Result<Option<ScalarType>> {
+        for expression in &spec.partition_by {
+            self.collect_expr(expression, inputs, None, catalog, depth + 1)?;
+        }
+        for order in &spec.order_by {
+            self.collect_expr(&order.expr, inputs, None, catalog, depth + 1)?;
+        }
+        if let Some(frame) = &spec.frame {
+            let range_type = if frame.units == WindowFrameUnits::Range {
+                spec.order_by
+                    .first()
+                    .map(|order| self.collect_expr(&order.expr, inputs, None, catalog, depth + 1))
+                    .transpose()?
+                    .flatten()
+            } else {
+                Some(ScalarType::Int64)
+            };
+            for bound in [&frame.start_bound, &frame.end_bound] {
+                if let ParsedWindowFrameBound::Preceding(expression)
+                | ParsedWindowFrameBound::Following(expression) = bound
+                {
+                    self.collect_expr(expression, inputs, range_type.as_ref(), catalog, depth + 1)?;
+                }
+            }
+        }
+        if let Some(filter) = &call.filter {
+            self.collect_expr(
+                filter,
+                inputs,
+                Some(&ScalarType::Boolean),
+                catalog,
+                depth + 1,
+            )?;
+        }
+        match call.function {
+            WindowFunction::RowNumber | WindowFunction::Rank | WindowFunction::DenseRank => {
+                Ok(Some(ScalarType::Int64))
+            }
+            WindowFunction::FirstValue
+            | WindowFunction::LastValue
+            | WindowFunction::Lag
+            | WindowFunction::Lead
+            | WindowFunction::NthValue => {
+                let value_type = call
+                    .arguments
+                    .first()
+                    .map(|argument| self.collect_expr(argument, inputs, None, catalog, depth + 1))
+                    .transpose()?
+                    .flatten();
+                if matches!(call.function, WindowFunction::Lag | WindowFunction::Lead)
+                    && let Some(offset) = call.arguments.get(1)
+                {
+                    self.collect_expr(
+                        offset,
+                        inputs,
+                        Some(&ScalarType::Int64),
+                        catalog,
+                        depth + 1,
+                    )?;
+                }
+                if call.function == WindowFunction::NthValue
+                    && let Some(offset) = call.arguments.get(1)
+                {
+                    self.collect_expr(
+                        offset,
+                        inputs,
+                        Some(&ScalarType::Int64),
+                        catalog,
+                        depth + 1,
+                    )?;
+                }
+                if matches!(call.function, WindowFunction::Lag | WindowFunction::Lead)
+                    && let Some(default) = call.arguments.get(2)
+                {
+                    let default_type = self.collect_expr(
+                        default,
+                        inputs,
+                        value_type.as_ref(),
+                        catalog,
+                        depth + 1,
+                    )?;
+                    let reconciled = match (value_type, default_type) {
+                        (Some(left), Some(right)) => common_type(&left, &right),
+                        (Some(data_type), None) | (None, Some(data_type)) => Some(data_type),
+                        (None, None) => None,
+                    };
+                    if let Some(reconciled) = &reconciled {
+                        if let Some(value) = call.arguments.first() {
+                            self.collect_expr(value, inputs, Some(reconciled), catalog, depth + 1)?;
+                        }
+                        self.collect_expr(default, inputs, Some(reconciled), catalog, depth + 1)?;
+                    }
+                    return Ok(reconciled);
+                }
+                Ok(value_type)
+            }
+            WindowFunction::Aggregate(function) => {
+                let argument_type = call
+                    .arguments
+                    .first()
+                    .map(|argument| self.collect_expr(argument, inputs, None, catalog, depth + 1))
+                    .transpose()?
+                    .flatten();
+                Ok(parameter_aggregate_type(function, argument_type))
+            }
+        }
+    }
+
+    fn collect_on_conflict(
+        &mut self,
+        on_conflict: &ParsedOnConflict,
+        table: &TableDefinition,
+        catalog: &Catalog,
+        depth: usize,
+    ) -> Result<()> {
+        let ParsedConflictAction::DoUpdate {
+            assignments,
+            filter,
+        } = &on_conflict.action
+        else {
+            return Ok(());
+        };
+        let width = table.columns().len();
+        let mut inputs = parameter_table_inputs(table, table.name.clone(), 0, false);
+        inputs.extend(parameter_table_inputs(
+            table,
+            Identifier::unquoted("excluded"),
+            width,
+            false,
+        ));
+        for (column, expression) in assignments {
+            if let Some(index) = table.column_index(&column.name) {
+                self.collect_expr(
+                    expression,
+                    &inputs,
+                    Some(&table.columns()[index].data_type),
+                    catalog,
+                    depth,
+                )?;
+            }
+        }
+        if let Some(filter) = filter {
+            self.collect_expr(filter, &inputs, Some(&ScalarType::Boolean), catalog, depth)?;
+        }
+        Ok(())
+    }
+
+    fn collect_merge(
+        &mut self,
+        merge: &ParsedMerge,
+        catalog: &Catalog,
+        expected_output: Option<&[Option<ScalarType>]>,
+        depth: usize,
+    ) -> Result<Vec<Option<ScalarType>>> {
+        let target = resolve_table(&merge.target.name, catalog)?;
+        let source = resolve_table(&merge.source.name, catalog)?;
+        let target_binding = merge
+            .target
+            .alias
+            .as_ref()
+            .map_or_else(|| target.name.clone(), |alias| alias.name.clone());
+        let source_binding = merge
+            .source
+            .alias
+            .as_ref()
+            .map_or_else(|| source.name.clone(), |alias| alias.name.clone());
+        let mut inputs = parameter_table_inputs(target, target_binding, 0, false);
+        let source_offset = inputs.len();
+        inputs.extend(parameter_table_inputs(
+            source,
+            source_binding,
+            source_offset,
+            false,
+        ));
+        self.collect_expr(
+            &merge.on,
+            &inputs,
+            Some(&ScalarType::Boolean),
+            catalog,
+            depth,
+        )?;
+        for clause in &merge.clauses {
+            if let Some(predicate) = &clause.predicate {
+                self.collect_expr(
+                    predicate,
+                    &inputs,
+                    Some(&ScalarType::Boolean),
+                    catalog,
+                    depth,
+                )?;
+            }
+            match &clause.action {
+                ParsedMergeAction::Update { assignments } => {
+                    for (column, expression) in assignments {
+                        if let Some(index) = target.column_index(&column.name) {
+                            self.collect_expr(
+                                expression,
+                                &inputs,
+                                Some(&target.columns()[index].data_type),
+                                catalog,
+                                depth,
+                            )?;
+                        }
+                    }
+                }
+                ParsedMergeAction::Insert { columns, values } => {
+                    let column_indexes = parameter_target_columns(columns, target)?;
+                    for (expression, index) in values.iter().zip(column_indexes) {
+                        self.collect_expr(
+                            expression,
+                            &inputs,
+                            Some(&target.columns()[index].data_type),
+                            catalog,
+                            depth,
+                        )?;
+                    }
+                }
+                ParsedMergeAction::Delete | ParsedMergeAction::DoNothing => {}
+            }
+        }
+        let target_inputs = parameter_table_inputs(target, target.name.clone(), 0, false);
+        self.collect_projection(
+            &merge.returning,
+            &target_inputs,
+            expected_output,
+            catalog,
+            depth,
+        )
+    }
+
+    fn collect_routine_arguments(
+        &mut self,
+        name: &ParsedObjectName,
+        arguments: &[ParsedExpr],
+        catalog: &Catalog,
+        depth: usize,
+    ) -> Result<()> {
+        let (schema, name, _) = split_table_name(name)?;
+        let Some(schema) = catalog.schema(&schema) else {
+            return Ok(());
+        };
+        let candidates = schema
+            .routines_named(&name)
+            .iter()
+            .filter(|routine| routine.arguments.len() == arguments.len())
+            .collect::<Vec<_>>();
+        for (index, expression) in arguments.iter().enumerate() {
+            let types = candidates
+                .iter()
+                .map(|routine| routine.arguments[index].data_type.clone())
+                .collect::<Vec<_>>();
+            let expected = types
+                .first()
+                .filter(|first| types.iter().all(|data_type| data_type == *first))
+                .cloned();
+            self.collect_expr(expression, &[], expected.as_ref(), catalog, depth)?;
+        }
+        Ok(())
+    }
+
+    fn collect_with_statement(
+        &mut self,
+        recursive: bool,
+        ctes: &[ParsedCte],
+        body: &ParsedStatement,
+        catalog: &Catalog,
+        expected_output: Option<&[Option<ScalarType>]>,
+        depth: usize,
+    ) -> Result<Vec<Option<ScalarType>>> {
+        let mut transient_catalog = catalog.clone();
+        let temporary_schema = Identifier::unquoted(format!("__ordadb_param_cte_{depth}"));
+        if transient_catalog.schema(&temporary_schema).is_none() {
+            transient_catalog.create_schema(temporary_schema.clone())?;
+        }
+        let mut replacements = BTreeMap::new();
+        let mut names = BTreeSet::new();
+        for cte in ctes {
+            if !names.insert(cte.name.name.clone()) {
+                return Err(DbError::new(
+                    "42712",
+                    format!("WITH query name {} specified more than once", cte.name.name),
+                )
+                .with_position_opt(cte.name.position));
+            }
+            let query = (*cte.query).clone();
+            let self_recursive =
+                recursive && parsed_query_references_table(&query, &cte.name.name, 0)?;
+            let (mut seed, recursive_term) = if self_recursive {
+                match query {
+                    ParsedStatement::SetOperation {
+                        left,
+                        operator: QuerySetOperator::Union,
+                        right,
+                        ..
+                    } => (*left, Some(*right)),
+                    _ => return Ok(Vec::new()),
+                }
+            } else {
+                (query, None)
+            };
+            rewrite_cte_references(&mut seed, &replacements, 0)?;
+            let seed_types =
+                self.collect_statement(&seed, &transient_catalog, &[], None, depth + 1)?;
+            let Some(mut output) =
+                self.try_statement_schema(&seed, &transient_catalog, &[], depth + 1)
+            else {
+                return Ok(seed_types);
+            };
+            apply_cte_column_aliases(&cte.name, &cte.columns, &mut output)?;
+            create_cte_relation(
+                &mut transient_catalog,
+                &temporary_schema,
+                &cte.name,
+                &output,
+            )?;
+            replacements.insert(
+                cte.name.name.clone(),
+                cte_replacement_name(&temporary_schema, &cte.name),
+            );
+            if let Some(mut recursive_term) = recursive_term {
+                rewrite_cte_references(&mut recursive_term, &replacements, 0)?;
+                let expected = output
+                    .fields
+                    .iter()
+                    .map(|field| Some(field.data_type.clone()))
+                    .collect::<Vec<_>>();
+                self.collect_statement(
+                    &recursive_term,
+                    &transient_catalog,
+                    &[],
+                    Some(&expected),
+                    depth + 1,
+                )?;
+            }
+        }
+        let mut body = body.clone();
+        rewrite_cte_references(&mut body, &replacements, 0)?;
+        self.collect_statement(&body, &transient_catalog, &[], expected_output, depth + 1)
+    }
+
+    fn try_statement_schema(
+        &self,
+        statement: &ParsedStatement,
+        catalog: &Catalog,
+        outer_inputs: &[InputColumn],
+        depth: usize,
+    ) -> Option<Schema> {
+        let mut statement = statement.clone();
+        resolve_statement_parameter_types(&mut statement, &self.types, depth).ok()?;
+        let statement = if outer_inputs.is_empty() {
+            bind_with_view_depth(statement, catalog, depth).ok()?
+        } else {
+            bind_apply_query(statement, catalog, depth, outer_inputs).ok()?
+        };
+        bound_query_schema(&statement).ok()
+    }
+}
+
+fn parameter_table_inputs(
+    table: &TableDefinition,
+    binding: Identifier,
+    offset: usize,
+    nullable: bool,
+) -> Vec<InputColumn> {
+    table
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(column_offset, column)| InputColumn {
+            binding: binding.clone(),
+            name: column.name.clone(),
+            index: offset + column_offset,
+            data_type: column.data_type.clone(),
+            nullable: nullable || column.nullable,
+            outer_depth: 0,
+        })
+        .collect()
+}
+
+fn parameter_target_columns(
+    columns: &[ParsedIdentifier],
+    table: &TableDefinition,
+) -> Result<Vec<usize>> {
+    if columns.is_empty() {
+        return Ok((0..table.columns().len()).collect());
+    }
+    columns
+        .iter()
+        .map(|column| {
+            table.column_index(&column.name).ok_or_else(|| {
+                DbError::new(
+                    UNDEFINED_COLUMN,
+                    format!("column {} does not exist", column.name),
+                )
+                .with_position_opt(column.position)
+            })
+        })
+        .collect()
+}
+
+fn parameter_aggregate_type(
+    function: AggregateFunction,
+    argument_type: Option<ScalarType>,
+) -> Option<ScalarType> {
+    match function {
+        AggregateFunction::Count => Some(ScalarType::Int64),
+        AggregateFunction::Avg => argument_type.map(|_| ScalarType::Float64),
+        AggregateFunction::Sum => argument_type.map(|data_type| match data_type {
+            ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64 => ScalarType::Int64,
+            ScalarType::Float32 | ScalarType::Float64 => ScalarType::Float64,
+            other => other,
+        }),
+        AggregateFunction::Min | AggregateFunction::Max => argument_type,
+    }
+}
+
+fn parsed_parameter_index(expression: &ParsedExpr) -> Option<usize> {
+    match expression.kind {
+        ParsedExprKind::Parameter(index) | ParsedExprKind::ResolvedParameter { index, .. } => {
+            Some(index)
+        }
+        _ => None,
+    }
+}
+
+fn resolve_statement_parameter_types(
+    statement: &mut ParsedStatement,
+    parameter_types: &BTreeMap<usize, ScalarType>,
+    depth: usize,
+) -> Result<()> {
+    if depth >= MAX_PARAMETER_SOLVER_DEPTH {
+        return Err(DbError::new(
+            "54001",
+            "parameter type resolution exceeded its statement depth limit",
+        ));
+    }
+    match statement {
+        ParsedStatement::CreateTable {
+            columns,
+            constraints,
+            ..
+        } => {
+            for column in columns {
+                if let Some(default) = &mut column.default {
+                    resolve_expr_parameter_types(
+                        &mut default.expression,
+                        parameter_types,
+                        depth + 1,
+                    )?;
+                }
+            }
+            for constraint in constraints {
+                resolve_constraint_parameter_types(constraint, parameter_types, depth + 1)?;
+            }
+        }
+        ParsedStatement::AlterTable { operations, .. } => {
+            for operation in operations {
+                match operation {
+                    ParsedAlterTableOperation::AddColumn { column, .. } => {
+                        if let Some(default) = &mut column.default {
+                            resolve_expr_parameter_types(
+                                &mut default.expression,
+                                parameter_types,
+                                depth + 1,
+                            )?;
+                        }
+                    }
+                    ParsedAlterTableOperation::SetDefault { default, .. } => {
+                        resolve_expr_parameter_types(
+                            &mut default.expression,
+                            parameter_types,
+                            depth + 1,
+                        )?;
+                    }
+                    ParsedAlterTableOperation::AddConstraint { constraint } => {
+                        resolve_constraint_parameter_types(constraint, parameter_types, depth + 1)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ParsedStatement::CreateView { query, .. }
+        | ParsedStatement::Explain { statement: query } => {
+            resolve_statement_parameter_types(query, parameter_types, depth + 1)?;
+        }
+        ParsedStatement::Call { arguments, .. }
+        | ParsedStatement::RoutineSelect { arguments, .. } => {
+            for argument in arguments {
+                resolve_expr_parameter_types(argument, parameter_types, depth + 1)?;
+            }
+        }
+        ParsedStatement::SequenceValue {
+            operation: ParsedSequenceOperation::SetValue { value, .. },
+            ..
+        } => {
+            resolve_expr_parameter_types(value, parameter_types, depth + 1)?;
+        }
+        ParsedStatement::Insert {
+            rows,
+            on_conflict,
+            returning,
+            ..
+        } => {
+            for expression in rows.iter_mut().flatten() {
+                resolve_expr_parameter_types(expression, parameter_types, depth + 1)?;
+            }
+            if let Some(on_conflict) = on_conflict
+                && let ParsedConflictAction::DoUpdate {
+                    assignments,
+                    filter,
+                } = &mut on_conflict.action
+            {
+                for (_, expression) in assignments {
+                    resolve_expr_parameter_types(expression, parameter_types, depth + 1)?;
+                }
+                if let Some(filter) = filter {
+                    resolve_expr_parameter_types(filter, parameter_types, depth + 1)?;
+                }
+            }
+            resolve_projection_parameter_types(returning, parameter_types, depth + 1)?;
+        }
+        ParsedStatement::Merge(merge) => {
+            resolve_expr_parameter_types(&mut merge.on, parameter_types, depth + 1)?;
+            for clause in &mut merge.clauses {
+                if let Some(predicate) = &mut clause.predicate {
+                    resolve_expr_parameter_types(predicate, parameter_types, depth + 1)?;
+                }
+                match &mut clause.action {
+                    ParsedMergeAction::Update { assignments } => {
+                        for (_, expression) in assignments {
+                            resolve_expr_parameter_types(expression, parameter_types, depth + 1)?;
+                        }
+                    }
+                    ParsedMergeAction::Insert { values, .. } => {
+                        for expression in values {
+                            resolve_expr_parameter_types(expression, parameter_types, depth + 1)?;
+                        }
+                    }
+                    ParsedMergeAction::Delete | ParsedMergeAction::DoNothing => {}
+                }
+            }
+            resolve_projection_parameter_types(&mut merge.returning, parameter_types, depth + 1)?;
+        }
+        ParsedStatement::With { ctes, body, .. } => {
+            for cte in ctes {
+                resolve_statement_parameter_types(&mut cte.query, parameter_types, depth + 1)?;
+            }
+            resolve_statement_parameter_types(body, parameter_types, depth + 1)?;
+        }
+        ParsedStatement::SetOperation {
+            left,
+            right,
+            order_by,
+            offset,
+            limit,
+            ..
+        } => {
+            resolve_statement_parameter_types(left, parameter_types, depth + 1)?;
+            resolve_statement_parameter_types(right, parameter_types, depth + 1)?;
+            resolve_orders_parameter_types(order_by, parameter_types, depth + 1)?;
+            resolve_optional_expr_parameter_types(offset, parameter_types, depth + 1)?;
+            resolve_optional_expr_parameter_types(limit, parameter_types, depth + 1)?;
+        }
+        ParsedStatement::Select {
+            projection,
+            filter,
+            order_by,
+            offset,
+            limit,
+            ..
+        } => {
+            resolve_projection_parameter_types(projection, parameter_types, depth + 1)?;
+            resolve_optional_expr_parameter_types(filter, parameter_types, depth + 1)?;
+            resolve_orders_parameter_types(order_by, parameter_types, depth + 1)?;
+            resolve_optional_expr_parameter_types(offset, parameter_types, depth + 1)?;
+            resolve_optional_expr_parameter_types(limit, parameter_types, depth + 1)?;
+        }
+        ParsedStatement::AdvancedSelect {
+            joins,
+            projection,
+            filter,
+            group_by,
+            having,
+            order_by,
+            offset,
+            limit,
+            ..
+        } => {
+            for join in joins {
+                if let ParsedJoinSource::Derived { query, .. } = &mut join.source {
+                    resolve_statement_parameter_types(query, parameter_types, depth + 1)?;
+                }
+                resolve_expr_parameter_types(&mut join.on, parameter_types, depth + 1)?;
+            }
+            resolve_projection_parameter_types(projection, parameter_types, depth + 1)?;
+            resolve_optional_expr_parameter_types(filter, parameter_types, depth + 1)?;
+            for expression in group_by {
+                resolve_expr_parameter_types(expression, parameter_types, depth + 1)?;
+            }
+            resolve_optional_expr_parameter_types(having, parameter_types, depth + 1)?;
+            resolve_orders_parameter_types(order_by, parameter_types, depth + 1)?;
+            resolve_optional_expr_parameter_types(offset, parameter_types, depth + 1)?;
+            resolve_optional_expr_parameter_types(limit, parameter_types, depth + 1)?;
+        }
+        ParsedStatement::Update {
+            assignments,
+            filter,
+            returning,
+            ..
+        } => {
+            for (_, expression) in assignments {
+                resolve_expr_parameter_types(expression, parameter_types, depth + 1)?;
+            }
+            resolve_optional_expr_parameter_types(filter, parameter_types, depth + 1)?;
+            resolve_projection_parameter_types(returning, parameter_types, depth + 1)?;
+        }
+        ParsedStatement::Delete {
+            filter, returning, ..
+        } => {
+            resolve_optional_expr_parameter_types(filter, parameter_types, depth + 1)?;
+            resolve_projection_parameter_types(returning, parameter_types, depth + 1)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn resolve_constraint_parameter_types(
+    constraint: &mut ParsedTableConstraint,
+    parameter_types: &BTreeMap<usize, ScalarType>,
+    depth: usize,
+) -> Result<()> {
+    if let ParsedTableConstraint::Check { expression, .. } = constraint {
+        resolve_expr_parameter_types(expression, parameter_types, depth)?;
+    }
+    Ok(())
+}
+
+fn resolve_projection_parameter_types(
+    projection: &mut [ParsedProjection],
+    parameter_types: &BTreeMap<usize, ScalarType>,
+    depth: usize,
+) -> Result<()> {
+    for item in projection {
+        if let ParsedProjection::Expression { expr, .. } = item {
+            resolve_expr_parameter_types(expr, parameter_types, depth)?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_orders_parameter_types(
+    order_by: &mut [ParsedOrder],
+    parameter_types: &BTreeMap<usize, ScalarType>,
+    depth: usize,
+) -> Result<()> {
+    for order in order_by {
+        resolve_expr_parameter_types(&mut order.expr, parameter_types, depth)?;
+    }
+    Ok(())
+}
+
+fn resolve_optional_expr_parameter_types(
+    expression: &mut Option<ParsedExpr>,
+    parameter_types: &BTreeMap<usize, ScalarType>,
+    depth: usize,
+) -> Result<()> {
+    if let Some(expression) = expression {
+        resolve_expr_parameter_types(expression, parameter_types, depth)?;
+    }
+    Ok(())
+}
+
+fn resolve_expr_parameter_types(
+    expression: &mut ParsedExpr,
+    parameter_types: &BTreeMap<usize, ScalarType>,
+    depth: usize,
+) -> Result<()> {
+    if depth >= MAX_PARAMETER_SOLVER_DEPTH {
+        return Err(DbError::new(
+            "54001",
+            "parameter type resolution exceeded its expression depth limit",
+        ));
+    }
+    if let ParsedExprKind::Parameter(index) = expression.kind
+        && let Some(data_type) = parameter_types.get(&index)
+    {
+        expression.kind = ParsedExprKind::ResolvedParameter {
+            index,
+            data_type: data_type.clone(),
+        };
+        return Ok(());
+    }
+    match &mut expression.kind {
+        ParsedExprKind::Unary { expr, .. } => {
+            resolve_expr_parameter_types(expr, parameter_types, depth + 1)?;
+        }
+        ParsedExprKind::Binary { left, right, .. } => {
+            resolve_expr_parameter_types(left, parameter_types, depth + 1)?;
+            resolve_expr_parameter_types(right, parameter_types, depth + 1)?;
+        }
+        ParsedExprKind::InList { expr, list, .. } => {
+            resolve_expr_parameter_types(expr, parameter_types, depth + 1)?;
+            for candidate in list {
+                resolve_expr_parameter_types(candidate, parameter_types, depth + 1)?;
+            }
+        }
+        ParsedExprKind::ScalarSubquery(subquery) | ParsedExprKind::Exists { subquery, .. } => {
+            resolve_statement_parameter_types(subquery, parameter_types, depth + 1)?;
+        }
+        ParsedExprKind::InSubquery { expr, subquery, .. }
+        | ParsedExprKind::QuantifiedSubquery {
+            left: expr,
+            subquery,
+            ..
+        } => {
+            resolve_expr_parameter_types(expr, parameter_types, depth + 1)?;
+            resolve_statement_parameter_types(subquery, parameter_types, depth + 1)?;
+        }
+        ParsedExprKind::RowSubquery { left, subquery, .. } => {
+            for expression in left {
+                resolve_expr_parameter_types(expression, parameter_types, depth + 1)?;
+            }
+            resolve_statement_parameter_types(subquery, parameter_types, depth + 1)?;
+        }
+        ParsedExprKind::Aggregate {
+            argument, filter, ..
+        } => {
+            if let Some(argument) = argument {
+                resolve_expr_parameter_types(argument, parameter_types, depth + 1)?;
+            }
+            if let Some(filter) = filter {
+                resolve_expr_parameter_types(filter, parameter_types, depth + 1)?;
+            }
+        }
+        ParsedExprKind::Window { call, spec } => {
+            resolve_window_parameter_types(call, spec, parameter_types, depth + 1)?;
+        }
+        ParsedExprKind::NamedWindow { call, .. } => {
+            for argument in &mut call.arguments {
+                resolve_expr_parameter_types(argument, parameter_types, depth + 1)?;
+            }
+            if let Some(filter) = &mut call.filter {
+                resolve_expr_parameter_types(filter, parameter_types, depth + 1)?;
+            }
+        }
+        ParsedExprKind::Column(_)
+        | ParsedExprKind::Literal(_)
+        | ParsedExprKind::Parameter(_)
+        | ParsedExprKind::ResolvedParameter { .. }
+        | ParsedExprKind::ApplyValue { .. }
+        | ParsedExprKind::WindowValue { .. } => {}
+    }
+    Ok(())
+}
+
+fn resolve_window_parameter_types(
+    call: &mut ParsedWindowCall,
+    spec: &mut ParsedWindowSpec,
+    parameter_types: &BTreeMap<usize, ScalarType>,
+    depth: usize,
+) -> Result<()> {
+    for argument in &mut call.arguments {
+        resolve_expr_parameter_types(argument, parameter_types, depth)?;
+    }
+    if let Some(filter) = &mut call.filter {
+        resolve_expr_parameter_types(filter, parameter_types, depth)?;
+    }
+    for expression in &mut spec.partition_by {
+        resolve_expr_parameter_types(expression, parameter_types, depth)?;
+    }
+    resolve_orders_parameter_types(&mut spec.order_by, parameter_types, depth)?;
+    if let Some(frame) = &mut spec.frame {
+        for bound in [&mut frame.start_bound, &mut frame.end_bound] {
+            if let ParsedWindowFrameBound::Preceding(expression)
+            | ParsedWindowFrameBound::Following(expression) = bound
+            {
+                resolve_expr_parameter_types(expression, parameter_types, depth)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn bind_with_view_depth(
@@ -2173,37 +4177,72 @@ fn bind_with_view_depth(
             table,
             columns,
             rows,
-        } => bind_insert(table, columns, rows, catalog),
+            on_conflict,
+            returning,
+        } => bind_insert(table, columns, rows, on_conflict, returning, catalog),
+        ParsedStatement::Merge(merge) => bind_merge(merge, catalog),
+        ParsedStatement::With {
+            recursive,
+            ctes,
+            body,
+        } => bind_with_clause(recursive, ctes, *body, catalog, view_depth),
+        ParsedStatement::SetOperation {
+            left,
+            operator,
+            all,
+            right,
+            order_by,
+            offset,
+            limit,
+        } => bind_set_operation(
+            *left, operator, all, *right, order_by, offset, limit, catalog, view_depth,
+        ),
         ParsedStatement::Select {
             table,
             projection,
             filter,
             order_by,
+            offset,
             limit,
         } => bind_select(
-            table, projection, filter, order_by, limit, catalog, view_depth,
+            SelectInput {
+                table_name: table,
+                projection,
+                filter,
+                order_by,
+                offset,
+                limit,
+            },
+            catalog,
+            view_depth,
         ),
         ParsedStatement::AdvancedSelect {
             table,
             joins,
             projection,
+            distinct,
             filter,
             group_by,
             having,
             order_by,
+            offset,
             limit,
         } => bind_advanced_select(
             AdvancedSelectInput {
                 table,
                 joins,
                 projection,
+                distinct,
                 filter,
                 group_by,
                 having,
                 order_by,
+                offset,
                 limit,
             },
             catalog,
+            view_depth,
+            &[],
         ),
         ParsedStatement::Explain { statement } => {
             let statement = bind_with_view_depth(*statement, catalog, view_depth)?;
@@ -2221,8 +4260,13 @@ fn bind_with_view_depth(
             table,
             assignments,
             filter,
-        } => bind_update(table, assignments, filter, catalog),
-        ParsedStatement::Delete { table, filter } => bind_delete(table, filter, catalog),
+            returning,
+        } => bind_update(table, assignments, filter, returning, catalog),
+        ParsedStatement::Delete {
+            table,
+            filter,
+            returning,
+        } => bind_delete(table, filter, returning, catalog),
     }
 }
 
@@ -2547,8 +4591,6 @@ fn convert_statement(statement: SqlStatement, sql: &str) -> Result<ParsedStateme
                 || !insert.assignments.is_empty()
                 || insert.partitioned.is_some()
                 || !insert.after_columns.is_empty()
-                || insert.on.is_some()
-                || insert.returning.is_some()
                 || insert.output.is_some()
                 || insert.replace_into
                 || insert.priority.is_some()
@@ -2562,6 +4604,8 @@ fn convert_statement(statement: SqlStatement, sql: &str) -> Result<ParsedStateme
             {
                 return unsupported("this INSERT form is not supported yet");
             }
+            let on_conflict = convert_on_conflict(insert.on, sql)?;
+            let returning = convert_projection_items(insert.returning.unwrap_or_default(), sql)?;
             let TableObject::TableName(table) = insert.table else {
                 return unsupported("INSERT targets must be named tables");
             };
@@ -2578,13 +4622,15 @@ fn convert_statement(statement: SqlStatement, sql: &str) -> Result<ParsedStateme
                 table: convert_object_name(table, sql)?,
                 columns,
                 rows,
+                on_conflict,
+                returning,
             })
         }
+        SqlStatement::Merge(merge) => convert_merge(merge, sql),
         SqlStatement::Query(query) => convert_select_query(*query, sql),
         SqlStatement::Update(update) => {
             if !update.optimizer_hints.is_empty()
                 || update.from.is_some()
-                || update.returning.is_some()
                 || update.output.is_some()
                 || update.or.is_some()
                 || !update.order_by.is_empty()
@@ -2592,20 +4638,9 @@ fn convert_statement(statement: SqlStatement, sql: &str) -> Result<ParsedStateme
             {
                 return unsupported("this UPDATE form is not supported yet");
             }
+            let returning = convert_projection_items(update.returning.unwrap_or_default(), sql)?;
             let table = convert_table_with_joins(update.table, sql)?;
-            let assignments = update
-                .assignments
-                .into_iter()
-                .map(|assignment| {
-                    let AssignmentTarget::ColumnName(name) = assignment.target else {
-                        return unsupported("tuple assignments are not supported yet");
-                    };
-                    Ok((
-                        convert_single_identifier(name, sql)?,
-                        convert_expr(assignment.value, sql)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let assignments = convert_assignments(update.assignments, sql)?;
             Ok(ParsedStatement::Update {
                 table,
                 assignments,
@@ -2613,19 +4648,20 @@ fn convert_statement(statement: SqlStatement, sql: &str) -> Result<ParsedStateme
                     .selection
                     .map(|expr| convert_expr(expr, sql))
                     .transpose()?,
+                returning,
             })
         }
         SqlStatement::Delete(delete) => {
             if !delete.optimizer_hints.is_empty()
                 || !delete.tables.is_empty()
                 || delete.using.is_some()
-                || delete.returning.is_some()
                 || delete.output.is_some()
                 || !delete.order_by.is_empty()
                 || delete.limit.is_some()
             {
                 return unsupported("this DELETE form is not supported yet");
             }
+            let returning = convert_projection_items(delete.returning.unwrap_or_default(), sql)?;
             let FromTable::WithFromKeyword(mut tables) = delete.from else {
                 return unsupported("DELETE requires a named table after FROM");
             };
@@ -2638,6 +4674,7 @@ fn convert_statement(statement: SqlStatement, sql: &str) -> Result<ParsedStateme
                     .selection
                     .map(|expr| convert_expr(expr, sql))
                     .transpose()?,
+                returning,
             })
         }
         SqlStatement::Explain {
@@ -3454,8 +5491,8 @@ fn convert_routine_invocation(
 }
 
 fn convert_select_query(query: Query, sql: &str) -> Result<ParsedStatement> {
-    if query.with.is_some()
-        || !query.locks.is_empty()
+    let with = query.with;
+    if !query.locks.is_empty()
         || query.for_clause.is_some()
         || query.settings.is_some()
         || query.format_clause.is_some()
@@ -3463,29 +5500,30 @@ fn convert_select_query(query: Query, sql: &str) -> Result<ParsedStatement> {
     {
         return unsupported("this SELECT query form is not supported yet");
     }
-    let SetExpr::Select(select) = *query.body else {
-        return unsupported(
-            "set operations, subqueries, and VALUES queries are not supported here",
-        );
-    };
-    let mut select = *select;
-    let top_limit = match select.top.take() {
-        None => None,
-        Some(top) if top.with_ties || top.percent => {
-            return unsupported("TOP PERCENT and TOP WITH TIES are not supported");
+    let (body, top_limit) = match *query.body {
+        SetExpr::Select(select) => {
+            let mut select = *select;
+            let top_limit = match select.top.take() {
+                None => None,
+                Some(top) if top.with_ties || top.percent => {
+                    return unsupported("TOP PERCENT and TOP WITH TIES are not supported");
+                }
+                Some(top) => match top.quantity {
+                    Some(TopQuantity::Expr(expression)) => Some(convert_expr(expression, sql)?),
+                    Some(TopQuantity::Constant(value)) => {
+                        let value = i64::try_from(value)
+                            .map_err(|_| DbError::new("22003", "TOP value is out of range"))?;
+                        Some(ParsedExpr {
+                            kind: ParsedExprKind::Literal(Value::Int64(value)),
+                            position: None,
+                        })
+                    }
+                    None => return unsupported("TOP requires an explicit row count"),
+                },
+            };
+            (SetExpr::Select(Box::new(select)), top_limit)
         }
-        Some(top) => match top.quantity {
-            Some(TopQuantity::Expr(expression)) => Some(convert_expr(expression, sql)?),
-            Some(TopQuantity::Constant(value)) => {
-                let value = i64::try_from(value)
-                    .map_err(|_| DbError::new("22003", "TOP value is out of range"))?;
-                Some(ParsedExpr {
-                    kind: ParsedExprKind::Literal(Value::Int64(value)),
-                    position: None,
-                })
-            }
-            None => return unsupported("TOP requires an explicit row count"),
-        },
+        body => (body, None),
     };
 
     let order_by = match query.order_by {
@@ -3529,31 +5567,24 @@ fn convert_select_query(query: Query, sql: &str) -> Result<ParsedStatement> {
                 }),
         ),
     };
-    let limit = match query.limit_clause {
-        None => None,
+    let (limit, offset) = match query.limit_clause {
+        None => (None, None),
         Some(LimitClause::LimitOffset {
             limit,
             offset,
             limit_by,
-        }) if offset.is_none() && limit_by.is_empty() => {
-            limit.map(|expr| convert_expr(expr, sql)).transpose()?
-        }
-        Some(LimitClause::LimitOffset {
-            limit,
-            offset: Some(offset),
-            limit_by,
-        }) if limit_by.is_empty() && sql_expr_is_integer_zero(&offset.value) => {
-            limit.map(|expr| convert_expr(expr, sql)).transpose()?
-        }
-        Some(LimitClause::OffsetCommaLimit { offset, limit })
-            if sql_expr_is_integer_zero(&offset) =>
-        {
-            Some(convert_expr(limit, sql)?)
-        }
+        }) if limit_by.is_empty() => (
+            limit.map(|expr| convert_expr(expr, sql)).transpose()?,
+            offset
+                .map(|offset| convert_expr(offset.value, sql))
+                .transpose()?,
+        ),
+        Some(LimitClause::OffsetCommaLimit { offset, limit }) => (
+            Some(convert_expr(limit, sql)?),
+            Some(convert_expr(offset, sql)?),
+        ),
         Some(_) => {
-            return unsupported(
-                "non-zero OFFSET and unrepresentable dialect-specific LIMIT forms are not supported",
-            );
+            return unsupported("LIMIT BY and unrepresentable row-limit forms are not supported");
         }
     };
     let limit = match (top_limit, limit, fetch_limit) {
@@ -3563,25 +5594,163 @@ fn convert_select_query(query: Query, sql: &str) -> Result<ParsedStatement> {
         (top, limit, fetch) => top.or(limit).or(fetch),
     };
 
-    convert_select(select, order_by, limit, sql)
+    let statement = match body {
+        SetExpr::Select(select) => convert_select(*select, order_by, offset, limit, sql),
+        SetExpr::SetOperation {
+            left,
+            op,
+            set_quantifier,
+            right,
+        } => convert_set_operation(
+            *left,
+            op,
+            set_quantifier,
+            *right,
+            order_by,
+            offset,
+            limit,
+            sql,
+            0,
+        ),
+        SetExpr::Query(query) if order_by.is_empty() && offset.is_none() && limit.is_none() => {
+            convert_select_query(*query, sql)
+        }
+        SetExpr::Query(_) => unsupported(
+            "outer ORDER BY, OFFSET, and LIMIT on a parenthesized query are not supported yet",
+        ),
+        SetExpr::Values(_) => unsupported("standalone VALUES queries are not supported yet"),
+        SetExpr::Insert(_)
+        | SetExpr::Update(_)
+        | SetExpr::Delete(_)
+        | SetExpr::Merge(_)
+        | SetExpr::Table(_) => unsupported("this query body is not supported in a set operation"),
+    }?;
+    if let Some(with) = with {
+        convert_with_clause(with, statement, sql)
+    } else {
+        Ok(statement)
+    }
 }
 
-fn sql_expr_is_integer_zero(expression: &SqlExpr) -> bool {
-    matches!(
-        expression,
-        SqlExpr::Value(value)
-            if matches!(&value.value, SqlValue::Number(number, _) if number == "0")
-    )
+fn convert_with_clause(with: SqlWith, body: ParsedStatement, sql: &str) -> Result<ParsedStatement> {
+    let recursive = with.recursive;
+    let ctes = with
+        .cte_tables
+        .into_iter()
+        .map(|cte| {
+            if cte.from.is_some() {
+                return unsupported("CTE FROM modifiers are not supported");
+            }
+            Ok(ParsedCte {
+                name: convert_ident(cte.alias.name, sql),
+                columns: cte
+                    .alias
+                    .columns
+                    .into_iter()
+                    .map(|column| convert_ident(column.name, sql))
+                    .collect(),
+                query: Box::new(convert_select_query(*cte.query, sql)?),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if ctes.is_empty() {
+        return Err(DbError::new(SYNTAX_ERROR, "WITH requires at least one CTE"));
+    }
+    Ok(ParsedStatement::With {
+        recursive,
+        ctes,
+        body: Box::new(body),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn convert_set_operation(
+    left: SetExpr,
+    operator: SqlSetOperator,
+    quantifier: SqlSetQuantifier,
+    right: SetExpr,
+    order_by: Vec<ParsedOrder>,
+    offset: Option<ParsedExpr>,
+    limit: Option<ParsedExpr>,
+    sql: &str,
+    depth: usize,
+) -> Result<ParsedStatement> {
+    if depth >= 64 {
+        return Err(DbError::new(
+            "54001",
+            "set operation nesting exceeds the maximum depth of 64",
+        ));
+    }
+    let operator = match operator {
+        SqlSetOperator::Union => QuerySetOperator::Union,
+        SqlSetOperator::Intersect => QuerySetOperator::Intersect,
+        SqlSetOperator::Except => QuerySetOperator::Except,
+        SqlSetOperator::Minus => return unsupported("MINUS set operations are not supported"),
+    };
+    let all = match quantifier {
+        SqlSetQuantifier::All => true,
+        SqlSetQuantifier::None | SqlSetQuantifier::Distinct => false,
+        SqlSetQuantifier::ByName
+        | SqlSetQuantifier::AllByName
+        | SqlSetQuantifier::DistinctByName => {
+            return unsupported("BY NAME set operations are not supported");
+        }
+    };
+    Ok(ParsedStatement::SetOperation {
+        left: Box::new(convert_set_operand(left, sql, depth + 1)?),
+        operator,
+        all,
+        right: Box::new(convert_set_operand(right, sql, depth + 1)?),
+        order_by,
+        offset,
+        limit,
+    })
+}
+
+fn convert_set_operand(expr: SetExpr, sql: &str, depth: usize) -> Result<ParsedStatement> {
+    match expr {
+        SetExpr::Select(select) => convert_select(*select, Vec::new(), None, None, sql),
+        SetExpr::Query(query) => convert_select_query(*query, sql),
+        SetExpr::SetOperation {
+            left,
+            op,
+            set_quantifier,
+            right,
+        } => convert_set_operation(
+            *left,
+            op,
+            set_quantifier,
+            *right,
+            Vec::new(),
+            None,
+            None,
+            sql,
+            depth,
+        ),
+        SetExpr::Values(_) => {
+            unsupported("VALUES operands are not supported in set operations yet")
+        }
+        SetExpr::Insert(_)
+        | SetExpr::Update(_)
+        | SetExpr::Delete(_)
+        | SetExpr::Merge(_)
+        | SetExpr::Table(_) => unsupported("this query body is not supported in a set operation"),
+    }
 }
 
 fn convert_select(
     select: Select,
-    order_by: Vec<ParsedOrder>,
+    mut order_by: Vec<ParsedOrder>,
+    offset: Option<ParsedExpr>,
     limit: Option<ParsedExpr>,
     sql: &str,
 ) -> Result<ParsedStatement> {
+    let distinct = match select.distinct.as_ref() {
+        None | Some(SqlDistinct::All) => false,
+        Some(SqlDistinct::Distinct) => true,
+        Some(SqlDistinct::On(_)) => return unsupported("DISTINCT ON is not supported yet"),
+    };
     if !select.optimizer_hints.is_empty()
-        || select.distinct.is_some()
         || select.select_modifiers.is_some()
         || select.top.is_some()
         || select.exclude.is_some()
@@ -3592,21 +5761,304 @@ fn convert_select(
         || !select.cluster_by.is_empty()
         || !select.distribute_by.is_empty()
         || !select.sort_by.is_empty()
-        || !select.named_window.is_empty()
         || select.qualify.is_some()
         || select.value_table_mode.is_some()
     {
-        return unsupported("DISTINCT and extended SELECT clauses are not supported yet");
+        return unsupported("extended SELECT clauses are not supported yet");
     }
     if select.from.is_empty() {
-        return convert_routine_select(select, order_by, limit, sql);
+        if distinct {
+            return unsupported("SELECT DISTINCT without FROM is not supported yet");
+        }
+        if !select.named_window.is_empty() {
+            return unsupported("named WINDOW clauses without FROM are not supported yet");
+        }
+        return convert_routine_select(select, order_by, offset, limit, sql);
     }
+    let named_windows = convert_named_windows(select.named_window, sql)?;
     if select.from.len() != 1 {
         return unsupported("SELECT supports exactly one table");
     }
 
-    let projection = select
-        .projection
+    let mut projection = convert_projection_items(select.projection, sql)?;
+    let mut filter = select
+        .selection
+        .map(|expr| convert_expr(expr, sql))
+        .transpose()?;
+    let mut group_by = match select.group_by {
+        GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => expressions
+            .into_iter()
+            .map(|expr| convert_expr(expr, sql))
+            .collect::<Result<Vec<_>>>()?,
+        GroupByExpr::Expressions(_, _) => {
+            return unsupported("GROUP BY modifiers are not supported yet");
+        }
+        GroupByExpr::All(_) => return unsupported("GROUP BY ALL is not supported yet"),
+    };
+    let mut having = select
+        .having
+        .map(|expr| convert_expr(expr, sql))
+        .transpose()?;
+    for projection in &mut projection {
+        if let ParsedProjection::Expression { expr, .. } = projection {
+            resolve_named_window_expr(expr, &named_windows)?;
+        }
+    }
+    if let Some(filter) = &mut filter {
+        resolve_named_window_expr(filter, &named_windows)?;
+    }
+    for expression in &mut group_by {
+        resolve_named_window_expr(expression, &named_windows)?;
+    }
+    if let Some(having) = &mut having {
+        resolve_named_window_expr(having, &named_windows)?;
+    }
+    for order in &mut order_by {
+        resolve_named_window_expr(&mut order.expr, &named_windows)?;
+    }
+    let from = select
+        .from
+        .into_iter()
+        .next()
+        .ok_or_else(|| DbError::new(SYNTAX_ERROR, "SELECT requires a table"))?;
+    let advanced = distinct
+        || matches!(&from.relation, TableFactor::Table { alias: Some(_), .. })
+        || !from.joins.is_empty()
+        || !group_by.is_empty()
+        || having.is_some()
+        || projection.iter().any(|projection| {
+            projection_has_aggregate(projection)
+                || projection_has_subquery(projection)
+                || projection_has_window(projection)
+        })
+        || filter
+            .as_ref()
+            .is_some_and(|expr| expr_has_subquery(expr) || expr_has_window(expr))
+        || order_by.iter().any(|order| expr_has_window(&order.expr));
+    if advanced {
+        let (table, joins) = convert_select_from(from, sql)?;
+        Ok(ParsedStatement::AdvancedSelect {
+            table,
+            joins,
+            projection,
+            distinct,
+            filter,
+            group_by,
+            having,
+            order_by,
+            offset,
+            limit,
+        })
+    } else {
+        Ok(ParsedStatement::Select {
+            table: convert_table_with_joins(from, sql)?,
+            projection,
+            filter,
+            order_by,
+            offset,
+            limit,
+        })
+    }
+}
+
+fn convert_on_conflict(on: Option<SqlOnInsert>, sql: &str) -> Result<Option<ParsedOnConflict>> {
+    let Some(on) = on else {
+        return Ok(None);
+    };
+    let SqlOnInsert::OnConflict(conflict) = on else {
+        return unsupported("ON DUPLICATE KEY UPDATE is not PostgreSQL ON CONFLICT");
+    };
+    let target = conflict
+        .conflict_target
+        .map(|target| match target {
+            SqlConflictTarget::Columns(columns) => columns
+                .into_iter()
+                .map(|column| convert_single_identifier(column.into(), sql))
+                .collect::<Result<Vec<_>>>()
+                .map(ParsedConflictTarget::Columns),
+            SqlConflictTarget::OnConstraint(name) => {
+                convert_object_name(name, sql).map(ParsedConflictTarget::Constraint)
+            }
+        })
+        .transpose()?;
+    let action = match conflict.action {
+        SqlOnConflictAction::DoNothing => ParsedConflictAction::DoNothing,
+        SqlOnConflictAction::DoUpdate(update) => ParsedConflictAction::DoUpdate {
+            assignments: convert_assignments(update.assignments, sql)?,
+            filter: update
+                .selection
+                .map(|expr| convert_expr(expr, sql))
+                .transpose()?,
+        },
+    };
+    Ok(Some(ParsedOnConflict { target, action }))
+}
+
+fn convert_merge(merge: SqlMerge, sql: &str) -> Result<ParsedStatement> {
+    let SqlMerge {
+        merge_token: _,
+        optimizer_hints,
+        into,
+        table,
+        source,
+        on,
+        clauses,
+        output,
+    } = merge;
+    if !optimizer_hints.is_empty() {
+        return unsupported("MERGE optimizer hints are not supported");
+    }
+    if !into {
+        return Err(DbError::new(SYNTAX_ERROR, "MERGE requires INTO"));
+    }
+    if clauses.is_empty() {
+        return Err(DbError::new(
+            SYNTAX_ERROR,
+            "MERGE requires at least one WHEN clause",
+        ));
+    }
+    let returning = match output {
+        None => Vec::new(),
+        Some(SqlOutputClause::Returning { select_items, .. }) => {
+            convert_projection_items(select_items, sql)?
+        }
+        Some(SqlOutputClause::Output { .. }) => {
+            return unsupported("MERGE OUTPUT is not supported");
+        }
+    };
+    let clause_tokens = merge_clause_token_info(&significant_tokens(sql)).ok_or_else(|| {
+        DbError::internal("MERGE token audit could not identify the statement clauses")
+    })?;
+    if clause_tokens.len() != clauses.len() {
+        return Err(DbError::internal(
+            "MERGE token audit disagrees with the parsed clause count",
+        ));
+    }
+    let clauses = clauses
+        .into_iter()
+        .enumerate()
+        .map(|(clause_index, clause)| {
+            let kind = match clause.clause_kind {
+                SqlMergeClauseKind::Matched => ParsedMergeClauseKind::Matched,
+                SqlMergeClauseKind::NotMatched | SqlMergeClauseKind::NotMatchedByTarget => {
+                    ParsedMergeClauseKind::NotMatchedByTarget
+                }
+                SqlMergeClauseKind::NotMatchedBySource => ParsedMergeClauseKind::NotMatchedBySource,
+            };
+            let action = if clause_tokens[clause_index].do_nothing.is_some() {
+                ParsedMergeAction::DoNothing
+            } else {
+                match clause.action {
+                    SqlMergeAction::Update(update) => {
+                        if kind == ParsedMergeClauseKind::NotMatchedByTarget {
+                            return Err(DbError::new(
+                                SYNTAX_ERROR,
+                                "MERGE UPDATE requires WHEN MATCHED or WHEN NOT MATCHED BY SOURCE",
+                            ));
+                        }
+                        if update.update_predicate.is_some() || update.delete_predicate.is_some() {
+                            return unsupported("Oracle MERGE UPDATE predicates are not supported");
+                        }
+                        ParsedMergeAction::Update {
+                            assignments: convert_assignments(update.assignments, sql)?,
+                        }
+                    }
+                    SqlMergeAction::Delete { .. } => {
+                        if kind == ParsedMergeClauseKind::NotMatchedByTarget {
+                            return Err(DbError::new(
+                                SYNTAX_ERROR,
+                                "MERGE DELETE requires WHEN MATCHED or WHEN NOT MATCHED BY SOURCE",
+                            ));
+                        }
+                        ParsedMergeAction::Delete
+                    }
+                    SqlMergeAction::Insert(mut insert) => {
+                        if kind != ParsedMergeClauseKind::NotMatchedByTarget {
+                            return Err(DbError::new(
+                                SYNTAX_ERROR,
+                                "MERGE INSERT requires WHEN NOT MATCHED",
+                            ));
+                        }
+                        if insert.insert_predicate.is_some() {
+                            return unsupported("Oracle MERGE INSERT predicates are not supported");
+                        }
+                        let columns = insert
+                            .columns
+                            .into_iter()
+                            .map(|column| convert_single_identifier(column, sql))
+                            .collect::<Result<Vec<_>>>()?;
+                        let values = match insert.kind {
+                            SqlMergeInsertKind::Values(ref mut values)
+                                if !values.explicit_row
+                                    && !values.value_keyword
+                                    && values.rows.len() == 1 =>
+                            {
+                                values
+                                    .rows
+                                    .pop()
+                                    .ok_or_else(|| {
+                                        DbError::new(SYNTAX_ERROR, "MERGE INSERT VALUES is empty")
+                                    })?
+                                    .content
+                                    .into_iter()
+                                    .map(|expr| convert_expr(expr, sql))
+                                    .collect::<Result<Vec<_>>>()?
+                            }
+                            SqlMergeInsertKind::Values(_) => {
+                                return unsupported(
+                                    "MERGE INSERT requires exactly one standard VALUES row",
+                                );
+                            }
+                            SqlMergeInsertKind::Row => {
+                                return unsupported("MERGE INSERT ROW is not supported");
+                            }
+                        };
+                        ParsedMergeAction::Insert { columns, values }
+                    }
+                }
+            };
+            Ok(ParsedMergeClause {
+                kind,
+                predicate: clause
+                    .predicate
+                    .map(|predicate| convert_expr(predicate, sql))
+                    .transpose()?,
+                action,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ParsedStatement::Merge(ParsedMerge {
+        target: convert_select_table(table, sql)?,
+        source: convert_select_table(source, sql)?,
+        on: convert_expr(*on, sql)?,
+        clauses,
+        returning,
+    }))
+}
+
+fn convert_assignments(
+    assignments: Vec<SqlAssignment>,
+    sql: &str,
+) -> Result<Vec<(ParsedIdentifier, ParsedExpr)>> {
+    assignments
+        .into_iter()
+        .map(|assignment| {
+            let AssignmentTarget::ColumnName(name) = assignment.target else {
+                return unsupported("tuple assignments are not supported yet");
+            };
+            Ok((
+                convert_single_identifier(name, sql)?,
+                convert_expr(assignment.value, sql)?,
+            ))
+        })
+        .collect()
+}
+
+fn convert_projection_items(
+    projection: Vec<SelectItem>,
+    sql: &str,
+) -> Result<Vec<ParsedProjection>> {
+    projection
         .into_iter()
         .map(|item| match item {
             SelectItem::Wildcard(_) => Ok(ParsedProjection::Wildcard),
@@ -3620,66 +6072,20 @@ fn convert_select(
             }),
             _ => unsupported("qualified wildcards and multiple aliases are not supported yet"),
         })
-        .collect::<Result<Vec<_>>>()?;
-    let filter = select
-        .selection
-        .map(|expr| convert_expr(expr, sql))
-        .transpose()?;
-    let group_by = match select.group_by {
-        GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => expressions
-            .into_iter()
-            .map(|expr| convert_expr(expr, sql))
-            .collect::<Result<Vec<_>>>()?,
-        GroupByExpr::Expressions(_, _) => {
-            return unsupported("GROUP BY modifiers are not supported yet");
-        }
-        GroupByExpr::All(_) => return unsupported("GROUP BY ALL is not supported yet"),
-    };
-    let having = select
-        .having
-        .map(|expr| convert_expr(expr, sql))
-        .transpose()?;
-    let from = select
-        .from
-        .into_iter()
-        .next()
-        .ok_or_else(|| DbError::new(SYNTAX_ERROR, "SELECT requires a table"))?;
-    let advanced = !from.joins.is_empty()
-        || !group_by.is_empty()
-        || having.is_some()
-        || projection.iter().any(projection_has_aggregate);
-    if advanced {
-        let (table, joins) = convert_select_from(from, sql)?;
-        Ok(ParsedStatement::AdvancedSelect {
-            table,
-            joins,
-            projection,
-            filter,
-            group_by,
-            having,
-            order_by,
-            limit,
-        })
-    } else {
-        Ok(ParsedStatement::Select {
-            table: convert_table_with_joins(from, sql)?,
-            projection,
-            filter,
-            order_by,
-            limit,
-        })
-    }
+        .collect()
 }
 
 fn convert_routine_select(
     select: Select,
     order_by: Vec<ParsedOrder>,
+    offset: Option<ParsedExpr>,
     limit: Option<ParsedExpr>,
     sql: &str,
 ) -> Result<ParsedStatement> {
     if select.selection.is_some()
         || select.having.is_some()
         || !order_by.is_empty()
+        || offset.is_some()
         || limit.is_some()
         || !matches!(
             select.group_by,
@@ -3842,13 +6248,59 @@ fn convert_select_from(table: TableWithJoins, sql: &str) -> Result<(ParsedTable,
                 return unsupported("joins require an ON predicate");
             };
             Ok(ParsedJoin {
-                table: convert_select_table(join.relation, sql)?,
+                source: convert_join_source(join.relation, sql)?,
                 kind,
                 on: convert_expr(on, sql)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
     Ok((first, joins))
+}
+
+fn convert_join_source(source: TableFactor, sql: &str) -> Result<ParsedJoinSource> {
+    match source {
+        source @ TableFactor::Table { .. } => {
+            convert_select_table(source, sql).map(ParsedJoinSource::Table)
+        }
+        TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+            sample,
+        } => {
+            if sample.is_some() {
+                return unsupported("TABLESAMPLE on derived tables is not supported yet");
+            }
+            let alias = alias.ok_or_else(|| {
+                DbError::new(
+                    SYNTAX_ERROR,
+                    "derived tables require an explicit relation alias",
+                )
+            })?;
+            if alias.at.is_some() {
+                return unsupported("AT aliases on derived tables are not supported");
+            }
+            let columns = alias
+                .columns
+                .into_iter()
+                .map(|column| {
+                    if column.data_type.is_some() {
+                        return unsupported(
+                            "typed column aliases on derived tables are not supported",
+                        );
+                    }
+                    Ok(convert_ident(column.name, sql))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ParsedJoinSource::Derived {
+                lateral,
+                query: Box::new(convert_select_query(*subquery, sql)?),
+                alias: convert_ident(alias.name, sql),
+                columns,
+            })
+        }
+        _ => unsupported("table functions and this join source are not supported yet"),
+    }
 }
 
 fn convert_select_table(table: TableFactor, sql: &str) -> Result<ParsedTable> {
@@ -3887,7 +6339,7 @@ fn convert_select_table(table: TableFactor, sql: &str) -> Result<ParsedTable> {
 }
 
 fn convert_table_alias(alias: TableAlias, sql: &str) -> Result<ParsedIdentifier> {
-    if !alias.columns.is_empty() {
+    if !alias.columns.is_empty() || alias.at.is_some() {
         return unsupported("column aliases on table bindings are not supported yet");
     }
     Ok(convert_ident(alias.name, sql))
@@ -3900,6 +6352,93 @@ fn projection_has_aggregate(projection: &ParsedProjection) -> bool {
     }
 }
 
+fn projection_has_subquery(projection: &ParsedProjection) -> bool {
+    match projection {
+        ParsedProjection::Wildcard => false,
+        ParsedProjection::Expression { expr, .. } => expr_has_subquery(expr),
+    }
+}
+
+fn projection_has_window(projection: &ParsedProjection) -> bool {
+    match projection {
+        ParsedProjection::Wildcard => false,
+        ParsedProjection::Expression { expr, .. } => expr_has_window(expr),
+    }
+}
+
+fn expr_has_window(expr: &ParsedExpr) -> bool {
+    match &expr.kind {
+        ParsedExprKind::Window { .. }
+        | ParsedExprKind::NamedWindow { .. }
+        | ParsedExprKind::WindowValue { .. } => true,
+        ParsedExprKind::Unary { expr, .. } => expr_has_window(expr),
+        ParsedExprKind::Binary { left, right, .. } => {
+            expr_has_window(left) || expr_has_window(right)
+        }
+        ParsedExprKind::InList { expr, list, .. } => {
+            expr_has_window(expr) || list.iter().any(expr_has_window)
+        }
+        ParsedExprKind::InSubquery { expr, .. } => expr_has_window(expr),
+        ParsedExprKind::QuantifiedSubquery { left, .. } => expr_has_window(left),
+        ParsedExprKind::RowSubquery { left, .. } => left.iter().any(expr_has_window),
+        ParsedExprKind::Aggregate {
+            argument, filter, ..
+        } => {
+            argument.as_deref().is_some_and(expr_has_window)
+                || filter.as_deref().is_some_and(expr_has_window)
+        }
+        ParsedExprKind::ScalarSubquery(_)
+        | ParsedExprKind::Exists { .. }
+        | ParsedExprKind::Column(_)
+        | ParsedExprKind::Literal(_)
+        | ParsedExprKind::Parameter(_)
+        | ParsedExprKind::ResolvedParameter { .. }
+        | ParsedExprKind::ApplyValue { .. } => false,
+    }
+}
+
+fn expr_has_subquery(expr: &ParsedExpr) -> bool {
+    match &expr.kind {
+        ParsedExprKind::ScalarSubquery(_)
+        | ParsedExprKind::Exists { .. }
+        | ParsedExprKind::InSubquery { .. }
+        | ParsedExprKind::QuantifiedSubquery { .. }
+        | ParsedExprKind::RowSubquery { .. } => true,
+        ParsedExprKind::Unary { expr, .. } => expr_has_subquery(expr),
+        ParsedExprKind::Binary { left, right, .. } => {
+            expr_has_subquery(left) || expr_has_subquery(right)
+        }
+        ParsedExprKind::InList { expr, list, .. } => {
+            expr_has_subquery(expr) || list.iter().any(expr_has_subquery)
+        }
+        ParsedExprKind::Aggregate {
+            argument, filter, ..
+        } => {
+            argument.as_deref().is_some_and(expr_has_subquery)
+                || filter.as_deref().is_some_and(expr_has_subquery)
+        }
+        ParsedExprKind::Window { call, spec } => {
+            call.arguments.iter().any(expr_has_subquery)
+                || call.filter.as_deref().is_some_and(expr_has_subquery)
+                || spec.partition_by.iter().any(expr_has_subquery)
+                || spec
+                    .order_by
+                    .iter()
+                    .any(|order| expr_has_subquery(&order.expr))
+        }
+        ParsedExprKind::NamedWindow { call, .. } => {
+            call.arguments.iter().any(expr_has_subquery)
+                || call.filter.as_deref().is_some_and(expr_has_subquery)
+        }
+        ParsedExprKind::Column(_)
+        | ParsedExprKind::Literal(_)
+        | ParsedExprKind::Parameter(_)
+        | ParsedExprKind::ResolvedParameter { .. }
+        | ParsedExprKind::ApplyValue { .. }
+        | ParsedExprKind::WindowValue { .. } => false,
+    }
+}
+
 fn expr_has_aggregate(expr: &ParsedExpr) -> bool {
     match &expr.kind {
         ParsedExprKind::Aggregate { .. } => true,
@@ -3907,8 +6446,31 @@ fn expr_has_aggregate(expr: &ParsedExpr) -> bool {
         ParsedExprKind::Binary { left, right, .. } => {
             expr_has_aggregate(left) || expr_has_aggregate(right)
         }
-        ParsedExprKind::Column(_) | ParsedExprKind::Literal(_) | ParsedExprKind::Parameter(_) => {
-            false
+        ParsedExprKind::InList { expr, list, .. } => {
+            expr_has_aggregate(expr) || list.iter().any(expr_has_aggregate)
+        }
+        ParsedExprKind::InSubquery { expr, .. } => expr_has_aggregate(expr),
+        ParsedExprKind::QuantifiedSubquery { left, .. } => expr_has_aggregate(left),
+        ParsedExprKind::RowSubquery { left, .. } => left.iter().any(expr_has_aggregate),
+        ParsedExprKind::ScalarSubquery(_) | ParsedExprKind::Exists { .. } => false,
+        ParsedExprKind::Column(_)
+        | ParsedExprKind::Literal(_)
+        | ParsedExprKind::Parameter(_)
+        | ParsedExprKind::ResolvedParameter { .. }
+        | ParsedExprKind::ApplyValue { .. }
+        | ParsedExprKind::WindowValue { .. } => false,
+        ParsedExprKind::NamedWindow { call, .. } => {
+            call.arguments.iter().any(expr_has_aggregate)
+                || call.filter.as_deref().is_some_and(expr_has_aggregate)
+        }
+        ParsedExprKind::Window { call, spec } => {
+            call.arguments.iter().any(expr_has_aggregate)
+                || call.filter.as_deref().is_some_and(expr_has_aggregate)
+                || spec.partition_by.iter().any(expr_has_aggregate)
+                || spec
+                    .order_by
+                    .iter()
+                    .any(|order| expr_has_aggregate(&order.expr))
         }
     }
 }
@@ -4020,78 +6582,810 @@ fn convert_expr(expr: SqlExpr, sql: &str) -> Result<ParsedExpr> {
             }
         }
         SqlExpr::BinaryOp { left, op, right } => {
-            let op = match op {
-                SqlBinaryOperator::Eq => BinaryOperator::Eq,
-                SqlBinaryOperator::NotEq => BinaryOperator::NotEq,
-                SqlBinaryOperator::Lt => BinaryOperator::Lt,
-                SqlBinaryOperator::LtEq => BinaryOperator::LtEq,
-                SqlBinaryOperator::Gt => BinaryOperator::Gt,
-                SqlBinaryOperator::GtEq => BinaryOperator::GtEq,
-                SqlBinaryOperator::And => BinaryOperator::And,
-                SqlBinaryOperator::Or => BinaryOperator::Or,
-                _ => return unsupported_at("this binary operator is not supported yet", position),
-            };
-            ParsedExprKind::Binary {
-                left: Box::new(convert_expr(*left, sql)?),
-                op,
-                right: Box::new(convert_expr(*right, sql)?),
+            let op = convert_binary_operator(op, position)?;
+            match (*left, *right) {
+                (SqlExpr::Tuple(left), SqlExpr::Tuple(right)) => {
+                    return convert_row_comparison(left, op, right, sql, position);
+                }
+                (SqlExpr::Tuple(left), SqlExpr::Subquery(subquery)) => {
+                    ParsedExprKind::RowSubquery {
+                        left: convert_row_items(left, sql, position)?,
+                        op: row_comparison_operator(op, position)?,
+                        quantifier: None,
+                        negated: false,
+                        subquery: Box::new(convert_select_query(*subquery, sql)?),
+                    }
+                }
+                (SqlExpr::Subquery(subquery), SqlExpr::Tuple(right)) => {
+                    ParsedExprKind::RowSubquery {
+                        left: convert_row_items(right, sql, position)?,
+                        op: row_comparison_operator(op, position)?,
+                        quantifier: None,
+                        negated: false,
+                        subquery: Box::new(convert_select_query(*subquery, sql)?),
+                    }
+                }
+                (left, right) => ParsedExprKind::Binary {
+                    left: Box::new(convert_expr(left, sql)?),
+                    op,
+                    right: Box::new(convert_expr(right, sql)?),
+                },
             }
         }
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            if list.is_empty() {
+                return Err(DbError::new(
+                    SYNTAX_ERROR,
+                    "IN list must contain at least one expression",
+                )
+                .with_position_opt(position));
+            }
+            match *expr {
+                SqlExpr::Tuple(left) => {
+                    return convert_row_in_list(left, list, negated, sql, position);
+                }
+                expr => ParsedExprKind::InList {
+                    expr: Box::new(convert_expr(expr, sql)?),
+                    list: list
+                        .into_iter()
+                        .map(|expr| convert_expr(expr, sql))
+                        .collect::<Result<Vec<_>>>()?,
+                    negated,
+                },
+            }
+        }
+        SqlExpr::Subquery(subquery) => {
+            ParsedExprKind::ScalarSubquery(Box::new(convert_select_query(*subquery, sql)?))
+        }
+        SqlExpr::Exists { subquery, negated } => ParsedExprKind::Exists {
+            subquery: Box::new(convert_select_query(*subquery, sql)?),
+            negated,
+        },
+        SqlExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => match *expr {
+            SqlExpr::Tuple(left) => ParsedExprKind::RowSubquery {
+                left: convert_row_items(left, sql, position)?,
+                op: BinaryOperator::Eq,
+                quantifier: Some(SubqueryQuantifier::Any),
+                negated,
+                subquery: Box::new(convert_select_query(*subquery, sql)?),
+            },
+            expr => ParsedExprKind::InSubquery {
+                expr: Box::new(convert_expr(expr, sql)?),
+                subquery: Box::new(convert_select_query(*subquery, sql)?),
+                negated,
+            },
+        },
+        SqlExpr::AnyOp {
+            left,
+            compare_op,
+            right,
+            is_some: _,
+        } => {
+            let SqlExpr::Subquery(subquery) = *right else {
+                return unsupported_at(
+                    "ANY over arrays or non-subquery expressions is not supported yet",
+                    position,
+                );
+            };
+            let op = convert_comparison_operator(compare_op, position)?;
+            match *left {
+                SqlExpr::Tuple(left) => ParsedExprKind::RowSubquery {
+                    left: convert_row_items(left, sql, position)?,
+                    op: row_comparison_operator(op, position)?,
+                    quantifier: Some(SubqueryQuantifier::Any),
+                    negated: false,
+                    subquery: Box::new(convert_select_query(*subquery, sql)?),
+                },
+                left => ParsedExprKind::QuantifiedSubquery {
+                    left: Box::new(convert_expr(left, sql)?),
+                    op,
+                    quantifier: SubqueryQuantifier::Any,
+                    subquery: Box::new(convert_select_query(*subquery, sql)?),
+                },
+            }
+        }
+        SqlExpr::AllOp {
+            left,
+            compare_op,
+            right,
+        } => {
+            let SqlExpr::Subquery(subquery) = *right else {
+                return unsupported_at(
+                    "ALL over arrays or non-subquery expressions is not supported yet",
+                    position,
+                );
+            };
+            let op = convert_comparison_operator(compare_op, position)?;
+            match *left {
+                SqlExpr::Tuple(left) => ParsedExprKind::RowSubquery {
+                    left: convert_row_items(left, sql, position)?,
+                    op: row_comparison_operator(op, position)?,
+                    quantifier: Some(SubqueryQuantifier::All),
+                    negated: false,
+                    subquery: Box::new(convert_select_query(*subquery, sql)?),
+                },
+                left => ParsedExprKind::QuantifiedSubquery {
+                    left: Box::new(convert_expr(left, sql)?),
+                    op,
+                    quantifier: SubqueryQuantifier::All,
+                    subquery: Box::new(convert_select_query(*subquery, sql)?),
+                },
+            }
+        }
+        SqlExpr::Tuple(_) => {
+            return unsupported_at(
+                "row values are supported only in comparisons and IN predicates",
+                position,
+            );
+        }
         SqlExpr::Function(function) => {
-            if function.uses_odbc_syntax
-                || !matches!(function.parameters, FunctionArguments::None)
-                || function.filter.is_some()
-                || function.null_treatment.is_some()
-                || function.over.is_some()
-                || !function.within_group.is_empty()
-            {
-                return unsupported_at(
-                    "aggregate options and window functions are not supported yet",
-                    position,
-                );
-            }
-            let function_name = function.name.to_string().to_ascii_lowercase();
-            let aggregate_function = match function_name.as_str() {
-                "count" => AggregateFunction::Count,
-                "sum" => AggregateFunction::Sum,
-                "avg" => AggregateFunction::Avg,
-                "min" => AggregateFunction::Min,
-                "max" => AggregateFunction::Max,
-                _ => return unsupported_at("this SQL function is not supported yet", position),
-            };
-            let FunctionArguments::List(arguments) = function.args else {
-                return unsupported_at("aggregate arguments must use parentheses", position);
-            };
-            if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
-                return unsupported_at(
-                    "DISTINCT and ordered aggregate arguments are not supported yet",
-                    position,
-                );
-            }
-            let argument = match arguments.args.as_slice() {
-                [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
-                    if aggregate_function == AggregateFunction::Count =>
+            if function.over.is_some() {
+                convert_window_function(function, sql, position)?
+            } else {
+                if function.uses_odbc_syntax
+                    || !matches!(function.parameters, FunctionArguments::None)
+                    || function.null_treatment.is_some()
+                    || !function.within_group.is_empty()
                 {
-                    None
+                    return unsupported_at("aggregate options are not supported yet", position);
                 }
-                [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] => {
-                    Some(Box::new(convert_expr(argument.clone(), sql)?))
-                }
-                _ => {
+                let filter = function
+                    .filter
+                    .map(|filter| convert_expr(*filter, sql).map(Box::new))
+                    .transpose()?;
+                let function_name = function.name.to_string().to_ascii_lowercase();
+                let aggregate_function = match function_name.as_str() {
+                    "count" => AggregateFunction::Count,
+                    "sum" => AggregateFunction::Sum,
+                    "avg" => AggregateFunction::Avg,
+                    "min" => AggregateFunction::Min,
+                    "max" => AggregateFunction::Max,
+                    _ => return unsupported_at("this SQL function is not supported yet", position),
+                };
+                let FunctionArguments::List(arguments) = function.args else {
+                    return unsupported_at("aggregate arguments must use parentheses", position);
+                };
+                if !arguments.clauses.is_empty() {
                     return unsupported_at(
-                        "aggregate requires one expression, or COUNT(*)",
+                        "ordered aggregate arguments are not supported yet",
                         position,
                     );
                 }
-            };
-            ParsedExprKind::Aggregate {
-                function: aggregate_function,
-                argument,
+                let distinct = matches!(
+                    arguments.duplicate_treatment,
+                    Some(DuplicateTreatment::Distinct)
+                );
+                let argument = match arguments.args.as_slice() {
+                    [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
+                        if aggregate_function == AggregateFunction::Count && !distinct =>
+                    {
+                        None
+                    }
+                    [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] => {
+                        return Err(DbError::new(
+                            SYNTAX_ERROR,
+                            "DISTINCT aggregate requires an expression",
+                        )
+                        .with_position_opt(position));
+                    }
+                    [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] => {
+                        Some(Box::new(convert_expr(argument.clone(), sql)?))
+                    }
+                    _ => {
+                        return unsupported_at(
+                            "aggregate requires one expression, or COUNT(*)",
+                            position,
+                        );
+                    }
+                };
+                ParsedExprKind::Aggregate {
+                    function: aggregate_function,
+                    argument,
+                    distinct,
+                    filter,
+                }
             }
         }
         _ => return unsupported_at("this SQL expression is not supported yet", position),
     };
     Ok(ParsedExpr { kind, position })
+}
+
+fn convert_row_items(
+    expressions: Vec<SqlExpr>,
+    sql: &str,
+    position: Option<usize>,
+) -> Result<Vec<ParsedExpr>> {
+    if expressions.is_empty() {
+        return Err(
+            DbError::new(SYNTAX_ERROR, "row value must not be empty").with_position_opt(position)
+        );
+    }
+    expressions
+        .into_iter()
+        .map(|expression| convert_expr(expression, sql))
+        .collect()
+}
+
+fn row_comparison_operator(
+    operator: BinaryOperator,
+    position: Option<usize>,
+) -> Result<BinaryOperator> {
+    match operator {
+        BinaryOperator::Eq | BinaryOperator::NotEq => Ok(operator),
+        _ => unsupported_at("ordered row comparisons are not supported yet", position),
+    }
+}
+
+fn convert_row_comparison(
+    left: Vec<SqlExpr>,
+    operator: BinaryOperator,
+    right: Vec<SqlExpr>,
+    sql: &str,
+    position: Option<usize>,
+) -> Result<ParsedExpr> {
+    let operator = row_comparison_operator(operator, position)?;
+    build_row_comparison(
+        convert_row_items(left, sql, position)?,
+        operator,
+        convert_row_items(right, sql, position)?,
+        position,
+    )
+}
+
+fn convert_row_in_list(
+    left: Vec<SqlExpr>,
+    list: Vec<SqlExpr>,
+    negated: bool,
+    sql: &str,
+    position: Option<usize>,
+) -> Result<ParsedExpr> {
+    let left = convert_row_items(left, sql, position)?;
+    let mut comparisons = Vec::with_capacity(list.len());
+    for candidate in list {
+        let SqlExpr::Tuple(candidate) = candidate else {
+            return Err(
+                DbError::new(SYNTAX_ERROR, "row IN list entries must all be row values")
+                    .with_position_opt(position),
+            );
+        };
+        comparisons.push(build_row_comparison(
+            left.clone(),
+            BinaryOperator::Eq,
+            convert_row_items(candidate, sql, position)?,
+            position,
+        )?);
+    }
+    let mut comparisons = comparisons.into_iter();
+    let mut expression = comparisons
+        .next()
+        .ok_or_else(|| DbError::new(SYNTAX_ERROR, "row IN list must not be empty"))?;
+    for candidate in comparisons {
+        expression = ParsedExpr {
+            position,
+            kind: ParsedExprKind::Binary {
+                left: Box::new(expression),
+                op: BinaryOperator::Or,
+                right: Box::new(candidate),
+            },
+        };
+    }
+    if negated {
+        expression = ParsedExpr {
+            position,
+            kind: ParsedExprKind::Unary {
+                op: UnaryOperator::Not,
+                expr: Box::new(expression),
+            },
+        };
+    }
+    Ok(expression)
+}
+
+fn build_row_comparison(
+    left: Vec<ParsedExpr>,
+    operator: BinaryOperator,
+    right: Vec<ParsedExpr>,
+    position: Option<usize>,
+) -> Result<ParsedExpr> {
+    if left.len() != right.len() {
+        return Err(
+            DbError::new(SYNTAX_ERROR, "unequal number of entries in row expressions")
+                .with_position_opt(position),
+        );
+    }
+    let mut comparisons = left.into_iter().zip(right).map(|(left, right)| ParsedExpr {
+        position,
+        kind: ParsedExprKind::Binary {
+            left: Box::new(left),
+            op: BinaryOperator::Eq,
+            right: Box::new(right),
+        },
+    });
+    let mut expression = comparisons
+        .next()
+        .ok_or_else(|| DbError::new(SYNTAX_ERROR, "row value must not be empty"))?;
+    for comparison in comparisons {
+        expression = ParsedExpr {
+            position,
+            kind: ParsedExprKind::Binary {
+                left: Box::new(expression),
+                op: BinaryOperator::And,
+                right: Box::new(comparison),
+            },
+        };
+    }
+    if operator == BinaryOperator::NotEq {
+        expression = ParsedExpr {
+            position,
+            kind: ParsedExprKind::Unary {
+                op: UnaryOperator::Not,
+                expr: Box::new(expression),
+            },
+        };
+    }
+    Ok(expression)
+}
+
+fn convert_window_function(
+    function: Function,
+    sql: &str,
+    position: Option<usize>,
+) -> Result<ParsedExprKind> {
+    if function.uses_odbc_syntax
+        || !matches!(function.parameters, FunctionArguments::None)
+        || function.null_treatment.is_some()
+        || !function.within_group.is_empty()
+    {
+        return unsupported_at("this window function option is not supported yet", position);
+    }
+    let FunctionArguments::List(arguments) = function.args else {
+        return unsupported_at("window function arguments must use parentheses", position);
+    };
+    if !arguments.clauses.is_empty() {
+        return unsupported_at(
+            "ordered window function arguments are not supported yet",
+            position,
+        );
+    }
+    if matches!(
+        arguments.duplicate_treatment,
+        Some(DuplicateTreatment::Distinct)
+    ) {
+        return unsupported_at("DISTINCT is not implemented for window functions", position);
+    }
+    let function_name = function.name.to_string().to_ascii_lowercase();
+    let mut count_star = false;
+    let (window_function, expected_arguments) = match function_name.as_str() {
+        "row_number" => (WindowFunction::RowNumber, 0..=0),
+        "rank" => (WindowFunction::Rank, 0..=0),
+        "dense_rank" => (WindowFunction::DenseRank, 0..=0),
+        "lag" => (WindowFunction::Lag, 1..=3),
+        "lead" => (WindowFunction::Lead, 1..=3),
+        "first_value" => (WindowFunction::FirstValue, 1..=1),
+        "last_value" => (WindowFunction::LastValue, 1..=1),
+        "nth_value" => (WindowFunction::NthValue, 2..=2),
+        "count" => (WindowFunction::Aggregate(AggregateFunction::Count), 1..=1),
+        "sum" => (WindowFunction::Aggregate(AggregateFunction::Sum), 1..=1),
+        "avg" => (WindowFunction::Aggregate(AggregateFunction::Avg), 1..=1),
+        "min" => (WindowFunction::Aggregate(AggregateFunction::Min), 1..=1),
+        "max" => (WindowFunction::Aggregate(AggregateFunction::Max), 1..=1),
+        _ => return unsupported_at("this window function is not supported yet", position),
+    };
+    let converted_arguments = match arguments.args.as_slice() {
+        [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
+            if window_function == WindowFunction::Aggregate(AggregateFunction::Count) =>
+        {
+            count_star = true;
+            Vec::new()
+        }
+        values => values
+            .iter()
+            .map(|argument| match argument {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)) => {
+                    convert_expr(argument.clone(), sql)
+                }
+                _ => unsupported_at("window function requires expression arguments", position),
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
+    if !count_star && !expected_arguments.contains(&converted_arguments.len()) {
+        return Err(DbError::new(
+            SYNTAX_ERROR,
+            format!("invalid argument count for window function {function_name}"),
+        )
+        .with_position_opt(position));
+    }
+    let filter = function
+        .filter
+        .map(|filter| convert_expr(*filter, sql).map(Box::new))
+        .transpose()?;
+    if filter.is_some() && !matches!(window_function, WindowFunction::Aggregate(_)) {
+        return Err(DbError::new(
+            "42809",
+            "FILTER is specified, but the window function is not an aggregate",
+        )
+        .with_position_opt(position));
+    }
+    let call = ParsedWindowCall {
+        function: window_function,
+        arguments: converted_arguments,
+        count_star,
+        filter,
+    };
+    let over = function
+        .over
+        .ok_or_else(|| DbError::internal("window function lost its OVER clause"))?;
+    match over {
+        WindowType::WindowSpec(spec) => Ok(ParsedExprKind::Window {
+            call: Box::new(call),
+            spec: Box::new(convert_window_spec(spec, sql, position)?),
+        }),
+        WindowType::NamedWindow(name) => Ok(ParsedExprKind::NamedWindow {
+            call: Box::new(call),
+            name: convert_ident(name, sql),
+        }),
+    }
+}
+
+fn convert_window_spec(
+    spec: SqlWindowSpec,
+    sql: &str,
+    position: Option<usize>,
+) -> Result<ParsedWindowSpec> {
+    let window_name = spec.window_name.map(|name| convert_ident(name, sql));
+    let partition_by = spec
+        .partition_by
+        .into_iter()
+        .map(|expr| convert_expr(expr, sql))
+        .collect::<Result<Vec<_>>>()?;
+    let order_by = spec
+        .order_by
+        .into_iter()
+        .map(|order| {
+            if order.with_fill.is_some() {
+                return unsupported_at("window ORDER BY WITH FILL is not supported", position);
+            }
+            Ok(ParsedOrder {
+                expr: convert_expr(order.expr, sql)?,
+                ascending: order.options.asc.unwrap_or(true),
+                nulls_first: order.options.nulls_first,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let frame = spec
+        .window_frame
+        .map(|frame| convert_window_frame(frame, sql, position))
+        .transpose()?;
+    Ok(ParsedWindowSpec {
+        window_name,
+        partition_by,
+        order_by,
+        frame,
+    })
+}
+
+fn convert_window_frame(
+    frame: SqlWindowFrame,
+    sql: &str,
+    position: Option<usize>,
+) -> Result<ParsedWindowFrame> {
+    let units = match frame.units {
+        SqlWindowFrameUnits::Rows => WindowFrameUnits::Rows,
+        SqlWindowFrameUnits::Range => WindowFrameUnits::Range,
+        SqlWindowFrameUnits::Groups => {
+            return unsupported_at("GROUPS window frames are not supported yet", position);
+        }
+    };
+    let start_bound = convert_window_frame_bound(frame.start_bound, sql)?;
+    let end_bound = frame
+        .end_bound
+        .map(|bound| convert_window_frame_bound(bound, sql))
+        .transpose()?
+        .unwrap_or(ParsedWindowFrameBound::CurrentRow);
+    validate_window_frame_order(&start_bound, &end_bound, position)?;
+    Ok(ParsedWindowFrame {
+        units,
+        start_bound,
+        end_bound,
+    })
+}
+
+fn convert_window_frame_bound(
+    bound: SqlWindowFrameBound,
+    sql: &str,
+) -> Result<ParsedWindowFrameBound> {
+    Ok(match bound {
+        SqlWindowFrameBound::CurrentRow => ParsedWindowFrameBound::CurrentRow,
+        SqlWindowFrameBound::Preceding(None) => ParsedWindowFrameBound::UnboundedPreceding,
+        SqlWindowFrameBound::Preceding(Some(offset)) => {
+            ParsedWindowFrameBound::Preceding(Box::new(convert_expr(*offset, sql)?))
+        }
+        SqlWindowFrameBound::Following(None) => ParsedWindowFrameBound::UnboundedFollowing,
+        SqlWindowFrameBound::Following(Some(offset)) => {
+            ParsedWindowFrameBound::Following(Box::new(convert_expr(*offset, sql)?))
+        }
+    })
+}
+
+fn validate_window_frame_order(
+    start: &ParsedWindowFrameBound,
+    end: &ParsedWindowFrameBound,
+    position: Option<usize>,
+) -> Result<()> {
+    if matches!(start, ParsedWindowFrameBound::UnboundedFollowing) {
+        return Err(
+            DbError::new("42P20", "frame start cannot be UNBOUNDED FOLLOWING")
+                .with_position_opt(position),
+        );
+    }
+    if matches!(end, ParsedWindowFrameBound::UnboundedPreceding) {
+        return Err(
+            DbError::new("42P20", "frame end cannot be UNBOUNDED PRECEDING")
+                .with_position_opt(position),
+        );
+    }
+    let rank = |bound: &ParsedWindowFrameBound| match bound {
+        ParsedWindowFrameBound::UnboundedPreceding => 0_u8,
+        ParsedWindowFrameBound::Preceding(_) => 1,
+        ParsedWindowFrameBound::CurrentRow => 2,
+        ParsedWindowFrameBound::Following(_) => 3,
+        ParsedWindowFrameBound::UnboundedFollowing => 4,
+    };
+    if rank(start) > rank(end) {
+        return Err(DbError::new(
+            "42P20",
+            "frame starting from following row cannot end before it",
+        )
+        .with_position_opt(position));
+    }
+    Ok(())
+}
+
+fn convert_named_windows(
+    definitions: Vec<sqlparser::ast::NamedWindowDefinition>,
+    sql: &str,
+) -> Result<BTreeMap<Identifier, ParsedWindowSpec>> {
+    let mut windows: BTreeMap<Identifier, ParsedWindowSpec> = BTreeMap::new();
+    for sqlparser::ast::NamedWindowDefinition(name, definition) in definitions {
+        let name = convert_ident(name, sql);
+        if windows.contains_key(&name.name) {
+            return Err(DbError::new(
+                "42712",
+                format!("window {} is specified more than once", name.name),
+            )
+            .with_position_opt(name.position));
+        }
+        let spec = match definition {
+            NamedWindowExpr::NamedWindow(base) => {
+                let base = convert_ident(base, sql);
+                windows.get(&base.name).cloned().ok_or_else(|| {
+                    DbError::new("42704", format!("window {} does not exist", base.name))
+                        .with_position_opt(base.position)
+                })?
+            }
+            NamedWindowExpr::WindowSpec(mut spec) => {
+                let inherited = spec
+                    .window_name
+                    .take()
+                    .map(|base| {
+                        let base = convert_ident(base, sql);
+                        windows.get(&base.name).cloned().ok_or_else(|| {
+                            DbError::new("42704", format!("window {} does not exist", base.name))
+                                .with_position_opt(base.position)
+                        })
+                    })
+                    .transpose()?;
+                let has_partition = !spec.partition_by.is_empty();
+                let has_order = !spec.order_by.is_empty();
+                let has_frame = spec.window_frame.is_some();
+                let mut converted = convert_window_spec(spec, sql, name.position)?;
+                if let Some(base) = inherited {
+                    if has_partition {
+                        return Err(DbError::new(
+                            "42P20",
+                            "cannot override PARTITION BY clause of named window",
+                        )
+                        .with_position_opt(name.position));
+                    }
+                    if has_order && !base.order_by.is_empty() {
+                        return Err(DbError::new(
+                            "42P20",
+                            "cannot override ORDER BY clause of named window",
+                        )
+                        .with_position_opt(name.position));
+                    }
+                    if base.frame.is_some() {
+                        return Err(DbError::new(
+                            "42P20",
+                            "cannot copy a window that has a frame clause",
+                        )
+                        .with_position_opt(name.position));
+                    }
+                    converted.partition_by = base.partition_by;
+                    if !has_order {
+                        converted.order_by = base.order_by;
+                    }
+                    if !has_frame {
+                        converted.frame = None;
+                    }
+                }
+                converted
+            }
+        };
+        windows.insert(name.name, spec);
+    }
+    Ok(windows)
+}
+
+fn resolve_named_window_expr(
+    expression: &mut ParsedExpr,
+    windows: &BTreeMap<Identifier, ParsedWindowSpec>,
+) -> Result<()> {
+    let mut pending = vec![expression];
+    while let Some(expression) = pending.pop() {
+        if let ParsedExprKind::NamedWindow { call, name } = &expression.kind {
+            let spec = windows.get(&name.name).cloned().ok_or_else(|| {
+                DbError::new("42704", format!("window {} does not exist", name.name))
+                    .with_position_opt(name.position)
+            })?;
+            expression.kind = ParsedExprKind::Window {
+                call: call.clone(),
+                spec: Box::new(spec),
+            };
+            continue;
+        }
+        match &mut expression.kind {
+            ParsedExprKind::Unary { expr, .. } => pending.push(expr),
+            ParsedExprKind::Binary { left, right, .. } => {
+                pending.push(right);
+                pending.push(left);
+            }
+            ParsedExprKind::InList { expr, list, .. } => {
+                pending.extend(list.iter_mut().rev());
+                pending.push(expr);
+            }
+            ParsedExprKind::InSubquery { expr, .. }
+            | ParsedExprKind::QuantifiedSubquery { left: expr, .. } => pending.push(expr),
+            ParsedExprKind::RowSubquery { left, .. } => pending.extend(left.iter_mut().rev()),
+            ParsedExprKind::Aggregate {
+                argument, filter, ..
+            } => {
+                if let Some(filter) = filter {
+                    pending.push(filter);
+                }
+                if let Some(argument) = argument {
+                    pending.push(argument);
+                }
+            }
+            ParsedExprKind::Window { call, spec } => {
+                resolve_window_spec_inheritance(spec, windows, expression.position)?;
+                if let Some(filter) = &mut call.filter {
+                    pending.push(filter);
+                }
+                pending.extend(call.arguments.iter_mut().rev());
+                if let Some(frame) = &mut spec.frame {
+                    match &mut frame.start_bound {
+                        ParsedWindowFrameBound::Preceding(offset)
+                        | ParsedWindowFrameBound::Following(offset) => pending.push(offset),
+                        ParsedWindowFrameBound::UnboundedPreceding
+                        | ParsedWindowFrameBound::CurrentRow
+                        | ParsedWindowFrameBound::UnboundedFollowing => {}
+                    }
+                    match &mut frame.end_bound {
+                        ParsedWindowFrameBound::Preceding(offset)
+                        | ParsedWindowFrameBound::Following(offset) => pending.push(offset),
+                        ParsedWindowFrameBound::UnboundedPreceding
+                        | ParsedWindowFrameBound::CurrentRow
+                        | ParsedWindowFrameBound::UnboundedFollowing => {}
+                    }
+                }
+                pending.extend(spec.order_by.iter_mut().map(|order| &mut order.expr));
+                pending.extend(&mut spec.partition_by);
+            }
+            ParsedExprKind::NamedWindow { .. } => unreachable!("handled above"),
+            ParsedExprKind::Column(_)
+            | ParsedExprKind::Literal(_)
+            | ParsedExprKind::Parameter(_)
+            | ParsedExprKind::ResolvedParameter { .. }
+            | ParsedExprKind::ScalarSubquery(_)
+            | ParsedExprKind::Exists { .. }
+            | ParsedExprKind::ApplyValue { .. }
+            | ParsedExprKind::WindowValue { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn resolve_window_spec_inheritance(
+    spec: &mut ParsedWindowSpec,
+    windows: &BTreeMap<Identifier, ParsedWindowSpec>,
+    position: Option<usize>,
+) -> Result<()> {
+    let Some(base_name) = spec.window_name.take() else {
+        return Ok(());
+    };
+    let base = windows.get(&base_name.name).cloned().ok_or_else(|| {
+        DbError::new("42704", format!("window {} does not exist", base_name.name))
+            .with_position_opt(base_name.position)
+    })?;
+    if !spec.partition_by.is_empty() {
+        return Err(DbError::new(
+            "42P20",
+            "cannot override PARTITION BY clause of named window",
+        )
+        .with_position_opt(position));
+    }
+    if !spec.order_by.is_empty() && !base.order_by.is_empty() {
+        return Err(
+            DbError::new("42P20", "cannot override ORDER BY clause of named window")
+                .with_position_opt(position),
+        );
+    }
+    if base.frame.is_some() {
+        return Err(
+            DbError::new("42P20", "cannot copy a window that has a frame clause")
+                .with_position_opt(position),
+        );
+    }
+    spec.partition_by = base.partition_by;
+    if spec.order_by.is_empty() {
+        spec.order_by = base.order_by;
+    }
+    Ok(())
+}
+
+fn convert_binary_operator(
+    operator: SqlBinaryOperator,
+    position: Option<usize>,
+) -> Result<BinaryOperator> {
+    match operator {
+        SqlBinaryOperator::Eq => Ok(BinaryOperator::Eq),
+        SqlBinaryOperator::Plus => Ok(BinaryOperator::Add),
+        SqlBinaryOperator::Minus => Ok(BinaryOperator::Subtract),
+        SqlBinaryOperator::Multiply => Ok(BinaryOperator::Multiply),
+        SqlBinaryOperator::Divide => Ok(BinaryOperator::Divide),
+        SqlBinaryOperator::Modulo => Ok(BinaryOperator::Modulo),
+        SqlBinaryOperator::NotEq => Ok(BinaryOperator::NotEq),
+        SqlBinaryOperator::Lt => Ok(BinaryOperator::Lt),
+        SqlBinaryOperator::LtEq => Ok(BinaryOperator::LtEq),
+        SqlBinaryOperator::Gt => Ok(BinaryOperator::Gt),
+        SqlBinaryOperator::GtEq => Ok(BinaryOperator::GtEq),
+        SqlBinaryOperator::And => Ok(BinaryOperator::And),
+        SqlBinaryOperator::Or => Ok(BinaryOperator::Or),
+        _ => unsupported_at("this binary operator is not supported yet", position),
+    }
+}
+
+fn convert_comparison_operator(
+    operator: SqlBinaryOperator,
+    position: Option<usize>,
+) -> Result<BinaryOperator> {
+    let operator = convert_binary_operator(operator, position)?;
+    if matches!(
+        operator,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+    ) {
+        Ok(operator)
+    } else {
+        unsupported_at(
+            "quantified subqueries require a comparison operator",
+            position,
+        )
+    }
 }
 
 fn convert_sql_value(value: SqlValue, position: Option<usize>) -> Result<ParsedExprKind> {
@@ -4630,10 +7924,32 @@ fn validate_check_expression(
                 stack.push(right);
                 stack.push(left);
             }
+            ParsedExprKind::InList { expr, list, .. } => {
+                stack.extend(list);
+                stack.push(expr);
+            }
             ParsedExprKind::Aggregate { .. } => {
                 return unsupported("aggregate functions are not allowed in CHECK constraints");
             }
-            ParsedExprKind::Literal(_) | ParsedExprKind::Parameter(_) => {}
+            ParsedExprKind::Window { .. }
+            | ParsedExprKind::NamedWindow { .. }
+            | ParsedExprKind::WindowValue { .. } => {
+                return Err(DbError::new(
+                    "42P20",
+                    "window functions are not allowed in CHECK constraints",
+                ));
+            }
+            ParsedExprKind::ScalarSubquery(_)
+            | ParsedExprKind::Exists { .. }
+            | ParsedExprKind::InSubquery { .. }
+            | ParsedExprKind::QuantifiedSubquery { .. }
+            | ParsedExprKind::RowSubquery { .. } => {
+                return unsupported("subqueries are not allowed in CHECK constraints");
+            }
+            ParsedExprKind::Literal(_)
+            | ParsedExprKind::Parameter(_)
+            | ParsedExprKind::ResolvedParameter { .. }
+            | ParsedExprKind::ApplyValue { .. } => {}
         }
     }
     Ok(())
@@ -4643,6 +7959,8 @@ fn bind_insert(
     table_name: ParsedObjectName,
     columns: Vec<ParsedIdentifier>,
     rows: Vec<Vec<ParsedExpr>>,
+    on_conflict: Option<ParsedOnConflict>,
+    returning: Vec<ParsedProjection>,
     catalog: &Catalog,
 ) -> Result<BoundStatement> {
     let table = resolve_table(&table_name, catalog)?.clone();
@@ -4694,11 +8012,478 @@ fn bind_insert(
                 .collect()
         })
         .collect::<Result<Vec<_>>>()?;
+    let on_conflict = on_conflict
+        .map(|on_conflict| bind_on_conflict(on_conflict, &table))
+        .transpose()?;
+    let returning = bind_returning(returning, &table)?;
     Ok(BoundStatement::Insert {
         table_id: table.id,
         column_indexes,
         rows,
+        on_conflict,
+        returning,
     })
+}
+
+fn bind_merge(merge: ParsedMerge, catalog: &Catalog) -> Result<BoundStatement> {
+    let ParsedMerge {
+        target,
+        source,
+        on,
+        clauses,
+        returning,
+    } = merge;
+    let target_definition = resolve_table(&target.name, catalog)?.clone();
+    let mut inputs = Vec::new();
+    let target = bind_input_table(target, false, catalog, &mut inputs)?;
+    let source = bind_input_table(source, false, catalog, &mut inputs)?;
+    let on = bind_merge_boolean(on, &inputs)?;
+    let clauses = clauses
+        .into_iter()
+        .map(|clause| {
+            let kind = match clause.kind {
+                ParsedMergeClauseKind::Matched => BoundMergeClauseKind::Matched,
+                ParsedMergeClauseKind::NotMatchedByTarget => {
+                    BoundMergeClauseKind::NotMatchedByTarget
+                }
+                ParsedMergeClauseKind::NotMatchedBySource => {
+                    BoundMergeClauseKind::NotMatchedBySource
+                }
+            };
+            let predicate = clause
+                .predicate
+                .map(|predicate| bind_merge_boolean(predicate, &inputs))
+                .transpose()?;
+            if kind == BoundMergeClauseKind::NotMatchedBySource
+                && predicate.as_ref().is_some_and(|predicate| {
+                    bound_expr_references_column_at_or_after(predicate, source.offset)
+                })
+            {
+                return Err(invalid_merge_source_reference());
+            }
+            let action = match clause.action {
+                ParsedMergeAction::Update { assignments } => {
+                    if kind == BoundMergeClauseKind::NotMatchedByTarget {
+                        return Err(DbError::new(
+                            SYNTAX_ERROR,
+                            "MERGE UPDATE requires WHEN MATCHED or WHEN NOT MATCHED BY SOURCE",
+                        ));
+                    }
+                    let mut seen = BTreeSet::new();
+                    let assignments = assignments
+                        .into_iter()
+                        .map(|(column, expr)| {
+                            let index =
+                                target_definition
+                                    .column_index(&column.name)
+                                    .ok_or_else(|| {
+                                        DbError::new(
+                                            UNDEFINED_COLUMN,
+                                            format!("column {} does not exist", column.name),
+                                        )
+                                        .with_position_opt(column.position)
+                                    })?;
+                            if !seen.insert(index) {
+                                return Err(DbError::new(
+                                    "42701",
+                                    format!("column {} assigned more than once", column.name),
+                                )
+                                .with_position_opt(column.position));
+                            }
+                            Ok((
+                                index,
+                                bind_expr_multi(
+                                    expr,
+                                    &inputs,
+                                    Some(&target_definition.columns()[index].data_type),
+                                    false,
+                                )?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    if kind == BoundMergeClauseKind::NotMatchedBySource
+                        && assignments.iter().any(|(_, expression)| {
+                            bound_expr_references_column_at_or_after(expression, source.offset)
+                        })
+                    {
+                        return Err(invalid_merge_source_reference());
+                    }
+                    BoundMergeAction::Update { assignments }
+                }
+                ParsedMergeAction::Delete => {
+                    if kind == BoundMergeClauseKind::NotMatchedByTarget {
+                        return Err(DbError::new(
+                            SYNTAX_ERROR,
+                            "MERGE DELETE requires WHEN MATCHED or WHEN NOT MATCHED BY SOURCE",
+                        ));
+                    }
+                    BoundMergeAction::Delete
+                }
+                ParsedMergeAction::Insert { columns, values } => {
+                    if kind != BoundMergeClauseKind::NotMatchedByTarget {
+                        return Err(DbError::new(
+                            SYNTAX_ERROR,
+                            "MERGE INSERT requires WHEN NOT MATCHED",
+                        ));
+                    }
+                    let column_indexes = if columns.is_empty() {
+                        (0..target_definition.columns().len()).collect::<Vec<_>>()
+                    } else {
+                        let mut seen = BTreeSet::new();
+                        columns
+                            .into_iter()
+                            .map(|column| {
+                                let index = target_definition
+                                    .column_index(&column.name)
+                                    .ok_or_else(|| {
+                                        DbError::new(
+                                            UNDEFINED_COLUMN,
+                                            format!("column {} does not exist", column.name),
+                                        )
+                                        .with_position_opt(column.position)
+                                    })?;
+                                if !seen.insert(index) {
+                                    return Err(DbError::new(
+                                        "42701",
+                                        format!("column {} specified more than once", column.name),
+                                    )
+                                    .with_position_opt(column.position));
+                                }
+                                Ok(index)
+                            })
+                            .collect::<Result<Vec<_>>>()?
+                    };
+                    if values.len() != column_indexes.len() {
+                        return Err(DbError::new(
+                            SYNTAX_ERROR,
+                            "MERGE INSERT has more target columns than expressions",
+                        ));
+                    }
+                    let values = values
+                        .into_iter()
+                        .zip(&column_indexes)
+                        .map(|(expr, index)| {
+                            bind_expr_multi(
+                                expr,
+                                &inputs,
+                                Some(&target_definition.columns()[*index].data_type),
+                                false,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    BoundMergeAction::Insert {
+                        column_indexes,
+                        values,
+                    }
+                }
+                ParsedMergeAction::DoNothing => BoundMergeAction::DoNothing,
+            };
+            Ok(BoundMergeClause {
+                kind,
+                predicate,
+                action,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(BoundStatement::Merge(BoundMerge {
+        target,
+        source,
+        on,
+        clauses,
+        returning: bind_returning(returning, &target_definition)?,
+    }))
+}
+
+fn bound_expr_references_column_at_or_after(expr: &BoundExpr, first_index: usize) -> bool {
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match &expr.kind {
+            BoundExprKind::Column { index } if *index >= first_index => return true,
+            BoundExprKind::Unary { expr, .. } => pending.push(expr),
+            BoundExprKind::Binary { left, right, .. } => {
+                pending.push(right);
+                pending.push(left);
+            }
+            BoundExprKind::InList { expr, list, .. } => {
+                pending.extend(list);
+                pending.push(expr);
+            }
+            BoundExprKind::Aggregate {
+                argument, filter, ..
+            } => {
+                if let Some(argument) = argument {
+                    pending.push(argument);
+                }
+                if let Some(filter) = filter {
+                    pending.push(filter);
+                }
+            }
+            BoundExprKind::Column { .. }
+            | BoundExprKind::Literal(_)
+            | BoundExprKind::Parameter { .. }
+            | BoundExprKind::Correlation { .. }
+            | BoundExprKind::ApplyValue { .. } => {}
+        }
+    }
+    false
+}
+
+fn invalid_merge_source_reference() -> DbError {
+    DbError::new(
+        UNDEFINED_TABLE,
+        "MERGE source columns are not available in WHEN NOT MATCHED BY SOURCE",
+    )
+    .with_hint("Reference only target columns in this MERGE branch.")
+}
+
+fn bind_merge_boolean(expr: ParsedExpr, inputs: &[InputColumn]) -> Result<BoundExpr> {
+    let position = expr.position;
+    let bound = bind_expr_multi(expr, inputs, Some(&ScalarType::Boolean), false)?;
+    if bound.data_type != ScalarType::Boolean {
+        return Err(DbError::new(DATATYPE_MISMATCH, "predicate must be boolean")
+            .with_position_opt(position));
+    }
+    Ok(bound)
+}
+
+fn bind_on_conflict(
+    on_conflict: ParsedOnConflict,
+    table: &TableDefinition,
+) -> Result<BoundOnConflict> {
+    let target_columns = on_conflict
+        .target
+        .map(|target| bind_conflict_target(target, table))
+        .transpose()?;
+    let action =
+        match on_conflict.action {
+            ParsedConflictAction::DoNothing => BoundConflictAction::DoNothing,
+            ParsedConflictAction::DoUpdate {
+                assignments,
+                filter,
+            } => {
+                if target_columns.is_none() {
+                    return Err(DbError::new(
+                        SYNTAX_ERROR,
+                        "ON CONFLICT DO UPDATE requires a conflict target",
+                    ));
+                }
+                let excluded = Identifier::unquoted("excluded");
+                if table.name == excluded {
+                    return Err(DbError::new(
+                        "42712",
+                        "table name excluded conflicts with the ON CONFLICT pseudo-relation",
+                    )
+                    .with_hint("Alias the target table when target aliases are supported."));
+                }
+                let width = table.columns().len();
+                let mut inputs = table
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| InputColumn {
+                        binding: table.name.clone(),
+                        name: column.name.clone(),
+                        index,
+                        data_type: column.data_type.clone(),
+                        nullable: column.nullable,
+                        outer_depth: 0,
+                    })
+                    .collect::<Vec<_>>();
+                inputs.extend(table.columns().iter().enumerate().map(|(index, column)| {
+                    InputColumn {
+                        binding: excluded.clone(),
+                        name: column.name.clone(),
+                        index: width + index,
+                        data_type: column.data_type.clone(),
+                        nullable: column.nullable,
+                        outer_depth: 0,
+                    }
+                }));
+                let mut seen = BTreeSet::new();
+                let assignments = assignments
+                    .into_iter()
+                    .map(|(column, expr)| {
+                        let index = table.column_index(&column.name).ok_or_else(|| {
+                            DbError::new(
+                                UNDEFINED_COLUMN,
+                                format!("column {} does not exist", column.name),
+                            )
+                            .with_position_opt(column.position)
+                        })?;
+                        if !seen.insert(index) {
+                            return Err(DbError::new(
+                                "42701",
+                                format!("column {} specified more than once", column.name),
+                            )
+                            .with_position_opt(column.position));
+                        }
+                        let expr = qualify_conflict_expr(expr, &table.name);
+                        let bound = bind_expr_multi(
+                            expr,
+                            &inputs,
+                            Some(&table.columns()[index].data_type),
+                            false,
+                        )?;
+                        Ok((index, bound))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let filter = filter
+                    .map(|expr| {
+                        bind_multi_boolean(qualify_conflict_expr(expr, &table.name), &inputs)
+                    })
+                    .transpose()?;
+                BoundConflictAction::DoUpdate {
+                    assignments,
+                    filter,
+                }
+            }
+        };
+    Ok(BoundOnConflict {
+        target_columns,
+        action,
+    })
+}
+
+fn bind_conflict_target(
+    target: ParsedConflictTarget,
+    table: &TableDefinition,
+) -> Result<Vec<usize>> {
+    let column_ids = match target {
+        ParsedConflictTarget::Columns(columns) => {
+            if columns.is_empty() {
+                return Err(DbError::new(
+                    SYNTAX_ERROR,
+                    "ON CONFLICT column target is empty",
+                ));
+            }
+            let mut seen = BTreeSet::new();
+            let column_ids = columns
+                .into_iter()
+                .map(|column| {
+                    let definition = table.column(&column.name).ok_or_else(|| {
+                        DbError::new(
+                            UNDEFINED_COLUMN,
+                            format!("column {} does not exist", column.name),
+                        )
+                        .with_position_opt(column.position)
+                    })?;
+                    if !seen.insert(definition.id) {
+                        return Err(DbError::new(
+                            "42701",
+                            format!("column {} specified more than once", column.name),
+                        )
+                        .with_position_opt(column.position));
+                    }
+                    Ok(definition.id)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let matches_unique_index = table.indexes().any(|index| {
+                index.unique
+                    && index.method == IndexMethod::BTree
+                    && same_column_set(&index.key_columns, &column_ids)
+            });
+            if !matches_unique_index {
+                return Err(DbError::new(
+                    "42P10",
+                    "there is no unique or exclusion constraint matching ON CONFLICT",
+                ));
+            }
+            column_ids
+        }
+        ParsedConflictTarget::Constraint(name) => {
+            let [name] = name.parts.as_slice() else {
+                return unsupported_at(
+                    "ON CONFLICT constraint names must be unqualified",
+                    name.parts.first().and_then(|part| part.position),
+                );
+            };
+            let constraint = table.constraint(&name.name).ok_or_else(|| {
+                DbError::new(
+                    "42704",
+                    format!(
+                        "constraint {} for table {} does not exist",
+                        name.name, table.name
+                    ),
+                )
+                .with_position_opt(name.position)
+            })?;
+            match &constraint.kind {
+                ConstraintKind::PrimaryKey { columns } | ConstraintKind::Unique { columns } => {
+                    columns.clone()
+                }
+                _ => {
+                    return Err(DbError::new(
+                        "42809",
+                        format!("constraint {} is not unique", constraint.name),
+                    )
+                    .with_position_opt(name.position));
+                }
+            }
+        }
+    };
+    column_ids
+        .into_iter()
+        .map(|column_id| {
+            table.column_index_by_id(column_id).ok_or_else(|| {
+                DbError::internal("ON CONFLICT target column is absent from its table")
+            })
+        })
+        .collect()
+}
+
+fn same_column_set(left: &[ColumnId], right: &[ColumnId]) -> bool {
+    left.len() == right.len() && left.iter().all(|column| right.contains(column))
+}
+
+fn qualify_conflict_expr(mut expr: ParsedExpr, target_binding: &Identifier) -> ParsedExpr {
+    expr.kind = match expr.kind {
+        ParsedExprKind::Column(mut name) if name.parts.len() == 1 => {
+            let position = name.parts.first().and_then(|part| part.position);
+            name.parts.insert(
+                0,
+                ParsedIdentifier {
+                    name: target_binding.clone(),
+                    position,
+                },
+            );
+            ParsedExprKind::Column(name)
+        }
+        ParsedExprKind::Unary { op, expr } => ParsedExprKind::Unary {
+            op,
+            expr: Box::new(qualify_conflict_expr(*expr, target_binding)),
+        },
+        ParsedExprKind::Binary { left, op, right } => ParsedExprKind::Binary {
+            left: Box::new(qualify_conflict_expr(*left, target_binding)),
+            op,
+            right: Box::new(qualify_conflict_expr(*right, target_binding)),
+        },
+        ParsedExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => ParsedExprKind::InList {
+            expr: Box::new(qualify_conflict_expr(*expr, target_binding)),
+            list: list
+                .into_iter()
+                .map(|expr| qualify_conflict_expr(expr, target_binding))
+                .collect(),
+            negated,
+        },
+        ParsedExprKind::Aggregate {
+            function,
+            argument,
+            distinct,
+            filter,
+        } => ParsedExprKind::Aggregate {
+            function,
+            argument: argument
+                .map(|argument| Box::new(qualify_conflict_expr(*argument, target_binding))),
+            distinct,
+            filter: filter.map(|filter| Box::new(qualify_conflict_expr(*filter, target_binding))),
+        },
+        kind => kind,
+    };
+    expr
 }
 
 fn bind_create_index(index: ParsedCreateIndex, catalog: &Catalog) -> Result<BoundStatement> {
@@ -5414,27 +9199,62 @@ fn bound_query_schema(statement: &BoundStatement) -> Result<Schema> {
     match statement {
         BoundStatement::Select { schema, .. }
         | BoundStatement::AdvancedSelect { schema, .. }
+        | BoundStatement::SetOperation { schema, .. }
+        | BoundStatement::With { schema, .. }
         | BoundStatement::ViewSelect { schema, .. }
-        | BoundStatement::RoutineSelect { schema, .. } => Ok(schema.clone()),
+        | BoundStatement::RoutineSelect { schema, .. }
+        | BoundStatement::SequenceValue { schema, .. } => Ok(schema.clone()),
         _ => unsupported("views require a SELECT query"),
     }
 }
 
 fn bound_statement_references(statement: &BoundStatement) -> Vec<CatalogObjectRef> {
-    let mut references = match statement {
-        BoundStatement::Select { table_id, .. } => vec![CatalogObjectRef::Table(*table_id)],
-        BoundStatement::AdvancedSelect { table, joins, .. } => std::iter::once(table.table_id)
-            .chain(joins.iter().map(|join| join.table.table_id))
-            .map(CatalogObjectRef::Table)
-            .collect(),
-        BoundStatement::ViewSelect { view_id, .. } => {
-            vec![CatalogObjectRef::View(*view_id)]
+    let mut references = Vec::new();
+    let mut pending = vec![statement];
+    while let Some(statement) = pending.pop() {
+        match statement {
+            BoundStatement::Select { table_id, .. } => {
+                references.push(CatalogObjectRef::Table(*table_id));
+            }
+            BoundStatement::AdvancedSelect {
+                table,
+                joins,
+                applies,
+                ..
+            } => {
+                references.push(CatalogObjectRef::Table(table.table_id));
+                for join in joins {
+                    match &join.source {
+                        BoundJoinSource::Table(table) => {
+                            references.push(CatalogObjectRef::Table(table.table_id));
+                        }
+                        BoundJoinSource::Derived { query, .. } => pending.push(query),
+                    }
+                }
+                pending.extend(applies.iter().map(|apply| apply.query.as_ref()));
+            }
+            BoundStatement::SetOperation { left, right, .. } => {
+                pending.push(right);
+                pending.push(left);
+            }
+            BoundStatement::With { ctes, body, .. } => {
+                pending.push(body);
+                for cte in ctes {
+                    pending.push(&cte.seed);
+                    if let Some(recursive) = &cte.recursive {
+                        pending.push(recursive);
+                    }
+                }
+            }
+            BoundStatement::ViewSelect { view_id, .. } => {
+                references.push(CatalogObjectRef::View(*view_id));
+            }
+            BoundStatement::RoutineSelect { routine_id, .. } => {
+                references.push(CatalogObjectRef::Routine(*routine_id));
+            }
+            _ => {}
         }
-        BoundStatement::RoutineSelect { routine_id, .. } => {
-            vec![CatalogObjectRef::Routine(*routine_id)]
-        }
-        _ => Vec::new(),
-    };
+    }
     references.sort();
     references.dedup();
     references
@@ -5465,36 +9285,1797 @@ struct InputColumn {
     index: usize,
     data_type: ScalarType,
     nullable: bool,
+    outer_depth: usize,
 }
 
 struct AdvancedSelectInput {
     table: ParsedTable,
     joins: Vec<ParsedJoin>,
     projection: Vec<ParsedProjection>,
+    distinct: bool,
     filter: Option<ParsedExpr>,
     group_by: Vec<ParsedExpr>,
     having: Option<ParsedExpr>,
     order_by: Vec<ParsedOrder>,
+    offset: Option<ParsedExpr>,
     limit: Option<ParsedExpr>,
 }
 
-fn bind_advanced_select(input: AdvancedSelectInput, catalog: &Catalog) -> Result<BoundStatement> {
+struct SelectInput {
+    table_name: ParsedObjectName,
+    projection: Vec<ParsedProjection>,
+    filter: Option<ParsedExpr>,
+    order_by: Vec<ParsedOrder>,
+    offset: Option<ParsedExpr>,
+    limit: Option<ParsedExpr>,
+}
+
+fn bind_with_clause(
+    recursive: bool,
+    ctes: Vec<ParsedCte>,
+    mut body: ParsedStatement,
+    catalog: &Catalog,
+    view_depth: usize,
+) -> Result<BoundStatement> {
+    let mut transient_catalog = catalog.clone();
+    let temporary_schema = (0_u64..)
+        .map(|suffix| Identifier::unquoted(format!("__ordadb_cte_{view_depth}_{suffix}")))
+        .find(|candidate| transient_catalog.schema(candidate).is_none())
+        .ok_or_else(|| DbError::new("54000", "could not allocate a transient CTE namespace"))?;
+    transient_catalog.create_schema(temporary_schema.clone())?;
+
+    let mut names = BTreeSet::new();
+    let mut replacements = BTreeMap::new();
+    let mut bound_ctes = Vec::with_capacity(ctes.len());
+    for cte in ctes {
+        if !names.insert(cte.name.name.clone()) {
+            return Err(DbError::new(
+                "42712",
+                format!("WITH query name {} specified more than once", cte.name.name),
+            )
+            .with_position_opt(cte.name.position));
+        }
+        let cte_name = cte.name.clone();
+        let cte_columns = cte.columns.clone();
+        let query = *cte.query;
+        let self_recursive = recursive && parsed_query_references_table(&query, &cte_name.name, 0)?;
+        let (mut seed, recursive_term, union_all) = if self_recursive {
+            match query {
+                ParsedStatement::SetOperation {
+                    left,
+                    operator: QuerySetOperator::Union,
+                    all,
+                    right,
+                    order_by,
+                    offset,
+                    limit,
+                } if order_by.is_empty() && offset.is_none() && limit.is_none() => {
+                    (*left, Some(*right), all)
+                }
+                _ => {
+                    return Err(DbError::new(
+                        FEATURE_NOT_SUPPORTED,
+                        "recursive CTEs require a top-level UNION or UNION ALL",
+                    ));
+                }
+            }
+        } else {
+            (query, None, false)
+        };
+        rewrite_cte_references(&mut seed, &replacements, 0)?;
+        if self_recursive && parsed_query_references_table(&seed, &cte_name.name, 0)? {
+            return Err(DbError::new(
+                "42P19",
+                "recursive reference must not appear within the non-recursive term",
+            ));
+        }
+        let seed = bind_with_view_depth(seed, &transient_catalog, view_depth + 1)?;
+        let mut output = bound_query_schema(&seed)?;
+        apply_cte_column_aliases(&cte_name, &cte_columns, &mut output)?;
+        let table_id = create_cte_relation(
+            &mut transient_catalog,
+            &temporary_schema,
+            &cte_name,
+            &output,
+        )?;
+        replacements.insert(
+            cte_name.name.clone(),
+            cte_replacement_name(&temporary_schema, &cte_name),
+        );
+        let recursive = recursive_term
+            .map(|mut recursive_term| {
+                rewrite_cte_references(&mut recursive_term, &replacements, 0)?;
+                let recursive_term =
+                    bind_with_view_depth(recursive_term, &transient_catalog, view_depth + 1)?;
+                let recursive_schema = bound_query_schema(&recursive_term)?;
+                ensure_recursive_cte_schema(&output, &recursive_schema)?;
+                Ok(Box::new(recursive_term))
+            })
+            .transpose()?;
+        bound_ctes.push(BoundCte {
+            table_id,
+            seed: Box::new(seed),
+            recursive,
+            union_all,
+        });
+    }
+    rewrite_cte_references(&mut body, &replacements, 0)?;
+    let body = bind_with_view_depth(body, &transient_catalog, view_depth + 1)?;
+    let schema = bound_query_schema(&body)?;
+    Ok(BoundStatement::With {
+        ctes: bound_ctes,
+        body: Box::new(body),
+        catalog: Box::new(transient_catalog),
+        schema,
+    })
+}
+
+fn apply_cte_column_aliases(
+    name: &ParsedIdentifier,
+    columns: &[ParsedIdentifier],
+    output: &mut Schema,
+) -> Result<()> {
+    if columns.is_empty() {
+        return Ok(());
+    }
+    if columns.len() != output.fields.len() {
+        return Err(DbError::new(
+            "42601",
+            format!(
+                "WITH query {} has {} columns available but {} columns specified",
+                name.name,
+                output.fields.len(),
+                columns.len()
+            ),
+        ));
+    }
+    for (field, column) in output.fields.iter_mut().zip(columns) {
+        field.name = column.name.as_str().to_owned();
+    }
+    Ok(())
+}
+
+fn create_cte_relation(
+    catalog: &mut Catalog,
+    schema: &Identifier,
+    name: &ParsedIdentifier,
+    output: &Schema,
+) -> Result<TableId> {
+    catalog.create_table(
+        schema,
+        name.name.clone(),
+        output
+            .fields
+            .iter()
+            .map(|field| NewColumn {
+                name: Identifier::unquoted(field.name.clone()),
+                data_type: field.data_type.clone(),
+                nullable: field.nullable,
+                primary_key: false,
+                unique: false,
+                default: None,
+            })
+            .collect(),
+    )
+}
+
+fn cte_replacement_name(schema: &Identifier, name: &ParsedIdentifier) -> ParsedObjectName {
+    ParsedObjectName {
+        parts: vec![
+            ParsedIdentifier {
+                name: schema.clone(),
+                position: name.position,
+            },
+            name.clone(),
+        ],
+    }
+}
+
+fn ensure_recursive_cte_schema(seed: &Schema, recursive: &Schema) -> Result<()> {
+    if seed.fields.len() != recursive.fields.len() {
+        return Err(DbError::new(
+            SYNTAX_ERROR,
+            "recursive UNION queries must have the same number of columns",
+        ));
+    }
+    for (seed, recursive) in seed.fields.iter().zip(&recursive.fields) {
+        let Some(common) = common_type(&seed.data_type, &recursive.data_type) else {
+            return Err(DbError::new(
+                DATATYPE_MISMATCH,
+                format!(
+                    "recursive UNION types {:?} and {:?} cannot be matched",
+                    seed.data_type, recursive.data_type
+                ),
+            ));
+        };
+        if common != seed.data_type {
+            return Err(DbError::new(
+                DATATYPE_MISMATCH,
+                "recursive query column type must match the non-recursive term",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parsed_query_references_table(
+    statement: &ParsedStatement,
+    table: &Identifier,
+    depth: usize,
+) -> Result<bool> {
+    if depth >= 64 {
+        return Err(DbError::new(
+            "54001",
+            "recursive CTE analysis exceeds the maximum depth of 64",
+        ));
+    }
+    let references = match statement {
+        ParsedStatement::Select {
+            table: source,
+            projection,
+            filter,
+            order_by,
+            offset,
+            limit,
+        } => {
+            cte_table_matches(source, table)
+                || parsed_projections_reference_table(projection, table, depth)?
+                || parsed_optional_expr_references_table(filter.as_ref(), table, depth)?
+                || parsed_orders_reference_table(order_by, table, depth)?
+                || parsed_optional_expr_references_table(offset.as_ref(), table, depth)?
+                || parsed_optional_expr_references_table(limit.as_ref(), table, depth)?
+        }
+        ParsedStatement::AdvancedSelect {
+            table: source,
+            joins,
+            projection,
+            filter,
+            group_by,
+            having,
+            order_by,
+            offset,
+            limit,
+            ..
+        } => {
+            cte_table_matches(&source.name, table)
+                || joins.iter().try_fold(false, |found, join| {
+                    Ok(found
+                        || match &join.source {
+                            ParsedJoinSource::Table(source) => {
+                                cte_table_matches(&source.name, table)
+                            }
+                            ParsedJoinSource::Derived { query, .. } => {
+                                parsed_query_references_table(query, table, depth + 1)?
+                            }
+                        })
+                })?
+                || parsed_exprs_reference_table(joins.iter().map(|join| &join.on), table, depth)?
+                || parsed_projections_reference_table(projection, table, depth)?
+                || parsed_optional_expr_references_table(filter.as_ref(), table, depth)?
+                || parsed_exprs_reference_table(group_by.iter(), table, depth)?
+                || parsed_optional_expr_references_table(having.as_ref(), table, depth)?
+                || parsed_orders_reference_table(order_by, table, depth)?
+                || parsed_optional_expr_references_table(offset.as_ref(), table, depth)?
+                || parsed_optional_expr_references_table(limit.as_ref(), table, depth)?
+        }
+        ParsedStatement::SetOperation {
+            left,
+            right,
+            order_by,
+            offset,
+            limit,
+            ..
+        } => {
+            parsed_query_references_table(left, table, depth + 1)?
+                || parsed_query_references_table(right, table, depth + 1)?
+                || parsed_orders_reference_table(order_by, table, depth)?
+                || parsed_optional_expr_references_table(offset.as_ref(), table, depth)?
+                || parsed_optional_expr_references_table(limit.as_ref(), table, depth)?
+        }
+        ParsedStatement::With { ctes, body, .. } => {
+            if ctes.iter().any(|cte| &cte.name.name == table) {
+                false
+            } else {
+                ctes.iter().try_fold(false, |found, cte| {
+                    Ok(found || parsed_query_references_table(&cte.query, table, depth + 1)?)
+                })? || parsed_query_references_table(body, table, depth + 1)?
+            }
+        }
+        ParsedStatement::Explain { statement } => {
+            parsed_query_references_table(statement, table, depth + 1)?
+        }
+        _ => false,
+    };
+    Ok(references)
+}
+
+fn parsed_projections_reference_table(
+    projections: &[ParsedProjection],
+    table: &Identifier,
+    depth: usize,
+) -> Result<bool> {
+    parsed_exprs_reference_table(
+        projections
+            .iter()
+            .filter_map(|projection| match projection {
+                ParsedProjection::Wildcard => None,
+                ParsedProjection::Expression { expr, .. } => Some(expr),
+            }),
+        table,
+        depth,
+    )
+}
+
+fn parsed_orders_reference_table(
+    orders: &[ParsedOrder],
+    table: &Identifier,
+    depth: usize,
+) -> Result<bool> {
+    parsed_exprs_reference_table(orders.iter().map(|order| &order.expr), table, depth)
+}
+
+fn parsed_optional_expr_references_table(
+    expression: Option<&ParsedExpr>,
+    table: &Identifier,
+    depth: usize,
+) -> Result<bool> {
+    match expression {
+        Some(expression) => parsed_expr_references_table(expression, table, depth),
+        None => Ok(false),
+    }
+}
+
+fn parsed_exprs_reference_table<'a>(
+    expressions: impl IntoIterator<Item = &'a ParsedExpr>,
+    table: &Identifier,
+    depth: usize,
+) -> Result<bool> {
+    for expression in expressions {
+        if parsed_expr_references_table(expression, table, depth)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn parsed_expr_references_table(
+    expression: &ParsedExpr,
+    table: &Identifier,
+    depth: usize,
+) -> Result<bool> {
+    let mut pending = vec![expression];
+    while let Some(expression) = pending.pop() {
+        match &expression.kind {
+            ParsedExprKind::Unary { expr, .. } => pending.push(expr),
+            ParsedExprKind::Binary { left, right, .. } => {
+                pending.push(right);
+                pending.push(left);
+            }
+            ParsedExprKind::InList { expr, list, .. } => {
+                pending.extend(list);
+                pending.push(expr);
+            }
+            ParsedExprKind::ScalarSubquery(query)
+            | ParsedExprKind::Exists {
+                subquery: query, ..
+            } => {
+                if parsed_query_references_table(query, table, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            ParsedExprKind::InSubquery { expr, subquery, .. } => {
+                pending.push(expr);
+                if parsed_query_references_table(subquery, table, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            ParsedExprKind::QuantifiedSubquery { left, subquery, .. } => {
+                pending.push(left);
+                if parsed_query_references_table(subquery, table, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            ParsedExprKind::RowSubquery { left, subquery, .. } => {
+                pending.extend(left);
+                if parsed_query_references_table(subquery, table, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            ParsedExprKind::Aggregate {
+                argument, filter, ..
+            } => {
+                if let Some(filter) = filter {
+                    pending.push(filter);
+                }
+                if let Some(argument) = argument {
+                    pending.push(argument);
+                }
+            }
+            ParsedExprKind::Window { call, spec } => {
+                if let Some(filter) = &call.filter {
+                    pending.push(filter);
+                }
+                pending.extend(&call.arguments);
+                pending.extend(spec.order_by.iter().map(|order| &order.expr));
+                pending.extend(&spec.partition_by);
+            }
+            ParsedExprKind::NamedWindow { call, .. } => {
+                if let Some(filter) = &call.filter {
+                    pending.push(filter);
+                }
+                pending.extend(&call.arguments);
+            }
+            ParsedExprKind::Column(_)
+            | ParsedExprKind::Literal(_)
+            | ParsedExprKind::Parameter(_)
+            | ParsedExprKind::ResolvedParameter { .. }
+            | ParsedExprKind::ApplyValue { .. }
+            | ParsedExprKind::WindowValue { .. } => {}
+        }
+    }
+    Ok(false)
+}
+
+fn cte_table_matches(name: &ParsedObjectName, table: &Identifier) -> bool {
+    matches!(name.parts.as_slice(), [name] if &name.name == table)
+}
+
+fn rewrite_cte_references(
+    statement: &mut ParsedStatement,
+    replacements: &BTreeMap<Identifier, ParsedObjectName>,
+    depth: usize,
+) -> Result<()> {
+    if depth >= 64 {
+        return Err(DbError::new(
+            "54001",
+            "CTE scope nesting exceeds the maximum depth of 64",
+        ));
+    }
+    match statement {
+        ParsedStatement::Select {
+            table,
+            projection,
+            filter,
+            order_by,
+            offset,
+            limit,
+        } => {
+            rewrite_cte_table(table, replacements);
+            rewrite_cte_projections(projection, replacements, depth)?;
+            rewrite_cte_optional_expr(filter.as_mut(), replacements, depth)?;
+            rewrite_cte_orders(order_by, replacements, depth)?;
+            rewrite_cte_optional_expr(offset.as_mut(), replacements, depth)?;
+            rewrite_cte_optional_expr(limit.as_mut(), replacements, depth)?;
+        }
+        ParsedStatement::AdvancedSelect {
+            table,
+            joins,
+            projection,
+            filter,
+            group_by,
+            having,
+            order_by,
+            offset,
+            limit,
+            ..
+        } => {
+            rewrite_cte_table(&mut table.name, replacements);
+            for join in joins {
+                match &mut join.source {
+                    ParsedJoinSource::Table(table) => {
+                        rewrite_cte_table(&mut table.name, replacements);
+                    }
+                    ParsedJoinSource::Derived { query, .. } => {
+                        rewrite_cte_references(query, replacements, depth + 1)?;
+                    }
+                }
+                rewrite_cte_expr(&mut join.on, replacements, depth)?;
+            }
+            rewrite_cte_projections(projection, replacements, depth)?;
+            rewrite_cte_optional_expr(filter.as_mut(), replacements, depth)?;
+            for expression in group_by {
+                rewrite_cte_expr(expression, replacements, depth)?;
+            }
+            rewrite_cte_optional_expr(having.as_mut(), replacements, depth)?;
+            rewrite_cte_orders(order_by, replacements, depth)?;
+            rewrite_cte_optional_expr(offset.as_mut(), replacements, depth)?;
+            rewrite_cte_optional_expr(limit.as_mut(), replacements, depth)?;
+        }
+        ParsedStatement::SetOperation {
+            left,
+            right,
+            order_by,
+            offset,
+            limit,
+            ..
+        } => {
+            rewrite_cte_references(left, replacements, depth + 1)?;
+            rewrite_cte_references(right, replacements, depth + 1)?;
+            rewrite_cte_orders(order_by, replacements, depth)?;
+            rewrite_cte_optional_expr(offset.as_mut(), replacements, depth)?;
+            rewrite_cte_optional_expr(limit.as_mut(), replacements, depth)?;
+        }
+        ParsedStatement::With { ctes, body, .. } => {
+            let mut outer = replacements.clone();
+            for cte in ctes.iter() {
+                outer.remove(&cte.name.name);
+            }
+            for cte in ctes {
+                rewrite_cte_references(&mut cte.query, &outer, depth + 1)?;
+            }
+            rewrite_cte_references(body, &outer, depth + 1)?;
+        }
+        ParsedStatement::Explain { statement } => {
+            rewrite_cte_references(statement, replacements, depth + 1)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn rewrite_cte_projections(
+    projections: &mut [ParsedProjection],
+    replacements: &BTreeMap<Identifier, ParsedObjectName>,
+    depth: usize,
+) -> Result<()> {
+    for projection in projections {
+        if let ParsedProjection::Expression { expr, .. } = projection {
+            rewrite_cte_expr(expr, replacements, depth)?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_cte_orders(
+    orders: &mut [ParsedOrder],
+    replacements: &BTreeMap<Identifier, ParsedObjectName>,
+    depth: usize,
+) -> Result<()> {
+    for order in orders {
+        rewrite_cte_expr(&mut order.expr, replacements, depth)?;
+    }
+    Ok(())
+}
+
+fn rewrite_cte_optional_expr(
+    expression: Option<&mut ParsedExpr>,
+    replacements: &BTreeMap<Identifier, ParsedObjectName>,
+    depth: usize,
+) -> Result<()> {
+    if let Some(expression) = expression {
+        rewrite_cte_expr(expression, replacements, depth)?;
+    }
+    Ok(())
+}
+
+fn rewrite_cte_expr(
+    expression: &mut ParsedExpr,
+    replacements: &BTreeMap<Identifier, ParsedObjectName>,
+    depth: usize,
+) -> Result<()> {
+    let mut pending = vec![expression];
+    while let Some(expression) = pending.pop() {
+        match &mut expression.kind {
+            ParsedExprKind::Unary { expr, .. } => pending.push(expr),
+            ParsedExprKind::Binary { left, right, .. } => {
+                pending.push(right);
+                pending.push(left);
+            }
+            ParsedExprKind::InList { expr, list, .. } => {
+                pending.extend(list);
+                pending.push(expr);
+            }
+            ParsedExprKind::ScalarSubquery(query)
+            | ParsedExprKind::Exists {
+                subquery: query, ..
+            } => rewrite_cte_references(query, replacements, depth + 1)?,
+            ParsedExprKind::InSubquery { expr, subquery, .. } => {
+                pending.push(expr);
+                rewrite_cte_references(subquery, replacements, depth + 1)?;
+            }
+            ParsedExprKind::QuantifiedSubquery { left, subquery, .. } => {
+                pending.push(left);
+                rewrite_cte_references(subquery, replacements, depth + 1)?;
+            }
+            ParsedExprKind::RowSubquery { left, subquery, .. } => {
+                pending.extend(left);
+                rewrite_cte_references(subquery, replacements, depth + 1)?;
+            }
+            ParsedExprKind::Aggregate {
+                argument, filter, ..
+            } => {
+                if let Some(filter) = filter {
+                    pending.push(filter);
+                }
+                if let Some(argument) = argument {
+                    pending.push(argument);
+                }
+            }
+            ParsedExprKind::Window { call, spec } => {
+                if let Some(filter) = &mut call.filter {
+                    pending.push(filter);
+                }
+                pending.extend(&mut call.arguments);
+                pending.extend(spec.order_by.iter_mut().map(|order| &mut order.expr));
+                pending.extend(&mut spec.partition_by);
+            }
+            ParsedExprKind::NamedWindow { call, .. } => {
+                if let Some(filter) = &mut call.filter {
+                    pending.push(filter);
+                }
+                pending.extend(&mut call.arguments);
+            }
+            ParsedExprKind::Column(_)
+            | ParsedExprKind::Literal(_)
+            | ParsedExprKind::Parameter(_)
+            | ParsedExprKind::ResolvedParameter { .. }
+            | ParsedExprKind::ApplyValue { .. }
+            | ParsedExprKind::WindowValue { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_cte_table(
+    table: &mut ParsedObjectName,
+    replacements: &BTreeMap<Identifier, ParsedObjectName>,
+) {
+    if let [name] = table.parts.as_slice()
+        && let Some(replacement) = replacements.get(&name.name)
+    {
+        *table = replacement.clone();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bind_set_operation(
+    left: ParsedStatement,
+    operator: QuerySetOperator,
+    all: bool,
+    right: ParsedStatement,
+    order_by: Vec<ParsedOrder>,
+    offset: Option<ParsedExpr>,
+    limit: Option<ParsedExpr>,
+    catalog: &Catalog,
+    view_depth: usize,
+) -> Result<BoundStatement> {
+    let left = bind_with_view_depth(left, catalog, view_depth + 1)?;
+    let right = bind_with_view_depth(right, catalog, view_depth + 1)?;
+    let left_schema = bound_query_schema(&left)?;
+    let right_schema = bound_query_schema(&right)?;
+    if left_schema.fields.len() != right_schema.fields.len() {
+        return Err(DbError::new(
+            SYNTAX_ERROR,
+            "each set-operation query must have the same number of columns",
+        ));
+    }
+    let schema = Schema::new(
+        left_schema
+            .fields
+            .iter()
+            .zip(&right_schema.fields)
+            .map(|(left, right)| {
+                let data_type =
+                    common_type(&left.data_type, &right.data_type).ok_or_else(|| {
+                        DbError::new(
+                            DATATYPE_MISMATCH,
+                            format!(
+                                "set-operation types {:?} and {:?} cannot be matched",
+                                left.data_type, right.data_type
+                            ),
+                        )
+                    })?;
+                Ok(Field::new(
+                    left.name.clone(),
+                    data_type,
+                    left.nullable || right.nullable,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    if !(operator == QuerySetOperator::Union && all)
+        && schema
+            .fields
+            .iter()
+            .any(|field| field.data_type == ScalarType::Json)
+    {
+        return Err(DbError::new(
+            "42883",
+            "could not identify an equality operator for type json",
+        ));
+    }
+    let order_by = order_by
+        .into_iter()
+        .map(|order| bind_set_order(order, &schema))
+        .collect::<Result<Vec<_>>>()?;
+    let offset = offset
+        .map(|expr| bind_expr(expr, None, Some(&ScalarType::Int64)))
+        .transpose()?;
+    let limit = limit
+        .map(|expr| bind_expr(expr, None, Some(&ScalarType::Int64)))
+        .transpose()?;
+    Ok(BoundStatement::SetOperation {
+        left: Box::new(left),
+        operator,
+        all,
+        right: Box::new(right),
+        schema,
+        order_by,
+        offset,
+        limit,
+    })
+}
+
+fn bind_set_order(order: ParsedOrder, schema: &Schema) -> Result<BoundOrder> {
+    let column_index = match order.expr.kind {
+        ParsedExprKind::Literal(Value::Int16(value)) if value > 0 => usize::from(value as u16) - 1,
+        ParsedExprKind::Literal(Value::Int32(value)) if value > 0 => usize::try_from(value - 1)
+            .map_err(|_| DbError::new("22003", "ORDER BY position is out of range"))?,
+        ParsedExprKind::Literal(Value::Int64(value)) if value > 0 => usize::try_from(value - 1)
+            .map_err(|_| DbError::new("22003", "ORDER BY position is out of range"))?,
+        ParsedExprKind::Column(name) if name.parts.len() == 1 => {
+            let column = &name.parts[0];
+            let matches = schema
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| field.name == column.name.as_str())
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [index] => *index,
+                [] => {
+                    return Err(DbError::new(
+                        UNDEFINED_COLUMN,
+                        format!("column {} does not exist", column.name),
+                    )
+                    .with_position_opt(column.position));
+                }
+                _ => {
+                    return Err(DbError::new(
+                        "42702",
+                        format!("column reference {} is ambiguous", column.name),
+                    )
+                    .with_position_opt(column.position));
+                }
+            }
+        }
+        _ => {
+            return unsupported_at(
+                "ORDER BY on a set operation supports output columns or ordinals only",
+                order.expr.position,
+            );
+        }
+    };
+    if column_index >= schema.fields.len() {
+        return Err(DbError::new(
+            "42P10",
+            format!(
+                "ORDER BY position {} is not in select list",
+                column_index + 1
+            ),
+        )
+        .with_position_opt(order.expr.position));
+    }
+    Ok(BoundOrder {
+        column_index,
+        expression: None,
+        ascending: order.ascending,
+        nulls_first: order.nulls_first,
+    })
+}
+
+fn bind_simple_order(
+    order: ParsedOrder,
+    projection: &[BoundProjection],
+    table: &TableDefinition,
+) -> Result<BoundOrder> {
+    let expression = match projected_order_position(&order.expr, projection)? {
+        Some(position) => projection[position].expr.clone(),
+        None => bind_expr(order.expr.clone(), Some(table), None)?,
+    };
+    bound_expression_order(order, expression)
+}
+
+fn bind_multi_order(
+    order: ParsedOrder,
+    projection: &[BoundProjection],
+    inputs: &[InputColumn],
+) -> Result<BoundOrder> {
+    let expression = match projected_order_position(&order.expr, projection)? {
+        Some(position) => projection[position].expr.clone(),
+        None => bind_expr_multi(order.expr.clone(), inputs, None, false)?,
+    };
+    bound_expression_order(order, expression)
+}
+
+fn bind_distinct_order(
+    order: ParsedOrder,
+    projection: &[BoundProjection],
+    inputs: &[InputColumn],
+) -> Result<BoundOrder> {
+    let expression = match projected_order_position(&order.expr, projection)? {
+        Some(position) => projection[position].expr.clone(),
+        None => {
+            let expression = bind_expr_multi(order.expr.clone(), inputs, None, false)?;
+            if !projection
+                .iter()
+                .any(|projected| projected.expr == expression)
+            {
+                return Err(DbError::new(
+                    "42P10",
+                    "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+                )
+                .with_position_opt(order.expr.position));
+            }
+            expression
+        }
+    };
+    bound_expression_order(order, expression)
+}
+
+fn bind_projected_order(
+    order: ParsedOrder,
+    projection: &[BoundProjection],
+    inputs: &[InputColumn],
+    group_by: &[BoundExpr],
+) -> Result<BoundOrder> {
+    let position = if let Some(position) = projected_order_position(&order.expr, projection)? {
+        position
+    } else {
+        let expression = bind_expr_multi(order.expr.clone(), inputs, None, true)?;
+        validate_grouped_expr(&expression, group_by)?;
+        projection
+            .iter()
+            .position(|projected| projected.expr == expression)
+            .ok_or_else(|| {
+                DbError::new(
+                    FEATURE_NOT_SUPPORTED,
+                    "ORDER BY on grouped queries requires a selected grouped expression",
+                )
+                .with_position_opt(order.expr.position)
+            })?
+    };
+    Ok(BoundOrder {
+        column_index: position,
+        expression: None,
+        ascending: order.ascending,
+        nulls_first: order.nulls_first,
+    })
+}
+
+fn projected_order_position(
+    expr: &ParsedExpr,
+    projection: &[BoundProjection],
+) -> Result<Option<usize>> {
+    let ordinal = match &expr.kind {
+        ParsedExprKind::Literal(Value::Int16(value)) => Some(i64::from(*value)),
+        ParsedExprKind::Literal(Value::Int32(value)) => Some(i64::from(*value)),
+        ParsedExprKind::Literal(Value::Int64(value)) => Some(*value),
+        _ => None,
+    };
+    if let Some(ordinal) = ordinal {
+        if ordinal <= 0 {
+            return Err(
+                DbError::new("42P10", "ORDER BY position must be greater than zero")
+                    .with_position_opt(expr.position),
+            );
+        }
+        let position = usize::try_from(ordinal - 1)
+            .map_err(|_| DbError::new("22003", "ORDER BY position is out of range"))?;
+        if position >= projection.len() {
+            return Err(DbError::new(
+                "42P10",
+                format!("ORDER BY position {ordinal} is not in select list"),
+            )
+            .with_position_opt(expr.position));
+        }
+        return Ok(Some(position));
+    }
+    let ParsedExprKind::Column(name) = &expr.kind else {
+        return Ok(None);
+    };
+    let [name] = name.parts.as_slice() else {
+        return Ok(None);
+    };
+    let matches = projection
+        .iter()
+        .enumerate()
+        .filter(|(_, projection)| projection.field.name == name.name.as_str())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [position] => Ok(Some(*position)),
+        _ => Err(
+            DbError::new("42702", format!("ORDER BY {} is ambiguous", name.name))
+                .with_position_opt(name.position),
+        ),
+    }
+}
+
+fn bound_expression_order(order: ParsedOrder, expression: BoundExpr) -> Result<BoundOrder> {
+    if expression.data_type == ScalarType::Json {
+        return Err(DbError::new(
+            "42883",
+            "could not identify an ordering operator for type json",
+        )
+        .with_position_opt(order.expr.position));
+    }
+    let (column_index, expression) = match &expression.kind {
+        BoundExprKind::Column { index } => (*index, None),
+        _ => (usize::MAX, Some(expression)),
+    };
+    Ok(BoundOrder {
+        column_index,
+        expression,
+        ascending: order.ascending,
+        nulls_first: order.nulls_first,
+    })
+}
+
+fn bind_apply_query(
+    statement: ParsedStatement,
+    catalog: &Catalog,
+    view_depth: usize,
+    outer_inputs: &[InputColumn],
+) -> Result<BoundStatement> {
+    match statement {
+        ParsedStatement::Select {
+            table,
+            projection,
+            filter,
+            order_by,
+            offset,
+            limit,
+        } => bind_advanced_select(
+            AdvancedSelectInput {
+                table: ParsedTable {
+                    name: table,
+                    alias: None,
+                },
+                joins: Vec::new(),
+                projection,
+                distinct: false,
+                filter,
+                group_by: Vec::new(),
+                having: None,
+                order_by,
+                offset,
+                limit,
+            },
+            catalog,
+            view_depth,
+            outer_inputs,
+        ),
+        ParsedStatement::AdvancedSelect {
+            table,
+            joins,
+            projection,
+            distinct,
+            filter,
+            group_by,
+            having,
+            order_by,
+            offset,
+            limit,
+        } => bind_advanced_select(
+            AdvancedSelectInput {
+                table,
+                joins,
+                projection,
+                distinct,
+                filter,
+                group_by,
+                having,
+                order_by,
+                offset,
+                limit,
+            },
+            catalog,
+            view_depth,
+            outer_inputs,
+        ),
+        statement => bind_with_view_depth(statement, catalog, view_depth),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_apply_expr(
+    mut expr: ParsedExpr,
+    catalog: &Catalog,
+    inputs: &[InputColumn],
+    apply_base: usize,
+    applies: &mut Vec<BoundApply>,
+    view_depth: usize,
+) -> Result<ParsedExpr> {
+    let position = expr.position;
+    expr.kind = match expr.kind {
+        ParsedExprKind::Unary { op, expr } => ParsedExprKind::Unary {
+            op,
+            expr: Box::new(lower_apply_expr(
+                *expr, catalog, inputs, apply_base, applies, view_depth,
+            )?),
+        },
+        ParsedExprKind::Binary { left, op, right } => ParsedExprKind::Binary {
+            left: Box::new(lower_apply_expr(
+                *left, catalog, inputs, apply_base, applies, view_depth,
+            )?),
+            op,
+            right: Box::new(lower_apply_expr(
+                *right, catalog, inputs, apply_base, applies, view_depth,
+            )?),
+        },
+        ParsedExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => ParsedExprKind::InList {
+            expr: Box::new(lower_apply_expr(
+                *expr, catalog, inputs, apply_base, applies, view_depth,
+            )?),
+            list: list
+                .into_iter()
+                .map(|expr| {
+                    lower_apply_expr(expr, catalog, inputs, apply_base, applies, view_depth)
+                })
+                .collect::<Result<Vec<_>>>()?,
+            negated,
+        },
+        ParsedExprKind::Aggregate {
+            function,
+            argument,
+            distinct,
+            filter,
+        } => ParsedExprKind::Aggregate {
+            function,
+            argument: argument
+                .map(|argument| {
+                    lower_apply_expr(*argument, catalog, inputs, apply_base, applies, view_depth)
+                        .map(Box::new)
+                })
+                .transpose()?,
+            distinct,
+            filter: filter
+                .map(|filter| {
+                    lower_apply_expr(*filter, catalog, inputs, apply_base, applies, view_depth)
+                        .map(Box::new)
+                })
+                .transpose()?,
+        },
+        ParsedExprKind::ScalarSubquery(subquery) => {
+            let query = bind_apply_query(*subquery, catalog, view_depth.saturating_add(1), inputs)?;
+            let field = scalar_subquery_field(&query, position)?;
+            let index = push_bound_apply(applies, apply_base, BoundApplyKind::Scalar, query)?;
+            ParsedExprKind::ApplyValue {
+                index,
+                data_type: field.data_type,
+                nullable: true,
+            }
+        }
+        ParsedExprKind::Exists { subquery, negated } => {
+            let query = bind_apply_query(*subquery, catalog, view_depth.saturating_add(1), inputs)?;
+            let index = push_bound_apply(
+                applies,
+                apply_base,
+                BoundApplyKind::Exists { negated },
+                query,
+            )?;
+            ParsedExprKind::ApplyValue {
+                index,
+                data_type: ScalarType::Boolean,
+                nullable: false,
+            }
+        }
+        ParsedExprKind::InSubquery {
+            expr: left,
+            subquery,
+            negated,
+        } => {
+            let left = lower_apply_expr(*left, catalog, inputs, apply_base, applies, view_depth)?;
+            let query = bind_apply_query(*subquery, catalog, view_depth.saturating_add(1), inputs)?;
+            let field = scalar_subquery_field(&query, position)?;
+            let left_type = infer_multi_type(&left, inputs)?;
+            let operand_type = left_type
+                .as_ref()
+                .map(|left_type| common_type(left_type, &field.data_type))
+                .unwrap_or_else(|| Some(field.data_type.clone()))
+                .ok_or_else(|| {
+                    DbError::new(
+                        DATATYPE_MISMATCH,
+                        format!(
+                            "IN types {:?} and {:?} cannot be matched",
+                            left_type, field.data_type
+                        ),
+                    )
+                    .with_position_opt(position)
+                })?;
+            if operand_type == ScalarType::Json {
+                return Err(DbError::new(
+                    "42883",
+                    "could not identify an equality operator for type json",
+                )
+                .with_position_opt(position));
+            }
+            let left = bind_expr_multi(left, inputs, Some(&operand_type), false)?;
+            let index = push_bound_apply(
+                applies,
+                apply_base,
+                BoundApplyKind::In { left, negated },
+                query,
+            )?;
+            ParsedExprKind::ApplyValue {
+                index,
+                data_type: ScalarType::Boolean,
+                nullable: true,
+            }
+        }
+        ParsedExprKind::QuantifiedSubquery {
+            left,
+            op,
+            quantifier,
+            subquery,
+        } => {
+            let left = lower_apply_expr(*left, catalog, inputs, apply_base, applies, view_depth)?;
+            let query = bind_apply_query(*subquery, catalog, view_depth.saturating_add(1), inputs)?;
+            let field = scalar_subquery_field(&query, position)?;
+            let left_type = infer_multi_type(&left, inputs)?;
+            let operand_type = left_type
+                .as_ref()
+                .map(|left_type| common_type(left_type, &field.data_type))
+                .unwrap_or_else(|| Some(field.data_type.clone()))
+                .ok_or_else(|| {
+                    DbError::new(
+                        DATATYPE_MISMATCH,
+                        format!(
+                            "quantified comparison types {:?} and {:?} cannot be matched",
+                            left_type, field.data_type
+                        ),
+                    )
+                    .with_position_opt(position)
+                })?;
+            if operand_type == ScalarType::Json {
+                return Err(DbError::new(
+                    "42883",
+                    "could not identify a comparison operator for type json",
+                )
+                .with_position_opt(position));
+            }
+            let left = bind_expr_multi(left, inputs, Some(&operand_type), false)?;
+            let index = push_bound_apply(
+                applies,
+                apply_base,
+                BoundApplyKind::Quantified {
+                    left,
+                    op,
+                    quantifier,
+                },
+                query,
+            )?;
+            ParsedExprKind::ApplyValue {
+                index,
+                data_type: ScalarType::Boolean,
+                nullable: true,
+            }
+        }
+        ParsedExprKind::RowSubquery {
+            left,
+            op,
+            quantifier,
+            negated,
+            subquery,
+        } => {
+            let left = left
+                .into_iter()
+                .map(|expression| {
+                    lower_apply_expr(expression, catalog, inputs, apply_base, applies, view_depth)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let query = bind_apply_query(*subquery, catalog, view_depth.saturating_add(1), inputs)?;
+            let schema = bound_query_schema(&query)?;
+            if left.len() != schema.fields.len() {
+                return Err(DbError::new(
+                    SYNTAX_ERROR,
+                    "unequal number of entries in row expressions",
+                )
+                .with_position_opt(position));
+            }
+            let mut bound_left = Vec::with_capacity(left.len());
+            let mut operand_types = Vec::with_capacity(left.len());
+            for (expression, field) in left.into_iter().zip(&schema.fields) {
+                let left_type = infer_multi_type(&expression, inputs)?;
+                let operand_type = left_type
+                    .as_ref()
+                    .map(|left_type| common_type(left_type, &field.data_type))
+                    .unwrap_or_else(|| Some(field.data_type.clone()))
+                    .ok_or_else(|| {
+                        DbError::new(
+                            DATATYPE_MISMATCH,
+                            format!(
+                                "row comparison types {:?} and {:?} cannot be matched",
+                                left_type, field.data_type
+                            ),
+                        )
+                        .with_position_opt(position)
+                    })?;
+                if operand_type == ScalarType::Json {
+                    return Err(DbError::new(
+                        "42883",
+                        "could not identify an equality operator for type json",
+                    )
+                    .with_position_opt(position));
+                }
+                bound_left.push(bind_expr_multi(
+                    expression,
+                    inputs,
+                    Some(&operand_type),
+                    false,
+                )?);
+                operand_types.push(operand_type);
+            }
+            let kind = match quantifier {
+                Some(quantifier) => BoundApplyKind::RowQuantified {
+                    left: bound_left,
+                    op,
+                    quantifier,
+                    negated,
+                    operand_types,
+                },
+                None if !negated => BoundApplyKind::RowScalar {
+                    left: bound_left,
+                    op,
+                    operand_types,
+                },
+                None => {
+                    return Err(DbError::internal(
+                        "scalar row subquery retained a negated quantifier flag",
+                    ));
+                }
+            };
+            let index = push_bound_apply(applies, apply_base, kind, query)?;
+            ParsedExprKind::ApplyValue {
+                index,
+                data_type: ScalarType::Boolean,
+                nullable: true,
+            }
+        }
+        kind => kind,
+    };
+    Ok(expr)
+}
+
+fn scalar_subquery_field(statement: &BoundStatement, position: Option<usize>) -> Result<Field> {
+    let schema = bound_query_schema(statement)?;
+    let [field] = schema.fields.as_slice() else {
+        return Err(
+            DbError::new(SYNTAX_ERROR, "subquery must return only one column")
+                .with_position_opt(position),
+        );
+    };
+    Ok(field.clone())
+}
+
+fn push_bound_apply(
+    applies: &mut Vec<BoundApply>,
+    apply_base: usize,
+    kind: BoundApplyKind,
+    query: BoundStatement,
+) -> Result<usize> {
+    let index = apply_base
+        .checked_add(applies.len())
+        .ok_or_else(|| DbError::new("54001", "Apply value index overflowed"))?;
+    applies.push(BoundApply {
+        kind,
+        query: Box::new(query),
+    });
+    Ok(index)
+}
+
+struct BoundWindowCall {
+    function: WindowFunction,
+    arguments: Vec<BoundExpr>,
+    count_star: bool,
+    filter: Option<BoundExpr>,
+    data_type: ScalarType,
+    nullable: bool,
+}
+
+fn bind_window_call(
+    call: ParsedWindowCall,
+    inputs: &[InputColumn],
+    position: Option<usize>,
+) -> Result<BoundWindowCall> {
+    if call.arguments.iter().any(expr_has_window)
+        || call.filter.as_deref().is_some_and(expr_has_window)
+    {
+        return Err(
+            DbError::new("42P20", "window function calls cannot be nested")
+                .with_position_opt(position),
+        );
+    }
+    if call.arguments.iter().any(expr_has_subquery)
+        || call.filter.as_deref().is_some_and(expr_has_subquery)
+    {
+        return unsupported_at(
+            "subquery expressions in window function arguments are not supported yet",
+            position,
+        );
+    }
+    if let WindowFunction::Aggregate(function) = call.function {
+        let argument = match call.arguments.into_iter().collect::<Vec<_>>().as_slice() {
+            [] if call.count_star && function == AggregateFunction::Count => None,
+            [argument] if !call.count_star => {
+                Some(bind_expr_multi(argument.clone(), inputs, None, true)?)
+            }
+            _ => {
+                return Err(DbError::internal(
+                    "aggregate window argument shape changed after parsing",
+                ));
+            }
+        };
+        let filter = call
+            .filter
+            .map(|filter| bind_expr_multi(*filter, inputs, Some(&ScalarType::Boolean), true))
+            .transpose()?;
+        let (data_type, nullable) = match (function, argument.as_ref()) {
+            (AggregateFunction::Count, _) => (ScalarType::Int64, false),
+            (AggregateFunction::Avg, Some(argument)) if is_numeric(&argument.data_type) => {
+                (ScalarType::Float64, true)
+            }
+            (AggregateFunction::Sum, Some(argument)) if is_numeric(&argument.data_type) => {
+                let data_type = match argument.data_type {
+                    ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64 => ScalarType::Int64,
+                    ScalarType::Float32 | ScalarType::Float64 => ScalarType::Float64,
+                    ScalarType::Decimal { .. } => argument.data_type.clone(),
+                    _ => unreachable!("numeric guard"),
+                };
+                (data_type, true)
+            }
+            (AggregateFunction::Min | AggregateFunction::Max, Some(argument))
+                if indexable_type(&argument.data_type) =>
+            {
+                (argument.data_type.clone(), true)
+            }
+            _ => {
+                return Err(DbError::new(
+                    DATATYPE_MISMATCH,
+                    "aggregate window argument has an incompatible type",
+                )
+                .with_position_opt(position));
+            }
+        };
+        return Ok(BoundWindowCall {
+            function: call.function,
+            arguments: argument.into_iter().collect(),
+            count_star: call.count_star,
+            filter,
+            data_type,
+            nullable,
+        });
+    }
+
+    let mut arguments = call.arguments.into_iter();
+    let first = match call.function {
+        WindowFunction::RowNumber | WindowFunction::Rank | WindowFunction::DenseRank => None,
+        WindowFunction::Lag
+        | WindowFunction::Lead
+        | WindowFunction::FirstValue
+        | WindowFunction::LastValue
+        | WindowFunction::NthValue => Some(bind_expr_multi(
+            arguments
+                .next()
+                .ok_or_else(|| DbError::internal("value window function argument disappeared"))?,
+            inputs,
+            None,
+            true,
+        )?),
+        WindowFunction::Aggregate(_) => unreachable!("aggregate handled above"),
+    };
+    let mut bound_arguments = first.iter().cloned().collect::<Vec<_>>();
+    match call.function {
+        WindowFunction::Lag | WindowFunction::Lead => {
+            if let Some(offset) = arguments.next() {
+                bound_arguments.push(bind_expr_multi(
+                    offset,
+                    inputs,
+                    Some(&ScalarType::Int64),
+                    false,
+                )?);
+            }
+            if let Some(default) = arguments.next() {
+                let data_type = &first
+                    .as_ref()
+                    .ok_or_else(|| DbError::internal("window value type disappeared"))?
+                    .data_type;
+                bound_arguments.push(bind_expr_multi(default, inputs, Some(data_type), false)?);
+            }
+        }
+        WindowFunction::NthValue => {
+            bound_arguments.push(bind_expr_multi(
+                arguments
+                    .next()
+                    .ok_or_else(|| DbError::internal("NTH_VALUE offset disappeared"))?,
+                inputs,
+                Some(&ScalarType::Int64),
+                false,
+            )?);
+        }
+        WindowFunction::RowNumber
+        | WindowFunction::Rank
+        | WindowFunction::DenseRank
+        | WindowFunction::FirstValue
+        | WindowFunction::LastValue => {}
+        WindowFunction::Aggregate(_) => unreachable!("aggregate handled above"),
+    }
+    if arguments.next().is_some() {
+        return Err(DbError::internal(
+            "window function retained an unexpected argument",
+        ));
+    }
+    let (data_type, nullable) = first.map_or((ScalarType::Int64, false), |argument| {
+        (argument.data_type, true)
+    });
+    Ok(BoundWindowCall {
+        function: call.function,
+        arguments: bound_arguments,
+        count_star: false,
+        filter: None,
+        data_type,
+        nullable,
+    })
+}
+
+fn bind_window_frame(
+    frame: ParsedWindowFrame,
+    inputs: &[InputColumn],
+    order_by: &[BoundOrder],
+    position: Option<usize>,
+) -> Result<BoundWindowFrame> {
+    let offset_type = match frame.units {
+        WindowFrameUnits::Rows => ScalarType::Int64,
+        WindowFrameUnits::Range => {
+            let has_offset = matches!(
+                frame.start_bound,
+                ParsedWindowFrameBound::Preceding(_) | ParsedWindowFrameBound::Following(_)
+            ) || matches!(
+                frame.end_bound,
+                ParsedWindowFrameBound::Preceding(_) | ParsedWindowFrameBound::Following(_)
+            );
+            if !has_offset {
+                ScalarType::Int64
+            } else {
+                let [order] = order_by else {
+                    return Err(DbError::new(
+                        "42P20",
+                        "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column",
+                    )
+                    .with_position_opt(position));
+                };
+                let data_type = if let Some(expression) = &order.expression {
+                    expression.data_type.clone()
+                } else {
+                    inputs
+                        .get(order.column_index)
+                        .map(|input| input.data_type.clone())
+                        .ok_or_else(|| {
+                            DbError::internal("window ORDER BY type index is out of bounds")
+                        })?
+                };
+                if !is_numeric(&data_type) {
+                    return Err(DbError::new(
+                        "42883",
+                        "RANGE offset is supported only for numeric ORDER BY expressions",
+                    )
+                    .with_position_opt(position));
+                }
+                data_type
+            }
+        }
+    };
+    Ok(BoundWindowFrame {
+        units: frame.units,
+        start_bound: bind_window_frame_bound(frame.start_bound, &offset_type, position)?,
+        end_bound: bind_window_frame_bound(frame.end_bound, &offset_type, position)?,
+    })
+}
+
+fn bind_window_frame_bound(
+    bound: ParsedWindowFrameBound,
+    offset_type: &ScalarType,
+    position: Option<usize>,
+) -> Result<BoundWindowFrameBound> {
+    let bind_offset = |offset: ParsedExpr| {
+        if expr_has_aggregate(&offset) || expr_has_subquery(&offset) || expr_has_window(&offset) {
+            return Err(DbError::new(
+                "42P20",
+                "window frame offset cannot contain aggregate, window, or subquery expressions",
+            )
+            .with_position_opt(offset.position.or(position)));
+        }
+        bind_expr_multi(offset, &[], Some(offset_type), false).map_err(|error| {
+            if matches!(error.sql_state.as_str(), "42703" | "42P01") {
+                DbError::new("42P20", "window frame offset cannot contain variables")
+                    .with_position_opt(error.position.or(position))
+            } else {
+                error
+            }
+        })
+    };
+    Ok(match bound {
+        ParsedWindowFrameBound::UnboundedPreceding => BoundWindowFrameBound::UnboundedPreceding,
+        ParsedWindowFrameBound::Preceding(offset) => {
+            BoundWindowFrameBound::Preceding(bind_offset(*offset)?)
+        }
+        ParsedWindowFrameBound::CurrentRow => BoundWindowFrameBound::CurrentRow,
+        ParsedWindowFrameBound::Following(offset) => {
+            BoundWindowFrameBound::Following(bind_offset(*offset)?)
+        }
+        ParsedWindowFrameBound::UnboundedFollowing => BoundWindowFrameBound::UnboundedFollowing,
+    })
+}
+
+fn lower_window_expr(
+    mut expr: ParsedExpr,
+    inputs: &[InputColumn],
+    windows: &mut Vec<BoundWindow>,
+) -> Result<ParsedExpr> {
+    let position = expr.position;
+    expr.kind = match expr.kind {
+        ParsedExprKind::Unary { op, expr } => ParsedExprKind::Unary {
+            op,
+            expr: Box::new(lower_window_expr(*expr, inputs, windows)?),
+        },
+        ParsedExprKind::Binary { left, op, right } => ParsedExprKind::Binary {
+            left: Box::new(lower_window_expr(*left, inputs, windows)?),
+            op,
+            right: Box::new(lower_window_expr(*right, inputs, windows)?),
+        },
+        ParsedExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => ParsedExprKind::InList {
+            expr: Box::new(lower_window_expr(*expr, inputs, windows)?),
+            list: list
+                .into_iter()
+                .map(|candidate| lower_window_expr(candidate, inputs, windows))
+                .collect::<Result<Vec<_>>>()?,
+            negated,
+        },
+        ParsedExprKind::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => ParsedExprKind::InSubquery {
+            expr: Box::new(lower_window_expr(*expr, inputs, windows)?),
+            subquery,
+            negated,
+        },
+        ParsedExprKind::QuantifiedSubquery {
+            left,
+            op,
+            quantifier,
+            subquery,
+        } => ParsedExprKind::QuantifiedSubquery {
+            left: Box::new(lower_window_expr(*left, inputs, windows)?),
+            op,
+            quantifier,
+            subquery,
+        },
+        ParsedExprKind::RowSubquery {
+            left,
+            op,
+            quantifier,
+            negated,
+            subquery,
+        } => ParsedExprKind::RowSubquery {
+            left: left
+                .into_iter()
+                .map(|expression| lower_window_expr(expression, inputs, windows))
+                .collect::<Result<Vec<_>>>()?,
+            op,
+            quantifier,
+            negated,
+            subquery,
+        },
+        ParsedExprKind::Aggregate {
+            argument,
+            distinct,
+            filter,
+            function,
+        } => {
+            if argument.as_deref().is_some_and(expr_has_window)
+                || filter.as_deref().is_some_and(expr_has_window)
+            {
+                return Err(
+                    DbError::new("42P20", "window function calls cannot be nested")
+                        .with_position_opt(position),
+                );
+            }
+            ParsedExprKind::Aggregate {
+                function,
+                argument,
+                distinct,
+                filter,
+            }
+        }
+        ParsedExprKind::Window { call, spec } => {
+            let call = *call;
+            let spec = *spec;
+            if spec.window_name.is_some() {
+                return Err(DbError::internal(
+                    "window inheritance was not resolved before binding",
+                ));
+            }
+            if spec.partition_by.iter().any(expr_has_window)
+                || spec
+                    .order_by
+                    .iter()
+                    .any(|order| expr_has_window(&order.expr))
+            {
+                return Err(
+                    DbError::new("42P20", "window function calls cannot be nested")
+                        .with_position_opt(position),
+                );
+            }
+            if spec.partition_by.iter().any(expr_has_subquery)
+                || spec
+                    .order_by
+                    .iter()
+                    .any(|order| expr_has_subquery(&order.expr))
+            {
+                return unsupported_at(
+                    "subquery expressions in window definitions are not supported yet",
+                    position,
+                );
+            }
+            let call = bind_window_call(call, inputs, position)?;
+            let partition_by = spec
+                .partition_by
+                .into_iter()
+                .map(|expr| bind_expr_multi(expr, inputs, None, true))
+                .collect::<Result<Vec<_>>>()?;
+            let order_by = spec
+                .order_by
+                .into_iter()
+                .map(|order| {
+                    let expression = bind_expr_multi(order.expr.clone(), inputs, None, true)?;
+                    bound_expression_order(order, expression)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let frame = spec
+                .frame
+                .map(|frame| bind_window_frame(frame, inputs, &order_by, position))
+                .transpose()?;
+            let ordinal = windows.len();
+            windows.push(BoundWindow {
+                function: call.function,
+                value_index: usize::MAX,
+                arguments: call.arguments,
+                count_star: call.count_star,
+                filter: call.filter,
+                partition_by,
+                order_by,
+                frame,
+                data_type: call.data_type,
+                nullable: call.nullable,
+            });
+            ParsedExprKind::WindowValue { ordinal }
+        }
+        ParsedExprKind::NamedWindow { .. } => {
+            return Err(DbError::internal("named window reference was not resolved"));
+        }
+        ParsedExprKind::WindowValue { .. } => {
+            return Err(DbError::internal(
+                "window expression was lowered more than once",
+            ));
+        }
+        kind => kind,
+    };
+    Ok(expr)
+}
+
+fn finalize_window_values(
+    expression: &mut ParsedExpr,
+    window_base: usize,
+    windows: &[BoundWindow],
+) -> Result<()> {
+    let mut pending = vec![expression];
+    while let Some(expression) = pending.pop() {
+        if let ParsedExprKind::WindowValue { ordinal } = &expression.kind {
+            let index = window_base
+                .checked_add(*ordinal)
+                .ok_or_else(|| DbError::new("54001", "window value index overflowed"))?;
+            let window = windows.get(*ordinal).ok_or_else(|| {
+                DbError::internal("window value ordinal is outside the bound window list")
+            })?;
+            expression.kind = ParsedExprKind::ApplyValue {
+                index,
+                data_type: window.data_type.clone(),
+                nullable: window.nullable,
+            };
+            continue;
+        }
+        match &mut expression.kind {
+            ParsedExprKind::Unary { expr, .. } => pending.push(expr),
+            ParsedExprKind::Binary { left, right, .. } => {
+                pending.push(right);
+                pending.push(left);
+            }
+            ParsedExprKind::InList { expr, list, .. } => {
+                pending.extend(list.iter_mut().rev());
+                pending.push(expr);
+            }
+            ParsedExprKind::InSubquery { expr, .. }
+            | ParsedExprKind::QuantifiedSubquery { left: expr, .. } => pending.push(expr),
+            ParsedExprKind::RowSubquery { left, .. } => pending.extend(left.iter_mut().rev()),
+            ParsedExprKind::Aggregate {
+                argument, filter, ..
+            } => {
+                if let Some(filter) = filter {
+                    pending.push(filter);
+                }
+                if let Some(argument) = argument {
+                    pending.push(argument);
+                }
+            }
+            ParsedExprKind::Window { .. } => {
+                return Err(DbError::internal("window expression was not lowered"));
+            }
+            ParsedExprKind::NamedWindow { .. } => {
+                return Err(DbError::internal("named window reference was not resolved"));
+            }
+            ParsedExprKind::WindowValue { .. } => unreachable!("handled above"),
+            ParsedExprKind::Column(_)
+            | ParsedExprKind::Literal(_)
+            | ParsedExprKind::Parameter(_)
+            | ParsedExprKind::ResolvedParameter { .. }
+            | ParsedExprKind::ScalarSubquery(_)
+            | ParsedExprKind::Exists { .. }
+            | ParsedExprKind::ApplyValue { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn bind_advanced_select(
+    input: AdvancedSelectInput,
+    catalog: &Catalog,
+    view_depth: usize,
+    outer_inputs: &[InputColumn],
+) -> Result<BoundStatement> {
     let AdvancedSelectInput {
         table,
         joins,
-        projection,
-        filter,
-        group_by,
-        having,
-        order_by,
+        mut projection,
+        distinct,
+        mut filter,
+        mut group_by,
+        mut having,
+        mut order_by,
+        offset,
         limit,
     } = input;
-    let mut inputs = Vec::new();
-    let table = bind_input_table(table, false, catalog, &mut inputs)?;
+    let mut local_inputs = Vec::new();
+    let table = bind_input_table(table, false, catalog, &mut local_inputs)?;
     let mut bound_joins = Vec::new();
     for join in joins {
+        if expr_has_window(&join.on) {
+            return Err(DbError::new(
+                "42P20",
+                "window functions are not allowed in JOIN conditions",
+            ));
+        }
         let nullable = join.kind == JoinKind::Left;
-        let table = bind_input_table(join.table, nullable, catalog, &mut inputs)?;
+        let source = bind_join_source(
+            join.source,
+            nullable,
+            catalog,
+            view_depth,
+            outer_inputs,
+            &mut local_inputs,
+        )?;
+        let inputs = inputs_with_outer(&local_inputs, outer_inputs)?;
         let on = bind_multi_boolean(join.on, &inputs)?;
         if bound_expr_has_aggregate(&on) {
             return Err(DbError::new(
@@ -5503,17 +11084,123 @@ fn bind_advanced_select(input: AdvancedSelectInput, catalog: &Catalog) -> Result
             ));
         }
         bound_joins.push(BoundJoin {
-            table,
+            source,
             kind: join.kind,
             on,
         });
+    }
+    let inputs = inputs_with_outer(&local_inputs, outer_inputs)?;
+    let apply_base = local_inputs.len();
+    let mut applies = Vec::new();
+    let mut windows = Vec::new();
+
+    if filter.as_ref().is_some_and(expr_has_window) {
+        return Err(DbError::new(
+            "42P20",
+            "window functions are not allowed in WHERE",
+        ));
+    }
+    if group_by.iter().any(expr_has_window) {
+        return Err(DbError::new(
+            "42P20",
+            "window functions are not allowed in GROUP BY",
+        ));
+    }
+    if having.as_ref().is_some_and(expr_has_window) {
+        return Err(DbError::new(
+            "42P20",
+            "window functions are not allowed in HAVING",
+        ));
+    }
+    if limit.as_ref().is_some_and(expr_has_window) || offset.as_ref().is_some_and(expr_has_window) {
+        return Err(DbError::new(
+            "42P20",
+            "window functions are not allowed in LIMIT or OFFSET",
+        ));
+    }
+
+    projection = projection
+        .into_iter()
+        .map(|projection| match projection {
+            ParsedProjection::Wildcard => Ok(ParsedProjection::Wildcard),
+            ParsedProjection::Expression { expr, alias } => Ok(ParsedProjection::Expression {
+                expr: lower_window_expr(expr, &inputs, &mut windows)?,
+                alias,
+            }),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    order_by = order_by
+        .into_iter()
+        .map(|mut order| {
+            order.expr = lower_window_expr(order.expr, &inputs, &mut windows)?;
+            Ok(order)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    projection = projection
+        .into_iter()
+        .map(|projection| match projection {
+            ParsedProjection::Wildcard => Ok(ParsedProjection::Wildcard),
+            ParsedProjection::Expression { expr, alias } => Ok(ParsedProjection::Expression {
+                expr: lower_apply_expr(
+                    expr,
+                    catalog,
+                    &inputs,
+                    apply_base,
+                    &mut applies,
+                    view_depth,
+                )?,
+                alias,
+            }),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    filter = filter
+        .map(|expr| lower_apply_expr(expr, catalog, &inputs, apply_base, &mut applies, view_depth))
+        .transpose()?;
+    group_by = group_by
+        .into_iter()
+        .map(|expr| lower_apply_expr(expr, catalog, &inputs, apply_base, &mut applies, view_depth))
+        .collect::<Result<Vec<_>>>()?;
+    having = having
+        .map(|expr| lower_apply_expr(expr, catalog, &inputs, apply_base, &mut applies, view_depth))
+        .transpose()?;
+    order_by = order_by
+        .into_iter()
+        .map(|mut order| {
+            order.expr = lower_apply_expr(
+                order.expr,
+                catalog,
+                &inputs,
+                apply_base,
+                &mut applies,
+                view_depth,
+            )?;
+            Ok(order)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let window_base = apply_base
+        .checked_add(applies.len())
+        .ok_or_else(|| DbError::new("54001", "window value index overflowed"))?;
+    for (ordinal, window) in windows.iter_mut().enumerate() {
+        window.value_index = window_base
+            .checked_add(ordinal)
+            .ok_or_else(|| DbError::new("54001", "window value index overflowed"))?;
+    }
+    for projection in &mut projection {
+        if let ParsedProjection::Expression { expr, .. } = projection {
+            finalize_window_values(expr, window_base, &windows)?;
+        }
+    }
+    for order in &mut order_by {
+        finalize_window_values(&mut order.expr, window_base, &windows)?;
     }
 
     let mut bound_projection = Vec::new();
     for item in projection {
         match item {
             ParsedProjection::Wildcard => {
-                for input in &inputs {
+                for input in &local_inputs {
                     bound_projection.push(BoundProjection {
                         expr: BoundExpr {
                             kind: BoundExprKind::Column { index: input.index },
@@ -5547,6 +11234,16 @@ fn bind_advanced_select(input: AdvancedSelectInput, catalog: &Catalog) -> Result
     if bound_projection.is_empty() {
         return Err(DbError::new(SYNTAX_ERROR, "SELECT projection is empty"));
     }
+    if distinct
+        && bound_projection
+            .iter()
+            .any(|projection| projection.expr.data_type == ScalarType::Json)
+    {
+        return Err(DbError::new(
+            "42883",
+            "could not identify an equality operator for type json",
+        ));
+    }
 
     let filter = filter
         .map(|expr| bind_multi_boolean(expr, &inputs))
@@ -5568,14 +11265,24 @@ fn bind_advanced_select(input: AdvancedSelectInput, catalog: &Catalog) -> Result
         || bound_projection
             .iter()
             .any(|projection| bound_expr_has_aggregate(&projection.expr))
-        || having.as_ref().is_some_and(bound_expr_has_aggregate);
+        || having.as_ref().is_some_and(bound_expr_has_aggregate)
+        || windows.iter().any(bound_window_input_has_aggregate);
     if aggregate {
         for projection in &bound_projection {
+            if window_ordinal_for_expr(&projection.expr, &windows).is_some() {
+                continue;
+            }
+            if bound_expr_has_window_slot(&projection.expr, &windows) {
+                return unsupported(
+                    "grouped window functions must be top-level SELECT expressions",
+                );
+            }
             validate_grouped_expr(&projection.expr, &group_by)?;
         }
         if let Some(having) = &having {
             validate_grouped_expr(having, &group_by)?;
         }
+        remap_grouped_window_inputs(&mut windows, &bound_projection, &group_by)?;
     } else if having.is_some() {
         return Err(DbError::new(
             "42803",
@@ -5586,20 +11293,24 @@ fn bind_advanced_select(input: AdvancedSelectInput, catalog: &Catalog) -> Result
     let order_by = order_by
         .into_iter()
         .map(|order| {
-            let ParsedExprKind::Column(column) = order.expr.kind else {
-                return unsupported_at(
-                    "ORDER BY supports source columns only",
-                    order.expr.position,
-                );
-            };
-            Ok(BoundOrder {
-                column_index: resolve_input_column(&column, &inputs)?.index,
-                ascending: order.ascending,
-                nulls_first: order.nulls_first,
-            })
+            if aggregate {
+                bind_projected_order(order, &bound_projection, &inputs, &group_by)
+            } else if distinct {
+                bind_distinct_order(order, &bound_projection, &inputs)
+            } else {
+                bind_multi_order(order, &bound_projection, &inputs)
+            }
         })
         .collect::<Result<Vec<_>>>()?;
+    if limit.as_ref().is_some_and(expr_has_subquery)
+        || offset.as_ref().is_some_and(expr_has_subquery)
+    {
+        return unsupported("subqueries in LIMIT or OFFSET are not supported yet");
+    }
     let limit = limit
+        .map(|expr| bind_expr_multi(expr, &inputs, Some(&ScalarType::Int64), false))
+        .transpose()?;
+    let offset = offset
         .map(|expr| bind_expr_multi(expr, &inputs, Some(&ScalarType::Int64), false))
         .transpose()?;
     let schema = Schema::new(
@@ -5611,15 +11322,112 @@ fn bind_advanced_select(input: AdvancedSelectInput, catalog: &Catalog) -> Result
     Ok(BoundStatement::AdvancedSelect {
         table,
         joins: bound_joins,
+        applies,
+        windows,
         schema,
         projection: bound_projection,
+        distinct,
         filter,
         group_by,
         having,
         order_by,
-        limit,
+        offset,
+        limit: limit.map(Box::new),
         aggregate,
     })
+}
+
+fn bind_join_source(
+    source: ParsedJoinSource,
+    nullable: bool,
+    catalog: &Catalog,
+    view_depth: usize,
+    outer_inputs: &[InputColumn],
+    local_inputs: &mut Vec<InputColumn>,
+) -> Result<BoundJoinSource> {
+    match source {
+        ParsedJoinSource::Table(table) => {
+            bind_input_table(table, nullable, catalog, local_inputs).map(BoundJoinSource::Table)
+        }
+        ParsedJoinSource::Derived {
+            lateral,
+            query,
+            alias,
+            columns,
+        } => {
+            let alias_position = alias.position;
+            let binding = alias.name;
+            if local_inputs.iter().any(|input| input.binding == binding) {
+                return Err(DbError::new(
+                    "42712",
+                    format!("table name {binding} specified more than once"),
+                )
+                .with_position_opt(alias_position));
+            }
+            let visible_inputs = if lateral {
+                inputs_with_outer(local_inputs, outer_inputs)?
+            } else {
+                Vec::new()
+            };
+            let nested_depth = view_depth.checked_add(1).ok_or_else(|| {
+                DbError::new(
+                    "54001",
+                    "derived table nesting exceeds the implementation limit",
+                )
+            })?;
+            let query = bind_apply_query(*query, catalog, nested_depth, &visible_inputs)?;
+            let schema = bound_query_schema(&query)?;
+            if columns.len() > schema.fields.len() {
+                return Err(DbError::new(
+                    SYNTAX_ERROR,
+                    "derived table has more column aliases than output columns",
+                )
+                .with_position_opt(alias_position));
+            }
+            let offset = local_inputs.len();
+            let width = schema.fields.len();
+            local_inputs.extend(schema.fields.iter().enumerate().map(|(index, field)| {
+                let name = columns.get(index).map_or_else(
+                    || Identifier::unquoted(&field.name),
+                    |alias| alias.name.clone(),
+                );
+                InputColumn {
+                    binding: binding.clone(),
+                    name,
+                    index: offset + index,
+                    data_type: field.data_type.clone(),
+                    nullable: nullable || field.nullable,
+                    outer_depth: 0,
+                }
+            }));
+            Ok(BoundJoinSource::Derived {
+                lateral,
+                query: Box::new(query),
+                binding,
+                offset,
+                width,
+                nullable,
+            })
+        }
+    }
+}
+
+fn inputs_with_outer(
+    local_inputs: &[InputColumn],
+    outer_inputs: &[InputColumn],
+) -> Result<Vec<InputColumn>> {
+    let mut inputs = Vec::with_capacity(local_inputs.len().saturating_add(outer_inputs.len()));
+    inputs.extend_from_slice(local_inputs);
+    for mut input in outer_inputs.iter().cloned() {
+        input.outer_depth = input.outer_depth.checked_add(1).ok_or_else(|| {
+            DbError::new(
+                "54001",
+                "correlation scope depth exceeds the implementation limit",
+            )
+        })?;
+        inputs.push(input);
+    }
+    Ok(inputs)
 }
 
 fn bind_input_table(
@@ -5651,6 +11459,7 @@ fn bind_input_table(
                 index: offset + column_offset,
                 data_type: column.data_type.clone(),
                 nullable: nullable || column.nullable,
+                outer_depth: 0,
             }),
     );
     Ok(BoundTable {
@@ -5686,8 +11495,15 @@ fn bind_expr_multi(
                 ensure_types_compatible(&column.data_type, expected, position)?;
             }
             Ok(BoundExpr {
-                kind: BoundExprKind::Column {
-                    index: column.index,
+                kind: if column.outer_depth > 0 {
+                    BoundExprKind::Correlation {
+                        depth: column.outer_depth,
+                        index: column.index,
+                    }
+                } else {
+                    BoundExprKind::Column {
+                        index: column.index,
+                    }
                 },
                 data_type: column.data_type.clone(),
                 nullable: column.nullable,
@@ -5706,6 +11522,30 @@ fn bind_expr_multi(
                 kind: BoundExprKind::Parameter { index },
                 data_type,
                 nullable: true,
+            })
+        }
+        ParsedExprKind::ResolvedParameter { index, data_type } => {
+            if let Some(expected) = expected {
+                ensure_types_compatible(&data_type, expected, position)?;
+            }
+            Ok(BoundExpr {
+                kind: BoundExprKind::Parameter { index },
+                data_type,
+                nullable: true,
+            })
+        }
+        ParsedExprKind::ApplyValue {
+            index,
+            data_type,
+            nullable,
+        } => {
+            if let Some(expected) = expected {
+                ensure_types_compatible(&data_type, expected, position)?;
+            }
+            Ok(BoundExpr {
+                kind: BoundExprKind::ApplyValue { index },
+                data_type,
+                nullable,
             })
         }
         ParsedExprKind::Unary { op, expr } => {
@@ -5739,10 +11579,101 @@ fn bind_expr_multi(
                 }
             }
         }
-        ParsedExprKind::Binary { left, op, right } => {
-            bind_multi_binary(*left, op, *right, inputs, position, allow_aggregate)
+        ParsedExprKind::Binary { left, op, right } => bind_multi_binary(
+            *left,
+            op,
+            *right,
+            inputs,
+            position,
+            expected,
+            allow_aggregate,
+        ),
+        ParsedExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            if expected.is_some_and(|expected| expected != &ScalarType::Boolean) {
+                return Err(DbError::new(
+                    DATATYPE_MISMATCH,
+                    "IN predicate produces a boolean result",
+                )
+                .with_position_opt(position));
+            }
+            let mut operand_type = infer_multi_type(&expr, inputs)?;
+            for candidate in &list {
+                let Some(candidate_type) = infer_multi_type(candidate, inputs)? else {
+                    continue;
+                };
+                operand_type = Some(match operand_type {
+                    Some(current) => common_type(&current, &candidate_type).ok_or_else(|| {
+                        DbError::new(
+                            DATATYPE_MISMATCH,
+                            format!(
+                                "IN types {current:?} and {candidate_type:?} cannot be matched"
+                            ),
+                        )
+                        .with_position_opt(position)
+                    })?,
+                    None => candidate_type,
+                });
+            }
+            let operand_type = operand_type.ok_or_else(|| {
+                DbError::new(
+                    INDETERMINATE_DATATYPE,
+                    "could not determine data type of IN operands",
+                )
+                .with_position_opt(position)
+            })?;
+            if operand_type == ScalarType::Json {
+                return Err(DbError::new(
+                    "42883",
+                    "could not identify an equality operator for type json",
+                )
+                .with_position_opt(position));
+            }
+            let expr = bind_expr_multi(*expr, inputs, Some(&operand_type), allow_aggregate)?;
+            let list = list
+                .into_iter()
+                .map(|candidate| {
+                    bind_expr_multi(candidate, inputs, Some(&operand_type), allow_aggregate)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let nullable = expr.nullable || list.iter().any(|candidate| candidate.nullable);
+            Ok(BoundExpr {
+                kind: BoundExprKind::InList {
+                    expr: Box::new(expr),
+                    list,
+                    negated,
+                },
+                data_type: ScalarType::Boolean,
+                nullable,
+            })
         }
-        ParsedExprKind::Aggregate { function, argument } => {
+        ParsedExprKind::ScalarSubquery(_) => unsupported_at(
+            "scalar subquery Apply execution is not supported yet",
+            position,
+        ),
+        ParsedExprKind::Exists { .. } => {
+            unsupported_at("EXISTS Apply execution is not supported yet", position)
+        }
+        ParsedExprKind::InSubquery { .. } => {
+            unsupported_at("IN subquery Apply execution is not supported yet", position)
+        }
+        ParsedExprKind::QuantifiedSubquery { .. } => unsupported_at(
+            "ANY/ALL subquery Apply execution is not supported yet",
+            position,
+        ),
+        ParsedExprKind::RowSubquery { .. } => unsupported_at(
+            "row subquery Apply execution is not supported in this context",
+            position,
+        ),
+        ParsedExprKind::Aggregate {
+            function,
+            argument,
+            distinct,
+            filter,
+        } => {
             if !allow_aggregate {
                 return Err(DbError::new(
                     "42803",
@@ -5753,6 +11684,30 @@ fn bind_expr_multi(
             let argument = argument
                 .map(|argument| bind_expr_multi(*argument, inputs, None, false))
                 .transpose()?;
+            if distinct
+                && argument
+                    .as_ref()
+                    .is_some_and(|argument| argument.data_type == ScalarType::Json)
+            {
+                return Err(DbError::new(
+                    "42883",
+                    "could not identify an equality operator for type json",
+                )
+                .with_position_opt(position));
+            }
+            let filter = filter
+                .map(|filter| bind_expr_multi(*filter, inputs, Some(&ScalarType::Boolean), false))
+                .transpose()?;
+            if filter
+                .as_ref()
+                .is_some_and(|filter| filter.data_type != ScalarType::Boolean)
+            {
+                return Err(DbError::new(
+                    DATATYPE_MISMATCH,
+                    "aggregate FILTER predicate must be boolean",
+                )
+                .with_position_opt(position));
+            }
             let (data_type, nullable) = match (function, argument.as_ref()) {
                 (AggregateFunction::Count, _) => (ScalarType::Int64, false),
                 (AggregateFunction::Avg, Some(argument)) if is_numeric(&argument.data_type) => {
@@ -5786,11 +11741,18 @@ fn bind_expr_multi(
                 kind: BoundExprKind::Aggregate {
                     function,
                     argument: argument.map(Box::new),
+                    distinct,
+                    filter: filter.map(Box::new),
                 },
                 data_type,
                 nullable,
             })
         }
+        ParsedExprKind::Window { .. }
+        | ParsedExprKind::NamedWindow { .. }
+        | ParsedExprKind::WindowValue { .. } => Err(DbError::internal(
+            "window expression reached binding before lowering",
+        )),
     }
 }
 
@@ -5800,6 +11762,7 @@ fn bind_multi_binary(
     right: ParsedExpr,
     inputs: &[InputColumn],
     position: Option<usize>,
+    expected: Option<&ScalarType>,
     allow_aggregate: bool,
 ) -> Result<BoundExpr> {
     if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
@@ -5817,11 +11780,11 @@ fn bind_multi_binary(
     }
     let left_type = infer_multi_type(&left, inputs)?;
     let right_type = infer_multi_type(&right, inputs)?;
-    let comparison_type = match (left_type, right_type) {
+    let mut operand_type = match (left_type, right_type) {
         (Some(left), Some(right)) => common_type(&left, &right).ok_or_else(|| {
             DbError::new(
                 DATATYPE_MISMATCH,
-                format!("cannot compare {left:?} with {right:?}"),
+                format!("operator cannot match {left:?} with {right:?}"),
             )
             .with_position_opt(position)
         })?,
@@ -5834,11 +11797,28 @@ fn bind_multi_binary(
             .with_position_opt(position));
         }
     };
-    let left = bind_expr_multi(left, inputs, Some(&comparison_type), allow_aggregate)?;
-    let right = bind_expr_multi(right, inputs, Some(&comparison_type), allow_aggregate)?;
+    if is_arithmetic_operator(op) && !is_numeric(&operand_type) {
+        return Err(DbError::new(
+            "42883",
+            format!("arithmetic operator is not defined for {operand_type:?}"),
+        )
+        .with_position_opt(position));
+    }
+    if is_arithmetic_operator(op)
+        && let Some(expected) = expected
+    {
+        ensure_types_compatible(&operand_type, expected, position)?;
+        operand_type = expected.clone();
+    }
+    let left = bind_expr_multi(left, inputs, Some(&operand_type), allow_aggregate)?;
+    let right = bind_expr_multi(right, inputs, Some(&operand_type), allow_aggregate)?;
     Ok(BoundExpr {
         nullable: left.nullable || right.nullable,
-        data_type: ScalarType::Boolean,
+        data_type: if is_arithmetic_operator(op) {
+            operand_type
+        } else {
+            ScalarType::Boolean
+        },
         kind: BoundExprKind::Binary {
             left: Box::new(left),
             op,
@@ -5854,12 +11834,41 @@ fn infer_multi_type(expr: &ParsedExpr, inputs: &[InputColumn]) -> Result<Option<
         )),
         ParsedExprKind::Literal(value) => Ok(value.scalar_type()),
         ParsedExprKind::Parameter(_) => Ok(None),
+        ParsedExprKind::ResolvedParameter { data_type, .. } => Ok(Some(data_type.clone())),
         ParsedExprKind::Unary { op, expr } => match op {
             UnaryOperator::Not => Ok(Some(ScalarType::Boolean)),
             UnaryOperator::Negate => infer_multi_type(expr, inputs),
         },
-        ParsedExprKind::Binary { .. } => Ok(Some(ScalarType::Boolean)),
-        ParsedExprKind::Aggregate { function, argument } => match function {
+        ParsedExprKind::Binary { left, op, right } => {
+            if is_arithmetic_operator(*op) {
+                let left = infer_multi_type(left, inputs)?;
+                let right = infer_multi_type(right, inputs)?;
+                Ok(match (left, right) {
+                    (Some(left), Some(right)) => common_type(&left, &right),
+                    (Some(data_type), None) | (None, Some(data_type)) => Some(data_type),
+                    (None, None) => None,
+                })
+            } else {
+                Ok(Some(ScalarType::Boolean))
+            }
+        }
+        ParsedExprKind::InList { .. }
+        | ParsedExprKind::Exists { .. }
+        | ParsedExprKind::InSubquery { .. }
+        | ParsedExprKind::QuantifiedSubquery { .. }
+        | ParsedExprKind::RowSubquery { .. } => Ok(Some(ScalarType::Boolean)),
+        ParsedExprKind::ScalarSubquery(_) => Ok(None),
+        ParsedExprKind::ApplyValue { data_type, .. } => Ok(Some(data_type.clone())),
+        ParsedExprKind::WindowValue { .. } => Ok(Some(ScalarType::Int64)),
+        ParsedExprKind::Window { .. } => Err(DbError::internal(
+            "window expression reached type inference before lowering",
+        )),
+        ParsedExprKind::NamedWindow { .. } => {
+            Err(DbError::internal("named window reference was not resolved"))
+        }
+        ParsedExprKind::Aggregate {
+            function, argument, ..
+        } => match function {
             AggregateFunction::Count => Ok(Some(ScalarType::Int64)),
             AggregateFunction::Avg => Ok(Some(ScalarType::Float64)),
             AggregateFunction::Sum => {
@@ -5907,7 +11916,13 @@ fn resolve_input_column<'a>(
             &input.name == column && qualifier.is_none_or(|qualifier| &input.binding == qualifier)
         })
         .collect::<Vec<_>>();
-    match matches.as_slice() {
+    let local = matches
+        .iter()
+        .copied()
+        .filter(|input| input.outer_depth == 0)
+        .collect::<Vec<_>>();
+    let visible = if local.is_empty() { &matches } else { &local };
+    match visible.as_slice() {
         [column] => Ok(*column),
         [] => Err(
             DbError::new(UNDEFINED_COLUMN, format!("column {column} does not exist"))
@@ -5927,10 +11942,156 @@ fn bound_expr_has_aggregate(expr: &BoundExpr) -> bool {
         BoundExprKind::Binary { left, right, .. } => {
             bound_expr_has_aggregate(left) || bound_expr_has_aggregate(right)
         }
+        BoundExprKind::InList { expr, list, .. } => {
+            bound_expr_has_aggregate(expr) || list.iter().any(bound_expr_has_aggregate)
+        }
         BoundExprKind::Column { .. }
         | BoundExprKind::Literal(_)
-        | BoundExprKind::Parameter { .. } => false,
+        | BoundExprKind::Parameter { .. }
+        | BoundExprKind::Correlation { .. }
+        | BoundExprKind::ApplyValue { .. } => false,
     }
+}
+
+fn bound_window_input_has_aggregate(window: &BoundWindow) -> bool {
+    window.arguments.iter().any(bound_expr_has_aggregate)
+        || window.filter.as_ref().is_some_and(bound_expr_has_aggregate)
+        || window.partition_by.iter().any(bound_expr_has_aggregate)
+        || window.order_by.iter().any(|order| {
+            order
+                .expression
+                .as_ref()
+                .is_some_and(bound_expr_has_aggregate)
+        })
+}
+
+fn window_ordinal_for_expr(expr: &BoundExpr, windows: &[BoundWindow]) -> Option<usize> {
+    let BoundExprKind::ApplyValue { index } = expr.kind else {
+        return None;
+    };
+    windows
+        .iter()
+        .position(|window| window.value_index == index)
+}
+
+fn bound_expr_has_window_slot(expr: &BoundExpr, windows: &[BoundWindow]) -> bool {
+    let mut pending = vec![expr];
+    while let Some(expression) = pending.pop() {
+        match &expression.kind {
+            BoundExprKind::ApplyValue { index }
+                if windows.iter().any(|window| window.value_index == *index) =>
+            {
+                return true;
+            }
+            BoundExprKind::Unary { expr, .. } => pending.push(expr),
+            BoundExprKind::Binary { left, right, .. } => {
+                pending.push(right);
+                pending.push(left);
+            }
+            BoundExprKind::InList { expr, list, .. } => {
+                pending.extend(list);
+                pending.push(expr);
+            }
+            BoundExprKind::Aggregate {
+                argument, filter, ..
+            } => {
+                if let Some(filter) = filter {
+                    pending.push(filter);
+                }
+                if let Some(argument) = argument {
+                    pending.push(argument);
+                }
+            }
+            BoundExprKind::Column { .. }
+            | BoundExprKind::Literal(_)
+            | BoundExprKind::Parameter { .. }
+            | BoundExprKind::Correlation { .. }
+            | BoundExprKind::ApplyValue { .. } => {}
+        }
+    }
+    false
+}
+
+fn remap_grouped_window_inputs(
+    windows: &mut [BoundWindow],
+    projection: &[BoundProjection],
+    group_by: &[BoundExpr],
+) -> Result<()> {
+    let base_projection = projection
+        .iter()
+        .filter(|projection| window_ordinal_for_expr(&projection.expr, windows).is_none())
+        .collect::<Vec<_>>();
+    for window in windows {
+        for argument in &mut window.arguments {
+            *argument = remap_grouped_window_expr(argument, &base_projection, group_by)?;
+        }
+        if let Some(filter) = &mut window.filter {
+            *filter = remap_grouped_window_expr(filter, &base_projection, group_by)?;
+        }
+        for expression in &mut window.partition_by {
+            *expression = remap_grouped_window_expr(expression, &base_projection, group_by)?;
+        }
+        for order in &mut window.order_by {
+            let expression = if let Some(expression) = &order.expression {
+                expression.clone()
+            } else {
+                base_projection
+                    .iter()
+                    .find_map(|projection| match projection.expr.kind {
+                        BoundExprKind::Column { index } if index == order.column_index => {
+                            Some(projection.expr.clone())
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        DbError::new(
+                            FEATURE_NOT_SUPPORTED,
+                            "grouped window ORDER BY expression must appear in the select list",
+                        )
+                    })?
+            };
+            let expression = remap_grouped_window_expr(&expression, &base_projection, group_by)?;
+            if let BoundExprKind::Column { index } = expression.kind {
+                order.column_index = index;
+                order.expression = None;
+            } else {
+                order.column_index = usize::MAX;
+                order.expression = Some(expression);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remap_grouped_window_expr(
+    expression: &BoundExpr,
+    base_projection: &[&BoundProjection],
+    group_by: &[BoundExpr],
+) -> Result<BoundExpr> {
+    validate_grouped_expr(expression, group_by)?;
+    if let Some((index, projected)) = base_projection
+        .iter()
+        .enumerate()
+        .find(|(_, projected)| projected.expr == *expression)
+    {
+        return Ok(BoundExpr {
+            kind: BoundExprKind::Column { index },
+            data_type: projected.expr.data_type.clone(),
+            nullable: projected.expr.nullable,
+        });
+    }
+    if matches!(
+        expression.kind,
+        BoundExprKind::Literal(_)
+            | BoundExprKind::Parameter { .. }
+            | BoundExprKind::Correlation { .. }
+    ) {
+        return Ok(expression.clone());
+    }
+    Err(DbError::new(
+        FEATURE_NOT_SUPPORTED,
+        "grouped window input expression must appear in the select list",
+    ))
 }
 
 fn validate_grouped_expr(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()> {
@@ -5940,7 +12101,9 @@ fn validate_grouped_expr(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()>
     match &expr.kind {
         BoundExprKind::Aggregate { .. }
         | BoundExprKind::Literal(_)
-        | BoundExprKind::Parameter { .. } => Ok(()),
+        | BoundExprKind::Parameter { .. }
+        | BoundExprKind::Correlation { .. }
+        | BoundExprKind::ApplyValue { .. } => Ok(()),
         BoundExprKind::Column { .. } => Err(DbError::new(
             "42803",
             "column must appear in GROUP BY or be used in an aggregate function",
@@ -5950,22 +12113,39 @@ fn validate_grouped_expr(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()>
             validate_grouped_expr(left, group_by)?;
             validate_grouped_expr(right, group_by)
         }
+        BoundExprKind::InList { expr, list, .. } => {
+            validate_grouped_expr(expr, group_by)?;
+            for candidate in list {
+                validate_grouped_expr(candidate, group_by)?;
+            }
+            Ok(())
+        }
     }
 }
 
-fn bind_select(
-    table_name: ParsedObjectName,
-    projection: Vec<ParsedProjection>,
-    filter: Option<ParsedExpr>,
-    order_by: Vec<ParsedOrder>,
-    limit: Option<ParsedExpr>,
-    catalog: &Catalog,
-    view_depth: usize,
-) -> Result<BoundStatement> {
+fn bind_select(input: SelectInput, catalog: &Catalog, view_depth: usize) -> Result<BoundStatement> {
+    let SelectInput {
+        table_name,
+        projection,
+        filter,
+        order_by,
+        offset,
+        limit,
+    } = input;
     let (schema_name, relation_name, _) = split_table_name(&table_name)?;
     if let Some(view) = catalog.view(&schema_name, &relation_name) {
         return bind_view_select(
-            view, projection, filter, order_by, limit, catalog, view_depth,
+            view,
+            SelectInput {
+                table_name,
+                projection,
+                filter,
+                order_by,
+                offset,
+                limit,
+            },
+            catalog,
+            view_depth,
         );
     }
     let table = resolve_table(&table_name, catalog)?.clone();
@@ -6007,27 +12187,17 @@ fn bind_select(
     if bound_projection.is_empty() {
         return Err(DbError::new(SYNTAX_ERROR, "SELECT projection is empty"));
     }
-
     let filter = filter
         .map(|expr| bind_boolean_expr(expr, &table))
         .transpose()?;
     let order_by = order_by
         .into_iter()
-        .map(|order| {
-            let ParsedExprKind::Column(column) = order.expr.kind else {
-                return unsupported_at(
-                    "ORDER BY supports source columns only",
-                    order.expr.position,
-                );
-            };
-            Ok(BoundOrder {
-                column_index: resolve_column(&column, &table)?,
-                ascending: order.ascending,
-                nulls_first: order.nulls_first,
-            })
-        })
+        .map(|order| bind_simple_order(order, &bound_projection, &table))
         .collect::<Result<Vec<_>>>()?;
     let limit = limit
+        .map(|expr| bind_expr(expr, Some(&table), Some(&ScalarType::Int64)))
+        .transpose()?;
+    let offset = offset
         .map(|expr| bind_expr(expr, Some(&table), Some(&ScalarType::Int64)))
         .transpose()?;
     let schema = Schema::new(
@@ -6042,22 +12212,28 @@ fn bind_select(
         projection: bound_projection,
         filter,
         order_by,
+        offset,
         limit,
     })
 }
 
 fn bind_view_select(
     view: &ViewDefinition,
-    projection: Vec<ParsedProjection>,
-    filter: Option<ParsedExpr>,
-    order_by: Vec<ParsedOrder>,
-    limit: Option<ParsedExpr>,
+    input: SelectInput,
     catalog: &Catalog,
     view_depth: usize,
 ) -> Result<BoundStatement> {
-    if filter.is_some() || !order_by.is_empty() || limit.is_some() {
+    let SelectInput {
+        table_name: _,
+        projection,
+        filter,
+        order_by,
+        offset,
+        limit,
+    } = input;
+    if filter.is_some() || !order_by.is_empty() || offset.is_some() || limit.is_some() {
         return unsupported(
-            "WHERE, ORDER BY, and LIMIT on views are not supported in this milestone",
+            "WHERE, ORDER BY, OFFSET, and LIMIT on views are not supported in this milestone",
         );
     }
     let source = match view.kind {
@@ -6095,6 +12271,7 @@ fn bind_view_select(
                 projection,
                 filter: None,
                 order_by: Vec::new(),
+                offset: None,
                 limit: None,
             }
         }
@@ -6162,6 +12339,7 @@ fn bind_update(
     table_name: ParsedObjectName,
     assignments: Vec<(ParsedIdentifier, ParsedExpr)>,
     filter: Option<ParsedExpr>,
+    returning: Vec<ParsedProjection>,
     catalog: &Catalog,
 ) -> Result<BoundStatement> {
     let table = resolve_table(&table_name, catalog)?.clone();
@@ -6189,27 +12367,89 @@ fn bind_update(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
+    let returning = bind_returning(returning, &table)?;
     Ok(BoundStatement::Update {
         table_id: table.id,
         assignments,
         filter: filter
             .map(|expr| bind_boolean_expr(expr, &table))
             .transpose()?,
+        returning,
     })
 }
 
 fn bind_delete(
     table_name: ParsedObjectName,
     filter: Option<ParsedExpr>,
+    returning: Vec<ParsedProjection>,
     catalog: &Catalog,
 ) -> Result<BoundStatement> {
     let table = resolve_table(&table_name, catalog)?.clone();
+    let returning = bind_returning(returning, &table)?;
     Ok(BoundStatement::Delete {
         table_id: table.id,
         filter: filter
             .map(|expr| bind_boolean_expr(expr, &table))
             .transpose()?,
+        returning,
     })
+}
+
+fn bind_returning(
+    returning: Vec<ParsedProjection>,
+    table: &TableDefinition,
+) -> Result<Option<BoundReturning>> {
+    if returning.is_empty() {
+        return Ok(None);
+    }
+    let mut projection = Vec::new();
+    for item in returning {
+        match item {
+            ParsedProjection::Wildcard => {
+                for (index, column) in table.columns().iter().enumerate() {
+                    projection.push(BoundProjection {
+                        expr: BoundExpr {
+                            kind: BoundExprKind::Column { index },
+                            data_type: column.data_type.clone(),
+                            nullable: column.nullable,
+                        },
+                        field: Field::new(
+                            column.name.as_str(),
+                            column.data_type.clone(),
+                            column.nullable,
+                        ),
+                    });
+                }
+            }
+            ParsedProjection::Expression { expr, alias } => {
+                let default_name = projection_name(&expr);
+                let bound = bind_expr(expr, Some(table), None)?;
+                if bound_expr_has_aggregate(&bound) {
+                    return Err(DbError::new(
+                        "42803",
+                        "aggregate functions are not allowed in RETURNING",
+                    ));
+                }
+                projection.push(BoundProjection {
+                    field: Field::new(
+                        alias
+                            .as_ref()
+                            .map_or(default_name.as_str(), |alias| alias.name.as_str()),
+                        bound.data_type.clone(),
+                        bound.nullable,
+                    ),
+                    expr: bound,
+                });
+            }
+        }
+    }
+    let schema = Schema::new(
+        projection
+            .iter()
+            .map(|projection| projection.field.clone())
+            .collect(),
+    );
+    Ok(Some(BoundReturning { schema, projection }))
 }
 
 fn bind_boolean_expr(expr: ParsedExpr, table: &TableDefinition) -> Result<BoundExpr> {
@@ -6276,6 +12516,34 @@ fn bind_expr_with_parameter_types(
                 nullable: true,
             })
         }
+        ParsedExprKind::ResolvedParameter { index, data_type } => {
+            let declared = parameter_types.get(&index);
+            if let Some(declared) = declared {
+                ensure_types_compatible(&data_type, declared, position)?;
+            }
+            if let Some(expected) = expected {
+                ensure_types_compatible(&data_type, expected, position)?;
+            }
+            Ok(BoundExpr {
+                kind: BoundExprKind::Parameter { index },
+                data_type,
+                nullable: true,
+            })
+        }
+        ParsedExprKind::ApplyValue {
+            index,
+            data_type,
+            nullable,
+        } => {
+            if let Some(expected) = expected {
+                ensure_types_compatible(&data_type, expected, position)?;
+            }
+            Ok(BoundExpr {
+                kind: BoundExprKind::ApplyValue { index },
+                data_type,
+                nullable,
+            })
+        }
         ParsedExprKind::Unary { op, expr } => match op {
             UnaryOperator::Not => {
                 let expr = bind_expr_with_parameter_types(
@@ -6319,12 +12587,112 @@ fn bind_expr_with_parameter_types(
                 })
             }
         },
-        ParsedExprKind::Binary { left, op, right } => {
-            bind_binary(*left, op, *right, table, position, parameter_types)
+        ParsedExprKind::Binary { left, op, right } => bind_binary(
+            *left,
+            op,
+            *right,
+            table,
+            position,
+            expected,
+            parameter_types,
+        ),
+        ParsedExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            if expected.is_some_and(|expected| expected != &ScalarType::Boolean) {
+                return Err(DbError::new(
+                    DATATYPE_MISMATCH,
+                    "IN predicate produces a boolean result",
+                )
+                .with_position_opt(position));
+            }
+            let mut operand_type = infer_expr_type(&expr, table, parameter_types)?;
+            for candidate in &list {
+                let Some(candidate_type) = infer_expr_type(candidate, table, parameter_types)?
+                else {
+                    continue;
+                };
+                operand_type = Some(match operand_type {
+                    Some(current) => common_type(&current, &candidate_type).ok_or_else(|| {
+                        DbError::new(
+                            DATATYPE_MISMATCH,
+                            format!(
+                                "IN types {current:?} and {candidate_type:?} cannot be matched"
+                            ),
+                        )
+                        .with_position_opt(position)
+                    })?,
+                    None => candidate_type,
+                });
+            }
+            let operand_type = operand_type.ok_or_else(|| {
+                DbError::new(
+                    INDETERMINATE_DATATYPE,
+                    "could not determine data type of IN operands",
+                )
+                .with_position_opt(position)
+            })?;
+            if operand_type == ScalarType::Json {
+                return Err(DbError::new(
+                    "42883",
+                    "could not identify an equality operator for type json",
+                )
+                .with_position_opt(position));
+            }
+            let expr =
+                bind_expr_with_parameter_types(*expr, table, Some(&operand_type), parameter_types)?;
+            let list = list
+                .into_iter()
+                .map(|candidate| {
+                    bind_expr_with_parameter_types(
+                        candidate,
+                        table,
+                        Some(&operand_type),
+                        parameter_types,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let nullable = expr.nullable || list.iter().any(|candidate| candidate.nullable);
+            Ok(BoundExpr {
+                kind: BoundExprKind::InList {
+                    expr: Box::new(expr),
+                    list,
+                    negated,
+                },
+                data_type: ScalarType::Boolean,
+                nullable,
+            })
         }
+        ParsedExprKind::ScalarSubquery(_) => unsupported_at(
+            "scalar subquery Apply execution is not supported yet",
+            position,
+        ),
+        ParsedExprKind::Exists { .. } => {
+            unsupported_at("EXISTS Apply execution is not supported yet", position)
+        }
+        ParsedExprKind::InSubquery { .. } => {
+            unsupported_at("IN subquery Apply execution is not supported yet", position)
+        }
+        ParsedExprKind::QuantifiedSubquery { .. } => unsupported_at(
+            "ANY/ALL subquery Apply execution is not supported yet",
+            position,
+        ),
+        ParsedExprKind::RowSubquery { .. } => unsupported_at(
+            "row subquery Apply execution is not supported in this context",
+            position,
+        ),
         ParsedExprKind::Aggregate { .. } => {
             unsupported_at("aggregate is not valid in this statement", position)
         }
+        ParsedExprKind::Window { .. }
+        | ParsedExprKind::NamedWindow { .. }
+        | ParsedExprKind::WindowValue { .. } => Err(DbError::new(
+            "42P20",
+            "window functions are not allowed in this statement",
+        )
+        .with_position_opt(position)),
     }
 }
 
@@ -6334,6 +12702,7 @@ fn bind_binary(
     right: ParsedExpr,
     table: Option<&TableDefinition>,
     position: Option<usize>,
+    expected: Option<&ScalarType>,
     parameter_types: &BTreeMap<usize, ScalarType>,
 ) -> Result<BoundExpr> {
     if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
@@ -6369,11 +12738,11 @@ fn bind_binary(
 
     let left_type = infer_expr_type(&left, table, parameter_types)?;
     let right_type = infer_expr_type(&right, table, parameter_types)?;
-    let comparison_type = match (left_type, right_type) {
+    let mut operand_type = match (left_type, right_type) {
         (Some(left), Some(right)) => common_type(&left, &right).ok_or_else(|| {
             DbError::new(
                 DATATYPE_MISMATCH,
-                format!("cannot compare {left:?} with {right:?}"),
+                format!("operator cannot match {left:?} with {right:?}"),
             )
             .with_position_opt(position)
         })?,
@@ -6386,10 +12755,21 @@ fn bind_binary(
             .with_position_opt(position));
         }
     };
-    let left =
-        bind_expr_with_parameter_types(left, table, Some(&comparison_type), parameter_types)?;
-    let right =
-        bind_expr_with_parameter_types(right, table, Some(&comparison_type), parameter_types)?;
+    if is_arithmetic_operator(op) && !is_numeric(&operand_type) {
+        return Err(DbError::new(
+            "42883",
+            format!("arithmetic operator is not defined for {operand_type:?}"),
+        )
+        .with_position_opt(position));
+    }
+    if is_arithmetic_operator(op)
+        && let Some(expected) = expected
+    {
+        ensure_types_compatible(&operand_type, expected, position)?;
+        operand_type = expected.clone();
+    }
+    let left = bind_expr_with_parameter_types(left, table, Some(&operand_type), parameter_types)?;
+    let right = bind_expr_with_parameter_types(right, table, Some(&operand_type), parameter_types)?;
     let nullable = left.nullable || right.nullable;
     Ok(BoundExpr {
         kind: BoundExprKind::Binary {
@@ -6397,7 +12777,11 @@ fn bind_binary(
             op,
             right: Box::new(right),
         },
-        data_type: ScalarType::Boolean,
+        data_type: if is_arithmetic_operator(op) {
+            operand_type
+        } else {
+            ScalarType::Boolean
+        },
         nullable,
     })
 }
@@ -6421,11 +12805,42 @@ fn infer_expr_type(
         }
         ParsedExprKind::Literal(value) => Ok(value.scalar_type()),
         ParsedExprKind::Parameter(index) => Ok(parameter_types.get(index).cloned()),
+        ParsedExprKind::ResolvedParameter { data_type, .. } => Ok(Some(data_type.clone())),
         ParsedExprKind::Unary { op, expr: inner } => match op {
             UnaryOperator::Not => Ok(Some(ScalarType::Boolean)),
             UnaryOperator::Negate => infer_expr_type(inner, table, parameter_types),
         },
-        ParsedExprKind::Binary { .. } => Ok(Some(ScalarType::Boolean)),
+        ParsedExprKind::Binary { left, op, right } => {
+            if is_arithmetic_operator(*op) {
+                let left = infer_expr_type(left, table, parameter_types)?;
+                let right = infer_expr_type(right, table, parameter_types)?;
+                Ok(match (left, right) {
+                    (Some(left), Some(right)) => common_type(&left, &right),
+                    (Some(data_type), None) | (None, Some(data_type)) => Some(data_type),
+                    (None, None) => None,
+                })
+            } else {
+                Ok(Some(ScalarType::Boolean))
+            }
+        }
+        ParsedExprKind::InList { .. }
+        | ParsedExprKind::Exists { .. }
+        | ParsedExprKind::InSubquery { .. }
+        | ParsedExprKind::QuantifiedSubquery { .. }
+        | ParsedExprKind::RowSubquery { .. } => Ok(Some(ScalarType::Boolean)),
+        ParsedExprKind::ScalarSubquery(_) => Ok(None),
+        ParsedExprKind::ApplyValue { data_type, .. } => Ok(Some(data_type.clone())),
+        ParsedExprKind::WindowValue { .. } => Ok(Some(ScalarType::Int64)),
+        ParsedExprKind::Window { .. } => Err(DbError::new(
+            "42P20",
+            "window functions are not allowed in this statement",
+        )
+        .with_position_opt(expr.position)),
+        ParsedExprKind::NamedWindow { .. } => Err(DbError::new(
+            "42704",
+            "named window reference was not resolved",
+        )
+        .with_position_opt(expr.position)),
         ParsedExprKind::Aggregate { .. } => {
             unsupported_at("aggregate is not valid in this statement", expr.position)
         }
@@ -6556,6 +12971,17 @@ fn ensure_types_compatible(
         .with_position_opt(position));
     }
     Ok(())
+}
+
+const fn is_arithmetic_operator(operator: BinaryOperator) -> bool {
+    matches!(
+        operator,
+        BinaryOperator::Add
+            | BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo
+    )
 }
 
 fn is_numeric(data_type: &ScalarType) -> bool {
@@ -7182,7 +13608,6 @@ mod tests {
     fn rejects_unsupported_syntax_without_panicking() {
         let catalog = catalog_with_documents();
         for sql in [
-            "WITH d AS (SELECT * FROM documents) SELECT * FROM d",
             "CREATE TABLE inherited (id BIGINT) INHERITS (documents)",
             "CREATE INDEX unsupported_hash ON documents USING HASH (id)",
         ] {
@@ -7233,6 +13658,886 @@ mod tests {
         )
         .expect("bind explain");
         assert!(matches!(explain, BoundStatement::Explain { .. }));
+    }
+
+    #[test]
+    fn binds_lateral_derived_tables_with_left_to_right_scope() {
+        let catalog = catalog_with_documents();
+        let statement = parse(
+            "SELECT d.id, matched.renamed_title FROM documents d \
+             INNER JOIN LATERAL ( \
+                 SELECT lookup.title FROM documents lookup WHERE lookup.id = d.id \
+             ) AS matched(renamed_title) ON TRUE",
+        )
+        .expect("parse LATERAL derived table");
+        let ParsedStatement::AdvancedSelect { joins, .. } = &statement else {
+            panic!("parsed LATERAL advanced select");
+        };
+        assert!(matches!(
+            joins[0].source,
+            ParsedJoinSource::Derived { lateral: true, .. }
+        ));
+
+        let statement = bind(statement, &catalog).expect("bind LATERAL derived table");
+        let BoundStatement::AdvancedSelect { joins, schema, .. } = statement else {
+            panic!("bound LATERAL advanced select");
+        };
+        assert_eq!(schema.fields[1].name, "renamed_title");
+        let BoundJoinSource::Derived {
+            lateral,
+            query,
+            offset,
+            width,
+            ..
+        } = &joins[0].source
+        else {
+            panic!("bound derived join source");
+        };
+        assert!(*lateral);
+        assert_eq!((*offset, *width), (2, 1));
+        let BoundStatement::AdvancedSelect {
+            filter: Some(filter),
+            ..
+        } = query.as_ref()
+        else {
+            panic!("bound correlated derived query");
+        };
+        assert!(matches!(
+            &filter.kind,
+            BoundExprKind::Binary { right, .. }
+                if matches!(right.kind, BoundExprKind::Correlation { depth: 1, index: 0 })
+        ));
+
+        let error = bind(
+            parse(
+                "SELECT d.id FROM documents d \
+                 INNER JOIN (SELECT lookup.id FROM documents lookup WHERE lookup.id = d.id) \
+                 AS matched ON TRUE",
+            )
+            .expect("parse non-LATERAL derived table"),
+            &catalog,
+        )
+        .expect_err("non-LATERAL source cannot see its left input");
+        assert_eq!(error.sql_state, UNDEFINED_COLUMN);
+
+        let error = bind(
+            parse(
+                "SELECT d.id FROM documents d \
+                 INNER JOIN LATERAL (SELECT lookup.id FROM documents lookup) \
+                 AS matched(first, extra) ON TRUE",
+            )
+            .expect("parse excessive derived aliases"),
+            &catalog,
+        )
+        .expect_err("derived alias count");
+        assert_eq!(error.sql_state, SYNTAX_ERROR);
+    }
+
+    #[test]
+    fn binds_postgres_aggregate_filter_predicates() {
+        let catalog = catalog_with_documents();
+        let statement = bind(
+            parse(
+                "SELECT COUNT(*) FILTER (WHERE id > $1) AS selected, \
+                 SUM(id) FILTER (WHERE title = 'keep') AS total FROM documents",
+            )
+            .expect("parse aggregate FILTER"),
+            &catalog,
+        )
+        .expect("bind aggregate FILTER");
+        let BoundStatement::AdvancedSelect { projection, .. } = statement else {
+            panic!("aggregate FILTER select");
+        };
+        assert!(matches!(
+            projection[0].expr.kind,
+            BoundExprKind::Aggregate {
+                filter: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            projection[1].expr.kind,
+            BoundExprKind::Aggregate {
+                filter: Some(_),
+                ..
+            }
+        ));
+
+        let error = bind(
+            parse("SELECT COUNT(*) FILTER (WHERE id) FROM documents")
+                .expect("parse invalid aggregate FILTER"),
+            &catalog,
+        )
+        .expect_err("non-boolean aggregate FILTER");
+        assert_eq!(error.sql_state, DATATYPE_MISMATCH);
+    }
+
+    #[test]
+    fn binds_postgres_distinct_aggregate_inputs() {
+        let catalog = catalog_with_documents();
+        let statement = bind(
+            parse(
+                "SELECT COUNT(DISTINCT id), SUM(DISTINCT id) FILTER (WHERE id > 0), \
+                 AVG(ALL id) FROM documents",
+            )
+            .expect("parse DISTINCT aggregates"),
+            &catalog,
+        )
+        .expect("bind DISTINCT aggregates");
+        let BoundStatement::AdvancedSelect { projection, .. } = statement else {
+            panic!("DISTINCT aggregate select");
+        };
+        assert!(matches!(
+            projection[0].expr.kind,
+            BoundExprKind::Aggregate { distinct: true, .. }
+        ));
+        assert!(matches!(
+            projection[1].expr.kind,
+            BoundExprKind::Aggregate {
+                distinct: true,
+                filter: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            projection[2].expr.kind,
+            BoundExprKind::Aggregate {
+                distinct: false,
+                ..
+            }
+        ));
+
+        let error = parse("SELECT COUNT(DISTINCT *) FROM documents")
+            .expect_err("DISTINCT wildcard aggregate must fail");
+        assert_eq!(error.sql_state, SYNTAX_ERROR);
+    }
+
+    #[test]
+    fn binds_inline_ranking_windows_after_apply_slots() {
+        let catalog = catalog_with_documents();
+        let statement = bind(
+            parse(
+                "SELECT id, \
+                 (SELECT lookup.id FROM documents lookup \
+                  WHERE lookup.id = documents.id LIMIT 1) AS copied, \
+                 ROW_NUMBER() OVER (PARTITION BY title ORDER BY id DESC) AS row_no, \
+                 RANK() OVER (PARTITION BY title ORDER BY id DESC) AS rank_no, \
+                 DENSE_RANK() OVER (PARTITION BY title ORDER BY id DESC) AS dense_no \
+                 FROM documents ORDER BY row_no, id",
+            )
+            .expect("parse ranking windows"),
+            &catalog,
+        )
+        .expect("bind ranking windows");
+        let BoundStatement::AdvancedSelect {
+            applies,
+            windows,
+            projection,
+            order_by,
+            ..
+        } = statement
+        else {
+            panic!("ranking window select");
+        };
+        assert_eq!(applies.len(), 1);
+        assert_eq!(windows.len(), 3);
+        assert!(matches!(windows[0].function, WindowFunction::RowNumber));
+        assert!(matches!(windows[1].function, WindowFunction::Rank));
+        assert!(matches!(windows[2].function, WindowFunction::DenseRank));
+        assert_eq!(windows[0].partition_by.len(), 1);
+        assert_eq!(windows[0].order_by.len(), 1);
+        assert!(!windows[0].order_by[0].ascending);
+        assert!(matches!(
+            projection[1].expr.kind,
+            BoundExprKind::ApplyValue { index: 2 }
+        ));
+        for (ordinal, projection) in projection.iter().skip(2).enumerate() {
+            assert!(matches!(
+                projection.expr.kind,
+                BoundExprKind::ApplyValue { index } if index == 3 + ordinal
+            ));
+            assert_eq!(projection.field.data_type, ScalarType::Int64);
+            assert!(!projection.field.nullable);
+        }
+        assert_eq!(order_by.len(), 2);
+    }
+
+    #[test]
+    fn ranking_windows_fail_closed_for_unimplemented_or_invalid_forms() {
+        let catalog = catalog_with_documents();
+        let named = bind(
+            parse(
+                "SELECT ROW_NUMBER() OVER ranked FROM documents \
+             WINDOW ranked AS (ORDER BY id)",
+            )
+            .expect("parse named window"),
+            &catalog,
+        )
+        .expect("bind named window");
+        let BoundStatement::AdvancedSelect { windows, .. } = named else {
+            panic!("named window select");
+        };
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].order_by.len(), 1);
+
+        let inherited = bind(
+            parse(
+                "SELECT RANK() OVER ranked FROM documents \
+                 WINDOW grouped AS (PARTITION BY title), \
+                        ranked AS (grouped ORDER BY id)",
+            )
+            .expect("parse inherited window"),
+            &catalog,
+        )
+        .expect("bind inherited window");
+        let BoundStatement::AdvancedSelect { windows, .. } = inherited else {
+            panic!("inherited window select");
+        };
+        assert_eq!(windows[0].partition_by.len(), 1);
+        assert_eq!(windows[0].order_by.len(), 1);
+
+        let missing = parse("SELECT RANK() OVER missing_window FROM documents")
+            .expect_err("missing named window");
+        assert_eq!(missing.sql_state, "42704");
+
+        let duplicate = parse(
+            "SELECT RANK() OVER duplicate_name FROM documents \
+             WINDOW duplicate_name AS (ORDER BY id), duplicate_name AS (ORDER BY title)",
+        )
+        .expect_err("duplicate named window");
+        assert_eq!(duplicate.sql_state, "42712");
+
+        let framed = bind(
+            parse("SELECT RANK() OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) FROM documents")
+                .expect("parse explicit frame"),
+            &catalog,
+        )
+        .expect("bind explicit frame");
+        let BoundStatement::AdvancedSelect { windows, .. } = framed else {
+            panic!("framed window select");
+        };
+        assert!(matches!(
+            windows[0].frame,
+            Some(BoundWindowFrame {
+                units: WindowFrameUnits::Rows,
+                start_bound: BoundWindowFrameBound::UnboundedPreceding,
+                end_bound: BoundWindowFrameBound::CurrentRow,
+            })
+        ));
+
+        let inline_inherited = bind(
+            parse(
+                "SELECT RANK() OVER (grouped ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) \
+                 FROM documents WINDOW grouped AS (PARTITION BY title)",
+            )
+            .expect("parse inline inherited frame"),
+            &catalog,
+        )
+        .expect("bind inline inherited frame");
+        let BoundStatement::AdvancedSelect { windows, .. } = inline_inherited else {
+            panic!("inline inherited window select");
+        };
+        assert_eq!(windows[0].partition_by.len(), 1);
+        assert!(windows[0].frame.is_some());
+
+        let invalid_order = parse(
+            "SELECT RANK() OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) \
+             FROM documents",
+        )
+        .expect_err("frame end before start");
+        assert_eq!(invalid_order.sql_state, "42P20");
+
+        let range_without_order = bind(
+            parse("SELECT RANK() OVER (RANGE 1 PRECEDING) FROM documents")
+                .expect("parse RANGE offset"),
+            &catalog,
+        )
+        .expect_err("RANGE offset without one ORDER BY");
+        assert_eq!(range_without_order.sql_state, "42P20");
+
+        let variable_offset = bind(
+            parse("SELECT RANK() OVER (ORDER BY id ROWS id PRECEDING) FROM documents")
+                .expect("parse variable ROWS offset"),
+            &catalog,
+        )
+        .expect_err("frame variable");
+        assert_eq!(variable_offset.sql_state, "42P20");
+
+        let groups = parse("SELECT RANK() OVER (ORDER BY id GROUPS CURRENT ROW) FROM documents")
+            .expect_err("GROUPS frame");
+        assert_eq!(groups.sql_state, FEATURE_NOT_SUPPORTED);
+
+        let in_where = bind(
+            parse("SELECT id FROM documents WHERE ROW_NUMBER() OVER () = 1")
+                .expect("parse window in WHERE"),
+            &catalog,
+        )
+        .expect_err("window in WHERE");
+        assert_eq!(in_where.sql_state, "42P20");
+
+        let nested = bind(
+            parse("SELECT SUM(ROW_NUMBER() OVER ()) FROM documents").expect("parse nested window"),
+            &catalog,
+        )
+        .expect_err("nested window");
+        assert_eq!(nested.sql_state, "42P20");
+    }
+
+    #[test]
+    fn binds_value_and_aggregate_window_types() {
+        let catalog = catalog_with_documents();
+        let statement = bind(
+            parse(
+                "SELECT
+                    LAG(id) OVER ordered,
+                    LEAD(id, 2, 0) OVER ordered,
+                    FIRST_VALUE(title) OVER ordered,
+                    LAST_VALUE(title) OVER (
+                        ordered ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ),
+                    NTH_VALUE(title, 2) OVER ordered,
+                    COUNT(*) OVER (PARTITION BY title),
+                    SUM(id) FILTER (WHERE id > 0) OVER (PARTITION BY title),
+                    AVG(id) OVER (PARTITION BY title)
+                 FROM documents WINDOW ordered AS (PARTITION BY title ORDER BY id)",
+            )
+            .expect("parse value and aggregate windows"),
+            &catalog,
+        )
+        .expect("bind value and aggregate windows");
+        let BoundStatement::AdvancedSelect {
+            windows, schema, ..
+        } = statement
+        else {
+            panic!("window select");
+        };
+        assert_eq!(windows.len(), 8);
+        assert!(matches!(windows[0].function, WindowFunction::Lag));
+        assert!(matches!(windows[1].function, WindowFunction::Lead));
+        assert!(matches!(windows[2].function, WindowFunction::FirstValue));
+        assert!(matches!(windows[3].function, WindowFunction::LastValue));
+        assert!(matches!(windows[4].function, WindowFunction::NthValue));
+        assert!(matches!(
+            windows[5].function,
+            WindowFunction::Aggregate(AggregateFunction::Count)
+        ));
+        assert!(windows[5].count_star);
+        assert!(windows[6].filter.is_some());
+        assert_eq!(schema.fields[0].data_type, ScalarType::Int64);
+        assert!(schema.fields[0].nullable);
+        assert_eq!(schema.fields[2].data_type, ScalarType::Text);
+        assert_eq!(schema.fields[5].data_type, ScalarType::Int64);
+        assert!(!schema.fields[5].nullable);
+        assert_eq!(schema.fields[6].data_type, ScalarType::Int64);
+        assert!(schema.fields[6].nullable);
+        assert_eq!(schema.fields[7].data_type, ScalarType::Float64);
+
+        let distinct = parse("SELECT COUNT(DISTINCT id) OVER () FROM documents")
+            .expect_err("DISTINCT window aggregate");
+        assert_eq!(distinct.sql_state, FEATURE_NOT_SUPPORTED);
+
+        let non_aggregate_filter =
+            parse("SELECT LAG(id) FILTER (WHERE id > 0) OVER (ORDER BY id) FROM documents")
+                .expect_err("FILTER on non-aggregate window");
+        assert_eq!(non_aggregate_filter.sql_state, "42809");
+    }
+
+    #[test]
+    fn binds_select_distinct_and_enforces_order_visibility() {
+        let catalog = catalog_with_documents();
+        let statement = bind(
+            parse("SELECT DISTINCT title FROM documents ORDER BY title")
+                .expect("parse SELECT DISTINCT"),
+            &catalog,
+        )
+        .expect("bind SELECT DISTINCT");
+        assert!(matches!(
+            statement,
+            BoundStatement::AdvancedSelect { distinct: true, .. }
+        ));
+
+        let all = bind(
+            parse("SELECT ALL title FROM documents").expect("parse SELECT ALL"),
+            &catalog,
+        )
+        .expect("bind SELECT ALL");
+        assert!(matches!(all, BoundStatement::Select { .. }));
+
+        let error = bind(
+            parse("SELECT DISTINCT title FROM documents ORDER BY id")
+                .expect("parse invalid DISTINCT order"),
+            &catalog,
+        )
+        .expect_err("DISTINCT order expression outside projection");
+        assert_eq!(error.sql_state, "42P10");
+
+        let error = parse("SELECT DISTINCT ON (title) title FROM documents")
+            .expect_err("DISTINCT ON remains explicit");
+        assert_eq!(error.sql_state, FEATURE_NOT_SUPPORTED);
+
+        let mut json_catalog = Catalog::default();
+        json_catalog
+            .create_table(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("payloads"),
+                vec![NewColumn::new(
+                    Identifier::unquoted("payload"),
+                    ScalarType::Json,
+                )],
+            )
+            .expect("JSON table");
+        for sql in [
+            "SELECT DISTINCT payload FROM payloads",
+            "SELECT COUNT(DISTINCT payload) FROM payloads",
+        ] {
+            let error = bind(parse(sql).expect("parse JSON DISTINCT"), &json_catalog)
+                .expect_err("JSON DISTINCT equality");
+            assert_eq!(error.sql_state, "42883");
+        }
+    }
+
+    #[test]
+    fn binds_in_lists_with_shared_parameter_types() {
+        let catalog = catalog_with_documents();
+        let statement = bind(
+            parse("SELECT id FROM documents WHERE id NOT IN ($1, 2, NULL)")
+                .expect("parse NOT IN list"),
+            &catalog,
+        )
+        .expect("bind NOT IN list");
+        let BoundStatement::Select {
+            filter:
+                Some(BoundExpr {
+                    kind:
+                        BoundExprKind::InList {
+                            expr,
+                            list,
+                            negated,
+                        },
+                    ..
+                }),
+            ..
+        } = statement
+        else {
+            panic!("bound NOT IN filter");
+        };
+        assert!(negated);
+        assert_eq!(expr.data_type, ScalarType::Int64);
+        assert_eq!(list.len(), 3);
+        assert!(matches!(
+            list[0].kind,
+            BoundExprKind::Parameter { index: 1 }
+        ));
+        assert_eq!(list[0].data_type, ScalarType::Int64);
+
+        let error = bind(
+            parse("SELECT id FROM documents WHERE id IN ('wrong')")
+                .expect("parse incompatible IN list"),
+            &catalog,
+        )
+        .expect_err("incompatible IN types");
+        assert_eq!(error.sql_state, DATATYPE_MISMATCH);
+
+        let error = bind(
+            parse("SELECT id FROM documents WHERE $1 IN ($2)")
+                .expect("parse indeterminate IN list"),
+            &catalog,
+        )
+        .expect_err("indeterminate IN types");
+        assert_eq!(error.sql_state, INDETERMINATE_DATATYPE);
+    }
+
+    #[test]
+    fn owns_and_binds_uncorrelated_subquery_apply_forms() {
+        let mut catalog = catalog_with_documents();
+        catalog
+            .create_table(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("apply_lookup"),
+                vec![NewColumn::new(
+                    Identifier::unquoted("id"),
+                    ScalarType::Int64,
+                )],
+            )
+            .expect("create Apply lookup");
+        let scalar =
+            parse("SELECT (SELECT id FROM documents LIMIT 1) AS selected_id FROM documents")
+                .expect("parse scalar subquery");
+        let ParsedStatement::AdvancedSelect { projection, .. } = &scalar else {
+            panic!("scalar subquery select");
+        };
+        assert!(matches!(
+            &projection[0],
+            ParsedProjection::Expression {
+                expr: ParsedExpr {
+                    kind: ParsedExprKind::ScalarSubquery(_),
+                    ..
+                },
+                ..
+            }
+        ));
+        let scalar = bind(scalar, &catalog).expect("bind scalar Apply");
+        let BoundStatement::AdvancedSelect {
+            applies,
+            projection,
+            ..
+        } = scalar
+        else {
+            panic!("bound scalar Apply select");
+        };
+        assert_eq!(applies.len(), 1);
+        assert!(matches!(applies[0].kind, BoundApplyKind::Scalar));
+        assert_eq!(
+            bound_query_schema(&applies[0].query).expect("scalar Apply schema"),
+            Schema::new(vec![Field::new("id", ScalarType::Int64, false)])
+        );
+        assert!(matches!(
+            projection[0].expr,
+            BoundExpr {
+                kind: BoundExprKind::ApplyValue { index: 2 },
+                data_type: ScalarType::Int64,
+                nullable: true,
+            }
+        ));
+
+        let cases = [
+            (
+                "SELECT id FROM documents WHERE EXISTS (SELECT id FROM documents)",
+                SubqueryQuantifier::Any,
+            ),
+            (
+                "SELECT id FROM documents WHERE id IN (SELECT id FROM documents)",
+                SubqueryQuantifier::Any,
+            ),
+            (
+                "SELECT id FROM documents WHERE id = ANY (SELECT id FROM documents)",
+                SubqueryQuantifier::Any,
+            ),
+            (
+                "SELECT id FROM documents WHERE id <> ALL (SELECT id FROM documents)",
+                SubqueryQuantifier::All,
+            ),
+        ];
+        for (index, (sql, quantifier)) in cases.into_iter().enumerate() {
+            let statement = parse(sql).expect("parse subquery predicate");
+            let ParsedStatement::AdvancedSelect {
+                filter: Some(filter),
+                ..
+            } = &statement
+            else {
+                panic!("subquery predicate select");
+            };
+            match (index, &filter.kind) {
+                (0, ParsedExprKind::Exists { negated: false, .. }) => {}
+                (1, ParsedExprKind::InSubquery { negated: false, .. }) => {}
+                (
+                    2 | 3,
+                    ParsedExprKind::QuantifiedSubquery {
+                        quantifier: actual, ..
+                    },
+                ) if actual == &quantifier => {}
+                _ => panic!("unexpected owned subquery form: {filter:?}"),
+            }
+            let statement = bind(statement, &catalog).expect("bind uncorrelated Apply");
+            let BoundStatement::AdvancedSelect {
+                applies,
+                filter: Some(filter),
+                ..
+            } = statement
+            else {
+                panic!("bound subquery predicate select");
+            };
+            assert_eq!(applies.len(), 1);
+            assert!(matches!(
+                filter.kind,
+                BoundExprKind::ApplyValue { index: 2 }
+            ));
+            match (index, &applies[0].kind) {
+                (0, BoundApplyKind::Exists { negated: false }) => {
+                    assert!(!filter.nullable);
+                }
+                (
+                    1,
+                    BoundApplyKind::In {
+                        left,
+                        negated: false,
+                    },
+                ) => {
+                    assert_eq!(left.data_type, ScalarType::Int64);
+                    assert!(filter.nullable);
+                }
+                (
+                    2 | 3,
+                    BoundApplyKind::Quantified {
+                        quantifier: actual, ..
+                    },
+                ) if actual == &quantifier => {
+                    assert!(filter.nullable);
+                }
+                _ => panic!("unexpected bound Apply form: {:?}", applies[0].kind),
+            }
+        }
+
+        let parameterized = bind(
+            parse("SELECT id FROM documents WHERE $1 IN (SELECT id FROM documents)")
+                .expect("parse parameterized Apply"),
+            &catalog,
+        )
+        .expect("bind parameterized Apply");
+        let BoundStatement::AdvancedSelect { applies, .. } = parameterized else {
+            panic!("parameterized Apply select");
+        };
+        assert!(matches!(
+            applies[0].kind,
+            BoundApplyKind::In {
+                left: BoundExpr {
+                    kind: BoundExprKind::Parameter { index: 1 },
+                    data_type: ScalarType::Int64,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        bind(
+            parse("SELECT id FROM documents WHERE EXISTS (SELECT id, title FROM documents)")
+                .expect("parse multi-column EXISTS"),
+            &catalog,
+        )
+        .expect("EXISTS may project multiple columns");
+
+        let error = bind(
+            parse("SELECT (SELECT id, title FROM documents) FROM documents")
+                .expect("parse multi-column scalar subquery"),
+            &catalog,
+        )
+        .expect_err("scalar subquery must return one column");
+        assert_eq!(error.sql_state, SYNTAX_ERROR);
+
+        let dependencies = bind(
+            parse(
+                "SELECT id FROM documents \
+                 WHERE EXISTS (SELECT id FROM apply_lookup)",
+            )
+            .expect("parse Apply dependencies"),
+            &catalog,
+        )
+        .expect("bind Apply dependencies");
+        assert_eq!(bound_statement_references(&dependencies).len(), 2);
+
+        let correlated = bind(
+            parse(
+                "SELECT outer_docs.id FROM documents outer_docs
+                 WHERE EXISTS (
+                     SELECT inner_docs.id FROM documents inner_docs
+                     WHERE inner_docs.id = outer_docs.id
+                 )",
+            )
+            .expect("parse correlated Apply"),
+            &catalog,
+        )
+        .expect("bind correlated Apply");
+        let BoundStatement::AdvancedSelect { applies, .. } = correlated else {
+            panic!("bound correlated Apply select");
+        };
+        let BoundStatement::AdvancedSelect {
+            filter: Some(filter),
+            ..
+        } = applies[0].query.as_ref()
+        else {
+            panic!("bound correlated Apply inner query");
+        };
+        assert!(matches!(
+            filter.kind,
+            BoundExprKind::Binary {
+                right: ref correlation,
+                ..
+            } if matches!(
+                correlation.kind,
+                BoundExprKind::Correlation { depth: 1, index: 0 }
+            )
+        ));
+
+        let nested = bind(
+            parse(
+                "SELECT outer_docs.id FROM documents outer_docs
+                 WHERE EXISTS (
+                     SELECT middle_docs.id FROM documents middle_docs
+                     WHERE EXISTS (
+                         SELECT inner_docs.id FROM documents inner_docs
+                         WHERE inner_docs.id = middle_docs.id
+                           AND middle_docs.id = outer_docs.id
+                     )
+                 )",
+            )
+            .expect("parse nested correlated Apply"),
+            &catalog,
+        )
+        .expect("bind nested correlated Apply");
+        assert!(matches!(nested, BoundStatement::AdvancedSelect { .. }));
+    }
+
+    #[test]
+    fn owns_and_binds_row_comparisons_and_row_apply_forms() {
+        fn select_filter(statement: &ParsedStatement) -> &ParsedExpr {
+            match statement {
+                ParsedStatement::Select {
+                    filter: Some(filter),
+                    ..
+                }
+                | ParsedStatement::AdvancedSelect {
+                    filter: Some(filter),
+                    ..
+                } => filter,
+                _ => panic!("statement does not contain a SELECT filter"),
+            }
+        }
+
+        let catalog = catalog_with_documents();
+
+        let direct = parse("SELECT id FROM documents WHERE (id, title) = (1, 'first')")
+            .expect("parse row equality");
+        let filter = select_filter(&direct);
+        assert!(matches!(
+            filter.kind,
+            ParsedExprKind::Binary {
+                op: BinaryOperator::And,
+                ..
+            }
+        ));
+        bind(direct, &catalog).expect("bind row equality");
+
+        let not_equal = parse("SELECT id FROM documents WHERE (id, title) <> (1, 'first')")
+            .expect("parse row inequality");
+        let filter = select_filter(&not_equal);
+        assert!(matches!(
+            filter.kind,
+            ParsedExprKind::Unary {
+                op: UnaryOperator::Not,
+                ..
+            }
+        ));
+        bind(not_equal, &catalog).expect("bind row inequality");
+
+        let listed =
+            parse("SELECT id FROM documents WHERE (id, title) IN ((1, 'first'), (2, NULL))")
+                .expect("parse row IN list");
+        let filter = select_filter(&listed);
+        assert!(matches!(
+            filter.kind,
+            ParsedExprKind::Binary {
+                op: BinaryOperator::Or,
+                ..
+            }
+        ));
+        bind(listed, &catalog).expect("bind row IN list");
+
+        let cases = [
+            (
+                "SELECT id FROM documents WHERE (id, title) = (SELECT id, title FROM documents LIMIT 1)",
+                None,
+                false,
+            ),
+            (
+                "SELECT id FROM documents WHERE (id, title) IN (SELECT id, title FROM documents)",
+                Some(SubqueryQuantifier::Any),
+                false,
+            ),
+            (
+                "SELECT id FROM documents WHERE (id, title) NOT IN (SELECT id, title FROM documents)",
+                Some(SubqueryQuantifier::Any),
+                true,
+            ),
+            (
+                "SELECT id FROM documents WHERE (id, title) = ANY (SELECT id, title FROM documents)",
+                Some(SubqueryQuantifier::Any),
+                false,
+            ),
+            (
+                "SELECT id FROM documents WHERE (id, title) <> ALL (SELECT id, title FROM documents)",
+                Some(SubqueryQuantifier::All),
+                false,
+            ),
+        ];
+        for (sql, quantifier, negated) in cases {
+            let statement = parse(sql).expect("parse row subquery");
+            let ParsedStatement::AdvancedSelect {
+                filter: Some(filter),
+                ..
+            } = &statement
+            else {
+                panic!("row subquery select");
+            };
+            assert!(matches!(
+                filter.kind,
+                ParsedExprKind::RowSubquery {
+                    quantifier: actual,
+                    negated: actual_negated,
+                    ..
+                } if actual == quantifier && actual_negated == negated
+            ));
+
+            let statement = bind(statement, &catalog).expect("bind row subquery");
+            let BoundStatement::AdvancedSelect {
+                applies,
+                filter: Some(filter),
+                ..
+            } = statement
+            else {
+                panic!("bound row subquery select");
+            };
+            assert_eq!(applies.len(), 1);
+            assert!(matches!(filter.kind, BoundExprKind::ApplyValue { .. }));
+            match (&applies[0].kind, quantifier) {
+                (
+                    BoundApplyKind::RowScalar {
+                        left,
+                        op: BinaryOperator::Eq,
+                        operand_types,
+                    },
+                    None,
+                ) => {
+                    assert_eq!(left.len(), 2);
+                    assert_eq!(operand_types, &[ScalarType::Int64, ScalarType::Text]);
+                }
+                (
+                    BoundApplyKind::RowQuantified {
+                        left,
+                        quantifier: actual,
+                        negated: actual_negated,
+                        operand_types,
+                        ..
+                    },
+                    Some(expected),
+                ) => {
+                    assert_eq!(left.len(), 2);
+                    assert_eq!(*actual, expected);
+                    assert_eq!(*actual_negated, negated);
+                    assert_eq!(operand_types, &[ScalarType::Int64, ScalarType::Text]);
+                }
+                _ => panic!("unexpected bound row Apply form: {:?}", applies[0].kind),
+            }
+        }
+
+        let direct_width = parse("SELECT id FROM documents WHERE (id, title) = (1, 'first', 3)")
+            .expect_err("direct row width mismatch");
+        assert_eq!(direct_width.sql_state, SYNTAX_ERROR);
+
+        let subquery_width = bind(
+            parse("SELECT id FROM documents WHERE (id, title) IN (SELECT id FROM documents)")
+                .expect("parse subquery row width mismatch"),
+            &catalog,
+        )
+        .expect_err("subquery row width mismatch");
+        assert_eq!(subquery_width.sql_state, SYNTAX_ERROR);
+
+        let ordered = parse("SELECT id FROM documents WHERE (id, title) < (1, 'first')")
+            .expect_err("ordered row comparison remains explicit");
+        assert_eq!(ordered.sql_state, FEATURE_NOT_SUPPORTED);
+
+        let mixed_list = parse("SELECT id FROM documents WHERE (id, title) IN ((1, 'first'), 2)")
+            .expect_err("row IN list requires row entries");
+        assert_eq!(mixed_list.sql_state, SYNTAX_ERROR);
     }
 
     #[test]
@@ -7482,6 +14787,98 @@ mod tests {
     }
 
     #[test]
+    fn solves_parameter_types_across_occurrences_and_query_boundaries() {
+        let catalog = catalog_with_documents();
+
+        let statement = bind(
+            parse("SELECT $1 AS repeated, id FROM documents WHERE id = $1")
+                .expect("parse cross-clause parameter"),
+            &catalog,
+        )
+        .expect("bind cross-clause parameter");
+        let BoundStatement::Select { projection, .. } = statement else {
+            panic!("simple SELECT");
+        };
+        assert_eq!(projection[0].expr.data_type, ScalarType::Int64);
+
+        let set = bind(
+            parse("SELECT $1 AS value FROM documents UNION SELECT id FROM documents")
+                .expect("parse set parameter"),
+            &catalog,
+        )
+        .expect("bind set parameter");
+        let BoundStatement::SetOperation { schema, .. } = set else {
+            panic!("set operation");
+        };
+        assert_eq!(schema.fields[0].data_type, ScalarType::Int64);
+
+        bind(
+            parse(
+                "WITH picked(value) AS (\
+                     SELECT $1 FROM documents WHERE id = $1\
+                 ) SELECT value FROM picked",
+            )
+            .expect("parse CTE parameter"),
+            &catalog,
+        )
+        .expect("bind CTE parameter");
+
+        bind(
+            parse(
+                "SELECT $1, LAG(id, $2, $1) OVER (ORDER BY id) FROM documents \
+                 WHERE id IN (SELECT id FROM documents WHERE id = $1)",
+            )
+            .expect("parse window and Apply parameters"),
+            &catalog,
+        )
+        .expect("bind window and Apply parameters");
+
+        bind(
+            parse(
+                "SELECT outer_documents.id FROM documents outer_documents \
+                 WHERE EXISTS (\
+                     SELECT middle_documents.id FROM documents middle_documents \
+                     WHERE EXISTS (\
+                         SELECT inner_documents.id FROM documents inner_documents \
+                         WHERE inner_documents.id = middle_documents.id \
+                           AND middle_documents.id = outer_documents.id\
+                     )\
+                 )",
+            )
+            .expect("parse nested correlation"),
+            &catalog,
+        )
+        .expect("parameter solver preserves nested correlation scopes");
+
+        let insert = bind(
+            parse(
+                "INSERT INTO documents (id, title) VALUES ($1, $2) \
+                 RETURNING $1, $2",
+            )
+            .expect("parse DML parameters"),
+            &catalog,
+        )
+        .expect("bind DML parameters");
+        let BoundStatement::Insert {
+            returning: Some(returning),
+            ..
+        } = insert
+        else {
+            panic!("INSERT RETURNING");
+        };
+        assert_eq!(returning.schema.fields[0].data_type, ScalarType::Int64);
+        assert_eq!(returning.schema.fields[1].data_type, ScalarType::Text);
+
+        let conflict = bind(
+            parse("SELECT $1 FROM documents WHERE id = $1 OR title = $1")
+                .expect("parse conflicting parameter"),
+            &catalog,
+        )
+        .expect_err("conflicting parameter constraints");
+        assert_eq!(conflict.sql_state, DATATYPE_MISMATCH);
+    }
+
+    #[test]
     fn defaults_to_postgresql_and_parses_dialect_names() {
         assert_eq!(
             parse("SELECT id FROM documents").expect("default parse"),
@@ -7652,33 +15049,43 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_verified_zero_offset_row_limit_forms() {
-        for (dialect, sql, expected_limit) in [
+    fn normalizes_supported_row_limit_and_offset_forms() {
+        for (dialect, sql, expected_limit, expected_offset) in [
             (
                 SqlDialect::PostgreSql,
                 "SELECT id FROM documents OFFSET 0 ROWS FETCH FIRST 4 ROWS ONLY",
                 4,
+                0,
             ),
-            (SqlDialect::MySql, "SELECT id FROM documents LIMIT 0, 5", 5),
+            (
+                SqlDialect::MySql,
+                "SELECT id FROM documents LIMIT 1, 5",
+                5,
+                1,
+            ),
             (
                 SqlDialect::Sqlite,
-                "SELECT id FROM documents LIMIT 6 OFFSET 0",
+                "SELECT id FROM documents LIMIT 6 OFFSET 2",
                 6,
+                2,
             ),
             (
                 SqlDialect::SqlServer,
                 "SELECT [id] FROM [documents] ORDER BY [id] \
-                 OFFSET 0 ROWS FETCH NEXT 7 ROWS ONLY",
+                 OFFSET 3 ROWS FETCH NEXT 7 ROWS ONLY",
                 7,
+                3,
             ),
         ] {
             let statement = parse_with_dialect(sql, dialect)
                 .unwrap_or_else(|error| panic!("{dialect}: {error:?}"));
             let ParsedStatement::Select {
-                limit: Some(limit), ..
+                limit: Some(limit),
+                offset: Some(offset),
+                ..
             } = statement
             else {
-                panic!("select with limit");
+                panic!("select with limit and offset");
             };
             assert!(
                 matches!(
@@ -7692,39 +15099,571 @@ mod tests {
                 ),
                 "{dialect}: {limit:?}"
             );
+            assert!(
+                matches!(
+                    offset.kind,
+                    ParsedExprKind::Literal(Value::Int32(value))
+                        if value == expected_offset
+                ) || matches!(
+                    offset.kind,
+                    ParsedExprKind::Literal(Value::Int64(value))
+                        if value == i64::from(expected_offset)
+                ),
+                "{dialect}: {offset:?}"
+            );
         }
     }
 
     #[test]
-    fn rejects_non_zero_offset_with_the_selected_dialect() {
-        for (dialect, sql) in [
-            (
-                SqlDialect::PostgreSql,
-                "SELECT id FROM documents LIMIT 5 OFFSET 1",
-            ),
-            (SqlDialect::MySql, "SELECT id FROM documents LIMIT 1, 5"),
-            (
-                SqlDialect::Sqlite,
-                "SELECT id FROM documents LIMIT 5 OFFSET 1",
-            ),
-            (
-                SqlDialect::SqlServer,
-                "SELECT [id] FROM [documents] ORDER BY [id] \
-                 OFFSET 1 ROWS FETCH NEXT 5 ROWS ONLY",
-            ),
-        ] {
-            let error = parse_with_dialect(sql, dialect).expect_err("non-zero offset");
-            assert_eq!(
-                error.sql_state, FEATURE_NOT_SUPPORTED,
-                "{dialect}: {error:?}"
-            );
-            if dialect != SqlDialect::PostgreSql {
-                assert!(
-                    error.message.contains(dialect.label()),
-                    "{dialect}: {error:?}"
-                );
+    fn binds_postgres_offset_and_limit_parameters_as_bigint() {
+        let catalog = catalog_with_documents();
+        let bound = bind(
+            parse("SELECT id FROM documents ORDER BY id OFFSET $1 LIMIT $2").expect("parse offset"),
+            &catalog,
+        )
+        .expect("bind offset");
+        let BoundStatement::Select {
+            offset: Some(offset),
+            limit: Some(limit),
+            ..
+        } = bound
+        else {
+            panic!("bound select with offset and limit");
+        };
+        assert_eq!(offset.data_type, ScalarType::Int64);
+        assert_eq!(limit.data_type, ScalarType::Int64);
+        assert!(matches!(offset.kind, BoundExprKind::Parameter { index: 1 }));
+        assert!(matches!(limit.kind, BoundExprKind::Parameter { index: 2 }));
+    }
+
+    #[test]
+    fn parses_and_binds_postgres_set_operations() {
+        let catalog = catalog_with_documents();
+        let bound = bind(
+            parse(
+                "SELECT id AS item_id FROM documents WHERE id <= 2 \
+                 UNION ALL \
+                 SELECT id FROM documents WHERE id >= 2 \
+                 INTERSECT \
+                 SELECT id FROM documents \
+                 ORDER BY item_id DESC NULLS LAST OFFSET $1 LIMIT $2",
+            )
+            .expect("parse set operation"),
+            &catalog,
+        )
+        .expect("bind set operation");
+        let BoundStatement::SetOperation {
+            operator: QuerySetOperator::Union,
+            all: true,
+            right,
+            schema,
+            order_by,
+            offset: Some(offset),
+            limit: Some(limit),
+            ..
+        } = bound
+        else {
+            panic!("bound outer set operation");
+        };
+        assert_eq!(schema.fields[0].name, "item_id");
+        assert_eq!(order_by[0].column_index, 0);
+        assert!(!order_by[0].ascending);
+        assert_eq!(order_by[0].nulls_first, Some(false));
+        assert!(matches!(offset.kind, BoundExprKind::Parameter { index: 1 }));
+        assert!(matches!(limit.kind, BoundExprKind::Parameter { index: 2 }));
+        assert!(matches!(
+            *right,
+            BoundStatement::SetOperation {
+                operator: QuerySetOperator::Intersect,
+                all: false,
+                ..
             }
-        }
+        ));
+
+        let width_error = bind(
+            parse(
+                "SELECT id, title FROM documents \
+                 EXCEPT SELECT id FROM documents",
+            )
+            .expect("parse mismatched set width"),
+            &catalog,
+        )
+        .expect_err("set width mismatch");
+        assert_eq!(width_error.sql_state, SYNTAX_ERROR);
+
+        let type_error = bind(
+            parse("SELECT id FROM documents UNION SELECT title FROM documents")
+                .expect("parse mismatched set types"),
+            &catalog,
+        )
+        .expect_err("set type mismatch");
+        assert_eq!(type_error.sql_state, DATATYPE_MISMATCH);
+    }
+
+    #[test]
+    fn parses_and_binds_ordered_non_recursive_ctes() {
+        let catalog = catalog_with_documents();
+        let bound = bind(
+            parse(
+                "WITH base(item, label) AS (
+                     SELECT id, title FROM documents WHERE id >= 1
+                 ), filtered AS (
+                     SELECT item AS id FROM base WHERE item <= 10
+                 )
+                 SELECT id FROM filtered ORDER BY id",
+            )
+            .expect("parse CTEs"),
+            &catalog,
+        )
+        .expect("bind CTEs");
+        let BoundStatement::With {
+            ctes, body, schema, ..
+        } = bound
+        else {
+            panic!("bound WITH");
+        };
+        assert_eq!(ctes.len(), 2);
+        assert_eq!(schema.fields[0].name, "id");
+        assert!(matches!(
+            ctes[1].seed.as_ref(),
+            BoundStatement::Select { table_id, .. } if *table_id == ctes[0].table_id
+        ));
+        assert!(matches!(
+            body.as_ref(),
+            BoundStatement::Select { table_id, .. } if *table_id == ctes[1].table_id
+        ));
+
+        let cte_apply = bind(
+            parse(
+                "WITH base(item) AS (
+                     SELECT id FROM documents WHERE id <= 2
+                 )
+                 SELECT id FROM documents
+                 WHERE EXISTS (SELECT item FROM base WHERE item = 2)",
+            )
+            .expect("parse CTE Apply"),
+            &catalog,
+        )
+        .expect("bind CTE Apply");
+        let BoundStatement::With { ctes, body, .. } = cte_apply else {
+            panic!("bound CTE Apply WITH");
+        };
+        let BoundStatement::AdvancedSelect { applies, .. } = body.as_ref() else {
+            panic!("bound CTE Apply body");
+        };
+        assert!(matches!(
+            applies[0].query.as_ref(),
+            BoundStatement::AdvancedSelect { table, .. } if table.table_id == ctes[0].table_id
+        ));
+
+        let duplicate = bind(
+            parse(
+                "WITH repeated AS (SELECT id FROM documents),
+                      repeated AS (SELECT id FROM documents)
+                 SELECT id FROM repeated",
+            )
+            .expect("parse duplicate CTE"),
+            &catalog,
+        )
+        .expect_err("duplicate CTE name");
+        assert_eq!(duplicate.sql_state, "42712");
+
+        let recursive = bind(
+            parse(
+                "WITH RECURSIVE numbers(value) AS (
+                     SELECT id FROM documents WHERE id = 1
+                     UNION ALL
+                     SELECT value + 1 FROM numbers WHERE value < 3
+                 ) SELECT value FROM numbers ORDER BY value",
+            )
+            .expect("parse recursive CTE"),
+            &catalog,
+        )
+        .expect("bind recursive CTE");
+        let BoundStatement::With { ctes, .. } = recursive else {
+            panic!("bound recursive WITH");
+        };
+        assert_eq!(ctes.len(), 1);
+        assert!(ctes[0].union_all);
+        assert!(ctes[0].recursive.is_some());
+
+        let invalid_recursive = bind(
+            parse(
+                "WITH RECURSIVE numbers(value) AS (
+                     SELECT value FROM numbers
+                 ) SELECT value FROM numbers",
+            )
+            .expect("parse invalid recursive CTE"),
+            &catalog,
+        )
+        .expect_err("recursive CTE without UNION");
+        assert_eq!(invalid_recursive.sql_state, FEATURE_NOT_SUPPORTED);
+    }
+
+    #[test]
+    fn parses_and_binds_dml_returning_projections() {
+        let catalog = catalog_with_documents();
+
+        let insert = bind(
+            parse("INSERT INTO documents VALUES (1, 'one') RETURNING id, title AS name")
+                .expect("parse insert returning"),
+            &catalog,
+        )
+        .expect("bind insert returning");
+        let BoundStatement::Insert {
+            returning: Some(returning),
+            ..
+        } = insert
+        else {
+            panic!("insert returning");
+        };
+        assert_eq!(returning.schema.fields[0].name, "id");
+        assert_eq!(returning.schema.fields[1].name, "name");
+
+        let update = bind(
+            parse("UPDATE documents SET title = 'changed' RETURNING *")
+                .expect("parse update returning"),
+            &catalog,
+        )
+        .expect("bind update returning");
+        let BoundStatement::Update {
+            returning: Some(returning),
+            ..
+        } = update
+        else {
+            panic!("update returning");
+        };
+        assert_eq!(returning.schema.fields.len(), 2);
+
+        let delete = bind(
+            parse("DELETE FROM documents RETURNING id").expect("parse delete returning"),
+            &catalog,
+        )
+        .expect("bind delete returning");
+        let BoundStatement::Delete {
+            returning: Some(returning),
+            ..
+        } = delete
+        else {
+            panic!("delete returning");
+        };
+        assert_eq!(returning.schema.fields.len(), 1);
+        assert_eq!(returning.schema.fields[0].data_type, ScalarType::Int64);
+    }
+
+    #[test]
+    fn parses_and_binds_postgres_on_conflict_actions() {
+        let mut catalog = catalog_with_documents();
+
+        let do_nothing = bind(
+            parse("INSERT INTO documents VALUES (1, 'one') ON CONFLICT DO NOTHING")
+                .expect("parse conflict do nothing"),
+            &catalog,
+        )
+        .expect("bind conflict do nothing");
+        let BoundStatement::Insert {
+            on_conflict:
+                Some(BoundOnConflict {
+                    target_columns,
+                    action,
+                }),
+            ..
+        } = do_nothing
+        else {
+            panic!("insert on conflict do nothing");
+        };
+        assert!(target_columns.is_none());
+        assert!(matches!(action, BoundConflictAction::DoNothing));
+
+        let do_update = bind(
+            parse(
+                "INSERT INTO documents VALUES (1, 'new') \
+                 ON CONFLICT (id) DO UPDATE SET title = excluded.title \
+                 WHERE documents.id = 1 RETURNING id, title",
+            )
+            .expect("parse conflict do update"),
+            &catalog,
+        )
+        .expect("bind conflict do update");
+        let BoundStatement::Insert {
+            on_conflict:
+                Some(BoundOnConflict {
+                    target_columns: Some(target_columns),
+                    action:
+                        BoundConflictAction::DoUpdate {
+                            assignments,
+                            filter: Some(filter),
+                        },
+                }),
+            returning: Some(returning),
+            ..
+        } = do_update
+        else {
+            panic!("insert on conflict do update");
+        };
+        assert_eq!(target_columns, vec![0]);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].0, 1);
+        assert!(matches!(
+            assignments[0].1.kind,
+            BoundExprKind::Column { index: 3 }
+        ));
+        assert_eq!(filter.data_type, ScalarType::Boolean);
+        assert_eq!(returning.schema.fields.len(), 2);
+
+        let table_id = catalog
+            .table(
+                &Identifier::unquoted("public"),
+                &Identifier::unquoted("documents"),
+            )
+            .expect("documents table")
+            .id;
+        let constraint_name = Identifier::unquoted("documents_id_key");
+        catalog
+            .create_constraint(
+                table_id,
+                NewConstraint {
+                    name: constraint_name.clone(),
+                    kind: NewConstraintKind::Unique {
+                        columns: vec![Identifier::unquoted("id")],
+                    },
+                },
+            )
+            .expect("create unique constraint");
+        let by_constraint = bind(
+            parse(&format!(
+                "INSERT INTO documents VALUES (1, 'one') \
+                 ON CONFLICT ON CONSTRAINT {} DO NOTHING",
+                constraint_name.as_str()
+            ))
+            .expect("parse conflict constraint"),
+            &catalog,
+        )
+        .expect("bind conflict constraint");
+        let BoundStatement::Insert {
+            on_conflict:
+                Some(BoundOnConflict {
+                    target_columns: Some(target_columns),
+                    action: BoundConflictAction::DoNothing,
+                }),
+            ..
+        } = by_constraint
+        else {
+            panic!("insert on conflict constraint");
+        };
+        assert_eq!(target_columns, vec![0]);
+    }
+
+    #[test]
+    fn parses_and_binds_ordered_postgres_merge_actions() {
+        let mut catalog = catalog_with_documents();
+        catalog
+            .create_table(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("updates"),
+                vec![
+                    NewColumn {
+                        name: Identifier::unquoted("id"),
+                        data_type: ScalarType::Int64,
+                        nullable: false,
+                        primary_key: true,
+                        unique: true,
+                        default: None,
+                    },
+                    NewColumn {
+                        name: Identifier::unquoted("title"),
+                        data_type: ScalarType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        default: None,
+                    },
+                ],
+            )
+            .expect("create merge source");
+
+        let bound = bind(
+            parse(
+                "MERGE INTO documents AS d USING updates AS u ON d.id = u.id \
+                 WHEN MATCHED AND u.title <> 'skip' THEN UPDATE SET title = u.title \
+                 WHEN MATCHED THEN DELETE \
+                 WHEN NOT MATCHED BY TARGET THEN \
+                 INSERT (id, title) VALUES (u.id, u.title) \
+                 RETURNING id, title",
+            )
+            .expect("parse merge"),
+            &catalog,
+        )
+        .expect("bind merge");
+        let BoundStatement::Merge(BoundMerge {
+            target,
+            source,
+            on,
+            clauses,
+            returning: Some(returning),
+        }) = bound
+        else {
+            panic!("bound merge");
+        };
+        assert_eq!(target.binding.as_str(), "d");
+        assert_eq!(target.offset, 0);
+        assert_eq!(source.binding.as_str(), "u");
+        assert_eq!(source.offset, 2);
+        assert!(matches!(
+            on.kind,
+            BoundExprKind::Binary {
+                left,
+                right,
+                ..
+            } if matches!(left.kind, BoundExprKind::Column { index: 0 })
+                && matches!(right.kind, BoundExprKind::Column { index: 2 })
+        ));
+        assert_eq!(clauses.len(), 3);
+        assert!(matches!(
+            &clauses[0],
+            BoundMergeClause {
+                kind: BoundMergeClauseKind::Matched,
+                predicate: Some(_),
+                action: BoundMergeAction::Update { assignments },
+            } if assignments.len() == 1
+                && assignments[0].0 == 1
+                && matches!(assignments[0].1.kind, BoundExprKind::Column { index: 3 })
+        ));
+        assert!(matches!(clauses[1].action, BoundMergeAction::Delete));
+        assert!(matches!(
+            &clauses[2].action,
+            BoundMergeAction::Insert {
+                column_indexes,
+                values,
+            } if column_indexes == &[0, 1]
+                && matches!(values[0].kind, BoundExprKind::Column { index: 2 })
+                && matches!(values[1].kind, BoundExprKind::Column { index: 3 })
+        ));
+        assert_eq!(returning.schema.fields.len(), 2);
+
+        let do_nothing = bind(
+            parse(
+                "MERGE INTO documents AS d USING updates AS u ON d.id = u.id \
+                 WHEN MATCHED THEN DO NOTHING \
+                 WHEN NOT MATCHED THEN DO NOTHING \
+                 WHEN NOT MATCHED BY SOURCE THEN DO NOTHING",
+            )
+            .expect("parse MERGE DO NOTHING"),
+            &catalog,
+        )
+        .expect("bind MERGE DO NOTHING");
+        let BoundStatement::Merge(BoundMerge {
+            clauses,
+            returning: None,
+            ..
+        }) = do_nothing
+        else {
+            panic!("bound MERGE DO NOTHING");
+        };
+        assert!(matches!(
+            clauses.as_slice(),
+            [
+                BoundMergeClause {
+                    kind: BoundMergeClauseKind::Matched,
+                    action: BoundMergeAction::DoNothing,
+                    ..
+                },
+                BoundMergeClause {
+                    kind: BoundMergeClauseKind::NotMatchedByTarget,
+                    action: BoundMergeAction::DoNothing,
+                    ..
+                },
+                BoundMergeClause {
+                    kind: BoundMergeClauseKind::NotMatchedBySource,
+                    action: BoundMergeAction::DoNothing,
+                    ..
+                }
+            ]
+        ));
+
+        let audited = merge_clause_token_info(&significant_tokens(
+            "MERGE INTO documents AS d USING updates AS u ON d.id = u.id \
+             WHEN MATCHED AND CASE WHEN u.id = 1 THEN TRUE ELSE FALSE END \
+                 THEN DO NOTHING \
+             WHEN NOT MATCHED THEN INSERT (id, title) VALUES (u.id, u.title)",
+        ))
+        .expect("audit MERGE clauses around CASE");
+        assert_eq!(audited.len(), 2);
+        assert!(audited[0].do_nothing.is_some());
+        assert!(audited[1].do_nothing.is_none());
+    }
+
+    #[test]
+    fn merge_rejects_unrepresented_upstream_fields() {
+        let catalog = catalog_with_documents();
+        let derived = parse(
+            "MERGE INTO documents AS d \
+             USING (SELECT id, title FROM documents) AS u ON d.id = u.id \
+             WHEN MATCHED THEN DELETE",
+        )
+        .expect_err("derived MERGE source");
+        assert_eq!(derived.sql_state, FEATURE_NOT_SUPPORTED);
+
+        let by_source = bind(
+            parse(
+                "MERGE INTO documents AS d USING documents AS u ON d.id = u.id \
+             WHEN NOT MATCHED BY SOURCE AND u.title = 'missing' THEN DELETE",
+            )
+            .expect("parse BY SOURCE"),
+            &catalog,
+        )
+        .expect_err("BY SOURCE source reference");
+        assert_eq!(by_source.sql_state, UNDEFINED_TABLE);
+
+        let missing_into = parse(
+            "MERGE documents AS d USING documents AS u ON d.id = u.id \
+             WHEN MATCHED THEN DELETE",
+        )
+        .expect_err("missing INTO");
+        assert_eq!(missing_into.sql_state, SYNTAX_ERROR);
+
+        let error = bind(
+            parse(
+                "MERGE INTO documents AS d USING documents AS u ON d.id = u.id \
+                 WHEN MATCHED THEN UPDATE SET missing = u.title",
+            )
+            .expect("parse missing target column"),
+            &catalog,
+        )
+        .expect_err("missing target column");
+        assert_eq!(error.sql_state, UNDEFINED_COLUMN);
+    }
+
+    #[test]
+    fn rejects_invalid_or_vendor_conflict_actions() {
+        let catalog = catalog_with_documents();
+
+        let error = bind(
+            parse("INSERT INTO documents VALUES (1, 'one') ON CONFLICT (title) DO NOTHING")
+                .expect("parse non-unique conflict target"),
+            &catalog,
+        )
+        .expect_err("non-unique target");
+        assert_eq!(error.sql_state, "42P10");
+
+        let error = bind(
+            parse(
+                "INSERT INTO documents VALUES (1, 'one') \
+                 ON CONFLICT DO UPDATE SET title = excluded.title",
+            )
+            .expect("parse targetless conflict update"),
+            &catalog,
+        )
+        .expect_err("targetless update");
+        assert_eq!(error.sql_state, SYNTAX_ERROR);
+
+        let error = parse_with_dialect(
+            "INSERT INTO documents VALUES (1, 'one') \
+             ON DUPLICATE KEY UPDATE title = 'changed'",
+            SqlDialect::MySql,
+        )
+        .expect_err("vendor conflict action");
+        assert_eq!(error.sql_state, FEATURE_NOT_SUPPORTED);
     }
 
     #[test]
@@ -7752,19 +15691,49 @@ mod tests {
         let mut stack = vec![expression];
         while let Some(expression) = stack.pop() {
             match &expression.kind {
-                ParsedExprKind::Parameter(index) => parameters.push(*index),
+                ParsedExprKind::Parameter(index)
+                | ParsedExprKind::ResolvedParameter { index, .. } => parameters.push(*index),
                 ParsedExprKind::Unary { expr, .. } => stack.push(expr),
                 ParsedExprKind::Binary { left, right, .. } => {
                     stack.push(right);
                     stack.push(left);
                 }
+                ParsedExprKind::InList { expr, list, .. } => {
+                    stack.extend(list);
+                    stack.push(expr);
+                }
+                ParsedExprKind::InSubquery { expr, .. } => stack.push(expr),
+                ParsedExprKind::QuantifiedSubquery { left, .. } => stack.push(left),
+                ParsedExprKind::RowSubquery { left, .. } => stack.extend(left),
+                ParsedExprKind::ScalarSubquery(_) | ParsedExprKind::Exists { .. } => {}
                 ParsedExprKind::Aggregate {
-                    argument: Some(argument),
-                    ..
-                } => stack.push(argument),
+                    argument, filter, ..
+                } => {
+                    if let Some(filter) = filter {
+                        stack.push(filter);
+                    }
+                    if let Some(argument) = argument {
+                        stack.push(argument);
+                    }
+                }
+                ParsedExprKind::Window { call, spec } => {
+                    if let Some(filter) = &call.filter {
+                        stack.push(filter);
+                    }
+                    stack.extend(&call.arguments);
+                    stack.extend(spec.order_by.iter().map(|order| &order.expr));
+                    stack.extend(&spec.partition_by);
+                }
+                ParsedExprKind::NamedWindow { call, .. } => {
+                    if let Some(filter) = &call.filter {
+                        stack.push(filter);
+                    }
+                    stack.extend(&call.arguments);
+                }
                 ParsedExprKind::Column(_)
                 | ParsedExprKind::Literal(_)
-                | ParsedExprKind::Aggregate { argument: None, .. } => {}
+                | ParsedExprKind::ApplyValue { .. }
+                | ParsedExprKind::WindowValue { .. } => {}
             }
         }
         parameters

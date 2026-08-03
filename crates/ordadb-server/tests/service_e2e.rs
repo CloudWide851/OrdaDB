@@ -11,7 +11,9 @@ use zeroize::Zeroizing;
 
 const ADMIN_USER: &str = "dba";
 const ADMIN_PASSWORD: &str = "correct horse battery staple";
+const OID_INT4: u32 = 23;
 const OID_INT8: u32 = 20;
+const OID_TEXT: u32 = 25;
 
 fn client(address: SocketAddr, password: &str) -> ordadb_types::Result<PgClient> {
     client_as(address, ADMIN_USER, password)
@@ -155,6 +157,33 @@ async fn pgwire_management_copy_and_restart_are_end_to_end() {
             vec![vec![Some("2".into()), Some("semi;colon".into())]]
         );
         assert_eq!(extended.command_tags, ["SELECT 1"]);
+
+        let inferred = pg.query_prepared(
+            "SELECT id, name FROM items WHERE id >= $1 ORDER BY id",
+            &[],
+            &[Some(b"2".to_vec())],
+            1,
+        )?;
+        assert_eq!(inferred.rows, extended.rows);
+
+        let widened = pg.query_prepared(
+            "SELECT id, name FROM items WHERE id >= $1 ORDER BY id",
+            &[OID_INT4],
+            &[Some(b"2".to_vec())],
+            1,
+        )?;
+        assert_eq!(widened.rows, extended.rows);
+
+        let declared_mismatch = pg
+            .query_prepared(
+                "SELECT id FROM items WHERE id >= $1",
+                &[OID_TEXT],
+                &[Some(b"2".to_vec())],
+                0,
+            )
+            .expect_err("declared parameter OID must match inferred type");
+        assert_eq!(declared_mismatch.sql_state, "42804");
+        assert_eq!(pg.query("SELECT id FROM items")?.rows.len(), 2);
 
         let extended_error = pg
             .query_prepared(
@@ -327,6 +356,163 @@ async fn pgwire_management_copy_and_restart_are_end_to_end() {
         .expect("closed connection task")
         .expect_err("stopped listener must refuse new connections");
     assert!(closed.sql_state.starts_with("08"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pgwire_dml_returning_describe_and_portal_are_end_to_end() {
+    let directory = tempdir().expect("tempdir");
+    let mut config = ServerConfig::new(directory.path());
+    config.pg_bind = "127.0.0.1:0".parse().expect("PG bind");
+    config.admin_bind = "127.0.0.1:0".parse().expect("admin bind");
+    let server = start_server(config).await.expect("server");
+    request_bootstrap(
+        server.bootstrap_pipe.as_deref().expect("bootstrap pipe"),
+        ADMIN_USER.into(),
+        Zeroizing::new(ADMIN_PASSWORD.into()),
+    )
+    .await
+    .expect("bootstrap");
+
+    let address = server.pg_address;
+    tokio::task::spawn_blocking(move || {
+        let mut pg = client(address, ADMIN_PASSWORD)?;
+        pg.query("CREATE TABLE returning_items (id BIGINT PRIMARY KEY, label TEXT NOT NULL)")?;
+
+        let inserted = pg.query(
+            "INSERT INTO returning_items VALUES (1, 'one'), (2, 'two'), (3, 'three') \
+             RETURNING id, label AS name",
+        )?;
+        assert_eq!(inserted.columns, ["id", "name"]);
+        assert_eq!(inserted.rows.len(), 3);
+        assert_eq!(inserted.command_tags, ["INSERT 0 3"]);
+
+        let upserted = pg.query_prepared(
+            "INSERT INTO returning_items VALUES ($1, $2) \
+             ON CONFLICT (id) DO UPDATE SET label = excluded.label \
+             RETURNING id, label",
+            &[OID_INT8, OID_TEXT],
+            &[Some(b"1".to_vec()), Some(b"upserted".to_vec())],
+            1,
+        )?;
+        assert_eq!(upserted.columns, ["id", "label"]);
+        assert_eq!(
+            upserted.rows,
+            [vec![Some("1".into()), Some("upserted".into())]]
+        );
+        assert_eq!(upserted.command_tags, ["INSERT 0 1"]);
+
+        let skipped = pg.query(
+            "INSERT INTO returning_items VALUES (1, 'ignored') \
+             ON CONFLICT DO NOTHING RETURNING id",
+        )?;
+        assert_eq!(skipped.columns, ["id"]);
+        assert!(skipped.rows.is_empty());
+        assert_eq!(skipped.command_tags, ["INSERT 0 0"]);
+
+        let mut returning_batches = 0_usize;
+        let updated = pg.query_prepared_batches(
+            "UPDATE returning_items SET label = label RETURNING id, label AS name",
+            &[],
+            &[],
+            1,
+            |event| {
+                if let PgQueryEvent::Batch(rows) = event {
+                    assert_eq!(rows.len(), 1);
+                    returning_batches += 1;
+                }
+                Ok(())
+            },
+        )?;
+        assert_eq!(updated.columns, ["id", "name"]);
+        assert_eq!(updated.row_count, 3);
+        assert_eq!(returning_batches, 3);
+        assert_eq!(updated.command_tags, ["UPDATE 3"]);
+
+        let deleted = pg.query_prepared(
+            "DELETE FROM returning_items WHERE id = $1 RETURNING *",
+            &[OID_INT8],
+            &[Some(b"2".to_vec())],
+            1,
+        )?;
+        assert_eq!(deleted.columns, ["id", "label"]);
+        assert_eq!(deleted.rows, [vec![Some("2".into()), Some("two".into())]]);
+        assert_eq!(deleted.command_tags, ["DELETE 1"]);
+        assert_eq!(pg.query("SELECT id FROM returning_items")?.rows.len(), 2);
+
+        pg.query("CREATE TABLE merge_source (id BIGINT PRIMARY KEY, label TEXT NOT NULL)")?;
+        pg.query("INSERT INTO merge_source VALUES (1, 'merged'), (4, 'four')")?;
+        let merged = pg.query_prepared(
+            "MERGE INTO returning_items AS target
+             USING merge_source AS source ON target.id = source.id
+             WHEN MATCHED AND source.id >= $1 THEN UPDATE SET label = source.label
+             WHEN NOT MATCHED THEN INSERT (id, label) VALUES (source.id, source.label)
+             RETURNING id, label",
+            &[OID_INT8],
+            &[Some(b"1".to_vec())],
+            1,
+        )?;
+        assert_eq!(merged.columns, ["id", "label"]);
+        assert_eq!(
+            merged.rows,
+            [
+                vec![Some("1".into()), Some("merged".into())],
+                vec![Some("4".into()), Some("four".into())],
+            ]
+        );
+        assert_eq!(merged.command_tags, ["MERGE 2"]);
+        assert_eq!(pg.query("SELECT id FROM returning_items")?.rows.len(), 3);
+
+        let set = pg.query_prepared(
+            "SELECT id AS item FROM returning_items
+             UNION ALL SELECT id FROM merge_source
+             ORDER BY item OFFSET $1 LIMIT $2",
+            &[OID_INT8, OID_INT8],
+            &[Some(b"1".to_vec()), Some(b"3".to_vec())],
+            1,
+        )?;
+        assert_eq!(set.columns, ["item"]);
+        assert_eq!(
+            set.rows,
+            [
+                vec![Some("1".into())],
+                vec![Some("3".into())],
+                vec![Some("4".into())],
+            ]
+        );
+        assert_eq!(set.command_tags, ["SELECT 3"]);
+
+        let mut window_batches = 0_usize;
+        let windowed = pg.query_prepared_batches(
+            "SELECT id, label, RANK() OVER ranked AS rank_no
+             FROM returning_items
+             WINDOW grouped AS (PARTITION BY label),
+                    ranked AS (grouped ORDER BY id)
+             ORDER BY id",
+            &[],
+            &[],
+            1,
+            |event| {
+                if let PgQueryEvent::Batch(rows) = event {
+                    assert_eq!(rows.len(), 1);
+                    window_batches += 1;
+                }
+                Ok(())
+            },
+        )?;
+        assert_eq!(windowed.columns, ["id", "label", "rank_no"]);
+        assert_eq!(windowed.row_count, 3);
+        assert_eq!(window_batches, 3);
+        assert_eq!(windowed.command_tags, ["SELECT 3"]);
+        Ok::<(), ordadb_types::DbError>(())
+    })
+    .await
+    .expect("returning query task")
+    .expect("returning queries");
+
+    tokio::time::timeout(Duration::from_secs(5), server.shutdown())
+        .await
+        .expect("shutdown timeout")
+        .expect("shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
