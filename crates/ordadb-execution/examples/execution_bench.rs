@@ -11,11 +11,11 @@ use ordadb_catalog::{
 };
 use ordadb_execution::{
     AdvancedExecutionCursor, AdvancedExecutionPlan, ExecutionContext, ExecutionCursor,
-    ExecutionOptions,
+    ExecutionOptions, JoinExecutionPlan, JoinExecutionSource,
 };
 use ordadb_index::{BPlusTree, IndexEntry, RowId};
 use ordadb_optimizer::{PlanNode, optimize_select};
-use ordadb_sql::{BoundStatement, bind, parse};
+use ordadb_sql::{BoundJoinSource, BoundStatement, bind, parse};
 use ordadb_types::{Identifier, IndexId, Row, ScalarType, Schema, TableId, Value};
 use serde::Serialize;
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
@@ -131,6 +131,13 @@ fn main() {
         &format!("SELECT payload FROM items WHERE id < {bounded_rows} ORDER BY id DESC"),
         &catalog,
     );
+    let window_rank = bind_plan(
+        &format!(
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY payload DESC) AS row_no \
+             FROM items WHERE id < {bounded_rows}"
+        ),
+        &catalog,
+    );
     let mut index_catalog = catalog.clone();
     let item_index = add_item_index(&mut index_catalog, item_table);
     let point_value = row_count / 2;
@@ -209,6 +216,15 @@ fn main() {
         scenarios.push(measure("spillSort", row_count, || {
             drain(
                 &spill_sort,
+                &context,
+                options(batch_rows, spill_soft_memory_bytes, 256 << 20),
+            )
+        }));
+    }
+    if includes_scenario(requested.as_deref(), "windowRank") {
+        scenarios.push(measure("windowRank", row_count, || {
+            drain(
+                &window_rank,
                 &context,
                 options(batch_rows, spill_soft_memory_bytes, 256 << 20),
             )
@@ -348,6 +364,7 @@ fn bind_plan(sql: &str, catalog: &Catalog) -> BenchmarkPlan {
             projection,
             filter,
             order_by,
+            offset,
             limit,
         } => BenchmarkPlan::Simple {
             plan: optimize_select(
@@ -355,6 +372,7 @@ fn bind_plan(sql: &str, catalog: &Catalog) -> BenchmarkPlan {
                 projection,
                 filter,
                 order_by,
+                offset,
                 limit,
             ),
             schema,
@@ -362,24 +380,44 @@ fn bind_plan(sql: &str, catalog: &Catalog) -> BenchmarkPlan {
         BoundStatement::AdvancedSelect {
             table,
             joins,
+            applies: _,
+            windows,
             schema,
             projection,
+            distinct,
             filter,
             group_by,
             having,
             order_by,
+            offset,
             limit,
             aggregate,
         } => BenchmarkPlan::Advanced(Box::new(AdvancedExecutionPlan {
             table,
-            joins,
+            joins: joins
+                .into_iter()
+                .map(|join| JoinExecutionPlan {
+                    source: match join.source {
+                        BoundJoinSource::Table(table) => JoinExecutionSource::Table(table),
+                        BoundJoinSource::Derived { .. } => {
+                            panic!("execution benchmark does not use derived joins")
+                        }
+                    },
+                    kind: join.kind,
+                    on: join.on,
+                })
+                .collect(),
+            applies: Vec::new(),
+            windows,
             schema,
             projection,
+            distinct,
             filter,
             group_by,
             having,
             order_by,
-            limit,
+            offset,
+            limit: limit.map(|limit| *limit),
             aggregate,
         })),
         _ => panic!("benchmark query did not bind as SELECT"),

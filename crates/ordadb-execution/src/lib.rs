@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,7 +25,10 @@ mod advanced;
 mod columnar;
 mod memory;
 mod scan;
-pub use advanced::{AdvancedExecutionCursor, AdvancedExecutionPlan};
+pub use advanced::{
+    AdvancedExecutionCursor, AdvancedExecutionPlan, ApplyExecutionKind, ApplyExecutionPlan,
+    JoinExecutionPlan, JoinExecutionSource, QueryExecutionPlan,
+};
 pub use columnar::{
     ChunkPool, ColumnVector, ColumnVectorKind, DataChunk, RowColumnView, SelectionVector,
 };
@@ -127,7 +130,11 @@ impl ExpressionStack {
             })?;
         self.reservation.resize(slot_bytes)?;
         if self.values.capacity() < slots {
-            let additional = slots - self.values.capacity();
+            // `try_reserve_exact` measures `additional` from the current
+            // length, not from the current capacity. `prepare` has cleared
+            // the stack, so reserving only the capacity delta can still
+            // leave a reused stack smaller than the compiled program needs.
+            let additional = slots - self.values.len();
             if let Err(error) = self.values.try_reserve_exact(additional) {
                 self.reservation
                     .resize(self.values.capacity() * std::mem::size_of::<Value>())?;
@@ -165,6 +172,10 @@ impl ExpressionStack {
     fn len(&self) -> usize {
         self.values.len()
     }
+
+    fn collapse_in_list(&mut self, count: usize, negated: bool) -> Result<()> {
+        <Self as ExpressionValues>::collapse_in_list(self, count, negated)
+    }
 }
 
 trait ExpressionValues {
@@ -172,6 +183,7 @@ trait ExpressionValues {
     fn push_value(&mut self, value: Value) -> Result<()>;
     fn pop_value(&mut self) -> Option<Value>;
     fn value_count(&self) -> usize;
+    fn collapse_in_list(&mut self, count: usize, negated: bool) -> Result<()>;
 }
 
 impl ExpressionValues for Vec<Value> {
@@ -191,6 +203,13 @@ impl ExpressionValues for Vec<Value> {
 
     fn value_count(&self) -> usize {
         self.len()
+    }
+
+    fn collapse_in_list(&mut self, count: usize, negated: bool) -> Result<()> {
+        let result = evaluate_in_list_stack(self, count, negated)?;
+        self.truncate(self.len().saturating_sub(count.saturating_add(1)));
+        self.push(result);
+        Ok(())
     }
 }
 
@@ -218,6 +237,13 @@ impl ExpressionValues for ExpressionStack {
 
     fn value_count(&self) -> usize {
         self.len()
+    }
+
+    fn collapse_in_list(&mut self, count: usize, negated: bool) -> Result<()> {
+        let result = evaluate_in_list_stack(&self.values, count, negated)?;
+        self.values
+            .truncate(self.values.len().saturating_sub(count.saturating_add(1)));
+        self.push(result)
     }
 }
 
@@ -256,6 +282,7 @@ enum OperatorFrame {
     Filter(ExpressionProgram),
     Projection(Vec<ExpressionProgram>),
     Sort(Vec<BoundOrder>),
+    Offset { remaining: usize },
     Limit { remaining: usize },
 }
 
@@ -829,7 +856,8 @@ impl ExecutionCursor {
         let OperatorFrame::Sort(order_by) = self.arena.get(sort_id)? else {
             return Err(DbError::internal("Sort frame index is invalid"));
         };
-        let order_by = order_by.clone();
+        let (mut order_by, sort_programs) =
+            compile_sort_orders(order_by, self.options.max_expression_depth)?;
         let mut rows = Vec::new();
         let mut rows_reservation = self.memory.try_reserve(0)?;
         let mut run_paths = Vec::new();
@@ -852,7 +880,7 @@ impl ExecutionCursor {
             }
             for logical_row in 0..input.chunk().len() {
                 let row = input.chunk().row(logical_row)?;
-                let Some(row) = apply_row_frames(
+                let Some(mut row) = apply_row_frames(
                     &mut self.arena,
                     &[],
                     &self.params,
@@ -862,6 +890,13 @@ impl ExecutionCursor {
                 else {
                     continue;
                 };
+                materialize_sort_keys(
+                    &mut row,
+                    &mut order_by,
+                    &sort_programs,
+                    &self.params,
+                    &mut self.expression_stack,
+                )?;
                 let row_bytes = estimated_row_bytes(&row);
                 if !rows.is_empty() && self.memory.would_cross_soft_limit(row_bytes) {
                     sort_rows(&mut rows, &order_by)?;
@@ -1010,6 +1045,14 @@ fn apply_chunk_frames(
                     return Ok(false);
                 }
             }
+            OperatorFrame::Offset { remaining } => {
+                let skipped = chunk.chunk().len().min(*remaining);
+                chunk.chunk_mut().selection_mut().discard_prefix(skipped);
+                *remaining -= skipped;
+                if chunk.chunk().is_empty() {
+                    return Ok(false);
+                }
+            }
             OperatorFrame::Sort(_) => {
                 return Err(DbError::internal(
                     "Sort frame reached the streaming chunk evaluator",
@@ -1050,6 +1093,12 @@ fn apply_row_frames(
                     return Ok(None);
                 }
                 *remaining -= 1;
+            }
+            OperatorFrame::Offset { remaining } => {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Ok(None);
+                }
             }
             OperatorFrame::Sort(_) => {
                 return Err(DbError::internal(
@@ -1110,6 +1159,20 @@ fn build_pipeline(
             }
             PlanKind::Sort { order_by, input } => {
                 let id = arena.insert(OperatorFrame::Sort(order_by.clone()));
+                frames.push(id);
+                node = input;
+            }
+            PlanKind::Offset { offset, input } => {
+                let id = arena.insert(OperatorFrame::Offset {
+                    remaining: evaluate_offset_program(
+                        &ExpressionProgram::compile_with_limit(
+                            offset,
+                            false,
+                            options.max_expression_depth,
+                        )?,
+                        context.params,
+                    )?,
+                });
                 frames.push(id);
                 node = input;
             }
@@ -1203,6 +1266,64 @@ fn compile_projections(
         .collect()
 }
 
+fn compile_sort_orders(
+    order_by: &[BoundOrder],
+    max_expression_depth: usize,
+) -> Result<(Vec<BoundOrder>, Vec<Option<ExpressionProgram>>)> {
+    let mut effective = order_by.to_vec();
+    let programs = effective
+        .iter_mut()
+        .map(|order| {
+            order
+                .expression
+                .take()
+                .map(|expression| {
+                    order.column_index = usize::MAX;
+                    ExpressionProgram::compile_with_limit(&expression, false, max_expression_depth)
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((effective, programs))
+}
+
+fn materialize_sort_keys(
+    row: &mut Row,
+    order_by: &mut [BoundOrder],
+    programs: &[Option<ExpressionProgram>],
+    params: &[Value],
+    stack: &mut ExpressionStack,
+) -> Result<()> {
+    let base_width = row.values.len();
+    let keys = programs
+        .iter()
+        .map(|program| {
+            program
+                .as_ref()
+                .map(|program| program.evaluate_reusing(&row.values, params, stack))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (ordinal, (order, key)) in order_by.iter_mut().zip(keys).enumerate() {
+        let Some(key) = key else {
+            continue;
+        };
+        let expected_index = base_width.saturating_add(ordinal);
+        if order.column_index == usize::MAX {
+            order.column_index = expected_index;
+        } else if order.column_index != expected_index {
+            return Err(DbError::internal(
+                "materialized sort-key layout changed between rows",
+            ));
+        }
+        while row.values.len() < expected_index {
+            row.values.push(Value::Null);
+        }
+        row.values.push(key);
+    }
+    Ok(())
+}
+
 fn sort_rows(rows: &mut [Row], order_by: &[BoundOrder]) -> Result<()> {
     let mut error = None;
     rows.sort_by(|left, right| {
@@ -1243,6 +1364,12 @@ struct ReservedSpillReader {
 impl Read for ReservedSpillReader {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         self.reader.read(buffer)
+    }
+}
+
+impl Seek for ReservedSpillReader {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.reader.seek(position)
     }
 }
 
@@ -1373,7 +1500,7 @@ fn write_spill_record<T: Serialize>(
     writer: &mut impl Write,
     value: &T,
     memory: &MemoryGrant,
-) -> Result<()> {
+) -> Result<usize> {
     let mut payload = ReservedSpillBuffer::new(memory)?;
     if let Err(error) = serde_json::to_writer(&mut payload, value) {
         if let Some(memory_error) = payload.failure.take() {
@@ -1389,7 +1516,7 @@ fn write_spill_record<T: Serialize>(
         .write_all(&length.to_le_bytes())
         .map_err(spill_io_error)?;
     writer.write_all(&payload.bytes).map_err(spill_io_error)?;
-    Ok(())
+    Ok(std::mem::size_of::<u32>().saturating_add(payload.bytes.len()))
 }
 
 fn read_spill_record<T: DeserializeOwned>(
@@ -1438,7 +1565,9 @@ fn program_limit_error(detail: impl Into<String>) -> DbError {
         .with_hint("Reduce nested expressions or split the query into simpler statements.")
 }
 
-pub(crate) fn estimated_row_bytes(row: &Row) -> usize {
+/// Returns the conservative query-memory charge for one public compatibility row.
+#[must_use]
+pub fn estimated_row_bytes(row: &Row) -> usize {
     std::mem::size_of::<Row>() + row.values.iter().map(estimated_value_bytes).sum::<usize>()
 }
 
@@ -1469,6 +1598,10 @@ enum ExpressionInstruction {
     LoadParameter(usize),
     Unary(UnaryOperator),
     Binary(BinaryOperator),
+    InList {
+        count: usize,
+        negated: bool,
+    },
     Aggregate {
         function: AggregateFunction,
         argument: Option<Vec<ExpressionInstruction>>,
@@ -1533,6 +1666,12 @@ impl ExpressionProgram {
                     BoundExprKind::Binary { op, .. } => {
                         instructions.push(ExpressionInstruction::Binary(*op));
                     }
+                    BoundExprKind::InList { list, negated, .. } => {
+                        instructions.push(ExpressionInstruction::InList {
+                            count: list.len(),
+                            negated: *negated,
+                        });
+                    }
                     _ => {
                         return Err(DbError::internal(
                             "expression compiler emitted an invalid parent frame",
@@ -1547,6 +1686,10 @@ impl ExpressionProgram {
                     instructions.push(ExpressionInstruction::LoadColumn(*index));
                     instructions.push(ExpressionInstruction::Coerce(expression.data_type.clone()));
                 }
+                BoundExprKind::ApplyValue { index } => {
+                    instructions.push(ExpressionInstruction::LoadColumn(*index));
+                    instructions.push(ExpressionInstruction::Coerce(expression.data_type.clone()));
+                }
                 BoundExprKind::Literal(value) => {
                     instructions.push(ExpressionInstruction::LoadLiteral(value.clone()));
                     instructions.push(ExpressionInstruction::Coerce(expression.data_type.clone()));
@@ -1554,6 +1697,11 @@ impl ExpressionProgram {
                 BoundExprKind::Parameter { index } => {
                     instructions.push(ExpressionInstruction::LoadParameter(*index));
                     instructions.push(ExpressionInstruction::Coerce(expression.data_type.clone()));
+                }
+                BoundExprKind::Correlation { .. } => {
+                    return Err(DbError::internal(
+                        "correlated expression reached execution without a parameter frame",
+                    ));
                 }
                 BoundExprKind::Unary { expr, .. } => {
                     pending.push((expression, true, depth));
@@ -1564,7 +1712,16 @@ impl ExpressionProgram {
                     pending.push((right, false, depth + 1));
                     pending.push((left, false, depth + 1));
                 }
-                BoundExprKind::Aggregate { function, argument } => {
+                BoundExprKind::InList { expr, list, .. } => {
+                    pending.push((expression, true, depth));
+                    for candidate in list.iter().rev() {
+                        pending.push((candidate, false, depth + 1));
+                    }
+                    pending.push((expr, false, depth + 1));
+                }
+                BoundExprKind::Aggregate {
+                    function, argument, ..
+                } => {
                     if !allow_aggregate {
                         return Err(DbError::internal(
                             "aggregate expression requires a grouped execution context",
@@ -1705,6 +1862,15 @@ fn expression_stack_slots(instructions: &[ExpressionInstruction]) -> Result<usiz
                 }
                 depth -= 1;
             }
+            ExpressionInstruction::InList { count, .. } => {
+                let required = count.saturating_add(1);
+                if depth < required {
+                    return Err(DbError::internal(
+                        "expression compiler produced an IN list stack underflow",
+                    ));
+                }
+                depth -= *count;
+            }
         }
     }
     if depth != 1 {
@@ -1786,6 +1952,36 @@ fn evaluate_fast_expression(
     }
 }
 
+fn evaluate_in_list_stack(values: &[Value], count: usize, negated: bool) -> Result<Value> {
+    let required = count
+        .checked_add(1)
+        .ok_or_else(|| program_limit_error("IN list stack width overflowed"))?;
+    if values.len() < required {
+        return Err(DbError::internal(
+            "expression compiler produced an IN list stack underflow",
+        ));
+    }
+    let start = values.len() - required;
+    let operand = &values[start];
+    if operand.is_null() {
+        return Ok(Value::Null);
+    }
+    let mut saw_null = false;
+    for candidate in &values[start + 1..] {
+        match evaluate_binary(operand.clone(), BinaryOperator::Eq, candidate.clone())? {
+            Value::Boolean(true) => return Ok(Value::Boolean(!negated)),
+            Value::Boolean(false) => {}
+            Value::Null => saw_null = true,
+            _ => return Err(DbError::internal("IN equality did not return boolean")),
+        }
+    }
+    if saw_null {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Boolean(negated))
+    }
+}
+
 fn evaluate_instructions(
     instructions: &[ExpressionInstruction],
     row: &[Value],
@@ -1831,6 +2027,9 @@ fn evaluate_instructions_reusing<S: ExpressionValues>(
                     .pop_value()
                     .ok_or_else(|| DbError::internal("expression value stack underflow"))?;
                 values.push_value(evaluate_binary(left, *operator, right)?)?;
+            }
+            ExpressionInstruction::InList { count, negated } => {
+                values.collapse_in_list(*count, *negated)?;
             }
             ExpressionInstruction::Aggregate { function, argument } => {
                 let rows = group_rows.ok_or_else(|| {
@@ -2019,6 +2218,16 @@ fn evaluate_binary(left: Value, operator: BinaryOperator, right: Value) -> Resul
     if left.is_null() || right.is_null() {
         return Ok(Value::Null);
     }
+    if matches!(
+        operator,
+        BinaryOperator::Add
+            | BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo
+    ) {
+        return evaluate_arithmetic_binary(left, operator, right);
+    }
     match operator {
         BinaryOperator::Eq => return Ok(Value::Boolean(left == right)),
         BinaryOperator::NotEq => return Ok(Value::Boolean(left != right)),
@@ -2032,6 +2241,103 @@ fn evaluate_binary(left: Value, operator: BinaryOperator, right: Value) -> Resul
         BinaryOperator::GtEq => ordering != Ordering::Less,
         _ => unreachable!("handled above"),
     }))
+}
+
+fn evaluate_arithmetic_binary(
+    left: Value,
+    operator: BinaryOperator,
+    right: Value,
+) -> Result<Value> {
+    macro_rules! checked_integer {
+        ($left:expr, $right:expr, $variant:ident) => {{
+            let value = match operator {
+                BinaryOperator::Add => $left.checked_add($right),
+                BinaryOperator::Subtract => $left.checked_sub($right),
+                BinaryOperator::Multiply => $left.checked_mul($right),
+                BinaryOperator::Divide if $right == 0 => return Err(division_by_zero()),
+                BinaryOperator::Divide => $left.checked_div($right),
+                BinaryOperator::Modulo if $right == 0 => return Err(division_by_zero()),
+                BinaryOperator::Modulo => $left.checked_rem($right),
+                _ => unreachable!("arithmetic operator checked by caller"),
+            }
+            .ok_or_else(numeric_out_of_range)?;
+            Ok(Value::$variant(value))
+        }};
+    }
+
+    match (left, right) {
+        (Value::Int16(left), Value::Int16(right)) => checked_integer!(left, right, Int16),
+        (Value::Int32(left), Value::Int32(right)) => checked_integer!(left, right, Int32),
+        (Value::Int64(left), Value::Int64(right)) => checked_integer!(left, right, Int64),
+        (Value::Float32(left), Value::Float32(right)) => {
+            evaluate_float32_arithmetic(left, operator, right)
+        }
+        (Value::Float64(left), Value::Float64(right)) => {
+            evaluate_float64_arithmetic(left, operator, right)
+        }
+        (Value::Decimal(left), Value::Decimal(right)) => {
+            let value = match operator {
+                BinaryOperator::Add => left.checked_add(right),
+                BinaryOperator::Subtract => left.checked_sub(right),
+                BinaryOperator::Multiply => left.checked_mul(right),
+                BinaryOperator::Divide if right.is_zero() => return Err(division_by_zero()),
+                BinaryOperator::Divide => left.checked_div(right),
+                BinaryOperator::Modulo if right.is_zero() => return Err(division_by_zero()),
+                BinaryOperator::Modulo => left.checked_rem(right),
+                _ => unreachable!("arithmetic operator checked by caller"),
+            }
+            .ok_or_else(numeric_out_of_range)?;
+            Ok(Value::Decimal(value))
+        }
+        _ => Err(DbError::new(
+            "42883",
+            "arithmetic operands do not have a common numeric type",
+        )),
+    }
+}
+
+fn evaluate_float32_arithmetic(left: f32, operator: BinaryOperator, right: f32) -> Result<Value> {
+    if matches!(operator, BinaryOperator::Divide | BinaryOperator::Modulo) && right == 0.0 {
+        return Err(division_by_zero());
+    }
+    let value = match operator {
+        BinaryOperator::Add => left + right,
+        BinaryOperator::Subtract => left - right,
+        BinaryOperator::Multiply => left * right,
+        BinaryOperator::Divide => left / right,
+        BinaryOperator::Modulo => left % right,
+        _ => unreachable!("arithmetic operator checked by caller"),
+    };
+    if value.is_infinite() && left.is_finite() && right.is_finite() {
+        return Err(numeric_out_of_range());
+    }
+    Ok(Value::Float32(value))
+}
+
+fn evaluate_float64_arithmetic(left: f64, operator: BinaryOperator, right: f64) -> Result<Value> {
+    if matches!(operator, BinaryOperator::Divide | BinaryOperator::Modulo) && right == 0.0 {
+        return Err(division_by_zero());
+    }
+    let value = match operator {
+        BinaryOperator::Add => left + right,
+        BinaryOperator::Subtract => left - right,
+        BinaryOperator::Multiply => left * right,
+        BinaryOperator::Divide => left / right,
+        BinaryOperator::Modulo => left % right,
+        _ => unreachable!("arithmetic operator checked by caller"),
+    };
+    if value.is_infinite() && left.is_finite() && right.is_finite() {
+        return Err(numeric_out_of_range());
+    }
+    Ok(Value::Float64(value))
+}
+
+fn division_by_zero() -> DbError {
+    DbError::new("22012", "division by zero")
+}
+
+fn numeric_out_of_range() -> DbError {
+    DbError::new("22003", "numeric value is out of range")
 }
 
 fn evaluate_boolean_binary(left: Value, operator: BinaryOperator, right: Value) -> Result<Value> {
@@ -2074,10 +2380,22 @@ fn evaluate_limit_program(program: &ExpressionProgram, params: &[Value]) -> Resu
         Value::Int64(value) if value >= 0 => {
             usize::try_from(value).map_err(|_| DbError::new("22003", "LIMIT value is out of range"))
         }
-        Value::Null => Err(DbError::new("22004", "LIMIT cannot be null")),
+        Value::Null => Ok(usize::MAX),
         _ => Err(DbError::new(
             "2201W",
             "LIMIT must be a non-negative integer",
+        )),
+    }
+}
+
+fn evaluate_offset_program(program: &ExpressionProgram, params: &[Value]) -> Result<usize> {
+    match program.evaluate(&[], params)? {
+        Value::Int64(value) if value >= 0 => usize::try_from(value)
+            .map_err(|_| DbError::new("22003", "OFFSET value is out of range")),
+        Value::Null => Ok(0),
+        _ => Err(DbError::new(
+            "2201X",
+            "OFFSET must be a non-negative integer",
         )),
     }
 }
@@ -2241,6 +2559,7 @@ mod tests {
             projection,
             filter,
             order_by,
+            offset,
             limit,
             ..
         } = bind(parse(query).expect("parse"), &catalog).expect("bind")
@@ -2252,6 +2571,7 @@ mod tests {
             projection,
             filter,
             order_by,
+            offset,
             limit,
         );
         (
@@ -2307,6 +2627,39 @@ mod tests {
         let rows = execute(&plan, &context).expect("execute");
         assert_eq!(rows.len(), 17);
         assert_eq!(rows[16].values, vec![Value::Int64(16)]);
+    }
+
+    #[test]
+    fn offset_streams_after_sort_and_limit_null_is_unbounded() {
+        let (plan, _schema, tables, indexes) = fixture(
+            "SELECT id FROM items ORDER BY id DESC OFFSET 10 LIMIT NULL",
+            numbered_rows(100),
+        );
+        let context = ExecutionContext {
+            tables: &tables,
+            indexes: &indexes,
+            params: &[],
+        };
+        let rows = execute(&plan, &context).expect("execute offset");
+        assert_eq!(rows.len(), 90);
+        assert_eq!(rows[0].values, vec![Value::Int64(89)]);
+        assert_eq!(rows[89].values, vec![Value::Int64(0)]);
+    }
+
+    #[test]
+    fn negative_offset_fails_before_scanning() {
+        let (plan, schema, tables, indexes) =
+            fixture("SELECT id FROM items OFFSET -1", numbered_rows(3));
+        let context = ExecutionContext {
+            tables: &tables,
+            indexes: &indexes,
+            params: &[],
+        };
+        let error = match ExecutionCursor::new(&plan, &context, schema) {
+            Ok(_) => panic!("negative offset must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.sql_state, "2201X");
     }
 
     #[test]
@@ -2395,6 +2748,7 @@ mod tests {
             let memory = MemoryGrant::new(1024 * 1024, 8 * 1024 * 1024).expect("memory");
             let order_by = vec![BoundOrder {
                 column_index: 0,
+                expression: None,
                 ascending: true,
                 nulls_first: None,
             }];
@@ -2459,6 +2813,7 @@ mod tests {
         let memory = MemoryGrant::new(1024, 16 * 1024).expect("memory");
         let order_by = vec![BoundOrder {
             column_index: 0,
+            expression: None,
             ascending: true,
             nulls_first: None,
         }];

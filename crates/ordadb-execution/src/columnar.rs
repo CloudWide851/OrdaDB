@@ -708,6 +708,10 @@ impl SelectionVector {
         self.indexes.truncate(len);
     }
 
+    pub fn discard_prefix(&mut self, len: usize) {
+        self.indexes.drain(..len.min(self.indexes.len()));
+    }
+
     fn physical_index(&self, logical_index: usize) -> Result<usize> {
         self.indexes
             .get(logical_index)

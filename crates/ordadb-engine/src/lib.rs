@@ -4,7 +4,7 @@
 //! encoding belongs to `ordadb-storage`; WAL and crash recovery belong to
 //! `ordadb-transaction`.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,9 +17,13 @@ use ordadb_catalog::{
     TableDefinition, TableStatistics, TriggerEvent, TriggerTiming, ViewKind, indexable_type,
 };
 use ordadb_execution::{
-    AdvancedExecutionCursor, AdvancedExecutionPlan, ExecutionContext, ExecutionCursor,
-    LeasedDataChunk, MemoryGrant, TableProvider, TableScan, coerce_value as coerce_execution_value,
-    evaluate as evaluate_scalar, predicate_matches as execution_predicate_matches,
+    AdvancedExecutionCursor, AdvancedExecutionPlan, ApplyExecutionKind, ApplyExecutionPlan,
+    DEFAULT_BATCH_ROWS, DEFAULT_HARD_MEMORY_BYTES, DEFAULT_SOFT_MEMORY_BYTES, ExecutionContext,
+    ExecutionCursor, JoinExecutionPlan, JoinExecutionSource, LeasedDataChunk, MemoryGrant,
+    QueryExecutionPlan, Reservation, TableProvider, TableScan,
+    coerce_value as coerce_execution_value, compare_values as compare_execution_values,
+    estimated_row_bytes, evaluate as evaluate_scalar,
+    predicate_matches as execution_predicate_matches,
 };
 use ordadb_index::{BPlusTree, IndexEntry, IndexKey, RowId};
 use ordadb_optimizer::{
@@ -33,10 +37,13 @@ pub use ordadb_search::{
 };
 use ordadb_search::{SearchCatalog, SearchLimits};
 use ordadb_sql::{
-    BinaryOperator, BoundAlterTableOperation, BoundExpr, BoundExprKind, BoundJoin, BoundOrder,
-    BoundProjection, BoundSequenceOperation, BoundStatement, BoundTable, DdlObjectKind, JoinKind,
-    ParsedStatement, SqlDialect, TransactionChain, bind, bind_catalog_expression,
-    bind_catalog_expression_with_parameter_types, parse, parse_with_dialect,
+    BinaryOperator, BoundAlterTableOperation, BoundApply, BoundApplyKind, BoundConflictAction,
+    BoundCte, BoundExpr, BoundExprKind, BoundJoin, BoundJoinSource, BoundMerge, BoundMergeAction,
+    BoundMergeClauseKind, BoundOnConflict, BoundOrder, BoundProjection, BoundReturning,
+    BoundSequenceOperation, BoundStatement, BoundTable, BoundWindow, BoundWindowFrameBound,
+    DdlObjectKind, JoinKind, ParsedStatement, QuerySetOperator, SqlDialect, SubqueryQuantifier,
+    TransactionChain, bind, bind_catalog_expression, bind_catalog_expression_with_parameter_types,
+    parse, parse_with_dialect,
 };
 use ordadb_storage::{
     ApplyPoint, DataFormat, DatabaseStore, DurabilityBarrier, FROZEN_TRANSACTION_ID,
@@ -54,11 +61,15 @@ use ordadb_types::{
     Batch, CommandComplete, DbError, Field, Identifier, IndexId, QueryEvent, QueryProgress, Result,
     Row, ScalarType, Schema, SequenceId, TableId, Value, ViewId,
 };
+
+const MAX_RECURSIVE_CTE_ITERATIONS: usize = 10_000;
+const MAX_RECURSIVE_CTE_ROWS: usize = 1_000_000;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const AUTOMATIC_CHECKPOINT_INTERVAL: u64 = 64;
 const MAX_REFERENTIAL_ACTIONS: usize = 16_384;
+const MAX_DML_LOCK_RECHECKS: usize = 32;
 const PLPGSQL_EXECUTION_STACK_BYTES: usize = 8 * 1024 * 1024;
 pub const LOGICAL_SNAPSHOT_VERSION: u16 = 1;
 
@@ -72,6 +83,12 @@ pub struct EngineConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionOptions {
     pub dialect: SqlDialect,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatementDescription {
+    pub schema: Schema,
+    pub parameter_types: Vec<ScalarType>,
 }
 
 #[derive(Debug, Clone)]
@@ -658,6 +675,13 @@ impl Session {
     /// Bind a statement against the session's current catalog snapshot without
     /// executing it and return the row schema exposed to protocol clients.
     pub fn describe(&mut self, sql: &str) -> Result<Schema> {
+        self.describe_statement(sql)
+            .map(|description| description.schema)
+    }
+
+    /// Bind a statement without executing it and return both its result schema
+    /// and the positional parameter types inferred by the binder.
+    pub fn describe_statement(&mut self, sql: &str) -> Result<StatementDescription> {
         self.normalize_sql_transaction_failure();
         if self.transaction_status() == TransactionStatus::Failed {
             return Err(failed_transaction_error());
@@ -665,7 +689,12 @@ impl Session {
         let snapshot = self.statement_snapshot()?;
         let described = parse_with_dialect(sql, self.options.dialect)
             .and_then(|statement| bind(statement, &snapshot.catalog))
-            .map(|statement| bound_statement_schema(&statement));
+            .and_then(|statement| {
+                Ok(StatementDescription {
+                    schema: bound_statement_schema(&statement),
+                    parameter_types: bound_statement_parameter_types(&statement)?,
+                })
+            });
         if described.is_err() {
             self.fail_sql_transaction();
         }
@@ -1345,7 +1374,7 @@ impl Session {
         let (_, events, dirty) =
             execute_bound_candidate(&snapshot, statement, params, None, maintenance)?;
         if !dirty {
-            return Ok(TryQueryStream::new(events));
+            return TryQueryStream::buffered(events);
         }
 
         let mut transaction = DurableTransaction::begin(
@@ -1405,6 +1434,7 @@ impl Session {
             Some(version_mutation_context(&transaction)?),
             maintenance,
         )?;
+        let stream = TryQueryStream::buffered(events)?;
         if dirty {
             let sequence_value = sequence_id
                 .map(|sequence_id| candidate_sequence_value(&candidate, sequence_id))
@@ -1436,7 +1466,7 @@ impl Session {
                 self.sequence_currvals.insert(sequence_id, value);
             }
         }
-        Ok(TryQueryStream::new(events))
+        Ok(stream)
     }
 
     fn execute_in_sql_transaction(
@@ -1461,11 +1491,26 @@ impl Session {
         if let Some(stream) = prepare_read_stream(&snapshot, statement.clone(), params, None)? {
             return Ok(stream);
         }
+        let has_conflict_action = matches!(
+            &statement,
+            BoundStatement::Insert {
+                on_conflict: Some(_),
+                ..
+            }
+        );
+        let read_committed =
+            transaction
+                .transaction
+                .characteristics()
+                .is_some_and(|characteristics| {
+                    characteristics.isolation_level == IsolationLevel::ReadCommitted
+                });
+        let recheck_conflict_after_locks = has_conflict_action && read_committed;
         let sequence_id = sequence_mutation_id(&statement);
         let write_scope = statement_write_scope(&statement);
         let maintenance =
             maintenance_context(self.transactions.as_ref(), self.transaction_status.as_ref())?;
-        let (candidate, events, dirty) = execute_bound_candidate(
+        let (mut candidate, mut events, dirty) = execute_bound_candidate(
             &snapshot,
             statement,
             params,
@@ -1473,7 +1518,7 @@ impl Session {
             maintenance,
         )?;
         if !dirty {
-            return Ok(TryQueryStream::new(events));
+            return TryQueryStream::buffered(events);
         }
         if transaction
             .transaction
@@ -1487,6 +1532,7 @@ impl Session {
                 "cannot execute a write in a read-only transaction",
             ));
         }
+        let mut statement_base = snapshot.clone();
         match write_scope {
             StatementWriteScope::Dml => {
                 let mut acquired = acquire_dml_locks(
@@ -1497,16 +1543,84 @@ impl Session {
                     &transaction.locks,
                     snapshot.cancellation.as_deref(),
                 )?;
+                transaction.locks.append(&mut acquired);
+                if recheck_conflict_after_locks {
+                    let mut completed = false;
+                    for _ in 0..MAX_DML_LOCK_RECHECKS {
+                        let recheck_base = read_committed_statement_state(
+                            &self.state,
+                            self.transaction_status.as_ref(),
+                            &mut transaction.transaction,
+                            transaction.base.as_ref(),
+                            transaction.working.as_ref(),
+                            snapshot.cancellation.clone(),
+                        )?;
+                        let (rechecked, rechecked_events, rechecked_dirty) = execute_candidate(
+                            &recheck_base,
+                            sql,
+                            params,
+                            self.options.dialect,
+                            Some(version_mutation_context(&transaction.transaction)?),
+                            maintenance,
+                        )?;
+                        if !rechecked_dirty {
+                            return Err(internal_error(
+                                "ON CONFLICT lock recheck produced a clean candidate",
+                            ));
+                        }
+                        let mut additional = acquire_dml_locks(
+                            &self.locks,
+                            &transaction.transaction,
+                            &recheck_base,
+                            &rechecked,
+                            &transaction.locks,
+                            snapshot.cancellation.as_deref(),
+                        )?;
+                        if additional.is_empty() {
+                            statement_base = recheck_base;
+                            candidate = rechecked;
+                            events = rechecked_events;
+                            completed = true;
+                            break;
+                        }
+                        transaction.locks.append(&mut additional);
+                    }
+                    if !completed {
+                        return Err(DbError::new(
+                            "54001",
+                            "ON CONFLICT lock recheck exceeded its iteration limit",
+                        )
+                        .with_hint("Retry the transaction after concurrent writers finish."));
+                    }
+                } else if has_conflict_action {
+                    let latest = committed_snapshot(&self.state)?;
+                    let merge_base = transaction.base.as_ref().unwrap_or(&snapshot);
+                    if let Err(error) = merge_dml_candidate(
+                        &latest,
+                        merge_base,
+                        &candidate,
+                        &transaction.transaction,
+                        self.transaction_status.as_ref(),
+                    ) {
+                        if error.sql_state == "23505" {
+                            return Err(DbError::new(
+                                "40001",
+                                "could not serialize access due to concurrent ON CONFLICT update",
+                            )
+                            .with_hint("Retry the transaction with a fresh snapshot."));
+                        }
+                        return Err(error);
+                    }
+                }
                 if let Some(ssi) = &transaction.ssi {
-                    for table_id in changed_table_ids(&snapshot, &candidate) {
+                    for table_id in changed_table_ids(&statement_base, &candidate) {
                         ssi.record_write(PredicateLock::Table {
                             table_id: table_id.get(),
                         })?;
                     }
                 }
-                transaction.locks.append(&mut acquired);
                 if transaction.base.is_none() {
-                    transaction.base = Some(snapshot.clone());
+                    transaction.base = Some(statement_base);
                 }
             }
             StatementWriteScope::Exclusive => {
@@ -1544,6 +1658,7 @@ impl Session {
                             "exclusive statement unexpectedly produced a clean candidate",
                         ));
                     }
+                    let stream = TryQueryStream::buffered(events)?;
                     if let Some(sequence_id) = sequence_id {
                         self.sequence_currvals.insert(
                             sequence_id,
@@ -1555,7 +1670,7 @@ impl Session {
                     transaction.lease = Some(lease);
                     transaction.locks.push(lock);
                     transaction.dml_only = false;
-                    return Ok(TryQueryStream::new(events));
+                    return Ok(stream);
                 }
                 if transaction.lease.is_none() {
                     transaction.lease = Some(
@@ -1580,6 +1695,7 @@ impl Session {
             }
         }
         if transaction.working.is_some() || write_scope == StatementWriteScope::Dml {
+            let stream = TryQueryStream::buffered(events)?;
             if let Some(sequence_id) = sequence_id {
                 self.sequence_currvals.insert(
                     sequence_id,
@@ -1587,7 +1703,7 @@ impl Session {
                 );
             }
             transaction.working = Some(candidate);
-            return Ok(TryQueryStream::new(events));
+            return Ok(stream);
         }
 
         let mut committed = committed_snapshot(&self.state)?;
@@ -1600,6 +1716,7 @@ impl Session {
             Some(version_mutation_context(&transaction.transaction)?),
             maintenance,
         )?;
+        let stream = TryQueryStream::buffered(events)?;
         if dirty {
             if let Some(sequence_id) = sequence_id {
                 self.sequence_currvals.insert(
@@ -1609,7 +1726,7 @@ impl Session {
             }
             transaction.working = Some(candidate);
         }
-        Ok(TryQueryStream::new(events))
+        Ok(stream)
     }
 
     fn fail_sql_transaction(&mut self) {
@@ -1670,9 +1787,27 @@ fn bound_statement_schema(statement: &BoundStatement) -> Schema {
     match statement {
         BoundStatement::Select { schema, .. }
         | BoundStatement::AdvancedSelect { schema, .. }
+        | BoundStatement::SetOperation { schema, .. }
+        | BoundStatement::With { schema, .. }
         | BoundStatement::ViewSelect { schema, .. }
         | BoundStatement::RoutineSelect { schema, .. }
         | BoundStatement::SequenceValue { schema, .. } => schema.clone(),
+        BoundStatement::Insert {
+            returning: Some(returning),
+            ..
+        }
+        | BoundStatement::Update {
+            returning: Some(returning),
+            ..
+        }
+        | BoundStatement::Delete {
+            returning: Some(returning),
+            ..
+        }
+        | BoundStatement::Merge(BoundMerge {
+            returning: Some(returning),
+            ..
+        }) => returning.schema.clone(),
         BoundStatement::Explain { .. } => {
             Schema::new(vec![Field::new("QUERY PLAN", ScalarType::Text, false)])
         }
@@ -1704,8 +1839,284 @@ fn bound_statement_schema(statement: &BoundStatement) -> Schema {
         | BoundStatement::CreateTrigger { .. }
         | BoundStatement::DropTrigger { .. }
         | BoundStatement::Insert { .. }
+        | BoundStatement::Merge(BoundMerge {
+            returning: None, ..
+        })
         | BoundStatement::Update { .. }
         | BoundStatement::Delete { .. } => Schema::empty(),
+    }
+}
+
+fn bound_statement_parameter_types(statement: &BoundStatement) -> Result<Vec<ScalarType>> {
+    let mut statements = vec![statement];
+    let mut expressions = Vec::new();
+    while let Some(statement) = statements.pop() {
+        match statement {
+            BoundStatement::CreateView { query, .. }
+            | BoundStatement::RefreshMaterializedView { query, .. } => {
+                statements.push(query);
+            }
+            BoundStatement::ViewSelect { source, .. }
+            | BoundStatement::Explain { statement: source } => {
+                statements.push(source);
+            }
+            BoundStatement::Call { arguments, .. }
+            | BoundStatement::RoutineSelect { arguments, .. } => {
+                expressions.extend(arguments);
+            }
+            BoundStatement::SequenceValue { operation, .. } => {
+                if let BoundSequenceOperation::SetValue { value, .. } = operation {
+                    expressions.push(value);
+                }
+            }
+            BoundStatement::Insert {
+                rows,
+                on_conflict,
+                returning,
+                ..
+            } => {
+                expressions.extend(rows.iter().flatten());
+                if let Some(BoundOnConflict {
+                    action:
+                        BoundConflictAction::DoUpdate {
+                            assignments,
+                            filter,
+                        },
+                    ..
+                }) = on_conflict
+                {
+                    expressions.extend(assignments.iter().map(|(_, expression)| expression));
+                    expressions.extend(filter.iter());
+                }
+                push_returning_expressions(&mut expressions, returning.as_ref());
+            }
+            BoundStatement::Merge(merge) => {
+                expressions.push(&merge.on);
+                for clause in &merge.clauses {
+                    expressions.extend(clause.predicate.iter());
+                    match &clause.action {
+                        BoundMergeAction::Update { assignments } => {
+                            expressions.extend(assignments.iter().map(|(_, expression)| expression))
+                        }
+                        BoundMergeAction::Insert { values, .. } => expressions.extend(values),
+                        BoundMergeAction::Delete | BoundMergeAction::DoNothing => {}
+                    }
+                }
+                push_returning_expressions(&mut expressions, merge.returning.as_ref());
+            }
+            BoundStatement::With { ctes, body, .. } => {
+                statements.push(body);
+                for cte in ctes {
+                    statements.push(&cte.seed);
+                    if let Some(recursive) = &cte.recursive {
+                        statements.push(recursive);
+                    }
+                }
+            }
+            BoundStatement::SetOperation {
+                left,
+                right,
+                order_by,
+                offset,
+                limit,
+                ..
+            } => {
+                statements.extend([left.as_ref(), right.as_ref()]);
+                push_order_expressions(&mut expressions, order_by);
+                expressions.extend(offset.iter());
+                expressions.extend(limit.iter());
+            }
+            BoundStatement::Select {
+                projection,
+                filter,
+                order_by,
+                offset,
+                limit,
+                ..
+            } => {
+                push_projection_expressions(&mut expressions, projection);
+                expressions.extend(filter.iter());
+                push_order_expressions(&mut expressions, order_by);
+                expressions.extend(offset.iter());
+                expressions.extend(limit.iter());
+            }
+            BoundStatement::AdvancedSelect {
+                joins,
+                applies,
+                windows,
+                projection,
+                filter,
+                group_by,
+                having,
+                order_by,
+                offset,
+                limit,
+                ..
+            } => {
+                for join in joins {
+                    if let BoundJoinSource::Derived { query, .. } = &join.source {
+                        statements.push(query);
+                    }
+                    expressions.push(&join.on);
+                }
+                for apply in applies {
+                    statements.push(&apply.query);
+                    match &apply.kind {
+                        BoundApplyKind::In { left, .. }
+                        | BoundApplyKind::Quantified { left, .. } => expressions.push(left),
+                        BoundApplyKind::RowScalar { left, .. }
+                        | BoundApplyKind::RowQuantified { left, .. } => expressions.extend(left),
+                        BoundApplyKind::Scalar | BoundApplyKind::Exists { .. } => {}
+                    }
+                }
+                for window in windows {
+                    expressions.extend(&window.arguments);
+                    expressions.extend(window.filter.iter());
+                    expressions.extend(&window.partition_by);
+                    push_order_expressions(&mut expressions, &window.order_by);
+                    if let Some(frame) = &window.frame {
+                        push_window_frame_bound(&mut expressions, &frame.start_bound);
+                        push_window_frame_bound(&mut expressions, &frame.end_bound);
+                    }
+                }
+                push_projection_expressions(&mut expressions, projection);
+                expressions.extend(filter.iter());
+                expressions.extend(group_by);
+                expressions.extend(having.iter());
+                push_order_expressions(&mut expressions, order_by);
+                expressions.extend(offset.iter());
+                expressions.extend(limit.iter().map(Box::as_ref));
+            }
+            BoundStatement::Update {
+                assignments,
+                filter,
+                returning,
+                ..
+            } => {
+                expressions.extend(assignments.iter().map(|(_, expression)| expression));
+                expressions.extend(filter.iter());
+                push_returning_expressions(&mut expressions, returning.as_ref());
+            }
+            BoundStatement::Delete {
+                filter, returning, ..
+            } => {
+                expressions.extend(filter.iter());
+                push_returning_expressions(&mut expressions, returning.as_ref());
+            }
+            BoundStatement::NoOp { .. }
+            | BoundStatement::Begin { .. }
+            | BoundStatement::Commit { .. }
+            | BoundStatement::Rollback { .. }
+            | BoundStatement::Savepoint { .. }
+            | BoundStatement::RollbackTo { .. }
+            | BoundStatement::ReleaseSavepoint { .. }
+            | BoundStatement::Analyze { .. }
+            | BoundStatement::Vacuum { .. }
+            | BoundStatement::CreateSchema { .. }
+            | BoundStatement::AlterSchemaRename { .. }
+            | BoundStatement::DropObjects { .. }
+            | BoundStatement::CreateTable { .. }
+            | BoundStatement::AlterTable { .. }
+            | BoundStatement::CreateIndex { .. }
+            | BoundStatement::AlterIndexRename { .. }
+            | BoundStatement::CreateSequence { .. }
+            | BoundStatement::AlterSequenceRename { .. }
+            | BoundStatement::AlterSequence { .. }
+            | BoundStatement::AlterViewRename { .. }
+            | BoundStatement::CreateRoutine { .. }
+            | BoundStatement::DropRoutine { .. }
+            | BoundStatement::CreateTrigger { .. }
+            | BoundStatement::DropTrigger { .. } => {}
+        }
+    }
+
+    let mut parameters = BTreeMap::new();
+    while let Some(expression) = expressions.pop() {
+        match &expression.kind {
+            BoundExprKind::Parameter { index } => {
+                if let Some(existing) = parameters.get(index) {
+                    if existing != &expression.data_type {
+                        return Err(DbError::new(
+                            "42804",
+                            format!("inconsistent types deduced for parameter ${index}"),
+                        )
+                        .with_detail(format!(
+                            "parameter ${index} was inferred as both {existing:?} and {:?}",
+                            expression.data_type
+                        )));
+                    }
+                } else {
+                    parameters.insert(*index, expression.data_type.clone());
+                }
+            }
+            BoundExprKind::Unary { expr, .. } => expressions.push(expr),
+            BoundExprKind::Binary { left, right, .. } => {
+                expressions.extend([left.as_ref(), right.as_ref()]);
+            }
+            BoundExprKind::InList { expr, list, .. } => {
+                expressions.push(expr);
+                expressions.extend(list);
+            }
+            BoundExprKind::Aggregate {
+                argument, filter, ..
+            } => {
+                expressions.extend(argument.iter().map(Box::as_ref));
+                expressions.extend(filter.iter().map(Box::as_ref));
+            }
+            BoundExprKind::Column { .. }
+            | BoundExprKind::Literal(_)
+            | BoundExprKind::Correlation { .. }
+            | BoundExprKind::ApplyValue { .. } => {}
+        }
+    }
+
+    let Some(max_index) = parameters.keys().next_back().copied() else {
+        return Ok(Vec::new());
+    };
+    (1..=max_index)
+        .map(|index| {
+            parameters.get(&index).cloned().ok_or_else(|| {
+                DbError::new(
+                    "42P18",
+                    format!("could not determine data type of parameter ${index}"),
+                )
+            })
+        })
+        .collect()
+}
+
+fn push_projection_expressions<'a>(
+    expressions: &mut Vec<&'a BoundExpr>,
+    projection: &'a [BoundProjection],
+) {
+    expressions.extend(projection.iter().map(|projection| &projection.expr));
+}
+
+fn push_returning_expressions<'a>(
+    expressions: &mut Vec<&'a BoundExpr>,
+    returning: Option<&'a BoundReturning>,
+) {
+    if let Some(returning) = returning {
+        push_projection_expressions(expressions, &returning.projection);
+    }
+}
+
+fn push_order_expressions<'a>(expressions: &mut Vec<&'a BoundExpr>, order_by: &'a [BoundOrder]) {
+    expressions.extend(
+        order_by
+            .iter()
+            .filter_map(|order| order.expression.as_ref()),
+    );
+}
+
+fn push_window_frame_bound<'a>(
+    expressions: &mut Vec<&'a BoundExpr>,
+    bound: &'a BoundWindowFrameBound,
+) {
+    if let BoundWindowFrameBound::Preceding(expression)
+    | BoundWindowFrameBound::Following(expression) = bound
+    {
+        expressions.push(expression);
     }
 }
 
@@ -2001,6 +2412,7 @@ pub struct TryQueryStream {
     failure_flag: Option<Arc<AtomicBool>>,
     cancellation: Option<Arc<AtomicBool>>,
     execution_memory_peak_bytes: Option<usize>,
+    _event_reservation: Option<Reservation>,
 }
 
 enum TryQueryStreamState {
@@ -2043,7 +2455,7 @@ impl StreamBatchCursor {
     fn memory_peak_bytes(&self) -> usize {
         match self {
             Self::Simple(cursor) => cursor.memory().peak_bytes(),
-            Self::Advanced(cursor) => cursor.memory().peak_bytes(),
+            Self::Advanced(cursor) => cursor.memory_peak_bytes(),
         }
     }
 }
@@ -2067,7 +2479,38 @@ impl TryQueryStream {
             failure_flag: None,
             cancellation: None,
             execution_memory_peak_bytes: None,
+            _event_reservation: None,
         }
+    }
+
+    fn buffered(events: Vec<QueryEvent>) -> Result<Self> {
+        let memory = MemoryGrant::new(DEFAULT_SOFT_MEMORY_BYTES, DEFAULT_HARD_MEMORY_BYTES)?;
+        let bytes = events.iter().try_fold(0usize, |total, event| {
+            let QueryEvent::Batch(batch) = event else {
+                return Ok(total);
+            };
+            batch.rows.iter().try_fold(total, |total, row| {
+                total.checked_add(estimated_row_bytes(row)).ok_or_else(|| {
+                    DbError::new("53200", "query memory limit exceeded")
+                        .with_detail("RETURNING row memory accounting overflow")
+                })
+            })
+        })?;
+        if bytes == 0 {
+            return Ok(Self::new(events));
+        }
+        let reservation = memory.try_reserve(bytes)?;
+        let peak = memory.peak_bytes();
+        Ok(Self {
+            state: TryQueryStreamState::Events(
+                events.into_iter().map(Ok).collect::<Vec<_>>().into_iter(),
+            ),
+            failed: false,
+            failure_flag: None,
+            cancellation: None,
+            execution_memory_peak_bytes: Some(peak),
+            _event_reservation: Some(reservation),
+        })
     }
 
     fn select(
@@ -2087,6 +2530,7 @@ impl TryQueryStream {
             failure_flag: None,
             cancellation,
             execution_memory_peak_bytes: Some(0),
+            _event_reservation: None,
         }
     }
 
@@ -2096,7 +2540,7 @@ impl TryQueryStream {
     }
 
     /// Returns the highest number of query-accounted bytes observed by this
-    /// SELECT stream. Non-SELECT statements do not own an execution cursor.
+    /// SELECT or row-returning DML stream. Other statements return `None`.
     #[must_use]
     pub const fn execution_memory_peak_bytes(&self) -> Option<usize> {
         self.execution_memory_peak_bytes
@@ -2233,7 +2677,42 @@ struct SelectExecution {
     projection: Vec<BoundProjection>,
     filter: Option<BoundExpr>,
     order_by: Vec<BoundOrder>,
+    offset: Option<BoundExpr>,
     limit: Option<BoundExpr>,
+}
+
+struct SetExecution {
+    left: Box<BoundStatement>,
+    operator: QuerySetOperator,
+    all: bool,
+    right: Box<BoundStatement>,
+    schema: Schema,
+    order_by: Vec<BoundOrder>,
+    offset: Option<BoundExpr>,
+    limit: Option<BoundExpr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SetRowKey(Vec<SetValueKey>);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SetValueKey {
+    Null,
+    Boolean(bool),
+    Int16(i16),
+    Int32(i32),
+    Int64(i64),
+    Float32(u32),
+    Float64(u64),
+    Decimal(String),
+    Text(String),
+    Binary(Vec<u8>),
+    Date(String),
+    Time(String),
+    Timestamp(String),
+    Jsonb(String),
+    Uuid([u8; 16]),
+    Vector(Vec<u32>),
 }
 
 struct CreateViewExecution {
@@ -2265,12 +2744,16 @@ enum ReferentialChange {
 struct AdvancedExecution {
     table: BoundTable,
     joins: Vec<BoundJoin>,
+    applies: Vec<BoundApply>,
+    windows: Vec<BoundWindow>,
     schema: Schema,
     projection: Vec<BoundProjection>,
+    distinct: bool,
     filter: Option<BoundExpr>,
     group_by: Vec<BoundExpr>,
     having: Option<BoundExpr>,
     order_by: Vec<BoundOrder>,
+    offset: Option<BoundExpr>,
     limit: Option<BoundExpr>,
     aggregate: bool,
 }
@@ -2729,6 +3212,7 @@ fn prepare_read_stream(
             projection,
             filter,
             order_by,
+            offset,
             limit,
         } => {
             let (schema, cursor) = prepare_select_cursor(
@@ -2739,6 +3223,7 @@ fn prepare_read_stream(
                     projection,
                     filter,
                     order_by,
+                    offset,
                     limit,
                 },
                 params,
@@ -2753,12 +3238,16 @@ fn prepare_read_stream(
         BoundStatement::AdvancedSelect {
             table,
             joins,
+            applies,
+            windows,
             schema,
             projection,
+            distinct,
             filter,
             group_by,
             having,
             order_by,
+            offset,
             limit,
             aggregate,
         } => {
@@ -2767,13 +3256,17 @@ fn prepare_read_stream(
                 AdvancedExecution {
                     table,
                     joins,
+                    applies,
+                    windows,
                     schema,
                     projection,
+                    distinct,
                     filter,
                     group_by,
                     having,
                     order_by,
-                    limit,
+                    offset,
+                    limit: limit.map(|limit| *limit),
                     aggregate,
                 },
                 params,
@@ -2822,10 +3315,13 @@ enum StatementWriteScope {
 fn statement_write_scope(statement: &BoundStatement) -> StatementWriteScope {
     match statement {
         BoundStatement::Insert { .. }
+        | BoundStatement::Merge(_)
         | BoundStatement::Update { .. }
         | BoundStatement::Delete { .. } => StatementWriteScope::Dml,
         BoundStatement::Select { .. }
         | BoundStatement::AdvancedSelect { .. }
+        | BoundStatement::SetOperation { .. }
+        | BoundStatement::With { .. }
         | BoundStatement::ViewSelect { .. }
         | BoundStatement::RoutineSelect { .. }
         | BoundStatement::Explain { .. }
@@ -2842,9 +3338,39 @@ fn statement_read_predicates(statement: &BoundStatement) -> Vec<PredicateLock> {
             BoundStatement::Select { table_id, .. } => {
                 table_ids.insert(*table_id);
             }
-            BoundStatement::AdvancedSelect { table, joins, .. } => {
+            BoundStatement::AdvancedSelect {
+                table,
+                joins,
+                applies,
+                ..
+            } => {
                 table_ids.insert(table.table_id);
-                table_ids.extend(joins.iter().map(|join| join.table.table_id));
+                for join in joins {
+                    match &join.source {
+                        BoundJoinSource::Table(table) => {
+                            table_ids.insert(table.table_id);
+                        }
+                        BoundJoinSource::Derived { query, .. } => pending.push(query),
+                    }
+                }
+                pending.extend(applies.iter().map(|apply| apply.query.as_ref()));
+            }
+            BoundStatement::SetOperation { left, right, .. } => {
+                pending.push(right);
+                pending.push(left);
+            }
+            BoundStatement::With { ctes, body, .. } => {
+                pending.push(body);
+                for cte in ctes {
+                    pending.push(&cte.seed);
+                    if let Some(recursive) = &cte.recursive {
+                        pending.push(recursive);
+                    }
+                }
+            }
+            BoundStatement::Merge(merge) => {
+                table_ids.insert(merge.target.table_id);
+                table_ids.insert(merge.source.table_id);
             }
             BoundStatement::ViewSelect { source, .. }
             | BoundStatement::Explain { statement: source } => {
@@ -3408,6 +3934,33 @@ fn refresh_read_committed_candidate(
     *base = Some(refreshed_base);
     *working = Some(refreshed_working);
     Ok(())
+}
+
+fn read_committed_statement_state(
+    state: &Arc<RwLock<DatabaseState>>,
+    statuses: &TransactionStatusStore,
+    transaction: &mut DurableTransaction,
+    base: Option<&DatabaseState>,
+    working: Option<&DatabaseState>,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> Result<DatabaseState> {
+    let transaction_snapshot = transaction.begin_statement()?.clone();
+    let mut latest = project_database_visibility(
+        committed_snapshot(state)?,
+        &transaction_snapshot,
+        transaction.transaction_id(),
+        statuses,
+    )?;
+    latest.cancellation = cancellation;
+    match (base, working) {
+        (Some(base), Some(working)) => {
+            merge_dml_candidate(&latest, base, working, transaction, statuses)
+        }
+        (None, None) => Ok(latest),
+        _ => Err(internal_error(
+            "DML transaction has incomplete base/working state during conflict recheck",
+        )),
+    }
 }
 
 struct DmlUpgradeAuthorities<'a> {
@@ -4173,13 +4726,54 @@ fn execute_bound(
             table_id,
             column_indexes,
             rows,
-        } => execute_insert(state, table_id, column_indexes, rows, params),
+            on_conflict,
+            returning,
+        } => execute_insert(
+            state,
+            table_id,
+            column_indexes,
+            rows,
+            on_conflict,
+            returning,
+            params,
+        ),
+        BoundStatement::Merge(merge) => execute_merge(state, merge, params),
+        BoundStatement::With {
+            ctes,
+            body,
+            catalog,
+            schema,
+        } => execute_with_clause(state, ctes, *body, *catalog, schema, params),
+        BoundStatement::SetOperation {
+            left,
+            operator,
+            all,
+            right,
+            schema,
+            order_by,
+            offset,
+            limit,
+        } => execute_set_operation(
+            state,
+            SetExecution {
+                left,
+                operator,
+                all,
+                right,
+                schema,
+                order_by,
+                offset,
+                limit,
+            },
+            params,
+        ),
         BoundStatement::Select {
             table_id,
             schema,
             projection,
             filter,
             order_by,
+            offset,
             limit,
         } => execute_select(
             state,
@@ -4189,6 +4783,7 @@ fn execute_bound(
                 projection,
                 filter,
                 order_by,
+                offset,
                 limit,
             },
             params,
@@ -4196,12 +4791,16 @@ fn execute_bound(
         BoundStatement::AdvancedSelect {
             table,
             joins,
+            applies,
+            windows,
             schema,
             projection,
+            distinct,
             filter,
             group_by,
             having,
             order_by,
+            offset,
             limit,
             aggregate,
         } => execute_advanced_select(
@@ -4209,13 +4808,17 @@ fn execute_bound(
             AdvancedExecution {
                 table,
                 joins,
+                applies,
+                windows,
                 schema,
                 projection,
+                distinct,
                 filter,
                 group_by,
                 having,
                 order_by,
-                limit,
+                offset,
+                limit: limit.map(|limit| *limit),
                 aggregate,
             },
             params,
@@ -4231,10 +4834,13 @@ fn execute_bound(
             table_id,
             assignments,
             filter,
-        } => execute_update(state, table_id, assignments, filter, params),
-        BoundStatement::Delete { table_id, filter } => {
-            execute_delete(state, table_id, filter, params)
-        }
+            returning,
+        } => execute_update(state, table_id, assignments, filter, returning, params),
+        BoundStatement::Delete {
+            table_id,
+            filter,
+            returning,
+        } => execute_delete(state, table_id, filter, returning, params),
         BoundStatement::Analyze { .. } | BoundStatement::Vacuum { .. } => Err(internal_error(
             "maintenance statement was not routed through the root executor",
         )),
@@ -5201,15 +5807,544 @@ fn expand_trigger_record_fields(
     Ok((output, expanded, parameter_types))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PlannedMergeAction {
+    clause_index: usize,
+    target_position: Option<usize>,
+    source_position: Option<usize>,
+}
+
+fn execute_merge(
+    state: &mut DatabaseState,
+    merge: BoundMerge,
+    params: &[Value],
+) -> Result<(Vec<QueryEvent>, bool)> {
+    let BoundMerge {
+        target,
+        source,
+        on,
+        clauses,
+        returning,
+    } = merge;
+    if target.offset != 0 || source.offset != target.width {
+        return Err(internal_error(
+            "MERGE input column offsets are inconsistent",
+        ));
+    }
+    let target_definition = table_definition(state, target.table_id)?.clone();
+    table_definition(state, source.table_id)?;
+    let target_rows = state
+        .rows
+        .get(&target.table_id)
+        .cloned()
+        .unwrap_or_default();
+    let source_rows = state
+        .rows
+        .get(&source.table_id)
+        .cloned()
+        .unwrap_or_default();
+    let memory = MemoryGrant::new(DEFAULT_SOFT_MEMORY_BYTES, DEFAULT_HARD_MEMORY_BYTES)?;
+    let mut plan_reservation = memory.try_reserve(0)?;
+    let mut input_reservation = memory.try_reserve(0)?;
+    let mut returning_reservation = memory.try_reserve(0)?;
+    let mut planned = Vec::new();
+    let mut affected_targets = BTreeSet::new();
+    let mut matched_targets = BTreeSet::new();
+
+    for (source_position, source_row) in source_rows.iter().enumerate() {
+        ensure_statement_not_cancelled(state)?;
+        let mut matched = false;
+        for (target_position, target_row) in target_rows.iter().enumerate() {
+            ensure_statement_not_cancelled(state)?;
+            let input = merge_input_row(
+                Some(target_row),
+                target.width,
+                source_row,
+                &mut input_reservation,
+            )?;
+            if !execution_predicate_matches(&on, &input, params)? {
+                continue;
+            }
+            matched = true;
+            if matched_targets.insert(target_position) {
+                plan_reservation.grow(mem::size_of::<usize>() * 4)?;
+            }
+            let Some(clause_index) = first_matching_merge_clause(
+                &clauses,
+                BoundMergeClauseKind::Matched,
+                &input,
+                params,
+            )?
+            else {
+                continue;
+            };
+            if matches!(clauses[clause_index].action, BoundMergeAction::DoNothing) {
+                continue;
+            }
+            if !matches!(
+                clauses[clause_index].action,
+                BoundMergeAction::Update { .. } | BoundMergeAction::Delete
+            ) {
+                return Err(internal_error(
+                    "MERGE matched clause contains an invalid action",
+                ));
+            }
+            if !affected_targets.insert(target_position) {
+                return Err(
+                    DbError::new("21000", "MERGE command cannot affect row a second time")
+                        .with_hint(
+                            "Ensure that no more than one source row matches each target row.",
+                        ),
+                );
+            }
+            plan_reservation
+                .grow(mem::size_of::<PlannedMergeAction>() + mem::size_of::<usize>() * 4)?;
+            planned.push(PlannedMergeAction {
+                clause_index,
+                target_position: Some(target_position),
+                source_position: Some(source_position),
+            });
+        }
+        if matched {
+            continue;
+        }
+        let input = merge_input_row(None, target.width, source_row, &mut input_reservation)?;
+        let Some(clause_index) = first_matching_merge_clause(
+            &clauses,
+            BoundMergeClauseKind::NotMatchedByTarget,
+            &input,
+            params,
+        )?
+        else {
+            continue;
+        };
+        if matches!(clauses[clause_index].action, BoundMergeAction::DoNothing) {
+            continue;
+        }
+        if !matches!(
+            clauses[clause_index].action,
+            BoundMergeAction::Insert { .. }
+        ) {
+            return Err(internal_error(
+                "MERGE not-matched clause contains an invalid action",
+            ));
+        }
+        plan_reservation.grow(mem::size_of::<PlannedMergeAction>())?;
+        planned.push(PlannedMergeAction {
+            clause_index,
+            target_position: None,
+            source_position: Some(source_position),
+        });
+    }
+
+    let null_source = Row::new(vec![Value::Null; source.width]);
+    input_reservation.grow(estimated_row_bytes(&null_source))?;
+    for (target_position, target_row) in target_rows.iter().enumerate() {
+        ensure_statement_not_cancelled(state)?;
+        if matched_targets.contains(&target_position) {
+            continue;
+        }
+        let input = merge_input_row(
+            Some(target_row),
+            target.width,
+            &null_source,
+            &mut input_reservation,
+        )?;
+        let Some(clause_index) = first_matching_merge_clause(
+            &clauses,
+            BoundMergeClauseKind::NotMatchedBySource,
+            &input,
+            params,
+        )?
+        else {
+            continue;
+        };
+        if matches!(clauses[clause_index].action, BoundMergeAction::DoNothing) {
+            continue;
+        }
+        if !matches!(
+            clauses[clause_index].action,
+            BoundMergeAction::Update { .. } | BoundMergeAction::Delete
+        ) {
+            return Err(internal_error(
+                "MERGE not-matched-by-source clause contains an invalid action",
+            ));
+        }
+        if !affected_targets.insert(target_position) {
+            return Err(internal_error("MERGE planned a target row more than once"));
+        }
+        plan_reservation
+            .grow(mem::size_of::<PlannedMergeAction>() + mem::size_of::<usize>() * 4)?;
+        planned.push(PlannedMergeAction {
+            clause_index,
+            target_position: Some(target_position),
+            source_position: None,
+        });
+    }
+
+    let mut affected = 0_u64;
+    let mut returned_rows = Vec::new();
+    let mut deleted_targets = BTreeSet::new();
+    for action in planned {
+        ensure_statement_not_cancelled(state)?;
+        let source_row = action
+            .source_position
+            .map_or(Ok(&null_source), |source_position| {
+                source_rows.get(source_position).ok_or_else(|| {
+                    internal_error("MERGE source row is outside its statement snapshot")
+                })
+            })?;
+        let clause = clauses
+            .get(action.clause_index)
+            .ok_or_else(|| internal_error("MERGE clause index is out of bounds"))?;
+        let changed_row = match (&clause.action, action.target_position) {
+            (BoundMergeAction::Update { assignments }, Some(target_position)) => {
+                let old_row = target_rows.get(target_position).ok_or_else(|| {
+                    internal_error("MERGE target row is outside its statement snapshot")
+                })?;
+                let current_position =
+                    current_merge_target_position(target_position, &deleted_targets)?;
+                let input = merge_input_row(
+                    Some(old_row),
+                    target.width,
+                    source_row,
+                    &mut input_reservation,
+                )?;
+                execute_merge_update(
+                    state,
+                    target.table_id,
+                    current_position,
+                    old_row,
+                    &input,
+                    assignments,
+                    params,
+                )?
+            }
+            (BoundMergeAction::Delete, Some(target_position)) => {
+                let old_row = target_rows.get(target_position).ok_or_else(|| {
+                    internal_error("MERGE target row is outside its statement snapshot")
+                })?;
+                let current_position =
+                    current_merge_target_position(target_position, &deleted_targets)?;
+                let deleted =
+                    execute_merge_delete(state, target.table_id, current_position, old_row)?;
+                if deleted.is_some() {
+                    plan_reservation.grow(mem::size_of::<usize>() * 4)?;
+                    deleted_targets.insert(target_position);
+                }
+                deleted
+            }
+            (
+                BoundMergeAction::Insert {
+                    column_indexes,
+                    values,
+                },
+                None,
+            ) => {
+                let input =
+                    merge_input_row(None, target.width, source_row, &mut input_reservation)?;
+                execute_merge_insert(
+                    state,
+                    &target_definition,
+                    column_indexes,
+                    values,
+                    &input,
+                    params,
+                )?
+            }
+            (BoundMergeAction::DoNothing, _) => None,
+            _ => {
+                return Err(internal_error(
+                    "MERGE action does not match its clause kind",
+                ));
+            }
+        };
+        let Some(changed_row) = changed_row else {
+            continue;
+        };
+        if let Some(returning) = &returning {
+            let returned = evaluate_returning(returning, &changed_row, params)?;
+            returning_reservation.grow(estimated_row_bytes(&returned))?;
+            returned_rows.push(returned);
+        }
+        affected = affected.saturating_add(1);
+    }
+
+    Ok((
+        dml_command_events(
+            returning.as_ref(),
+            format!("MERGE {affected}"),
+            affected,
+            returned_rows,
+        ),
+        affected != 0,
+    ))
+}
+
+fn first_matching_merge_clause(
+    clauses: &[ordadb_sql::BoundMergeClause],
+    kind: BoundMergeClauseKind,
+    input: &Row,
+    params: &[Value],
+) -> Result<Option<usize>> {
+    for (index, clause) in clauses.iter().enumerate() {
+        if clause.kind != kind {
+            continue;
+        }
+        if clause
+            .predicate
+            .as_ref()
+            .map(|predicate| execution_predicate_matches(predicate, input, params))
+            .transpose()?
+            .unwrap_or(true)
+        {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+fn merge_input_row(
+    target: Option<&Row>,
+    target_width: usize,
+    source: &Row,
+    reservation: &mut Reservation,
+) -> Result<Row> {
+    let target_bytes = target.map_or_else(
+        || target_width.saturating_mul(mem::size_of::<Value>()),
+        estimated_row_bytes,
+    );
+    reservation.resize(
+        target_bytes
+            .saturating_add(estimated_row_bytes(source))
+            .saturating_add(mem::size_of::<Row>()),
+    )?;
+    let mut values = Vec::with_capacity(target_width.saturating_add(source.values.len()));
+    match target {
+        Some(target) => values.extend(target.values.iter().cloned()),
+        None => values.resize(target_width, Value::Null),
+    }
+    values.extend(source.values.iter().cloned());
+    Ok(Row::new(values))
+}
+
+fn current_merge_target_position(
+    original_position: usize,
+    deleted_targets: &BTreeSet<usize>,
+) -> Result<usize> {
+    if deleted_targets.contains(&original_position) {
+        return Err(internal_error("MERGE target row was already deleted"));
+    }
+    original_position
+        .checked_sub(deleted_targets.range(..original_position).count())
+        .ok_or_else(|| internal_error("MERGE target position underflowed"))
+}
+
+fn execute_merge_update(
+    state: &mut DatabaseState,
+    table_id: TableId,
+    position: usize,
+    old_row: &Row,
+    input: &Row,
+    assignments: &[(usize, BoundExpr)],
+    params: &[Value],
+) -> Result<Option<Row>> {
+    let mut proposed = old_row.clone();
+    for (column_index, expression) in assignments {
+        proposed.values[*column_index] = evaluate_scalar(expression, &input.values, params)?;
+    }
+    let replacement = match fire_row_triggers_with_rows(
+        state,
+        table_id,
+        TriggerTiming::Before,
+        TriggerEvent::Update,
+        Some(old_row),
+        Some(&proposed),
+    )? {
+        RowTriggerOutcome::Proceed(Some(row)) => row,
+        RowTriggerOutcome::Proceed(None) | RowTriggerOutcome::Suppress => return Ok(None),
+    };
+    let current = state
+        .rows
+        .get(&table_id)
+        .and_then(|rows| rows.get(position))
+        .ok_or_else(|| DbError::new("55000", "MERGE target row disappeared before update"))?;
+    if current != old_row {
+        return Err(DbError::new(
+            "55000",
+            "BEFORE trigger changed the row targeted by MERGE UPDATE",
+        )
+        .with_hint("Return a replacement NEW row instead of updating the same row recursively."));
+    }
+    Arc::make_mut(
+        state
+            .rows
+            .get_mut(&table_id)
+            .ok_or_else(|| internal_error("MERGE target rows disappeared"))?,
+    )[position] = replacement.clone();
+    if replacement != *old_row {
+        apply_referential_actions(
+            state,
+            vec![ReferentialChange::Update {
+                table_id,
+                old: old_row.clone(),
+                new: replacement.clone(),
+            }],
+        )?;
+    }
+    validate_database_rows(state)?;
+    rebuild_table_derived(state, table_id)?;
+    let _ = fire_row_triggers_with_rows(
+        state,
+        table_id,
+        TriggerTiming::After,
+        TriggerEvent::Update,
+        Some(old_row),
+        Some(&replacement),
+    )?;
+    validate_database_rows(state)?;
+    rebuild_table_derived(state, table_id)?;
+    Ok(Some(replacement))
+}
+
+fn execute_merge_delete(
+    state: &mut DatabaseState,
+    table_id: TableId,
+    position: usize,
+    old_row: &Row,
+) -> Result<Option<Row>> {
+    if matches!(
+        fire_row_triggers_with_rows(
+            state,
+            table_id,
+            TriggerTiming::Before,
+            TriggerEvent::Delete,
+            Some(old_row),
+            None,
+        )?,
+        RowTriggerOutcome::Suppress
+    ) {
+        return Ok(None);
+    }
+    let current = state
+        .rows
+        .get(&table_id)
+        .and_then(|rows| rows.get(position))
+        .ok_or_else(|| DbError::new("55000", "MERGE target row disappeared before delete"))?;
+    if current != old_row {
+        return Err(DbError::new(
+            "55000",
+            "BEFORE trigger changed the row targeted by MERGE DELETE",
+        )
+        .with_hint("Return OLD instead of deleting the same row recursively."));
+    }
+    Arc::make_mut(
+        state
+            .rows
+            .get_mut(&table_id)
+            .ok_or_else(|| internal_error("MERGE target rows disappeared"))?,
+    )
+    .remove(position);
+    apply_referential_actions(
+        state,
+        vec![ReferentialChange::Delete {
+            table_id,
+            old: old_row.clone(),
+        }],
+    )?;
+    validate_database_rows(state)?;
+    rebuild_table_derived(state, table_id)?;
+    let _ = fire_row_triggers_with_rows(
+        state,
+        table_id,
+        TriggerTiming::After,
+        TriggerEvent::Delete,
+        Some(old_row),
+        None,
+    )?;
+    validate_database_rows(state)?;
+    rebuild_table_derived(state, table_id)?;
+    Ok(Some(old_row.clone()))
+}
+
+fn execute_merge_insert(
+    state: &mut DatabaseState,
+    table: &TableDefinition,
+    column_indexes: &[usize],
+    expressions: &[BoundExpr],
+    input: &Row,
+    params: &[Value],
+) -> Result<Option<Row>> {
+    let mut values = table
+        .columns()
+        .iter()
+        .map(|column| catalog_default_value(column.default.as_ref(), &column.data_type))
+        .collect::<Result<Vec<_>>>()?;
+    for (expression, column_index) in expressions.iter().zip(column_indexes) {
+        values[*column_index] = evaluate_scalar(expression, &input.values, params)?;
+    }
+    let proposed = Row::new(values);
+    let inserted = match fire_row_triggers_with_rows(
+        state,
+        table.id,
+        TriggerTiming::Before,
+        TriggerEvent::Insert,
+        None,
+        Some(&proposed),
+    )? {
+        RowTriggerOutcome::Proceed(Some(row)) => row,
+        RowTriggerOutcome::Proceed(None) | RowTriggerOutcome::Suppress => return Ok(None),
+    };
+    validate_rows(table, std::slice::from_ref(&inserted))?;
+    Arc::make_mut(
+        state
+            .rows
+            .entry(table.id)
+            .or_insert_with(|| Arc::new(Vec::new())),
+    )
+    .push(inserted.clone());
+    validate_database_rows(state)?;
+    rebuild_table_derived(state, table.id)?;
+    let _ = fire_row_triggers_with_rows(
+        state,
+        table.id,
+        TriggerTiming::After,
+        TriggerEvent::Insert,
+        None,
+        Some(&inserted),
+    )?;
+    validate_database_rows(state)?;
+    rebuild_table_derived(state, table.id)?;
+    Ok(Some(inserted))
+}
+
+fn ensure_statement_not_cancelled(state: &DatabaseState) -> Result<()> {
+    if state
+        .cancellation
+        .as_ref()
+        .is_some_and(|cancellation| cancellation.load(Ordering::Acquire))
+    {
+        Err(DbError::new("57014", "query was cancelled"))
+    } else {
+        Ok(())
+    }
+}
+
 fn execute_insert(
     state: &mut DatabaseState,
     table_id: TableId,
     column_indexes: Vec<usize>,
     expressions: Vec<Vec<BoundExpr>>,
+    on_conflict: Option<BoundOnConflict>,
+    returning: Option<BoundReturning>,
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
     let table = table_definition(state, table_id)?.clone();
-    let mut inserted = 0u64;
+    let mut affected = 0u64;
+    let mut returned_rows = Vec::new();
+    let mut command_affected_rows = BTreeSet::new();
+    let conflict_memory = MemoryGrant::new(DEFAULT_SOFT_MEMORY_BYTES, DEFAULT_HARD_MEMORY_BYTES)?;
+    let mut conflict_reservation = conflict_memory.try_reserve(0)?;
     for expressions in expressions {
         let mut values = table
             .columns()
@@ -5231,6 +6366,56 @@ fn execute_insert(
             RowTriggerOutcome::Proceed(Some(row)) => row,
             RowTriggerOutcome::Proceed(None) | RowTriggerOutcome::Suppress => continue,
         };
+        validate_rows(&table, std::slice::from_ref(&inserted_row))?;
+        if let Some(on_conflict) = &on_conflict
+            && let Some(position) = conflicting_row_position(
+                state,
+                &table,
+                &inserted_row,
+                on_conflict.target_columns.as_deref(),
+            )?
+        {
+            match &on_conflict.action {
+                BoundConflictAction::DoNothing => continue,
+                BoundConflictAction::DoUpdate {
+                    assignments,
+                    filter,
+                } => {
+                    if command_affected_rows.contains(&position) {
+                        return Err(DbError::new(
+                            "21000",
+                            "ON CONFLICT DO UPDATE command cannot affect row a second time",
+                        )
+                        .with_hint(
+                            "Ensure that no rows proposed for insertion within the same command have duplicate constrained values.",
+                        ));
+                    }
+                    conflict_reservation.grow(std::mem::size_of::<usize>() * 4)?;
+                    command_affected_rows.insert(position);
+                    let replacement = execute_conflict_update(
+                        state,
+                        table_id,
+                        position,
+                        &inserted_row,
+                        assignments,
+                        filter.as_ref(),
+                        params,
+                    )?;
+                    if let Some(replacement) = replacement {
+                        if let Some(returning) = &returning {
+                            returned_rows.push(evaluate_returning(
+                                returning,
+                                &replacement,
+                                params,
+                            )?);
+                        }
+                        affected = affected.saturating_add(1);
+                    }
+                    continue;
+                }
+            }
+        }
+        let inserted_position = state.rows.get(&table_id).map_or(0, |rows| rows.len());
         Arc::make_mut(
             state
                 .rows
@@ -5250,17 +6435,185 @@ fn execute_insert(
         )?;
         validate_database_rows(state)?;
         rebuild_table_derived(state, table_id)?;
-        inserted = inserted.saturating_add(1);
+        if let Some(returning) = &returning {
+            returned_rows.push(evaluate_returning(returning, &inserted_row, params)?);
+        }
+        if matches!(
+            on_conflict.as_ref().map(|conflict| &conflict.action),
+            Some(BoundConflictAction::DoUpdate { .. })
+        ) {
+            conflict_reservation.grow(std::mem::size_of::<usize>() * 4)?;
+            command_affected_rows.insert(inserted_position);
+        }
+        affected = affected.saturating_add(1);
     }
     Ok((
-        command_events(
-            Schema::empty(),
-            format!("INSERT 0 {inserted}"),
-            inserted,
-            None,
+        dml_command_events(
+            returning.as_ref(),
+            format!("INSERT 0 {affected}"),
+            affected,
+            returned_rows,
         ),
         true,
     ))
+}
+
+fn conflicting_row_position(
+    state: &DatabaseState,
+    table: &TableDefinition,
+    candidate: &Row,
+    target_columns: Option<&[usize]>,
+) -> Result<Option<usize>> {
+    let target_column_ids = target_columns
+        .map(|target| {
+            target
+                .iter()
+                .map(|position| {
+                    table
+                        .columns()
+                        .get(*position)
+                        .map(|column| column.id)
+                        .ok_or_else(|| internal_error("conflict target column is out of bounds"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+    for definition in table.indexes().filter(|index| {
+        index.unique
+            && index.method == IndexMethod::BTree
+            && target_column_ids.as_deref().is_none_or(|target| {
+                target.len() == index.key_columns.len()
+                    && target
+                        .iter()
+                        .all(|column_id| index.key_columns.contains(column_id))
+            })
+    }) {
+        let positions = definition
+            .key_columns
+            .iter()
+            .map(|column_id| {
+                table
+                    .column_index_by_id(*column_id)
+                    .ok_or_else(|| internal_error("conflict index column is absent from its table"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let values = positions
+            .iter()
+            .map(|position| candidate.values[*position].clone())
+            .collect::<Vec<_>>();
+        if values.iter().any(Value::is_null) {
+            continue;
+        }
+        let key = IndexKey::from_values(&values)?;
+        let tree = state
+            .indexes
+            .get(&definition.id)
+            .ok_or_else(|| internal_error("conflict arbiter index is absent from live state"))?;
+        if let Some(entry) = tree.get_iter(&key).next() {
+            let position = usize::try_from(entry.row_id.get())
+                .map_err(|_| internal_error("conflict row ID does not fit this platform"))?;
+            if state
+                .rows
+                .get(&table.id)
+                .and_then(|rows| rows.get(position))
+                .is_none()
+            {
+                return Err(internal_error("conflict index row ID is outside its table"));
+            }
+            return Ok(Some(position));
+        }
+    }
+    Ok(None)
+}
+
+fn execute_conflict_update(
+    state: &mut DatabaseState,
+    table_id: TableId,
+    conflict_position: usize,
+    excluded: &Row,
+    assignments: &[(usize, BoundExpr)],
+    filter: Option<&BoundExpr>,
+    params: &[Value],
+) -> Result<Option<Row>> {
+    let old_row = state
+        .rows
+        .get(&table_id)
+        .and_then(|rows| rows.get(conflict_position))
+        .cloned()
+        .ok_or_else(|| internal_error("conflict row disappeared before update"))?;
+    let mut conflict_values = old_row.values.clone();
+    conflict_values.extend(excluded.values.iter().cloned());
+    let conflict_row = Row::new(conflict_values);
+    if !filter
+        .map(|filter| execution_predicate_matches(filter, &conflict_row, params))
+        .transpose()?
+        .unwrap_or(true)
+    {
+        return Ok(None);
+    }
+
+    let mut replacements = Vec::with_capacity(assignments.len());
+    for (column_index, expression) in assignments {
+        replacements.push((
+            *column_index,
+            evaluate_scalar(expression, &conflict_row.values, params)?,
+        ));
+    }
+    let mut proposed = old_row.clone();
+    for (column_index, value) in replacements {
+        proposed.values[column_index] = value;
+    }
+    let replacement = match fire_row_triggers_with_rows(
+        state,
+        table_id,
+        TriggerTiming::Before,
+        TriggerEvent::Update,
+        Some(&old_row),
+        Some(&proposed),
+    )? {
+        RowTriggerOutcome::Proceed(Some(row)) => row,
+        RowTriggerOutcome::Proceed(None) | RowTriggerOutcome::Suppress => return Ok(None),
+    };
+    let position = state
+        .rows
+        .get(&table_id)
+        .and_then(|rows| rows.iter().position(|row| row == &old_row))
+        .ok_or_else(|| {
+            DbError::new(
+                "55000",
+                "BEFORE trigger changed the row targeted by ON CONFLICT DO UPDATE",
+            )
+            .with_hint("Return a replacement NEW row instead of updating the same row recursively.")
+        })?;
+    Arc::make_mut(
+        state
+            .rows
+            .get_mut(&table_id)
+            .ok_or_else(|| internal_error("conflict target rows disappeared"))?,
+    )[position] = replacement.clone();
+    if replacement != old_row {
+        apply_referential_actions(
+            state,
+            vec![ReferentialChange::Update {
+                table_id,
+                old: old_row.clone(),
+                new: replacement.clone(),
+            }],
+        )?;
+    }
+    validate_database_rows(state)?;
+    rebuild_table_derived(state, table_id)?;
+    let _ = fire_row_triggers_with_rows(
+        state,
+        table_id,
+        TriggerTiming::After,
+        TriggerEvent::Update,
+        Some(&old_row),
+        Some(&replacement),
+    )?;
+    validate_database_rows(state)?;
+    rebuild_table_derived(state, table_id)?;
+    Ok(Some(replacement))
 }
 
 fn execute_select(
@@ -5293,6 +6646,521 @@ fn execute_select(
     Ok((events, false))
 }
 
+fn execute_with_clause(
+    state: &DatabaseState,
+    ctes: Vec<BoundCte>,
+    body: BoundStatement,
+    catalog: Catalog,
+    schema: Schema,
+    params: &[Value],
+) -> Result<(Vec<QueryEvent>, bool)> {
+    let memory = MemoryGrant::new(DEFAULT_SOFT_MEMORY_BYTES, DEFAULT_HARD_MEMORY_BYTES)?;
+    let mut reservation = memory.try_reserve(0)?;
+    let mut local = state.clone();
+    local.catalog = Arc::new(catalog);
+    for cte in ctes {
+        ensure_statement_not_cancelled(state)?;
+        let cte_schema = cte_table_schema(&local, cte.table_id)?;
+        let (events, changed) = execute_bound(&mut local, *cte.seed, params)?;
+        if changed {
+            return Err(internal_error(
+                "CTE query unexpectedly changed database state",
+            ));
+        }
+        let mut rows = coerce_set_rows(
+            collect_set_operand_rows(events),
+            &cte_schema,
+            &mut reservation,
+        )?;
+        ensure_recursive_cte_row_limit(rows.len())?;
+        if let Some(recursive) = cte.recursive {
+            let mut seen = (!cte.union_all).then(HashSet::new);
+            if let Some(seen) = &mut seen {
+                for row in &rows {
+                    seen.insert(accounted_set_row_key(row, &mut reservation)?);
+                }
+            }
+            let mut working = rows.clone();
+            for row in &working {
+                reservation.grow(estimated_row_bytes(row))?;
+            }
+            let mut iteration = 0_usize;
+            while !working.is_empty() {
+                ensure_statement_not_cancelled(state)?;
+                iteration = iteration.saturating_add(1);
+                if iteration > MAX_RECURSIVE_CTE_ITERATIONS {
+                    return Err(DbError::new(
+                        "54001",
+                        format!("recursive CTE exceeded {MAX_RECURSIVE_CTE_ITERATIONS} iterations"),
+                    )
+                    .with_hint("Add a terminating predicate to the recursive term."));
+                }
+                local.rows.insert(cte.table_id, Arc::new(working));
+                let (events, changed) = execute_bound(&mut local, (*recursive).clone(), params)?;
+                if changed {
+                    return Err(internal_error(
+                        "recursive CTE term unexpectedly changed database state",
+                    ));
+                }
+                let candidates = coerce_set_rows(
+                    collect_set_operand_rows(events),
+                    &cte_schema,
+                    &mut reservation,
+                )?;
+                let mut next = Vec::new();
+                for row in candidates {
+                    ensure_statement_not_cancelled(state)?;
+                    if let Some(seen) = &mut seen {
+                        let key = accounted_set_row_key(&row, &mut reservation)?;
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                    }
+                    ensure_recursive_cte_row_limit(
+                        rows.len().saturating_add(next.len()).saturating_add(1),
+                    )?;
+                    next.push(row);
+                }
+                for row in &next {
+                    reservation.grow(estimated_row_bytes(row))?;
+                }
+                working = next.clone();
+                rows.extend(next);
+            }
+        }
+        local.rows.insert(cte.table_id, Arc::new(rows));
+    }
+    if bound_statement_schema(&body) != schema {
+        return Err(internal_error(
+            "WITH body schema changed after binding its CTEs",
+        ));
+    }
+    let (events, changed) = execute_bound(&mut local, body, params)?;
+    if changed {
+        return Err(internal_error(
+            "WITH body unexpectedly changed database state",
+        ));
+    }
+    Ok((events, false))
+}
+
+fn ensure_recursive_cte_row_limit(row_count: usize) -> Result<()> {
+    if row_count > MAX_RECURSIVE_CTE_ROWS {
+        return Err(DbError::new(
+            "54000",
+            format!("recursive CTE exceeded {MAX_RECURSIVE_CTE_ROWS} rows"),
+        ));
+    }
+    Ok(())
+}
+
+fn cte_table_schema(state: &DatabaseState, table_id: TableId) -> Result<Schema> {
+    Ok(Schema::new(
+        table_definition(state, table_id)?
+            .columns()
+            .iter()
+            .map(|column| {
+                Field::new(
+                    column.name.as_str(),
+                    column.data_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect(),
+    ))
+}
+
+fn execute_set_operation(
+    state: &mut DatabaseState,
+    execution: SetExecution,
+    params: &[Value],
+) -> Result<(Vec<QueryEvent>, bool)> {
+    let SetExecution {
+        left,
+        operator,
+        all,
+        right,
+        schema,
+        order_by,
+        offset,
+        limit,
+    } = execution;
+    let memory = MemoryGrant::new(DEFAULT_SOFT_MEMORY_BYTES, DEFAULT_HARD_MEMORY_BYTES)?;
+    let mut reservation = memory.try_reserve(0)?;
+    let (left_events, left_changed) = execute_bound(state, *left, params)?;
+    let (right_events, right_changed) = execute_bound(state, *right, params)?;
+    if left_changed || right_changed {
+        return Err(internal_error(
+            "set-operation operand unexpectedly changed database state",
+        ));
+    }
+    let left = coerce_set_rows(
+        collect_set_operand_rows(left_events),
+        &schema,
+        &mut reservation,
+    )?;
+    let right = coerce_set_rows(
+        collect_set_operand_rows(right_events),
+        &schema,
+        &mut reservation,
+    )?;
+    let mut rows = combine_set_rows(state, left, right, operator, all, &memory)?;
+    if !order_by.is_empty() {
+        sort_set_rows(&mut rows, &order_by)?;
+    }
+    let offset = evaluate_set_offset(offset.as_ref(), params)?;
+    let limit = evaluate_set_limit(limit.as_ref(), params)?;
+    let rows = rows
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    Ok((select_rows_events(schema, rows), false))
+}
+
+fn collect_set_operand_rows(events: Vec<QueryEvent>) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for event in events {
+        if let QueryEvent::Batch(mut batch) = event {
+            rows.append(&mut batch.rows);
+        }
+    }
+    rows
+}
+
+fn coerce_set_rows(
+    rows: Vec<Row>,
+    schema: &Schema,
+    reservation: &mut Reservation,
+) -> Result<Vec<Row>> {
+    rows.into_iter()
+        .map(|row| {
+            if row.values.len() != schema.fields.len() {
+                return Err(internal_error(
+                    "set-operation row width does not match its bound schema",
+                ));
+            }
+            let row = Row::new(
+                row.values
+                    .into_iter()
+                    .zip(&schema.fields)
+                    .map(|(value, field)| coerce_execution_value(value, &field.data_type))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            reservation.grow(estimated_row_bytes(&row))?;
+            Ok(row)
+        })
+        .collect()
+}
+
+fn combine_set_rows(
+    state: &DatabaseState,
+    left: Vec<Row>,
+    right: Vec<Row>,
+    operator: QuerySetOperator,
+    all: bool,
+    memory: &MemoryGrant,
+) -> Result<Vec<Row>> {
+    if operator == QuerySetOperator::Union && all {
+        return Ok(left.into_iter().chain(right).collect());
+    }
+    let mut key_reservation = memory.try_reserve(0)?;
+    let mut output = Vec::new();
+    match operator {
+        QuerySetOperator::Union => {
+            let mut seen = HashSet::new();
+            for row in left.into_iter().chain(right) {
+                ensure_statement_not_cancelled(state)?;
+                let key = accounted_set_row_key(&row, &mut key_reservation)?;
+                if seen.insert(key) {
+                    output.push(row);
+                }
+            }
+        }
+        QuerySetOperator::Intersect => {
+            let mut right_counts = set_row_counts(state, right, &mut key_reservation)?;
+            let mut emitted = (!all).then(HashSet::new);
+            for row in left {
+                ensure_statement_not_cancelled(state)?;
+                let key = accounted_set_row_key(&row, &mut key_reservation)?;
+                if emitted
+                    .as_ref()
+                    .is_some_and(|emitted| emitted.contains(&key))
+                {
+                    continue;
+                }
+                let Some(count) = right_counts.get_mut(&key) else {
+                    continue;
+                };
+                if *count == 0 {
+                    continue;
+                }
+                if all {
+                    *count -= 1;
+                } else if let Some(emitted) = &mut emitted {
+                    emitted.insert(key);
+                }
+                output.push(row);
+            }
+        }
+        QuerySetOperator::Except => {
+            let mut right_counts = set_row_counts(state, right, &mut key_reservation)?;
+            let mut emitted = (!all).then(HashSet::new);
+            for row in left {
+                ensure_statement_not_cancelled(state)?;
+                let key = accounted_set_row_key(&row, &mut key_reservation)?;
+                if emitted
+                    .as_ref()
+                    .is_some_and(|emitted| emitted.contains(&key))
+                {
+                    continue;
+                }
+                if let Some(count) = right_counts.get_mut(&key)
+                    && *count > 0
+                {
+                    if all {
+                        *count -= 1;
+                    }
+                    continue;
+                }
+                if let Some(emitted) = &mut emitted {
+                    emitted.insert(key);
+                }
+                output.push(row);
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn set_row_counts(
+    state: &DatabaseState,
+    rows: Vec<Row>,
+    reservation: &mut Reservation,
+) -> Result<HashMap<SetRowKey, usize>> {
+    let mut counts = HashMap::<SetRowKey, usize>::new();
+    for row in rows {
+        ensure_statement_not_cancelled(state)?;
+        let key = accounted_set_row_key(&row, reservation)?;
+        let count = counts.entry(key).or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| DbError::new("22003", "set-operation duplicate count overflowed"))?;
+    }
+    Ok(counts)
+}
+
+fn accounted_set_row_key(row: &Row, reservation: &mut Reservation) -> Result<SetRowKey> {
+    let key = set_row_key(row)?;
+    reservation.grow(estimated_set_key_bytes(&key).saturating_add(64))?;
+    Ok(key)
+}
+
+fn set_row_key(row: &Row) -> Result<SetRowKey> {
+    row.values
+        .iter()
+        .map(|value| match value {
+            Value::Null => Ok(SetValueKey::Null),
+            Value::Boolean(value) => Ok(SetValueKey::Boolean(*value)),
+            Value::Int16(value) => Ok(SetValueKey::Int16(*value)),
+            Value::Int32(value) => Ok(SetValueKey::Int32(*value)),
+            Value::Int64(value) => Ok(SetValueKey::Int64(*value)),
+            Value::Float32(value) => Ok(SetValueKey::Float32(canonical_float32(*value))),
+            Value::Float64(value) => Ok(SetValueKey::Float64(canonical_float64(*value))),
+            Value::Decimal(value) => Ok(SetValueKey::Decimal(value.normalize().to_string())),
+            Value::Text(value) => Ok(SetValueKey::Text(value.clone())),
+            Value::Binary(value) => Ok(SetValueKey::Binary(value.clone())),
+            Value::Date(value) => Ok(SetValueKey::Date(value.to_string())),
+            Value::Time(value) => Ok(SetValueKey::Time(value.to_string())),
+            Value::Timestamp(value) => Ok(SetValueKey::Timestamp(value.to_string())),
+            Value::Json(_) => Err(DbError::new(
+                "42883",
+                "could not identify an equality operator for type json",
+            )),
+            Value::Jsonb(value) => serde_json::to_string(value)
+                .map(SetValueKey::Jsonb)
+                .map_err(|error| internal_error(format!("failed to canonicalize jsonb: {error}"))),
+            Value::Uuid(value) => Ok(SetValueKey::Uuid(*value.as_bytes())),
+            Value::Vector(values) => Ok(SetValueKey::Vector(
+                values
+                    .iter()
+                    .map(|value| canonical_float32(*value))
+                    .collect(),
+            )),
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(SetRowKey)
+}
+
+fn canonical_float32(value: f32) -> u32 {
+    if value == 0.0 {
+        0.0_f32.to_bits()
+    } else if value.is_nan() {
+        f32::NAN.to_bits()
+    } else {
+        value.to_bits()
+    }
+}
+
+fn canonical_float64(value: f64) -> u64 {
+    if value == 0.0 {
+        0.0_f64.to_bits()
+    } else if value.is_nan() {
+        f64::NAN.to_bits()
+    } else {
+        value.to_bits()
+    }
+}
+
+fn estimated_set_key_bytes(key: &SetRowKey) -> usize {
+    mem::size_of::<SetRowKey>()
+        .saturating_add(key.0.iter().map(estimated_set_value_key_bytes).sum())
+}
+
+fn estimated_set_value_key_bytes(key: &SetValueKey) -> usize {
+    mem::size_of::<SetValueKey>()
+        + match key {
+            SetValueKey::Decimal(value)
+            | SetValueKey::Text(value)
+            | SetValueKey::Date(value)
+            | SetValueKey::Time(value)
+            | SetValueKey::Timestamp(value)
+            | SetValueKey::Jsonb(value) => value.len(),
+            SetValueKey::Binary(value) => value.len(),
+            SetValueKey::Vector(values) => values.len().saturating_mul(mem::size_of::<u32>()),
+            SetValueKey::Null
+            | SetValueKey::Boolean(_)
+            | SetValueKey::Int16(_)
+            | SetValueKey::Int32(_)
+            | SetValueKey::Int64(_)
+            | SetValueKey::Float32(_)
+            | SetValueKey::Float64(_)
+            | SetValueKey::Uuid(_) => 0,
+        }
+}
+
+fn sort_set_rows(rows: &mut [Row], order_by: &[BoundOrder]) -> Result<()> {
+    let mut error = None;
+    rows.sort_by(|left, right| {
+        compare_set_rows(left, right, order_by).unwrap_or_else(|sort_error| {
+            error = Some(sort_error);
+            std::cmp::Ordering::Equal
+        })
+    });
+    error.map_or(Ok(()), Err)
+}
+
+fn compare_set_rows(
+    left: &Row,
+    right: &Row,
+    order_by: &[BoundOrder],
+) -> Result<std::cmp::Ordering> {
+    for order in order_by {
+        let left = left
+            .values
+            .get(order.column_index)
+            .ok_or_else(|| internal_error("set-operation sort column is out of bounds"))?;
+        let right = right
+            .values
+            .get(order.column_index)
+            .ok_or_else(|| internal_error("set-operation sort column is out of bounds"))?;
+        let ordering = match (left.is_null(), right.is_null()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => {
+                if order.nulls_first.unwrap_or(!order.ascending) {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if order.nulls_first.unwrap_or(!order.ascending) {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }
+            }
+            (false, false) => {
+                let ordering = compare_execution_values(left, right)?;
+                if order.ascending {
+                    ordering
+                } else {
+                    ordering.reverse()
+                }
+            }
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return Ok(ordering);
+        }
+    }
+    Ok(std::cmp::Ordering::Equal)
+}
+
+fn evaluate_set_offset(offset: Option<&BoundExpr>, params: &[Value]) -> Result<usize> {
+    let Some(offset) = offset else {
+        return Ok(0);
+    };
+    match evaluate_scalar(offset, &[], params)? {
+        Value::Int64(value) if value >= 0 => usize::try_from(value)
+            .map_err(|_| DbError::new("22003", "OFFSET value is out of range")),
+        Value::Null => Ok(0),
+        _ => Err(DbError::new(
+            "2201X",
+            "OFFSET must be a non-negative integer",
+        )),
+    }
+}
+
+fn evaluate_set_limit(limit: Option<&BoundExpr>, params: &[Value]) -> Result<usize> {
+    let Some(limit) = limit else {
+        return Ok(usize::MAX);
+    };
+    match evaluate_scalar(limit, &[], params)? {
+        Value::Int64(value) if value >= 0 => {
+            usize::try_from(value).map_err(|_| DbError::new("22003", "LIMIT value is out of range"))
+        }
+        Value::Null => Ok(usize::MAX),
+        _ => Err(DbError::new(
+            "2201W",
+            "LIMIT must be a non-negative integer",
+        )),
+    }
+}
+
+fn select_rows_events(schema: Schema, rows: Vec<Row>) -> Vec<QueryEvent> {
+    let count = rows.len() as u64;
+    let mut events = vec![QueryEvent::Schema(schema.clone())];
+    let mut batch_rows = Vec::with_capacity(DEFAULT_BATCH_ROWS.min(rows.len()));
+    for row in rows {
+        batch_rows.push(row);
+        if batch_rows.len() == DEFAULT_BATCH_ROWS {
+            events.push(QueryEvent::Batch(Batch {
+                schema: schema.clone(),
+                rows: mem::take(&mut batch_rows),
+            }));
+        }
+    }
+    if !batch_rows.is_empty() {
+        events.push(QueryEvent::Batch(Batch {
+            schema: schema.clone(),
+            rows: batch_rows,
+        }));
+    } else if count == 0 {
+        events.push(QueryEvent::Batch(Batch {
+            schema,
+            rows: Vec::new(),
+        }));
+    }
+    events.push(QueryEvent::Progress(QueryProgress {
+        rows_processed: count,
+    }));
+    events.push(QueryEvent::Complete(CommandComplete {
+        tag: format!("SELECT {count}"),
+        rows_affected: count,
+    }));
+    events
+}
+
 fn prepare_select_cursor(
     state: &DatabaseState,
     execution: SelectExecution,
@@ -5305,6 +7173,7 @@ fn prepare_select_cursor(
         projection,
         filter,
         order_by,
+        offset,
         limit,
     } = execution;
     let plan = optimize_select(
@@ -5312,6 +7181,7 @@ fn prepare_select_cursor(
         projection,
         filter,
         order_by,
+        offset,
         limit,
     );
     let context = ExecutionContext {
@@ -5369,12 +7239,16 @@ fn prepare_advanced_cursor(
     let AdvancedExecution {
         table,
         joins,
+        applies,
+        windows,
         schema,
         projection,
+        distinct,
         filter,
         group_by,
         having,
         order_by,
+        offset,
         limit,
         aggregate,
     } = execution;
@@ -5383,22 +7257,710 @@ fn prepare_advanced_cursor(
         indexes: &state.indexes,
         params,
     };
-    let cursor = AdvancedExecutionCursor::new(
+    let applies = applies
+        .into_iter()
+        .map(|apply| build_apply_execution_plan(state, apply, params.len(), &[]))
+        .collect::<Result<Vec<_>>>()?;
+    let joins = joins
+        .into_iter()
+        .map(|join| build_join_execution_plan(state, join, params.len(), &[]))
+        .collect::<Result<Vec<_>>>()?;
+    let cursor = AdvancedExecutionCursor::new_with_cancellation(
         AdvancedExecutionPlan {
             table,
             joins,
+            applies,
+            windows,
             schema: schema.clone(),
+            projection,
+            distinct,
+            filter,
+            group_by,
+            having,
+            order_by,
+            offset,
+            limit,
+            aggregate,
+        },
+        &context,
+        state.cancellation.clone(),
+    )?;
+    Ok((schema, cursor))
+}
+
+fn build_join_execution_plan(
+    state: &DatabaseState,
+    join: BoundJoin,
+    parameter_base: usize,
+    ancestor_slots: &[BTreeMap<usize, usize>],
+) -> Result<JoinExecutionPlan> {
+    let BoundJoin { source, kind, on } = join;
+    let source = match source {
+        BoundJoinSource::Table(table) => JoinExecutionSource::Table(table),
+        BoundJoinSource::Derived {
+            mut query,
+            offset,
+            width,
+            ..
+        } => {
+            let correlation =
+                rewrite_statement_correlations(&mut query, parameter_base, ancestor_slots)?;
+            let nested_parameter_base = parameter_base
+                .checked_add(correlation.indexes.len())
+                .ok_or_else(|| DbError::new("54001", "LATERAL parameter depth overflowed"))?;
+            let mut nested_ancestors = Vec::with_capacity(ancestor_slots.len().saturating_add(1));
+            nested_ancestors.push(correlation.parameter_slots);
+            nested_ancestors.extend_from_slice(ancestor_slots);
+            JoinExecutionSource::Derived {
+                query: Box::new(build_query_execution_plan(
+                    state,
+                    *query,
+                    nested_parameter_base,
+                    &nested_ancestors,
+                )?),
+                correlation_indexes: correlation.indexes,
+                offset,
+                width,
+            }
+        }
+    };
+    Ok(JoinExecutionPlan { source, kind, on })
+}
+
+fn build_apply_execution_plan(
+    state: &DatabaseState,
+    apply: BoundApply,
+    parameter_base: usize,
+    ancestor_slots: &[BTreeMap<usize, usize>],
+) -> Result<ApplyExecutionPlan> {
+    let BoundApply { kind, mut query } = apply;
+    let correlation = rewrite_statement_correlations(&mut query, parameter_base, ancestor_slots)?;
+    let nested_parameter_base = parameter_base
+        .checked_add(correlation.indexes.len())
+        .ok_or_else(|| DbError::new("54001", "correlation parameter depth overflowed"))?;
+    let mut nested_ancestors = Vec::with_capacity(ancestor_slots.len().saturating_add(1));
+    nested_ancestors.push(correlation.parameter_slots);
+    nested_ancestors.extend_from_slice(ancestor_slots);
+    let kind = match kind {
+        BoundApplyKind::Scalar => ApplyExecutionKind::Scalar,
+        BoundApplyKind::Exists { negated } => ApplyExecutionKind::Exists { negated },
+        BoundApplyKind::In { left, negated } => ApplyExecutionKind::In { left, negated },
+        BoundApplyKind::Quantified {
+            left,
+            op,
+            quantifier,
+        } => ApplyExecutionKind::Quantified {
+            left,
+            op,
+            quantifier,
+        },
+        BoundApplyKind::RowScalar {
+            left,
+            op,
+            operand_types,
+        } => ApplyExecutionKind::RowScalar {
+            left,
+            op,
+            operand_types,
+        },
+        BoundApplyKind::RowQuantified {
+            left,
+            op,
+            quantifier,
+            negated,
+            operand_types,
+        } => ApplyExecutionKind::RowQuantified {
+            left,
+            op,
+            quantifier,
+            negated,
+            operand_types,
+        },
+    };
+    Ok(ApplyExecutionPlan {
+        kind,
+        query: Box::new(build_query_execution_plan(
+            state,
+            *query,
+            nested_parameter_base,
+            &nested_ancestors,
+        )?),
+        correlation_indexes: correlation.indexes,
+    })
+}
+
+fn build_query_execution_plan(
+    state: &DatabaseState,
+    statement: BoundStatement,
+    parameter_base: usize,
+    ancestor_slots: &[BTreeMap<usize, usize>],
+) -> Result<QueryExecutionPlan> {
+    match statement {
+        BoundStatement::Select {
+            table_id,
+            schema,
+            projection,
+            filter,
+            order_by,
+            offset,
+            limit,
+        } => Ok(QueryExecutionPlan::Simple {
+            plan: optimize_select(
+                table_definition(state, table_id)?,
+                projection,
+                filter,
+                order_by,
+                offset,
+                limit,
+            ),
+            schema,
+        }),
+        BoundStatement::AdvancedSelect {
+            table,
+            joins,
+            applies,
+            windows,
+            schema,
+            projection,
+            distinct,
+            filter,
+            group_by,
+            having,
+            order_by,
+            offset,
+            limit,
+            aggregate,
+        } => Ok(QueryExecutionPlan::Advanced(Box::new(
+            AdvancedExecutionPlan {
+                table,
+                joins: joins
+                    .into_iter()
+                    .map(|join| {
+                        build_join_execution_plan(state, join, parameter_base, ancestor_slots)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                applies: applies
+                    .into_iter()
+                    .map(|apply| {
+                        build_apply_execution_plan(state, apply, parameter_base, ancestor_slots)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                windows,
+                schema,
+                projection,
+                distinct,
+                filter,
+                group_by,
+                having,
+                order_by,
+                offset,
+                limit: limit.map(|limit| *limit),
+                aggregate,
+            },
+        ))),
+        _ => Err(DbError::new(
+            "0A000",
+            "Apply subqueries currently support SELECT query bodies only",
+        )),
+    }
+}
+
+struct CorrelationRewrite {
+    indexes: Vec<usize>,
+    parameter_slots: BTreeMap<usize, usize>,
+}
+
+fn collect_forwarded_correlation_indexes(statement: &BoundStatement) -> Result<BTreeSet<usize>> {
+    let mut indexes = BTreeSet::new();
+    let mut statements = vec![(statement, 0_usize)];
+    while let Some((statement, query_depth)) = statements.pop() {
+        let target_depth = query_depth.checked_add(1).ok_or_else(|| {
+            DbError::new(
+                "54001",
+                "correlation scope depth exceeds the implementation limit",
+            )
+        })?;
+        match statement {
+            BoundStatement::Select {
+                projection,
+                filter,
+                order_by,
+                offset,
+                limit,
+                ..
+            } => {
+                for projection in projection {
+                    collect_expr_correlations(&projection.expr, target_depth, &mut indexes);
+                }
+                if let Some(filter) = filter {
+                    collect_expr_correlations(filter, target_depth, &mut indexes);
+                }
+                for order in order_by {
+                    if let Some(expression) = &order.expression {
+                        collect_expr_correlations(expression, target_depth, &mut indexes);
+                    }
+                }
+                if let Some(offset) = offset {
+                    collect_expr_correlations(offset, target_depth, &mut indexes);
+                }
+                if let Some(limit) = limit {
+                    collect_expr_correlations(limit, target_depth, &mut indexes);
+                }
+            }
+            BoundStatement::AdvancedSelect {
+                joins,
+                applies,
+                windows,
+                projection,
+                filter,
+                group_by,
+                having,
+                order_by,
+                offset,
+                limit,
+                ..
+            } => {
+                for join in joins {
+                    collect_expr_correlations(&join.on, target_depth, &mut indexes);
+                    if let BoundJoinSource::Derived { query, .. } = &join.source {
+                        statements.push((query, target_depth));
+                    }
+                }
+                for apply in applies {
+                    match &apply.kind {
+                        BoundApplyKind::In { left, .. }
+                        | BoundApplyKind::Quantified { left, .. } => {
+                            collect_expr_correlations(left, target_depth, &mut indexes);
+                        }
+                        BoundApplyKind::RowScalar { left, .. }
+                        | BoundApplyKind::RowQuantified { left, .. } => {
+                            for expression in left {
+                                collect_expr_correlations(expression, target_depth, &mut indexes);
+                            }
+                        }
+                        BoundApplyKind::Scalar | BoundApplyKind::Exists { .. } => {}
+                    }
+                    statements.push((&apply.query, target_depth));
+                }
+                for window in windows {
+                    for argument in &window.arguments {
+                        collect_expr_correlations(argument, target_depth, &mut indexes);
+                    }
+                    if let Some(filter) = &window.filter {
+                        collect_expr_correlations(filter, target_depth, &mut indexes);
+                    }
+                    for expression in &window.partition_by {
+                        collect_expr_correlations(expression, target_depth, &mut indexes);
+                    }
+                    for order in &window.order_by {
+                        if let Some(expression) = &order.expression {
+                            collect_expr_correlations(expression, target_depth, &mut indexes);
+                        }
+                    }
+                    if let Some(frame) = &window.frame {
+                        for bound in [&frame.start_bound, &frame.end_bound] {
+                            if let BoundWindowFrameBound::Preceding(expression)
+                            | BoundWindowFrameBound::Following(expression) = bound
+                            {
+                                collect_expr_correlations(expression, target_depth, &mut indexes);
+                            }
+                        }
+                    }
+                }
+                for projection in projection {
+                    collect_expr_correlations(&projection.expr, target_depth, &mut indexes);
+                }
+                if let Some(filter) = filter {
+                    collect_expr_correlations(filter, target_depth, &mut indexes);
+                }
+                for expression in group_by {
+                    collect_expr_correlations(expression, target_depth, &mut indexes);
+                }
+                if let Some(having) = having {
+                    collect_expr_correlations(having, target_depth, &mut indexes);
+                }
+                for order in order_by {
+                    if let Some(expression) = &order.expression {
+                        collect_expr_correlations(expression, target_depth, &mut indexes);
+                    }
+                }
+                if let Some(offset) = offset {
+                    collect_expr_correlations(offset, target_depth, &mut indexes);
+                }
+                if let Some(limit) = limit {
+                    collect_expr_correlations(limit, target_depth, &mut indexes);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(indexes)
+}
+
+fn collect_expr_correlations(
+    expression: &BoundExpr,
+    target_depth: usize,
+    indexes: &mut BTreeSet<usize>,
+) {
+    let mut pending = vec![expression];
+    while let Some(expression) = pending.pop() {
+        match &expression.kind {
+            BoundExprKind::Correlation { depth, index } => {
+                if *depth == target_depth {
+                    indexes.insert(*index);
+                }
+            }
+            BoundExprKind::Unary { expr, .. } => pending.push(expr),
+            BoundExprKind::Binary { left, right, .. } => {
+                pending.push(right);
+                pending.push(left);
+            }
+            BoundExprKind::InList { expr, list, .. } => {
+                pending.extend(list.iter().rev());
+                pending.push(expr);
+            }
+            BoundExprKind::Aggregate {
+                argument, filter, ..
+            } => {
+                if let Some(filter) = filter {
+                    pending.push(filter);
+                }
+                if let Some(argument) = argument {
+                    pending.push(argument);
+                }
+            }
+            BoundExprKind::Column { .. }
+            | BoundExprKind::Literal(_)
+            | BoundExprKind::Parameter { .. }
+            | BoundExprKind::ApplyValue { .. } => {}
+        }
+    }
+}
+
+fn rewrite_statement_correlations(
+    statement: &mut BoundStatement,
+    parameter_base: usize,
+    ancestor_slots: &[BTreeMap<usize, usize>],
+) -> Result<CorrelationRewrite> {
+    let mut correlation_indexes = Vec::new();
+    let mut slots = BTreeMap::new();
+    for index in collect_forwarded_correlation_indexes(statement)? {
+        correlation_parameter_slot(index, parameter_base, &mut slots, &mut correlation_indexes)?;
+    }
+    match statement {
+        BoundStatement::Select {
+            projection,
+            filter,
+            order_by,
+            offset,
+            limit,
+            ..
+        } => {
+            for projection in projection {
+                rewrite_expr_correlations(
+                    &mut projection.expr,
+                    parameter_base,
+                    &mut slots,
+                    &mut correlation_indexes,
+                    ancestor_slots,
+                )?;
+            }
+            if let Some(filter) = filter {
+                rewrite_expr_correlations(
+                    filter,
+                    parameter_base,
+                    &mut slots,
+                    &mut correlation_indexes,
+                    ancestor_slots,
+                )?;
+            }
+            for order in order_by {
+                if let Some(expression) = &mut order.expression {
+                    rewrite_expr_correlations(
+                        expression,
+                        parameter_base,
+                        &mut slots,
+                        &mut correlation_indexes,
+                        ancestor_slots,
+                    )?;
+                }
+            }
+            if let Some(offset) = offset {
+                rewrite_expr_correlations(
+                    offset,
+                    parameter_base,
+                    &mut slots,
+                    &mut correlation_indexes,
+                    ancestor_slots,
+                )?;
+            }
+            if let Some(limit) = limit {
+                rewrite_expr_correlations(
+                    limit,
+                    parameter_base,
+                    &mut slots,
+                    &mut correlation_indexes,
+                    ancestor_slots,
+                )?;
+            }
+        }
+        BoundStatement::AdvancedSelect {
+            joins,
+            applies,
+            windows,
             projection,
             filter,
             group_by,
             having,
             order_by,
+            offset,
             limit,
-            aggregate,
-        },
-        &context,
-    )?;
-    Ok((schema, cursor))
+            ..
+        } => {
+            for join in joins {
+                rewrite_expr_correlations(
+                    &mut join.on,
+                    parameter_base,
+                    &mut slots,
+                    &mut correlation_indexes,
+                    ancestor_slots,
+                )?;
+            }
+            for apply in applies {
+                match &mut apply.kind {
+                    BoundApplyKind::In { left, .. } | BoundApplyKind::Quantified { left, .. } => {
+                        rewrite_expr_correlations(
+                            left,
+                            parameter_base,
+                            &mut slots,
+                            &mut correlation_indexes,
+                            ancestor_slots,
+                        )?;
+                    }
+                    BoundApplyKind::RowScalar { left, .. }
+                    | BoundApplyKind::RowQuantified { left, .. } => {
+                        for expression in left {
+                            rewrite_expr_correlations(
+                                expression,
+                                parameter_base,
+                                &mut slots,
+                                &mut correlation_indexes,
+                                ancestor_slots,
+                            )?;
+                        }
+                    }
+                    BoundApplyKind::Scalar | BoundApplyKind::Exists { .. } => {}
+                }
+            }
+            for window in windows {
+                for argument in &mut window.arguments {
+                    rewrite_expr_correlations(
+                        argument,
+                        parameter_base,
+                        &mut slots,
+                        &mut correlation_indexes,
+                        ancestor_slots,
+                    )?;
+                }
+                if let Some(filter) = &mut window.filter {
+                    rewrite_expr_correlations(
+                        filter,
+                        parameter_base,
+                        &mut slots,
+                        &mut correlation_indexes,
+                        ancestor_slots,
+                    )?;
+                }
+                for expression in &mut window.partition_by {
+                    rewrite_expr_correlations(
+                        expression,
+                        parameter_base,
+                        &mut slots,
+                        &mut correlation_indexes,
+                        ancestor_slots,
+                    )?;
+                }
+                for order in &mut window.order_by {
+                    if let Some(expression) = &mut order.expression {
+                        rewrite_expr_correlations(
+                            expression,
+                            parameter_base,
+                            &mut slots,
+                            &mut correlation_indexes,
+                            ancestor_slots,
+                        )?;
+                    }
+                }
+                if let Some(frame) = &mut window.frame {
+                    for bound in [&mut frame.start_bound, &mut frame.end_bound] {
+                        if let BoundWindowFrameBound::Preceding(expression)
+                        | BoundWindowFrameBound::Following(expression) = bound
+                        {
+                            rewrite_expr_correlations(
+                                expression,
+                                parameter_base,
+                                &mut slots,
+                                &mut correlation_indexes,
+                                ancestor_slots,
+                            )?;
+                        }
+                    }
+                }
+            }
+            for projection in projection {
+                rewrite_expr_correlations(
+                    &mut projection.expr,
+                    parameter_base,
+                    &mut slots,
+                    &mut correlation_indexes,
+                    ancestor_slots,
+                )?;
+            }
+            if let Some(filter) = filter {
+                rewrite_expr_correlations(
+                    filter,
+                    parameter_base,
+                    &mut slots,
+                    &mut correlation_indexes,
+                    ancestor_slots,
+                )?;
+            }
+            for expression in group_by {
+                rewrite_expr_correlations(
+                    expression,
+                    parameter_base,
+                    &mut slots,
+                    &mut correlation_indexes,
+                    ancestor_slots,
+                )?;
+            }
+            if let Some(having) = having {
+                rewrite_expr_correlations(
+                    having,
+                    parameter_base,
+                    &mut slots,
+                    &mut correlation_indexes,
+                    ancestor_slots,
+                )?;
+            }
+            for order in order_by {
+                if let Some(expression) = &mut order.expression {
+                    rewrite_expr_correlations(
+                        expression,
+                        parameter_base,
+                        &mut slots,
+                        &mut correlation_indexes,
+                        ancestor_slots,
+                    )?;
+                }
+            }
+            if let Some(offset) = offset {
+                rewrite_expr_correlations(
+                    offset,
+                    parameter_base,
+                    &mut slots,
+                    &mut correlation_indexes,
+                    ancestor_slots,
+                )?;
+            }
+            if let Some(limit) = limit {
+                rewrite_expr_correlations(
+                    limit,
+                    parameter_base,
+                    &mut slots,
+                    &mut correlation_indexes,
+                    ancestor_slots,
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(CorrelationRewrite {
+        indexes: correlation_indexes,
+        parameter_slots: slots,
+    })
+}
+
+fn rewrite_expr_correlations(
+    expression: &mut BoundExpr,
+    parameter_base: usize,
+    slots: &mut BTreeMap<usize, usize>,
+    correlation_indexes: &mut Vec<usize>,
+    ancestor_slots: &[BTreeMap<usize, usize>],
+) -> Result<()> {
+    let mut pending = vec![expression];
+    while let Some(expression) = pending.pop() {
+        if let BoundExprKind::Correlation { depth, index } = &expression.kind {
+            let depth = *depth;
+            let outer_index = *index;
+            let parameter_index = if depth == 1 {
+                correlation_parameter_slot(outer_index, parameter_base, slots, correlation_indexes)?
+            } else if depth > 1 {
+                ancestor_slots
+                    .get(depth - 2)
+                    .and_then(|slots| slots.get(&outer_index))
+                    .copied()
+                    .ok_or_else(|| {
+                        DbError::internal(
+                            "nested correlation parameter was not forwarded by its parent Apply",
+                        )
+                    })?
+            } else {
+                return Err(DbError::internal("correlation depth must be positive"));
+            };
+            expression.kind = BoundExprKind::Parameter {
+                index: parameter_index,
+            };
+            continue;
+        }
+        match &mut expression.kind {
+            BoundExprKind::Unary { expr, .. } => pending.push(expr),
+            BoundExprKind::Binary { left, right, .. } => {
+                pending.push(right);
+                pending.push(left);
+            }
+            BoundExprKind::InList { expr, list, .. } => {
+                for candidate in list.iter_mut().rev() {
+                    pending.push(candidate);
+                }
+                pending.push(expr);
+            }
+            BoundExprKind::Aggregate {
+                argument, filter, ..
+            } => {
+                if let Some(filter) = filter {
+                    pending.push(filter);
+                }
+                if let Some(argument) = argument {
+                    pending.push(argument);
+                }
+            }
+            BoundExprKind::Column { .. }
+            | BoundExprKind::Literal(_)
+            | BoundExprKind::Parameter { .. }
+            | BoundExprKind::Correlation { .. }
+            | BoundExprKind::ApplyValue { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn correlation_parameter_slot(
+    outer_index: usize,
+    parameter_base: usize,
+    slots: &mut BTreeMap<usize, usize>,
+    correlation_indexes: &mut Vec<usize>,
+) -> Result<usize> {
+    if let Some(parameter_index) = slots.get(&outer_index) {
+        return Ok(*parameter_index);
+    }
+    let parameter_index = parameter_base
+        .checked_add(correlation_indexes.len())
+        .and_then(|index| index.checked_add(1))
+        .ok_or_else(|| DbError::new("54001", "correlation parameter depth overflowed"))?;
+    slots.insert(outer_index, parameter_index);
+    correlation_indexes.push(outer_index);
+    Ok(parameter_index)
 }
 
 fn equi_join_columns(expr: &BoundExpr, right_offset: usize) -> Option<(usize, usize)> {
@@ -5434,6 +7996,7 @@ fn execute_explain(
             projection,
             filter,
             order_by,
+            offset,
             limit,
             ..
         } => explain_plan(&optimize_select(
@@ -5441,15 +8004,30 @@ fn execute_explain(
             projection,
             filter,
             order_by,
+            offset,
             limit,
         )),
         BoundStatement::AdvancedSelect {
             table,
             joins,
+            applies,
+            windows,
             filter,
+            distinct,
             aggregate,
             ..
-        } => explain_advanced(state, &table, &joins, filter.is_some(), aggregate)?,
+        } => explain_advanced(
+            state,
+            &table,
+            &joins,
+            &applies,
+            AdvancedExplainFeatures {
+                window_count: windows.len(),
+                filtered: filter.is_some(),
+                distinct,
+                aggregate,
+            },
+        )?,
         _ => {
             return Err(DbError::new(
                 "0A000",
@@ -5472,33 +8050,81 @@ fn execute_explain(
     ))
 }
 
+struct AdvancedExplainFeatures {
+    window_count: usize,
+    filtered: bool,
+    distinct: bool,
+    aggregate: bool,
+}
+
 fn explain_advanced(
     state: &DatabaseState,
     table: &BoundTable,
     joins: &[BoundJoin],
-    filtered: bool,
-    aggregate: bool,
+    applies: &[BoundApply],
+    features: AdvancedExplainFeatures,
 ) -> Result<Vec<String>> {
     let base = table_definition(state, table.table_id)?;
     let mut estimated_rows = base.statistics().row_count;
     let mut lines = vec!["Projection  (cost=0.00 rows=1)".to_owned()];
-    if aggregate {
+    if features.distinct {
+        lines.push("  Unique  (cost=0.00 rows=1)".to_owned());
+    }
+    if features.aggregate {
         lines.push("  Aggregate  (cost=0.00 rows=1)".to_owned());
     }
-    if filtered {
+    if features.window_count > 0 {
+        lines.push(format!(
+            "  WindowAgg  (cost=0.00 rows=1 windows={})",
+            features.window_count
+        ));
+    }
+    if features.filtered {
         lines.push(format!(
             "  Filter  (cost={:.2} rows={})",
             estimated_rows as f64 * 0.01,
             estimated_rows
         ));
     }
+    for apply in applies {
+        let kind = match &apply.kind {
+            BoundApplyKind::Scalar => "Scalar Apply",
+            BoundApplyKind::Exists { negated: false } => "Exists Apply",
+            BoundApplyKind::Exists { negated: true } => "Not Exists Apply",
+            BoundApplyKind::In { negated: false, .. } => "In Apply",
+            BoundApplyKind::In { negated: true, .. } => "Not In Apply",
+            BoundApplyKind::Quantified {
+                quantifier: SubqueryQuantifier::Any,
+                ..
+            } => "Any Apply",
+            BoundApplyKind::Quantified {
+                quantifier: SubqueryQuantifier::All,
+                ..
+            } => "All Apply",
+            BoundApplyKind::RowScalar { .. } => "Row Scalar Apply",
+            BoundApplyKind::RowQuantified {
+                quantifier: SubqueryQuantifier::Any,
+                ..
+            } => "Row Any Apply",
+            BoundApplyKind::RowQuantified {
+                quantifier: SubqueryQuantifier::All,
+                ..
+            } => "Row All Apply",
+        };
+        lines.push(format!("  {kind}  (cost=0.00 rows=1)"));
+    }
     for join in joins {
-        let right = table_definition(state, join.table.table_id)?;
-        let choice = choose_join_strategy(
-            estimated_rows,
-            right.statistics().row_count,
-            equi_join_columns(&join.on, join.table.offset).is_some(),
-        );
+        let (right_rows, equi) = match &join.source {
+            BoundJoinSource::Table(table) => {
+                let right = table_definition(state, table.table_id)?;
+                (
+                    right.statistics().row_count,
+                    equi_join_columns(&join.on, table.offset).is_some(),
+                )
+            }
+            BoundJoinSource::Derived { .. } => (1, false),
+        };
+        let choice = choose_join_strategy(estimated_rows, right_rows, equi);
         let name = match choice.strategy {
             JoinStrategy::NestedLoop => "Nested Loop",
             JoinStrategy::Hash => "Hash Join",
@@ -5521,13 +8147,27 @@ fn explain_advanced(
         base.statistics().row_count
     ));
     for join in joins {
-        let right = table_definition(state, join.table.table_id)?;
-        lines.push(format!(
-            "    Seq Scan on {}  (cost={:.2} rows={})",
-            join.table.binding,
-            right.statistics().row_count as f64 * 0.01,
-            right.statistics().row_count
-        ));
+        match &join.source {
+            BoundJoinSource::Table(table) => {
+                let right = table_definition(state, table.table_id)?;
+                lines.push(format!(
+                    "    Seq Scan on {}  (cost={:.2} rows={})",
+                    table.binding,
+                    right.statistics().row_count as f64 * 0.01,
+                    right.statistics().row_count
+                ));
+            }
+            BoundJoinSource::Derived {
+                lateral, binding, ..
+            } => {
+                let label = if *lateral {
+                    "Lateral Subquery Scan"
+                } else {
+                    "Subquery Scan"
+                };
+                lines.push(format!("    {label} on {binding}  (cost=0.01 rows=1)"));
+            }
+        }
     }
     Ok(lines)
 }
@@ -5537,6 +8177,7 @@ fn execute_update(
     table_id: TableId,
     assignments: Vec<(usize, BoundExpr)>,
     filter: Option<BoundExpr>,
+    returning: Option<BoundReturning>,
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
     table_definition(state, table_id)?;
@@ -5546,6 +8187,7 @@ fn execute_update(
         .map(|rows| (**rows).clone())
         .unwrap_or_default();
     let mut updated = 0u64;
+    let mut returned_rows = Vec::new();
     for old_row in source_rows {
         if filter
             .as_ref()
@@ -5617,11 +8259,19 @@ fn execute_update(
             )?;
             validate_database_rows(state)?;
             rebuild_table_derived(state, table_id)?;
+            if let Some(returning) = &returning {
+                returned_rows.push(evaluate_returning(returning, &replacement, params)?);
+            }
             updated = updated.saturating_add(1);
         }
     }
     Ok((
-        command_events(Schema::empty(), format!("UPDATE {updated}"), updated, None),
+        dml_command_events(
+            returning.as_ref(),
+            format!("UPDATE {updated}"),
+            updated,
+            returned_rows,
+        ),
         true,
     ))
 }
@@ -5630,6 +8280,7 @@ fn execute_delete(
     state: &mut DatabaseState,
     table_id: TableId,
     filter: Option<BoundExpr>,
+    returning: Option<BoundReturning>,
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
     table_definition(state, table_id)?;
@@ -5639,6 +8290,7 @@ fn execute_delete(
         .map(|rows| (**rows).clone())
         .unwrap_or_default();
     let mut deleted = 0u64;
+    let mut returned_rows = Vec::new();
     for old_row in source_rows {
         let matches = filter
             .as_ref()
@@ -5698,12 +8350,68 @@ fn execute_delete(
         )?;
         validate_database_rows(state)?;
         rebuild_table_derived(state, table_id)?;
+        if let Some(returning) = &returning {
+            returned_rows.push(evaluate_returning(returning, &old_row, params)?);
+        }
         deleted = deleted.saturating_add(1);
     }
     Ok((
-        command_events(Schema::empty(), format!("DELETE {deleted}"), deleted, None),
+        dml_command_events(
+            returning.as_ref(),
+            format!("DELETE {deleted}"),
+            deleted,
+            returned_rows,
+        ),
         true,
     ))
+}
+
+fn evaluate_returning(returning: &BoundReturning, row: &Row, params: &[Value]) -> Result<Row> {
+    returning
+        .projection
+        .iter()
+        .map(|projection| evaluate_scalar(&projection.expr, &row.values, params))
+        .collect::<Result<Vec<_>>>()
+        .map(Row::new)
+}
+
+fn dml_command_events(
+    returning: Option<&BoundReturning>,
+    tag: impl Into<String>,
+    rows_affected: u64,
+    rows: Vec<Row>,
+) -> Vec<QueryEvent> {
+    match returning {
+        Some(returning) => {
+            let schema = returning.schema.clone();
+            let mut events = vec![QueryEvent::Schema(schema.clone())];
+            let mut batch_rows = Vec::with_capacity(DEFAULT_BATCH_ROWS.min(rows.len()));
+            for row in rows {
+                batch_rows.push(row);
+                if batch_rows.len() == DEFAULT_BATCH_ROWS {
+                    events.push(QueryEvent::Batch(Batch {
+                        schema: schema.clone(),
+                        rows: mem::take(&mut batch_rows),
+                    }));
+                }
+            }
+            if !batch_rows.is_empty() {
+                events.push(QueryEvent::Batch(Batch {
+                    schema: schema.clone(),
+                    rows: batch_rows,
+                }));
+            }
+            events.push(QueryEvent::Progress(QueryProgress {
+                rows_processed: rows_affected,
+            }));
+            events.push(QueryEvent::Complete(CommandComplete {
+                tag: tag.into(),
+                rows_affected,
+            }));
+            events
+        }
+        None => command_events(Schema::empty(), tag, rows_affected, None),
+    }
 }
 
 fn removed_rows(before: &[Row], after: &[Row]) -> Vec<Row> {
@@ -6330,16 +9038,75 @@ mod tests {
     }
 
     #[test]
+    fn describe_statement_infers_parameters_without_execution() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        create_documents(&mut session);
+
+        let description = session
+            .describe_statement(
+                "SELECT id, title FROM documents \
+                 WHERE score >= $1 ORDER BY id OFFSET $2 LIMIT $3",
+            )
+            .expect("describe statement");
+        assert_eq!(
+            description.parameter_types,
+            [ScalarType::Int32, ScalarType::Int64, ScalarType::Int64]
+        );
+        assert_eq!(description.schema.fields.len(), 2);
+
+        let fixed_point = session
+            .describe_statement("SELECT $1 AS repeated, id FROM documents WHERE id = $1")
+            .expect("describe cross-occurrence parameter");
+        assert_eq!(fixed_point.parameter_types, [ScalarType::Int64]);
+        assert_eq!(fixed_point.schema.fields[0].data_type, ScalarType::Int64);
+        let executed = execute(
+            &mut session,
+            "SELECT $1 AS repeated, id FROM documents WHERE id = $1",
+            &[Value::Int64(1)],
+        );
+        assert!(matches!(
+            executed.first(),
+            Some(QueryEvent::Schema(schema))
+                if schema.fields[0].data_type == ScalarType::Int64
+        ));
+
+        let conflict = session
+            .describe_statement("SELECT id FROM documents WHERE id = $1 OR score = $1")
+            .expect_err("conflicting parameter types");
+        assert_eq!(conflict.sql_state, "42804");
+    }
+
+    #[test]
+    fn describe_statement_rejects_parameter_index_gaps() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        create_documents(&mut session);
+
+        let error = session
+            .describe_statement("SELECT id FROM documents WHERE id = $2")
+            .expect_err("missing parameter type");
+        assert_eq!(error.sql_state, "42P18");
+    }
+
+    #[test]
     fn executes_crud_with_parameters_ordering_and_limits() {
         let (_directory, engine) = engine();
         let mut session = engine.connect().expect("connect");
         create_documents(&mut session);
-        execute(
+        let events = execute(
             &mut session,
             "INSERT INTO documents (id, title, score) VALUES \
-             ($1, 'first', 10), ($2, 'second', 20), ($3, 'third', 30)",
+             ($1, 'first', 10), ($2, 'second', 20), ($3, 'third', 30) \
+             RETURNING id, title",
             &[Value::Int64(1), Value::Int64(2), Value::Int64(3)],
         );
+        assert_eq!(rows(&events).len(), 3);
+        assert!(matches!(
+            events.last(),
+            Some(QueryEvent::Complete(CommandComplete { tag, rows_affected: 3 }))
+                if tag == "INSERT 0 3"
+        ));
 
         let events = execute(
             &mut session,
@@ -6354,15 +9121,43 @@ mod tests {
             ]
         );
 
-        execute(
+        let events = execute(
             &mut session,
-            "UPDATE documents SET title = 'updated' WHERE id = $1",
+            "SELECT id, title FROM documents ORDER BY id DESC OFFSET $1 LIMIT NULL",
+            &[Value::Int64(1)],
+        );
+        assert_eq!(
+            rows(&events),
+            vec![
+                Row::new(vec![Value::Int64(2), Value::Text("second".into())]),
+                Row::new(vec![Value::Int64(1), Value::Text("first".into())]),
+            ]
+        );
+
+        let events = execute(
+            &mut session,
+            "UPDATE documents SET title = 'updated' WHERE id = $1 RETURNING id, title AS name",
             &[Value::Int64(2)],
         );
-        execute(
+        assert_eq!(
+            rows(&events),
+            vec![Row::new(vec![
+                Value::Int64(2),
+                Value::Text("updated".into()),
+            ])]
+        );
+        let events = execute(
             &mut session,
-            "DELETE FROM documents WHERE id = $1",
+            "DELETE FROM documents WHERE id = $1 RETURNING *",
             &[Value::Int64(1)],
+        );
+        assert_eq!(
+            rows(&events),
+            vec![Row::new(vec![
+                Value::Int64(1),
+                Value::Text("first".into()),
+                Value::Int32(10),
+            ])]
         );
         let events = execute(
             &mut session,
@@ -6376,6 +9171,742 @@ mod tests {
                 Row::new(vec![Value::Int64(3), Value::Text("third".into())]),
             ]
         );
+    }
+
+    #[test]
+    fn executes_on_conflict_atomically_with_returning_and_cardinality_checks() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE conflict_items (
+                id BIGINT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                label TEXT NOT NULL
+            )",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO conflict_items VALUES (1, 'one@example.test', 'original')",
+            &[],
+        );
+
+        let skipped = execute(
+            &mut session,
+            "INSERT INTO conflict_items VALUES (1, 'ignored@example.test', 'ignored') \
+             ON CONFLICT DO NOTHING RETURNING id",
+            &[],
+        );
+        assert!(rows(&skipped).is_empty());
+        assert!(matches!(
+            skipped.last(),
+            Some(QueryEvent::Complete(CommandComplete {
+                tag,
+                rows_affected: 0
+            })) if tag == "INSERT 0 0"
+        ));
+
+        let updated = execute(
+            &mut session,
+            "INSERT INTO conflict_items VALUES (1, 'updated@example.test', 'updated') \
+             ON CONFLICT (id) DO UPDATE \
+             SET email = excluded.email, label = excluded.label \
+             WHERE conflict_items.label <> excluded.label \
+             RETURNING id, email, label",
+            &[],
+        );
+        assert_eq!(
+            rows(&updated),
+            vec![Row::new(vec![
+                Value::Int64(1),
+                Value::Text("updated@example.test".into()),
+                Value::Text("updated".into()),
+            ])]
+        );
+        assert!(matches!(
+            updated.last(),
+            Some(QueryEvent::Complete(CommandComplete {
+                tag,
+                rows_affected: 1
+            })) if tag == "INSERT 0 1"
+        ));
+
+        let filtered = execute(
+            &mut session,
+            "INSERT INTO conflict_items VALUES (1, 'different@example.test', 'updated') \
+             ON CONFLICT (id) DO UPDATE SET email = excluded.email \
+             WHERE conflict_items.label <> excluded.label RETURNING id",
+            &[],
+        );
+        assert!(rows(&filtered).is_empty());
+        assert!(matches!(
+            filtered.last(),
+            Some(QueryEvent::Complete(CommandComplete {
+                tag,
+                rows_affected: 0
+            })) if tag == "INSERT 0 0"
+        ));
+
+        let non_arbiter = session
+            .execute(
+                "INSERT INTO conflict_items VALUES (2, 'updated@example.test', 'duplicate') \
+                 ON CONFLICT (id) DO NOTHING",
+                &[],
+            )
+            .expect_err("non-arbiter unique conflict");
+        assert_eq!(non_arbiter.sql_state, "23505");
+
+        let cardinality = session
+            .execute(
+                "INSERT INTO conflict_items VALUES \
+                 (1, 'updated@example.test', 'first'), \
+                 (1, 'updated@example.test', 'second') \
+                 ON CONFLICT (id) DO UPDATE SET label = excluded.label",
+                &[],
+            )
+            .expect_err("same target row affected twice");
+        assert_eq!(cardinality.sql_state, "21000");
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT id, email, label FROM conflict_items",
+                &[],
+            )),
+            vec![Row::new(vec![
+                Value::Int64(1),
+                Value::Text("updated@example.test".into()),
+                Value::Text("updated".into()),
+            ])]
+        );
+
+        execute(&mut session, "BEGIN ISOLATION LEVEL SERIALIZABLE", &[]);
+        execute(&mut session, "SAVEPOINT before_upsert", &[]);
+        execute(
+            &mut session,
+            "INSERT INTO conflict_items VALUES (1, 'updated@example.test', 'temporary') \
+             ON CONFLICT (id) DO UPDATE SET label = excluded.label",
+            &[],
+        );
+        execute(&mut session, "ROLLBACK TO SAVEPOINT before_upsert", &[]);
+        execute(&mut session, "COMMIT", &[]);
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT label FROM conflict_items WHERE id = 1",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Text("updated".into())])]
+        );
+    }
+
+    #[test]
+    fn recursive_cte_row_limit_accepts_the_exact_boundary() {
+        ensure_recursive_cte_row_limit(MAX_RECURSIVE_CTE_ROWS).expect("exact row limit");
+        let error = ensure_recursive_cte_row_limit(MAX_RECURSIVE_CTE_ROWS + 1)
+            .expect_err("row above recursive CTE limit");
+        assert_eq!(error.sql_state, "54000");
+    }
+
+    #[test]
+    fn executes_postgres_set_operations_with_duplicates_nulls_and_limits() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(&mut session, "CREATE TABLE set_left (value BIGINT)", &[]);
+        execute(&mut session, "CREATE TABLE set_right (value INTEGER)", &[]);
+        execute(
+            &mut session,
+            "INSERT INTO set_left VALUES (1), (1), (2), (3), (NULL)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO set_right VALUES (1), (2), (2), (4), (NULL)",
+            &[],
+        );
+
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT value AS item FROM set_left
+                 UNION SELECT value FROM set_right
+                 ORDER BY item NULLS FIRST",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Null]),
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(2)]),
+                Row::new(vec![Value::Int64(3)]),
+                Row::new(vec![Value::Int64(4)]),
+            ]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT value AS item FROM set_left
+                 UNION ALL SELECT value FROM set_right
+                 ORDER BY item NULLS FIRST OFFSET $1 LIMIT $2",
+                &[Value::Int64(2), Value::Int64(4)],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(2)]),
+            ]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT value FROM set_left
+                 INTERSECT SELECT value FROM set_right
+                 ORDER BY value NULLS FIRST",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Null]),
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(2)]),
+            ]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT value FROM set_left
+                 EXCEPT ALL SELECT value FROM set_right
+                 ORDER BY value",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(3)]),
+            ]
+        );
+
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "WITH combined(item) AS (
+                     SELECT value FROM set_left
+                     UNION ALL SELECT value FROM set_right
+                 ), filtered AS (
+                     SELECT item FROM combined WHERE item >= 2
+                 )
+                 SELECT item FROM filtered ORDER BY item OFFSET 1 LIMIT 3",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(2)]),
+                Row::new(vec![Value::Int64(2)]),
+                Row::new(vec![Value::Int64(3)]),
+            ]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "WITH RECURSIVE numbers(value) AS (
+                     SELECT value FROM set_left WHERE value = 3
+                     UNION ALL
+                     SELECT value - 1 FROM numbers WHERE value > 1
+                 )
+                 SELECT value FROM numbers ORDER BY value",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(2)]),
+                Row::new(vec![Value::Int64(3)]),
+            ]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "WITH RECURSIVE stable(value) AS (
+                     SELECT value FROM set_left WHERE value = 3
+                     UNION
+                     SELECT value FROM stable
+                 )
+                 SELECT value FROM stable",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Int64(3)])]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT value + 2 * 3 FROM set_left WHERE value = 1 LIMIT 1",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Int64(7)])]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT value * 2 AS doubled FROM set_left
+                 WHERE value <= 3 ORDER BY doubled DESC",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(6)]),
+                Row::new(vec![Value::Int64(4)]),
+                Row::new(vec![Value::Int64(2)]),
+                Row::new(vec![Value::Int64(2)]),
+            ]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT value FROM set_left
+                 WHERE value <= 3 ORDER BY value + 1 DESC, 1 ASC",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(3)]),
+                Row::new(vec![Value::Int64(2)]),
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(1)]),
+            ]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT value, COUNT(*) AS total FROM set_left
+                 GROUP BY value ORDER BY total DESC, 1 ASC",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Int64(2)]),
+                Row::new(vec![Value::Int64(2), Value::Int64(1)]),
+                Row::new(vec![Value::Int64(3), Value::Int64(1)]),
+                Row::new(vec![Value::Null, Value::Int64(1)]),
+            ]
+        );
+        let division = session
+            .execute("SELECT value / 0 FROM set_left LIMIT 1", &[])
+            .expect_err("division by zero");
+        assert_eq!(division.sql_state, "22012");
+        execute(
+            &mut session,
+            "INSERT INTO set_left VALUES (9223372036854775807)",
+            &[],
+        );
+        let overflow = session
+            .execute(
+                "SELECT value + 1 FROM set_left WHERE value = 9223372036854775807",
+                &[],
+            )
+            .expect_err("integer overflow");
+        assert_eq!(overflow.sql_state, "22003");
+    }
+
+    #[test]
+    fn executes_merge_as_one_atomic_ordered_candidate() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE merge_target (
+                id BIGINT PRIMARY KEY,
+                value TEXT UNIQUE NOT NULL
+            )",
+            &[],
+        );
+        execute(
+            &mut session,
+            "CREATE TABLE merge_source (
+                id BIGINT NOT NULL,
+                value TEXT NOT NULL,
+                action TEXT NOT NULL
+            )",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO merge_target VALUES
+                (1, 'old-one'), (2, 'old-two'), (4, 'stable')",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO merge_source VALUES
+                (1, 'new-one', 'update'),
+                (2, 'ignored', 'delete'),
+                (3, 'new-three', 'insert'),
+                (4, 'ignored', 'skip')",
+            &[],
+        );
+
+        let events = execute(
+            &mut session,
+            "MERGE INTO merge_target AS target
+             USING merge_source AS source ON target.id = source.id
+             WHEN MATCHED AND source.action = 'delete' THEN DELETE
+             WHEN MATCHED AND source.action = 'update' THEN
+                 UPDATE SET value = source.value
+             WHEN NOT MATCHED THEN INSERT (id, value)
+                 VALUES (source.id, source.value)
+             RETURNING id, value",
+            &[],
+        );
+        assert_eq!(
+            rows(&events),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Text("new-one".into())]),
+                Row::new(vec![Value::Int64(2), Value::Text("old-two".into())]),
+                Row::new(vec![Value::Int64(3), Value::Text("new-three".into())]),
+            ]
+        );
+        assert!(matches!(
+            events.last(),
+            Some(QueryEvent::Complete(CommandComplete {
+                tag,
+                rows_affected: 3
+            })) if tag == "MERGE 3"
+        ));
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT id, value FROM merge_target ORDER BY id",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Text("new-one".into())]),
+                Row::new(vec![Value::Int64(3), Value::Text("new-three".into())]),
+                Row::new(vec![Value::Int64(4), Value::Text("stable".into())]),
+            ]
+        );
+
+        let do_nothing = execute(
+            &mut session,
+            "MERGE INTO merge_target AS target
+             USING merge_source AS source ON target.id = source.id
+             WHEN MATCHED THEN DO NOTHING
+             WHEN NOT MATCHED THEN DO NOTHING
+             RETURNING id, value",
+            &[],
+        );
+        assert!(rows(&do_nothing).is_empty());
+        assert!(matches!(
+            do_nothing.last(),
+            Some(QueryEvent::Complete(CommandComplete {
+                tag,
+                rows_affected: 0
+            })) if tag == "MERGE 0"
+        ));
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT id, value FROM merge_target ORDER BY id",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Text("new-one".into())]),
+                Row::new(vec![Value::Int64(3), Value::Text("new-three".into())]),
+                Row::new(vec![Value::Int64(4), Value::Text("stable".into())]),
+            ]
+        );
+
+        execute(&mut session, "DELETE FROM merge_source", &[]);
+        execute(
+            &mut session,
+            "INSERT INTO merge_source VALUES
+                (1, 'first', 'update'), (1, 'second', 'update')",
+            &[],
+        );
+        let cardinality = session
+            .execute(
+                "MERGE INTO merge_target AS target
+                 USING merge_source AS source ON target.id = source.id
+                 WHEN MATCHED THEN UPDATE SET value = source.value",
+                &[],
+            )
+            .expect_err("same target affected twice");
+        assert_eq!(cardinality.sql_state, "21000");
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT value FROM merge_target WHERE id = 1",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Text("new-one".into())])]
+        );
+
+        execute(&mut session, "DELETE FROM merge_source", &[]);
+        execute(
+            &mut session,
+            "INSERT INTO merge_source VALUES
+                (1, 'temporary', 'update'), (5, 'stable', 'insert')",
+            &[],
+        );
+        let uniqueness = session
+            .execute(
+                "MERGE INTO merge_target AS target
+                 USING merge_source AS source ON target.id = source.id
+                 WHEN MATCHED THEN UPDATE SET value = source.value
+                 WHEN NOT MATCHED THEN INSERT (id, value)
+                     VALUES (source.id, source.value)",
+                &[],
+            )
+            .expect_err("atomic unique failure");
+        assert_eq!(uniqueness.sql_state, "23505");
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT id, value FROM merge_target ORDER BY id",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Text("new-one".into())]),
+                Row::new(vec![Value::Int64(3), Value::Text("new-three".into())]),
+                Row::new(vec![Value::Int64(4), Value::Text("stable".into())]),
+            ]
+        );
+
+        execute(&mut session, "DELETE FROM merge_source", &[]);
+        execute(
+            &mut session,
+            "INSERT INTO merge_source VALUES (4, 'savepoint', 'update')",
+            &[],
+        );
+        execute(&mut session, "BEGIN ISOLATION LEVEL SERIALIZABLE", &[]);
+        execute(&mut session, "SAVEPOINT before_merge", &[]);
+        execute(
+            &mut session,
+            "MERGE INTO merge_target AS target
+             USING merge_source AS source ON target.id = source.id
+             WHEN MATCHED THEN UPDATE SET value = source.value",
+            &[],
+        );
+        execute(&mut session, "ROLLBACK TO SAVEPOINT before_merge", &[]);
+        execute(&mut session, "COMMIT", &[]);
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT value FROM merge_target WHERE id = 4",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Text("stable".into())])]
+        );
+
+        execute(&mut session, "DELETE FROM merge_source", &[]);
+        execute(
+            &mut session,
+            "INSERT INTO merge_source VALUES (1, 'ignored', 'skip')",
+            &[],
+        );
+        let by_source = execute(
+            &mut session,
+            "MERGE INTO merge_target AS target
+             USING merge_source AS source ON target.id = source.id
+             WHEN MATCHED THEN DO NOTHING
+             WHEN NOT MATCHED BY SOURCE AND target.id = 3 THEN DELETE
+             WHEN NOT MATCHED BY SOURCE THEN UPDATE SET value = 'orphan'
+             RETURNING id, value",
+            &[],
+        );
+        let returned = rows(&by_source);
+        assert_eq!(returned.len(), 2);
+        assert!(returned.contains(&Row::new(vec![
+            Value::Int64(3),
+            Value::Text("new-three".into()),
+        ])));
+        assert!(returned.contains(&Row::new(vec![
+            Value::Int64(4),
+            Value::Text("orphan".into()),
+        ])));
+        assert!(matches!(
+            by_source.last(),
+            Some(QueryEvent::Complete(CommandComplete {
+                tag,
+                rows_affected: 2
+            })) if tag == "MERGE 2"
+        ));
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT id, value FROM merge_target ORDER BY id",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Text("new-one".into())]),
+                Row::new(vec![Value::Int64(4), Value::Text("orphan".into())]),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_committed_on_conflict_rechecks_after_unique_key_wait() {
+        let (_directory, engine) = engine();
+        engine
+            .set_default_lock_timeout(Duration::from_secs(2))
+            .expect("configure lock timeout");
+        let mut first = engine.connect().expect("first session");
+        let mut second = engine.connect().expect("second session");
+        execute(
+            &mut first,
+            "CREATE TABLE concurrent_upserts (id BIGINT PRIMARY KEY, label TEXT NOT NULL)",
+            &[],
+        );
+        execute(&mut first, "BEGIN", &[]);
+        execute(&mut second, "BEGIN", &[]);
+        execute(
+            &mut first,
+            "INSERT INTO concurrent_upserts VALUES (1, 'first')",
+            &[],
+        );
+
+        let worker = std::thread::spawn(move || -> Result<Vec<QueryEvent>> {
+            let events = second
+                .execute(
+                    "INSERT INTO concurrent_upserts VALUES (1, 'second') \
+                     ON CONFLICT (id) DO UPDATE SET label = excluded.label \
+                     RETURNING label",
+                    &[],
+                )?
+                .collect::<Vec<_>>();
+            second.execute("COMMIT", &[])?.for_each(drop);
+            Ok(events)
+        });
+        let mut waiting_observed = false;
+        for _ in 0..100 {
+            if !engine.lock_snapshot().expect("lock snapshot").1.is_empty() {
+                waiting_observed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(waiting_observed, "UPSERT did not wait for the unique key");
+        execute(&mut first, "COMMIT", &[]);
+
+        let events = worker
+            .join()
+            .expect("UPSERT worker")
+            .expect("UPSERT result");
+        assert_eq!(
+            rows(&events),
+            vec![Row::new(vec![Value::Text("second".into())])]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut first,
+                "SELECT label FROM concurrent_upserts WHERE id = 1",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Text("second".into())])]
+        );
+    }
+
+    #[test]
+    fn repeatable_read_on_conflict_reports_serialization_after_unique_key_wait() {
+        let (_directory, engine) = engine();
+        engine
+            .set_default_lock_timeout(Duration::from_secs(2))
+            .expect("configure lock timeout");
+        let mut first = engine.connect().expect("first session");
+        let mut second = engine.connect().expect("second session");
+        execute(
+            &mut first,
+            "CREATE TABLE repeatable_upserts (id BIGINT PRIMARY KEY, label TEXT NOT NULL)",
+            &[],
+        );
+        execute(&mut first, "BEGIN", &[]);
+        execute(&mut second, "BEGIN ISOLATION LEVEL REPEATABLE READ", &[]);
+        execute(
+            &mut first,
+            "INSERT INTO repeatable_upserts VALUES (1, 'first')",
+            &[],
+        );
+
+        let worker = std::thread::spawn(move || -> Result<String> {
+            let error = second
+                .execute(
+                    "INSERT INTO repeatable_upserts VALUES (1, 'second') \
+                     ON CONFLICT (id) DO UPDATE SET label = excluded.label",
+                    &[],
+                )
+                .expect_err("stale Repeatable Read UPSERT");
+            second.execute("ROLLBACK", &[])?.for_each(drop);
+            Ok(error.sql_state)
+        });
+        let mut waiting_observed = false;
+        for _ in 0..100 {
+            if !engine.lock_snapshot().expect("lock snapshot").1.is_empty() {
+                waiting_observed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(waiting_observed, "UPSERT did not wait for the unique key");
+        execute(&mut first, "COMMIT", &[]);
+
+        assert_eq!(
+            worker
+                .join()
+                .expect("UPSERT worker")
+                .expect("UPSERT result"),
+            "40001"
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut first,
+                "SELECT label FROM repeatable_upserts WHERE id = 1",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Text("first".into())])]
+        );
+    }
+
+    #[test]
+    fn returning_stream_batches_rows_and_retains_its_memory_peak() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE returning_items (id BIGINT PRIMARY KEY)",
+            &[],
+        );
+        let values = (0..=DEFAULT_BATCH_ROWS)
+            .map(|id| format!("({id})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stream = session
+            .execute_stream(
+                &format!("INSERT INTO returning_items VALUES {values} RETURNING id"),
+                &[],
+            )
+            .expect("returning stream");
+        assert!(
+            stream
+                .execution_memory_peak_bytes()
+                .is_some_and(|peak| peak > 0)
+        );
+
+        let events = stream
+            .by_ref()
+            .collect::<Result<Vec<_>>>()
+            .expect("stream events");
+        let batch_lengths = events
+            .iter()
+            .filter_map(|event| match event {
+                QueryEvent::Batch(batch) => Some(batch.rows.len()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(batch_lengths, [DEFAULT_BATCH_ROWS, 1]);
+        assert_eq!(rows(&events).len(), DEFAULT_BATCH_ROWS + 1);
+        assert!(
+            stream
+                .execution_memory_peak_bytes()
+                .is_some_and(|peak| peak > 0)
+        );
+        assert!(matches!(
+            events.last(),
+            Some(QueryEvent::Complete(CommandComplete {
+                tag,
+                rows_affected
+            })) if tag == "INSERT 0 1025" && *rows_affected == 1_025
+        ));
     }
 
     #[test]
@@ -7832,6 +11363,22 @@ mod tests {
             ]
         );
 
+        let filtered_aggregates = execute(
+            &mut session,
+            "SELECT c.id, COUNT(*) FILTER (WHERE o.amount > 5) AS large_orders, \
+             SUM(o.amount) FILTER (WHERE o.amount > 5) AS large_total \
+             FROM customers c LEFT JOIN orders o ON c.id = o.customer_id \
+             GROUP BY c.id ORDER BY c.id",
+            &[],
+        );
+        assert_eq!(
+            rows(&filtered_aggregates),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Int64(1), Value::Int64(7)]),
+                Row::new(vec![Value::Int64(2), Value::Int64(0), Value::Null]),
+            ]
+        );
+
         let having = execute(
             &mut session,
             "SELECT c.id, COUNT(o.id) AS order_count \
@@ -7857,6 +11404,1227 @@ mod tests {
                 Value::Int64(5),
                 Value::Int64(7),
             ])]
+        );
+
+        execute(
+            &mut session,
+            "CREATE TABLE aggregate_values (id BIGINT PRIMARY KEY, amount BIGINT)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO aggregate_values VALUES (1, 5), (2, 5), (3, 7), (4, NULL)",
+            &[],
+        );
+        let distinct = execute(
+            &mut session,
+            "SELECT COUNT(DISTINCT amount), SUM(DISTINCT amount), \
+             AVG(DISTINCT amount), MIN(DISTINCT amount), MAX(DISTINCT amount), \
+             COUNT(DISTINCT amount) FILTER (WHERE id < 3) FROM aggregate_values",
+            &[],
+        );
+        assert_eq!(
+            rows(&distinct),
+            vec![Row::new(vec![
+                Value::Int64(2),
+                Value::Int64(12),
+                Value::Float64(6.0),
+                Value::Int64(5),
+                Value::Int64(7),
+                Value::Int64(1),
+            ])]
+        );
+
+        let empty = execute(
+            &mut session,
+            "SELECT COUNT(DISTINCT amount), SUM(DISTINCT amount), \
+             AVG(amount), MIN(amount), MAX(amount) \
+             FROM aggregate_values WHERE id < 0",
+            &[],
+        );
+        assert_eq!(
+            rows(&empty),
+            vec![Row::new(vec![
+                Value::Int64(0),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ])]
+        );
+    }
+
+    #[test]
+    fn executes_select_distinct_before_offset_and_limit() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE distinct_values (id BIGINT PRIMARY KEY, bucket BIGINT, label TEXT)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO distinct_values VALUES \
+             (1, 1, 'b'), (2, 1, 'b'), (3, 2, 'a'), (4, 2, 'a'), (5, 2, NULL)",
+            &[],
+        );
+
+        let distinct = execute(
+            &mut session,
+            "SELECT DISTINCT bucket, label FROM distinct_values ORDER BY label, bucket",
+            &[],
+        );
+        assert_eq!(
+            rows(&distinct),
+            vec![
+                Row::new(vec![Value::Int64(2), Value::Text("a".to_owned())]),
+                Row::new(vec![Value::Int64(1), Value::Text("b".to_owned())]),
+                Row::new(vec![Value::Int64(2), Value::Null]),
+            ]
+        );
+
+        let paged = execute(
+            &mut session,
+            "SELECT DISTINCT label FROM distinct_values ORDER BY label OFFSET 1 LIMIT 1",
+            &[],
+        );
+        assert_eq!(
+            rows(&paged),
+            vec![Row::new(vec![Value::Text("b".to_owned())])]
+        );
+
+        let in_rows = execute(
+            &mut session,
+            "SELECT id FROM distinct_values WHERE bucket IN ($1, 99, NULL) ORDER BY id",
+            &[Value::Int64(1)],
+        );
+        assert_eq!(
+            rows(&in_rows),
+            vec![
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(2)]),
+            ]
+        );
+        let not_in_with_null = execute(
+            &mut session,
+            "SELECT id FROM distinct_values WHERE bucket NOT IN (1, NULL) ORDER BY id",
+            &[],
+        );
+        assert!(rows(&not_in_with_null).is_empty());
+        let projected_in = execute(
+            &mut session,
+            "SELECT id, label IN ('a', NULL) FROM distinct_values ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            rows(&projected_in),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Null]),
+                Row::new(vec![Value::Int64(2), Value::Null]),
+                Row::new(vec![Value::Int64(3), Value::Boolean(true)]),
+                Row::new(vec![Value::Int64(4), Value::Boolean(true)]),
+                Row::new(vec![Value::Int64(5), Value::Null]),
+            ]
+        );
+
+        execute(
+            &mut session,
+            "INSERT INTO distinct_values VALUES (6, 3, 'c'), (7, 3, 'c')",
+            &[],
+        );
+        let grouped = execute(
+            &mut session,
+            "SELECT DISTINCT COUNT(*) AS count FROM distinct_values \
+             GROUP BY bucket ORDER BY count",
+            &[],
+        );
+        assert_eq!(
+            rows(&grouped),
+            vec![
+                Row::new(vec![Value::Int64(2)]),
+                Row::new(vec![Value::Int64(3)]),
+            ]
+        );
+        let grouped_in = execute(
+            &mut session,
+            "SELECT bucket, COUNT(*) IN (2) FROM distinct_values \
+             GROUP BY bucket ORDER BY bucket",
+            &[],
+        );
+        assert_eq!(
+            rows(&grouped_in),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Boolean(true)]),
+                Row::new(vec![Value::Int64(2), Value::Boolean(false)]),
+                Row::new(vec![Value::Int64(3), Value::Boolean(true)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn executes_uncorrelated_apply_with_postgres_cardinality_and_null_semantics() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE apply_values (id BIGINT PRIMARY KEY, value BIGINT, marker TEXT)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO apply_values VALUES (1, 10, 'a'), (2, 20, 'b'), (3, NULL, 'c')",
+            &[],
+        );
+        execute(
+            &mut session,
+            "CREATE TABLE apply_lookup (id BIGINT PRIMARY KEY, value BIGINT, marker TEXT)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO apply_lookup VALUES (1, 10, 'x'), (2, 20, 'y'), (3, NULL, 'z')",
+            &[],
+        );
+
+        let scalar = execute(
+            &mut session,
+            "SELECT id, (SELECT value FROM apply_lookup WHERE id = 1) \
+             FROM apply_values WHERE id IN (1, 3) ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            rows(&scalar),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Int64(10)]),
+                Row::new(vec![Value::Int64(3), Value::Int64(10)]),
+            ]
+        );
+        let empty_scalar = execute(
+            &mut session,
+            "SELECT id, (SELECT value FROM apply_lookup WHERE id = 99) \
+             FROM apply_values WHERE id = 1",
+            &[],
+        );
+        assert_eq!(
+            rows(&empty_scalar),
+            vec![Row::new(vec![Value::Int64(1), Value::Null])]
+        );
+
+        let exists = execute(
+            &mut session,
+            "SELECT id, EXISTS (SELECT id, marker FROM apply_lookup WHERE id = 2), \
+             NOT EXISTS (SELECT id FROM apply_lookup WHERE id = 99) \
+             FROM apply_values WHERE id = 1",
+            &[],
+        );
+        assert_eq!(
+            rows(&exists),
+            vec![Row::new(vec![
+                Value::Int64(1),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ])]
+        );
+
+        let membership = execute(
+            &mut session,
+            "SELECT id, value IN (SELECT value FROM apply_lookup WHERE id IN (1, 3)), \
+             value NOT IN (SELECT value FROM apply_lookup WHERE id IN (1, 3)) \
+             FROM apply_values ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            rows(&membership),
+            vec![
+                Row::new(vec![
+                    Value::Int64(1),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                ]),
+                Row::new(vec![Value::Int64(2), Value::Null, Value::Null]),
+                Row::new(vec![Value::Int64(3), Value::Null, Value::Null]),
+            ]
+        );
+
+        let quantified = execute(
+            &mut session,
+            "SELECT id, value = ANY (SELECT value FROM apply_lookup WHERE id IN (1, 3)), \
+             value = ALL (SELECT value FROM apply_lookup WHERE id IN (1, 3)), \
+             value = ANY (SELECT value FROM apply_lookup WHERE id = 99), \
+             value = ALL (SELECT value FROM apply_lookup WHERE id = 99) \
+             FROM apply_values ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            rows(&quantified),
+            vec![
+                Row::new(vec![
+                    Value::Int64(1),
+                    Value::Boolean(true),
+                    Value::Null,
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                ]),
+                Row::new(vec![
+                    Value::Int64(2),
+                    Value::Null,
+                    Value::Boolean(false),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                ]),
+                Row::new(vec![
+                    Value::Int64(3),
+                    Value::Null,
+                    Value::Null,
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                ]),
+            ]
+        );
+
+        let parameterized = execute(
+            &mut session,
+            "SELECT id, $1 IN (SELECT value FROM apply_lookup WHERE id = 2) \
+             FROM apply_values WHERE id = 1",
+            &[Value::Int64(20)],
+        );
+        assert_eq!(
+            rows(&parameterized),
+            vec![Row::new(vec![Value::Int64(1), Value::Boolean(true),])]
+        );
+
+        let cte_apply = execute(
+            &mut session,
+            "WITH lookup(value) AS (
+                 SELECT value FROM apply_lookup WHERE id = 2
+             )
+             SELECT id FROM apply_values
+             WHERE value IN (SELECT value FROM lookup) ORDER BY id",
+            &[],
+        );
+        assert_eq!(rows(&cte_apply), vec![Row::new(vec![Value::Int64(2)])]);
+
+        let catalog = engine.catalog_snapshot().expect("catalog snapshot");
+        let predicate_statement = bind(
+            parse(
+                "SELECT id FROM apply_values \
+                 WHERE EXISTS (SELECT id FROM apply_lookup)",
+            )
+            .expect("parse Apply predicate locks"),
+            &catalog,
+        )
+        .expect("bind Apply predicate locks");
+        assert_eq!(statement_read_predicates(&predicate_statement).len(), 2);
+
+        let explain = execute(
+            &mut session,
+            "EXPLAIN SELECT id FROM apply_values \
+             WHERE EXISTS (SELECT id FROM apply_lookup)",
+            &[],
+        );
+        assert!(rows(&explain).iter().any(|row| {
+            matches!(row.values.as_slice(), [Value::Text(line)] if line.contains("Exists Apply"))
+        }));
+
+        let error = session
+            .execute(
+                "SELECT (SELECT value FROM apply_lookup) FROM apply_values",
+                &[],
+            )
+            .expect_err("scalar subquery returning multiple rows");
+        assert_eq!(error.sql_state, "21000");
+    }
+
+    #[test]
+    fn executes_row_comparisons_and_row_subqueries_with_three_value_logic() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE row_values (id BIGINT PRIMARY KEY, key_value BIGINT, item_value BIGINT)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO row_values VALUES \
+             (1, 10, 100), (2, 10, 200), (3, 20, NULL), (4, 30, 300)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "CREATE TABLE row_lookup (id BIGINT PRIMARY KEY, key_value BIGINT, item_value BIGINT)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO row_lookup VALUES (1, 10, 100), (2, 10, NULL), (3, 20, NULL)",
+            &[],
+        );
+
+        let membership = execute(
+            &mut session,
+            "SELECT id,
+                    (key_value, item_value) IN (
+                        SELECT key_value, item_value FROM row_lookup
+                    ) AS included,
+                    (key_value, item_value) NOT IN (
+                        SELECT key_value, item_value FROM row_lookup
+                    ) AS excluded
+             FROM row_values ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            rows(&membership),
+            vec![
+                Row::new(vec![
+                    Value::Int64(1),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                ]),
+                Row::new(vec![Value::Int64(2), Value::Null, Value::Null]),
+                Row::new(vec![Value::Int64(3), Value::Null, Value::Null]),
+                Row::new(vec![
+                    Value::Int64(4),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                ]),
+            ]
+        );
+
+        let scalar = execute(
+            &mut session,
+            "SELECT id,
+                    (key_value, item_value) = (
+                        SELECT key_value, item_value FROM row_lookup WHERE id = 1
+                    ) AS same_row,
+                    (key_value, item_value) = (
+                        SELECT key_value, item_value FROM row_lookup WHERE id = 99
+                    ) AS empty_row
+             FROM row_values ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            rows(&scalar),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Boolean(true), Value::Null]),
+                Row::new(vec![Value::Int64(2), Value::Boolean(false), Value::Null,]),
+                Row::new(vec![Value::Int64(3), Value::Boolean(false), Value::Null,]),
+                Row::new(vec![Value::Int64(4), Value::Boolean(false), Value::Null,]),
+            ]
+        );
+
+        let direct = execute(
+            &mut session,
+            "SELECT id,
+                    (key_value, item_value) = (10, 100) AS exact_row,
+                    (key_value, item_value) IN ((10, 100), (20, NULL)) AS listed_row
+             FROM row_values ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            rows(&direct),
+            vec![
+                Row::new(vec![
+                    Value::Int64(1),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                ]),
+                Row::new(vec![
+                    Value::Int64(2),
+                    Value::Boolean(false),
+                    Value::Boolean(false),
+                ]),
+                Row::new(vec![Value::Int64(3), Value::Boolean(false), Value::Null,]),
+                Row::new(vec![
+                    Value::Int64(4),
+                    Value::Boolean(false),
+                    Value::Boolean(false),
+                ]),
+            ]
+        );
+
+        let correlated = execute(
+            &mut session,
+            "SELECT outer_values.id,
+                    (outer_values.key_value, outer_values.item_value) = (
+                        SELECT inner_values.key_value, inner_values.item_value
+                        FROM row_lookup inner_values
+                        WHERE inner_values.id = outer_values.id
+                    ) AS same_row
+             FROM row_values outer_values ORDER BY outer_values.id",
+            &[],
+        );
+        assert_eq!(
+            rows(&correlated),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Boolean(true)]),
+                Row::new(vec![Value::Int64(2), Value::Null]),
+                Row::new(vec![Value::Int64(3), Value::Null]),
+                Row::new(vec![Value::Int64(4), Value::Null]),
+            ]
+        );
+
+        let parameterized = execute(
+            &mut session,
+            "SELECT ($1, $2) IN (
+                 SELECT key_value, item_value FROM row_lookup
+             ) FROM row_values WHERE id = 1",
+            &[Value::Int64(10), Value::Int64(100)],
+        );
+        assert_eq!(
+            rows(&parameterized),
+            vec![Row::new(vec![Value::Boolean(true)])]
+        );
+
+        let empty_quantifiers = execute(
+            &mut session,
+            "SELECT (key_value, item_value) = ANY (
+                         SELECT key_value, item_value FROM row_lookup WHERE id = 99
+                     ),
+                    (key_value, item_value) = ALL (
+                         SELECT key_value, item_value FROM row_lookup WHERE id = 99
+                     )
+             FROM row_values WHERE id = 1",
+            &[],
+        );
+        assert_eq!(
+            rows(&empty_quantifiers),
+            vec![Row::new(vec![Value::Boolean(false), Value::Boolean(true),])]
+        );
+
+        let null_witness = execute(
+            &mut session,
+            "SELECT (key_value, item_value) = ANY (
+                         SELECT key_value, item_value FROM row_lookup
+                     ),
+                    (key_value, item_value) <> ALL (
+                         SELECT key_value, item_value FROM row_lookup
+                     )
+             FROM row_values WHERE id = 2",
+            &[],
+        );
+        assert_eq!(
+            rows(&null_witness),
+            vec![Row::new(vec![Value::Null, Value::Null])]
+        );
+
+        let cardinality = session
+            .execute(
+                "SELECT (key_value, item_value) = (
+                     SELECT key_value, item_value FROM row_lookup WHERE key_value = 10
+                 ) FROM row_values WHERE id = 1",
+                &[],
+            )
+            .expect_err("row scalar subquery cardinality");
+        assert_eq!(cardinality.sql_state, "21000");
+
+        execute(
+            &mut session,
+            "CREATE TABLE row_narrow (
+                 id BIGINT PRIMARY KEY,
+                 key_value INTEGER,
+                 item_value SMALLINT
+             )",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO row_narrow VALUES (1, $1, $2)",
+            &[Value::Int32(10), Value::Int16(100)],
+        );
+        let promoted = execute(
+            &mut session,
+            "SELECT (key_value, item_value) = (
+                         SELECT key_value, item_value FROM row_narrow WHERE id = 1
+                     ),
+                    (key_value, item_value) IN (
+                         SELECT key_value, item_value FROM row_narrow
+                     )
+             FROM row_values WHERE id = 1",
+            &[],
+        );
+        assert_eq!(
+            rows(&promoted),
+            vec![Row::new(vec![Value::Boolean(true), Value::Boolean(true),])]
+        );
+
+        let width = session
+            .execute(
+                "SELECT id FROM row_values WHERE (key_value, item_value) IN (
+                     SELECT key_value FROM row_lookup
+                 )",
+                &[],
+            )
+            .expect_err("row width mismatch");
+        assert_eq!(width.sql_state, "42601");
+    }
+
+    #[test]
+    fn executes_correlated_apply_with_parameter_frames_and_per_row_results() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE correlated_values (id BIGINT PRIMARY KEY, value BIGINT)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO correlated_values VALUES (1, 10), (2, 20), (3, NULL), (4, 40)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "CREATE TABLE correlated_lookup (id BIGINT PRIMARY KEY, value BIGINT, marker TEXT)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO correlated_lookup VALUES (1, 10, 'x'), (2, 20, 'y'), (4, NULL, 'z')",
+            &[],
+        );
+
+        let scalar = execute(
+            &mut session,
+            "SELECT outer_values.id, (
+                 SELECT inner_values.marker FROM correlated_lookup inner_values
+                 WHERE inner_values.id = outer_values.id
+             )
+             FROM correlated_values outer_values ORDER BY outer_values.id",
+            &[],
+        );
+        assert_eq!(
+            rows(&scalar),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Text("x".to_owned())]),
+                Row::new(vec![Value::Int64(2), Value::Text("y".to_owned())]),
+                Row::new(vec![Value::Int64(3), Value::Null]),
+                Row::new(vec![Value::Int64(4), Value::Text("z".to_owned())]),
+            ]
+        );
+
+        let exists = execute(
+            &mut session,
+            "SELECT outer_values.id FROM correlated_values outer_values
+             WHERE EXISTS (
+                 SELECT inner_values.id FROM correlated_lookup inner_values
+                 WHERE inner_values.id = outer_values.id
+             ) ORDER BY outer_values.id",
+            &[],
+        );
+        assert_eq!(
+            rows(&exists),
+            vec![
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(2)]),
+                Row::new(vec![Value::Int64(4)]),
+            ]
+        );
+
+        let membership = execute(
+            &mut session,
+            "SELECT outer_values.id, outer_values.value IN (
+                 SELECT inner_values.value FROM correlated_lookup inner_values
+                 WHERE inner_values.id <= outer_values.id
+             ) FROM correlated_values outer_values ORDER BY outer_values.id",
+            &[],
+        );
+        assert_eq!(
+            rows(&membership),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Boolean(true)]),
+                Row::new(vec![Value::Int64(2), Value::Boolean(true)]),
+                Row::new(vec![Value::Int64(3), Value::Null]),
+                Row::new(vec![Value::Int64(4), Value::Null]),
+            ]
+        );
+
+        let quantified = execute(
+            &mut session,
+            "SELECT outer_values.id,
+                    outer_values.value = ANY (
+                        SELECT inner_values.value FROM correlated_lookup inner_values
+                        WHERE inner_values.id <= outer_values.id
+                    ),
+                    outer_values.value = ALL (
+                        SELECT inner_values.value FROM correlated_lookup inner_values
+                        WHERE inner_values.id <= outer_values.id
+                    )
+             FROM correlated_values outer_values ORDER BY outer_values.id",
+            &[],
+        );
+        assert_eq!(
+            rows(&quantified),
+            vec![
+                Row::new(vec![
+                    Value::Int64(1),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                ]),
+                Row::new(vec![
+                    Value::Int64(2),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                ]),
+                Row::new(vec![Value::Int64(3), Value::Null, Value::Null]),
+                Row::new(vec![Value::Int64(4), Value::Null, Value::Boolean(false)]),
+            ]
+        );
+
+        let shadowed = execute(
+            &mut session,
+            "SELECT outer_values.id FROM correlated_values outer_values
+             WHERE EXISTS (
+                 SELECT id FROM correlated_lookup
+                 WHERE id = id AND outer_values.id = 3
+             )",
+            &[],
+        );
+        assert_eq!(rows(&shadowed), vec![Row::new(vec![Value::Int64(3)])]);
+
+        let nested = execute(
+            &mut session,
+            "SELECT outer_values.id FROM correlated_values outer_values
+             WHERE EXISTS (
+                 SELECT middle_values.id FROM correlated_lookup middle_values
+                 WHERE EXISTS (
+                     SELECT inner_values.id FROM correlated_lookup inner_values
+                     WHERE inner_values.id = middle_values.id
+                       AND middle_values.id = outer_values.id
+                 )
+             ) ORDER BY outer_values.id",
+            &[],
+        );
+        assert_eq!(
+            rows(&nested),
+            vec![
+                Row::new(vec![Value::Int64(1)]),
+                Row::new(vec![Value::Int64(2)]),
+                Row::new(vec![Value::Int64(4)]),
+            ]
+        );
+
+        let parameterized = execute(
+            &mut session,
+            "SELECT outer_values.id FROM correlated_values outer_values
+             WHERE EXISTS (
+                 SELECT inner_values.id FROM correlated_lookup inner_values
+                 WHERE inner_values.id = outer_values.id AND inner_values.marker = $1
+             )",
+            &[Value::Text("y".to_owned())],
+        );
+        assert_eq!(rows(&parameterized), vec![Row::new(vec![Value::Int64(2)])]);
+
+        let error = session
+            .execute(
+                "SELECT (
+                     SELECT inner_values.value FROM correlated_lookup inner_values
+                     WHERE inner_values.id <= outer_values.id
+                 ) FROM correlated_values outer_values WHERE outer_values.id = 2",
+                &[],
+            )
+            .expect_err("correlated scalar returning multiple rows");
+        assert_eq!(error.sql_state, "21000");
+
+        let error = session
+            .execute(
+                "SELECT outer_values.id FROM correlated_values outer_values
+                 WHERE EXISTS (
+                     SELECT inner_values.id FROM correlated_lookup inner_values
+                     WHERE inner_values.id = missing_outer.id
+                 )",
+                &[],
+            )
+            .expect_err("unknown outer alias");
+        assert_eq!(error.sql_state, "42703");
+    }
+
+    #[test]
+    fn executes_streaming_lateral_joins_with_left_null_extension() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE lateral_values (id BIGINT PRIMARY KEY, ceiling BIGINT)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO lateral_values VALUES (1, 1), (2, 2), (3, 0)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "CREATE TABLE lateral_lookup (id BIGINT PRIMARY KEY, marker TEXT)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO lateral_lookup VALUES (1, 'a'), (2, 'b')",
+            &[],
+        );
+
+        let inner = execute(
+            &mut session,
+            "SELECT outer_values.id, matched.renamed_marker
+             FROM lateral_values outer_values
+             INNER JOIN LATERAL (
+                 SELECT lookup.marker FROM lateral_lookup lookup
+                 WHERE lookup.id <= outer_values.ceiling
+             ) AS matched(renamed_marker) ON TRUE
+             ORDER BY outer_values.id, matched.renamed_marker",
+            &[],
+        );
+        assert_eq!(
+            rows(&inner),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Text("a".to_owned())]),
+                Row::new(vec![Value::Int64(2), Value::Text("a".to_owned())]),
+                Row::new(vec![Value::Int64(2), Value::Text("b".to_owned())]),
+            ]
+        );
+
+        let left = execute(
+            &mut session,
+            "SELECT outer_values.id, matched.marker
+             FROM lateral_values outer_values
+             LEFT JOIN LATERAL (
+                 SELECT lookup.marker FROM lateral_lookup lookup
+                 WHERE lookup.id = outer_values.id
+             ) AS matched ON TRUE
+             ORDER BY outer_values.id",
+            &[],
+        );
+        assert_eq!(
+            rows(&left),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Text("a".to_owned())]),
+                Row::new(vec![Value::Int64(2), Value::Text("b".to_owned())]),
+                Row::new(vec![Value::Int64(3), Value::Null]),
+            ]
+        );
+
+        let parameterized = execute(
+            &mut session,
+            "SELECT outer_values.id
+             FROM lateral_values outer_values
+             INNER JOIN LATERAL (
+                 SELECT lookup.marker FROM lateral_lookup lookup
+                 WHERE lookup.id = outer_values.id AND lookup.marker = $1
+             ) AS matched ON TRUE",
+            &[Value::Text("b".to_owned())],
+        );
+        assert_eq!(rows(&parameterized), vec![Row::new(vec![Value::Int64(2)])]);
+
+        let multiple_left_inputs = execute(
+            &mut session,
+            "SELECT outer_values.id, derived.marker
+             FROM lateral_values outer_values
+             INNER JOIN lateral_lookup first_match ON first_match.id = outer_values.id
+             INNER JOIN LATERAL (
+                 SELECT second_match.marker FROM lateral_lookup second_match
+                 WHERE second_match.id = first_match.id
+                   AND second_match.id = outer_values.id
+             ) AS derived ON TRUE
+             ORDER BY outer_values.id",
+            &[],
+        );
+        assert_eq!(
+            rows(&multiple_left_inputs),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Text("a".to_owned())]),
+                Row::new(vec![Value::Int64(2), Value::Text("b".to_owned())]),
+            ]
+        );
+
+        let catalog = engine.catalog_snapshot().expect("catalog snapshot");
+        let statement = bind(
+            parse(
+                "SELECT outer_values.id FROM lateral_values outer_values
+                 INNER JOIN LATERAL (
+                     SELECT lookup.id FROM lateral_lookup lookup
+                     WHERE lookup.id = outer_values.id
+                 ) AS matched ON TRUE",
+            )
+            .expect("parse LATERAL predicate locks"),
+            &catalog,
+        )
+        .expect("bind LATERAL predicate locks");
+        assert_eq!(statement_read_predicates(&statement).len(), 2);
+
+        let explain = execute(
+            &mut session,
+            "EXPLAIN SELECT outer_values.id FROM lateral_values outer_values
+             INNER JOIN LATERAL (
+                 SELECT lookup.id FROM lateral_lookup lookup
+                 WHERE lookup.id = outer_values.id
+             ) AS matched ON TRUE",
+            &[],
+        );
+        assert!(rows(&explain).iter().any(|row| {
+            matches!(row.values.as_slice(), [Value::Text(line)] if line.contains("Lateral Subquery Scan"))
+        }));
+
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let mut stream = session
+            .execute_stream_with_cancellation(
+                "SELECT outer_values.id, matched.marker
+                 FROM lateral_values outer_values
+                 INNER JOIN LATERAL (
+                     SELECT lookup.marker FROM lateral_lookup lookup
+                     WHERE lookup.id <= outer_values.id
+                 ) AS matched ON TRUE",
+                &[],
+                Arc::clone(&cancellation),
+            )
+            .expect("LATERAL cancellable stream");
+        assert!(matches!(
+            stream.next().expect("schema").expect("schema event"),
+            QueryEvent::Schema(_)
+        ));
+        cancellation.store(true, Ordering::Release);
+        assert_eq!(
+            stream
+                .next()
+                .expect("cancellation error")
+                .expect_err("cancelled LATERAL stream")
+                .sql_state,
+            "57014"
+        );
+        assert!(stream.next().is_none());
+
+        let error = session
+            .execute(
+                "SELECT outer_values.id FROM lateral_values outer_values
+                 INNER JOIN (
+                     SELECT lookup.id FROM lateral_lookup lookup
+                     WHERE lookup.id = outer_values.id
+                 ) AS matched ON TRUE",
+                &[],
+            )
+            .expect_err("non-LATERAL derived table cannot see the left input");
+        assert_eq!(error.sql_state, "42703");
+    }
+
+    #[test]
+    fn executes_partitioned_ranking_windows_with_apply_and_outer_order() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE window_values (id BIGINT PRIMARY KEY, group_name TEXT, score BIGINT)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO window_values VALUES \
+             (1, 'a', 20), (2, 'a', 10), (3, 'a', 20), (4, 'b', 30)",
+            &[],
+        );
+
+        let ranked = execute(
+            &mut session,
+            "SELECT id, \
+                    (SELECT lookup.score FROM window_values lookup \
+                     WHERE lookup.id = window_values.id) AS copied_score, \
+                    ROW_NUMBER() OVER (PARTITION BY group_name ORDER BY score DESC) AS row_no, \
+                    RANK() OVER (PARTITION BY group_name ORDER BY score DESC) AS rank_no, \
+                    DENSE_RANK() OVER (PARTITION BY group_name ORDER BY score DESC) AS dense_no \
+             FROM window_values ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            rows(&ranked),
+            vec![
+                Row::new(vec![
+                    Value::Int64(1),
+                    Value::Int64(20),
+                    Value::Int64(1),
+                    Value::Int64(1),
+                    Value::Int64(1),
+                ]),
+                Row::new(vec![
+                    Value::Int64(2),
+                    Value::Int64(10),
+                    Value::Int64(3),
+                    Value::Int64(3),
+                    Value::Int64(2),
+                ]),
+                Row::new(vec![
+                    Value::Int64(3),
+                    Value::Int64(20),
+                    Value::Int64(2),
+                    Value::Int64(1),
+                    Value::Int64(1),
+                ]),
+                Row::new(vec![
+                    Value::Int64(4),
+                    Value::Int64(30),
+                    Value::Int64(1),
+                    Value::Int64(1),
+                    Value::Int64(1),
+                ]),
+            ]
+        );
+
+        let named = execute(
+            &mut session,
+            "SELECT id, RANK() OVER ranked AS rank_no FROM window_values \
+             WINDOW ranked AS (PARTITION BY group_name ORDER BY score DESC) \
+             ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            rows(&named),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Int64(1)]),
+                Row::new(vec![Value::Int64(2), Value::Int64(3)]),
+                Row::new(vec![Value::Int64(3), Value::Int64(1)]),
+                Row::new(vec![Value::Int64(4), Value::Int64(1)]),
+            ]
+        );
+
+        let framed = execute(
+            &mut session,
+            "SELECT id, RANK() OVER (
+                 PARTITION BY group_name ORDER BY score DESC
+                 ROWS BETWEEN $1 PRECEDING AND $2 FOLLOWING
+             ) AS rank_no FROM window_values ORDER BY id",
+            &[Value::Int64(1), Value::Int64(1)],
+        );
+        assert_eq!(rows(&framed), rows(&named));
+
+        let negative_frame = session
+            .execute(
+                "SELECT RANK() OVER (ORDER BY score ROWS $1 PRECEDING) FROM window_values",
+                &[Value::Int64(-1)],
+            )
+            .expect_err("negative frame offset");
+        assert_eq!(negative_frame.sql_state, "22013");
+
+        let reversed_frame = session
+            .execute(
+                "SELECT RANK() OVER (
+                     ORDER BY score ROWS BETWEEN $1 PRECEDING AND $2 PRECEDING
+                 ) FROM window_values",
+                &[Value::Int64(1), Value::Int64(2)],
+            )
+            .expect_err("frame start after end");
+        assert_eq!(reversed_frame.sql_state, "42P20");
+
+        let values = execute(
+            &mut session,
+            "SELECT id,
+                    LAG(score) OVER grouped AS lag_score,
+                    LEAD(score, 1, -1) OVER grouped AS lead_score,
+                    FIRST_VALUE(score) OVER grouped AS first_score,
+                    LAST_VALUE(score) OVER (
+                        grouped ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS last_score,
+                    NTH_VALUE(score, 2) OVER (
+                        grouped ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                    ) AS second_score,
+                    COUNT(*) OVER (PARTITION BY group_name) AS group_count,
+                    SUM(score) OVER (
+                        grouped ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS running_score,
+                    AVG(score) OVER (PARTITION BY group_name) AS average_score
+             FROM window_values
+             WINDOW grouped AS (PARTITION BY group_name ORDER BY id)
+             ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            rows(&values),
+            vec![
+                Row::new(vec![
+                    Value::Int64(1),
+                    Value::Null,
+                    Value::Int64(10),
+                    Value::Int64(20),
+                    Value::Int64(20),
+                    Value::Int64(10),
+                    Value::Int64(3),
+                    Value::Int64(20),
+                    Value::Float64(50.0 / 3.0),
+                ]),
+                Row::new(vec![
+                    Value::Int64(2),
+                    Value::Int64(20),
+                    Value::Int64(20),
+                    Value::Int64(20),
+                    Value::Int64(10),
+                    Value::Int64(10),
+                    Value::Int64(3),
+                    Value::Int64(30),
+                    Value::Float64(50.0 / 3.0),
+                ]),
+                Row::new(vec![
+                    Value::Int64(3),
+                    Value::Int64(10),
+                    Value::Int64(-1),
+                    Value::Int64(20),
+                    Value::Int64(20),
+                    Value::Int64(10),
+                    Value::Int64(3),
+                    Value::Int64(50),
+                    Value::Float64(50.0 / 3.0),
+                ]),
+                Row::new(vec![
+                    Value::Int64(4),
+                    Value::Null,
+                    Value::Int64(-1),
+                    Value::Int64(30),
+                    Value::Int64(30),
+                    Value::Null,
+                    Value::Int64(1),
+                    Value::Int64(30),
+                    Value::Float64(30.0),
+                ]),
+            ]
+        );
+
+        let range = execute(
+            &mut session,
+            "SELECT id, SUM(score) OVER (
+                 ORDER BY score RANGE BETWEEN 5 PRECEDING AND CURRENT ROW
+             ) AS nearby_score FROM window_values ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            rows(&range),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Int64(40)]),
+                Row::new(vec![Value::Int64(2), Value::Int64(10)]),
+                Row::new(vec![Value::Int64(3), Value::Int64(40)]),
+                Row::new(vec![Value::Int64(4), Value::Int64(30)]),
+            ]
+        );
+
+        let sliding_rows = execute(
+            &mut session,
+            "SELECT id, SUM(score) OVER (
+                 PARTITION BY group_name ORDER BY id
+                 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+             ) AS sliding_score FROM window_values ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            rows(&sliding_rows),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Int64(20)]),
+                Row::new(vec![Value::Int64(2), Value::Int64(30)]),
+                Row::new(vec![Value::Int64(3), Value::Int64(30)]),
+                Row::new(vec![Value::Int64(4), Value::Int64(30)]),
+            ]
+        );
+
+        let default_range = execute(
+            &mut session,
+            "SELECT id, SUM(score) OVER (ORDER BY score) AS running_peers \
+             FROM window_values ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            rows(&default_range),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Int64(50)]),
+                Row::new(vec![Value::Int64(2), Value::Int64(10)]),
+                Row::new(vec![Value::Int64(3), Value::Int64(50)]),
+                Row::new(vec![Value::Int64(4), Value::Int64(80)]),
+            ]
+        );
+
+        let signed_offsets = execute(
+            &mut session,
+            "SELECT id,
+                    LAG(score, -1) OVER grouped AS next_score,
+                    LEAD(score, NULL, 999) OVER grouped AS null_offset
+             FROM window_values
+             WINDOW grouped AS (PARTITION BY group_name ORDER BY id)
+             ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            rows(&signed_offsets),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Int64(10), Value::Null]),
+                Row::new(vec![Value::Int64(2), Value::Int64(20), Value::Null]),
+                Row::new(vec![Value::Int64(3), Value::Null, Value::Null]),
+                Row::new(vec![Value::Int64(4), Value::Null, Value::Null]),
+            ]
+        );
+
+        let grouped_windows = execute(
+            &mut session,
+            "SELECT group_name,
+                    SUM(score) AS total_score,
+                    RANK() OVER (ORDER BY SUM(score) DESC) AS total_rank,
+                    SUM(SUM(score)) OVER (
+                        ORDER BY group_name ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS running_groups
+             FROM window_values
+             GROUP BY group_name
+             ORDER BY group_name",
+            &[],
+        );
+        assert_eq!(
+            rows(&grouped_windows),
+            vec![
+                Row::new(vec![
+                    Value::Text("a".to_owned()),
+                    Value::Int64(50),
+                    Value::Int64(1),
+                    Value::Int64(50),
+                ]),
+                Row::new(vec![
+                    Value::Text("b".to_owned()),
+                    Value::Int64(30),
+                    Value::Int64(2),
+                    Value::Int64(80),
+                ]),
+            ]
+        );
+
+        let ordered = execute(
+            &mut session,
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY score DESC) AS row_no \
+             FROM window_values ORDER BY row_no DESC",
+            &[],
+        );
+        assert_eq!(
+            rows(&ordered),
+            vec![
+                Row::new(vec![Value::Int64(2), Value::Int64(4)]),
+                Row::new(vec![Value::Int64(3), Value::Int64(3)]),
+                Row::new(vec![Value::Int64(1), Value::Int64(2)]),
+                Row::new(vec![Value::Int64(4), Value::Int64(1)]),
+            ]
+        );
+
+        let explain = execute(
+            &mut session,
+            "EXPLAIN SELECT ROW_NUMBER() OVER (ORDER BY score) FROM window_values",
+            &[],
+        );
+        assert!(rows(&explain).iter().any(|row| {
+            matches!(row.values.as_slice(), [Value::Text(line)] if line.contains("WindowAgg"))
+        }));
+
+        let mut stream = session
+            .execute_stream(
+                "SELECT id, ROW_NUMBER() OVER (ORDER BY score) FROM window_values",
+                &[],
+            )
+            .expect("window stream");
+        for event in stream.by_ref() {
+            event.expect("window stream event");
+        }
+        assert!(
+            stream
+                .execution_memory_peak_bytes()
+                .is_some_and(|peak| peak > 0)
         );
     }
 
@@ -8340,6 +13108,7 @@ mod tests {
             failure_flag: Some(failure_flag),
             cancellation: None,
             execution_memory_peak_bytes: None,
+            _event_reservation: None,
         };
 
         assert_eq!(

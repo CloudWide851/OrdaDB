@@ -44,6 +44,10 @@ pub enum PlanKind {
         order_by: Vec<BoundOrder>,
         input: Box<PlanNode>,
     },
+    Offset {
+        offset: BoundExpr,
+        input: Box<PlanNode>,
+    },
     Limit {
         limit: BoundExpr,
         input: Box<PlanNode>,
@@ -96,6 +100,7 @@ pub fn optimize_select(
     projection: Vec<BoundProjection>,
     filter: Option<BoundExpr>,
     order_by: Vec<BoundOrder>,
+    offset: Option<BoundExpr>,
     limit: Option<BoundExpr>,
 ) -> PlanNode {
     let mut required_columns = BTreeSet::new();
@@ -105,7 +110,13 @@ pub fn optimize_select(
     if let Some(filter) = &filter {
         collect_columns(filter, &mut required_columns);
     }
-    required_columns.extend(order_by.iter().map(|order| order.column_index));
+    for order in &order_by {
+        if let Some(expression) = &order.expression {
+            collect_columns(expression, &mut required_columns);
+        } else {
+            required_columns.insert(order.column_index);
+        }
+    }
     let required_columns = required_columns.into_iter().collect::<Vec<_>>();
     let constant_filter = filter.as_ref().and_then(constant_truth);
     let filter = if constant_filter == Some(true) {
@@ -171,6 +182,16 @@ pub fn optimize_select(
             estimated_cost: plan.estimated_cost + sort_cost,
             kind: PlanKind::Sort {
                 order_by,
+                input: Box::new(plan),
+            },
+        };
+    }
+    if let Some(offset) = offset {
+        plan = PlanNode {
+            estimated_rows,
+            estimated_cost: plan.estimated_cost,
+            kind: PlanKind::Offset {
+                offset,
                 input: Box::new(plan),
             },
         };
@@ -252,12 +273,26 @@ fn collect_columns(expr: &BoundExpr, columns: &mut BTreeSet<usize>) {
             collect_columns(left, columns);
             collect_columns(right, columns);
         }
-        BoundExprKind::Aggregate { argument, .. } => {
+        BoundExprKind::InList { expr, list, .. } => {
+            collect_columns(expr, columns);
+            for candidate in list {
+                collect_columns(candidate, columns);
+            }
+        }
+        BoundExprKind::Aggregate {
+            argument, filter, ..
+        } => {
             if let Some(argument) = argument {
                 collect_columns(argument, columns);
             }
+            if let Some(filter) = filter {
+                collect_columns(filter, columns);
+            }
         }
-        BoundExprKind::Literal(_) | BoundExprKind::Parameter { .. } => {}
+        BoundExprKind::Literal(_)
+        | BoundExprKind::Parameter { .. }
+        | BoundExprKind::Correlation { .. }
+        | BoundExprKind::ApplyValue { .. } => {}
     }
 }
 
@@ -316,6 +351,7 @@ fn explain_node(plan: &PlanNode, depth: usize, lines: &mut Vec<String>) {
         PlanKind::Filter { .. } => "Filter".to_owned(),
         PlanKind::Projection { .. } => "Projection".to_owned(),
         PlanKind::Sort { .. } => "Sort".to_owned(),
+        PlanKind::Offset { .. } => "Offset".to_owned(),
         PlanKind::Limit { .. } => "Limit".to_owned(),
     };
     lines.push(format!(
@@ -329,6 +365,7 @@ fn explain_node(plan: &PlanNode, depth: usize, lines: &mut Vec<String>) {
         PlanKind::Filter { input, .. }
         | PlanKind::Projection { input, .. }
         | PlanKind::Sort { input, .. }
+        | PlanKind::Offset { input, .. }
         | PlanKind::Limit { input, .. } => explain_node(input, depth + 1, lines),
         PlanKind::Scan { .. } => {}
     }
@@ -359,6 +396,7 @@ mod tests {
             projection,
             filter,
             order_by,
+            offset,
             limit,
             ..
         } = bind(
@@ -374,6 +412,7 @@ mod tests {
             projection.clone(),
             filter.clone(),
             order_by.clone(),
+            offset.clone(),
             limit.clone(),
         );
         assert!(matches!(scan_access(&small), AccessPath::Sequential));
@@ -395,6 +434,7 @@ mod tests {
             projection,
             filter,
             order_by,
+            offset,
             limit,
         );
         assert!(matches!(scan_access(&large), AccessPath::Index { .. }));
@@ -438,6 +478,7 @@ mod tests {
             projection,
             filter,
             order_by,
+            offset,
             limit,
             ..
         } = bind(
@@ -453,6 +494,7 @@ mod tests {
             projection,
             filter,
             order_by,
+            offset,
             limit,
         );
         assert!(matches!(scan_access(&plan), AccessPath::Empty));
@@ -465,6 +507,7 @@ mod tests {
             PlanKind::Filter { input, .. }
             | PlanKind::Projection { input, .. }
             | PlanKind::Sort { input, .. }
+            | PlanKind::Offset { input, .. }
             | PlanKind::Limit { input, .. } => scan_access(input),
         }
     }
@@ -477,6 +520,7 @@ mod tests {
             PlanKind::Filter { input, .. }
             | PlanKind::Projection { input, .. }
             | PlanKind::Sort { input, .. }
+            | PlanKind::Offset { input, .. }
             | PlanKind::Limit { input, .. } => scan_required_columns(input),
         }
     }

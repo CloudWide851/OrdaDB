@@ -165,6 +165,26 @@ impl Reservation {
             std::cmp::Ordering::Equal => Ok(()),
         }
     }
+
+    pub(crate) fn transfer_to(&mut self, target: &mut Self, bytes: usize) -> Result<()> {
+        if !Arc::ptr_eq(&self.grant.state, &target.grant.state) {
+            return Err(DbError::internal(
+                "memory reservation transfer crossed query grants",
+            ));
+        }
+        if bytes > self.bytes {
+            return Err(DbError::internal(
+                "memory reservation transfer exceeded its source",
+            ));
+        }
+        let target_bytes = target
+            .bytes
+            .checked_add(bytes)
+            .ok_or_else(|| DbError::new("53200", "query memory limit exceeded"))?;
+        self.bytes -= bytes;
+        target.bytes = target_bytes;
+        Ok(())
+    }
 }
 
 impl fmt::Debug for Reservation {

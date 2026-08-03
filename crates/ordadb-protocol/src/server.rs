@@ -20,7 +20,7 @@ use ordadb_admin::{
     Action, AuthStore, Authorizer, CancellationHandle, DbObject, QueryOutcome, SessionRegistry,
 };
 use ordadb_catalog::{Catalog, ColumnDefinition, RoutineKind, ViewKind};
-use ordadb_engine::{Engine, Session, TransactionStatus};
+use ordadb_engine::{Engine, Session, StatementDescription, TransactionStatus};
 use ordadb_types::{
     Batch, CommandComplete, DbError, Field, Identifier, QueryEvent, QueryProgress, Result, Row,
     ScalarType, Schema, Value,
@@ -475,6 +475,59 @@ struct PreparedStatement {
     schema: Schema,
 }
 
+fn resolve_parameter_oids(
+    declared_oids: &[u32],
+    inferred_types: &[ScalarType],
+) -> Result<Vec<u32>> {
+    let inferred_oids = inferred_types.iter().map(type_oid).collect::<Vec<_>>();
+    if declared_oids.is_empty() {
+        return Ok(inferred_oids);
+    }
+    if declared_oids.len() != inferred_oids.len() {
+        return Err(protocol(format!(
+            "declared parameter count {} does not match inferred count {}",
+            declared_oids.len(),
+            inferred_oids.len()
+        )));
+    }
+    declared_oids
+        .iter()
+        .copied()
+        .zip(inferred_oids)
+        .enumerate()
+        .map(|(index, (declared, inferred))| match declared {
+            0 => Ok(inferred),
+            value if parameter_oid_can_coerce(value, inferred) => Ok(value),
+            value => Err(DbError::new(
+                "42804",
+                format!(
+                    "parameter ${} has type OID {value}, but the statement requires OID {inferred}",
+                    index + 1
+                ),
+            )),
+        })
+        .collect()
+}
+
+fn parameter_oid_can_coerce(source: u32, target: u32) -> bool {
+    use crate::value::{
+        OID_BPCHAR, OID_FLOAT4, OID_FLOAT8, OID_INT2, OID_INT4, OID_INT8, OID_NUMERIC, OID_TEXT,
+        OID_VARCHAR,
+    };
+
+    source == target
+        || matches!(
+            (source, target),
+            (
+                OID_INT2,
+                OID_INT4 | OID_INT8 | OID_FLOAT4 | OID_FLOAT8 | OID_NUMERIC
+            ) | (OID_INT4, OID_INT8 | OID_FLOAT8 | OID_NUMERIC)
+                | (OID_INT8, OID_FLOAT8 | OID_NUMERIC)
+        )
+        || matches!(source, OID_TEXT | OID_BPCHAR | OID_VARCHAR)
+            && matches!(target, OID_TEXT | OID_BPCHAR | OID_VARCHAR)
+}
+
 struct Portal {
     sql: String,
     parameters: Vec<Value>,
@@ -653,13 +706,14 @@ impl Connection {
         if sql.len() > self.config.max_frame_bytes {
             return Err(protocol("prepared SQL exceeds frame limit"));
         }
-        let schema = self.statement_schema(&sql)?;
+        let description = self.statement_description(&sql)?;
+        let parameter_oids = resolve_parameter_oids(&parameter_oids, &description.parameter_types)?;
         self.prepared.insert(
             name,
             PreparedStatement {
                 sql,
                 parameter_oids,
-                schema,
+                schema: description.schema,
             },
         );
         write_parse_complete(&mut self.stream)
@@ -894,24 +948,31 @@ impl Connection {
         )?))
     }
 
-    fn statement_schema(&mut self, sql: &str) -> Result<Schema> {
+    fn statement_description(&mut self, sql: &str) -> Result<StatementDescription> {
         if matches!(self.session.transaction_status(), TransactionStatus::Failed) {
-            return self.session.describe(sql);
+            return self.session.describe_statement(sql);
         }
         if parse_security_statement(sql)?.is_some() {
-            return Ok(Schema::empty());
+            return Ok(StatementDescription {
+                schema: Schema::empty(),
+                parameter_types: Vec::new(),
+            });
         }
         let catalog = self.engine.catalog_snapshot()?;
         if let Some(events) = virtual_query(sql, &self.principal.user, &self.database, &catalog) {
-            return events
+            let schema = events
                 .into_iter()
                 .find_map(|event| match event {
                     QueryEvent::Schema(schema) => Some(schema),
                     _ => None,
                 })
-                .ok_or_else(|| DbError::new("XX000", "virtual query has no schema event"));
+                .ok_or_else(|| DbError::new("XX000", "virtual query has no schema event"))?;
+            return Ok(StatementDescription {
+                schema,
+                parameter_types: Vec::new(),
+            });
         }
-        self.session.describe(sql)
+        self.session.describe_statement(sql)
     }
 
     fn authorize(&self, sql: &str) -> Result<()> {
@@ -1751,6 +1812,38 @@ fn invalid(message: impl Into<String>) -> DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_parameter_oids_fill_unknowns_and_reject_conflicts() {
+        assert_eq!(
+            resolve_parameter_oids(&[], &[ScalarType::Int64, ScalarType::Text]).expect("infer all"),
+            [crate::value::OID_INT8, crate::value::OID_TEXT]
+        );
+        assert_eq!(
+            resolve_parameter_oids(
+                &[0, crate::value::OID_TEXT],
+                &[ScalarType::Int64, ScalarType::Text],
+            )
+            .expect("fill unknown"),
+            [crate::value::OID_INT8, crate::value::OID_TEXT]
+        );
+        assert_eq!(
+            resolve_parameter_oids(&[crate::value::OID_INT4], &[ScalarType::Int64])
+                .expect("safe widening"),
+            [crate::value::OID_INT4]
+        );
+
+        let mismatch = resolve_parameter_oids(&[crate::value::OID_TEXT], &[ScalarType::Int64])
+            .expect_err("mismatched declaration");
+        assert_eq!(mismatch.sql_state, "42804");
+
+        let count = resolve_parameter_oids(
+            &[crate::value::OID_INT8],
+            &[ScalarType::Int64, ScalarType::Text],
+        )
+        .expect_err("mismatched count");
+        assert_eq!(count.sql_state, "08P01");
+    }
 
     #[test]
     fn simple_query_splitter_respects_quotes_and_copy_is_explicit() {
