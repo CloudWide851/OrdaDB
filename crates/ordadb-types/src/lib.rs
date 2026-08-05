@@ -1,4 +1,5 @@
 use std::fmt;
+use std::str::FromStr;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use rust_decimal::Decimal;
@@ -37,6 +38,10 @@ object_id!(SequenceId);
 object_id!(ViewId);
 object_id!(RoutineId);
 object_id!(TriggerId);
+object_id!(TypeId);
+
+pub const MAX_ARRAY_DIMENSIONS: usize = 6;
+pub const MAX_ARRAY_ELEMENTS: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Identifier {
@@ -133,11 +138,19 @@ pub enum ScalarType {
         length: Option<u32>,
     },
     Text,
+    Enum {
+        type_id: TypeId,
+        labels: Vec<String>,
+    },
     Binary,
     Date,
     Time,
     Timestamp {
         with_timezone: bool,
+    },
+    Interval,
+    Array {
+        element: Box<ScalarType>,
     },
     Json,
     Jsonb,
@@ -161,9 +174,347 @@ impl ScalarType {
                 matches!(self, Self::Int64 | Self::Float64 | Self::Decimal { .. })
             }
             Value::Int64(_) => matches!(self, Self::Float64 | Self::Decimal { .. }),
-            Value::Text(_) => matches!(self, Self::Char { .. } | Self::Varchar { .. }),
+            Value::Text(value) => match self {
+                Self::Char { .. } | Self::Varchar { .. } => true,
+                Self::Enum { labels, .. } => labels.iter().any(|label| label == value),
+                _ => false,
+            },
+            Value::Array(value) => {
+                matches!(self, Self::Array { element }
+                    if value.values().iter().all(|value| element.accepts(value)))
+            }
             _ => false,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PgInterval {
+    pub months: i32,
+    pub days: i32,
+    pub microseconds: i64,
+}
+
+impl PgInterval {
+    #[must_use]
+    pub const fn new(months: i32, days: i32, microseconds: i64) -> Self {
+        Self {
+            months,
+            days,
+            microseconds,
+        }
+    }
+}
+
+impl fmt::Display for PgInterval {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let negative = self.microseconds.is_negative();
+        let micros = i128::from(self.microseconds).abs();
+        let hours = micros / 3_600_000_000;
+        let minutes = micros / 60_000_000 % 60;
+        let seconds = micros / 1_000_000 % 60;
+        let fraction = micros % 1_000_000;
+        write!(
+            formatter,
+            "{} mons {} days {}{hours:02}:{minutes:02}:{seconds:02}.{fraction:06}",
+            self.months,
+            self.days,
+            if negative { "-" } else { "" }
+        )
+    }
+}
+
+impl FromStr for PgInterval {
+    type Err = DbError;
+
+    fn from_str(input: &str) -> Result<Self> {
+        let input = input.trim();
+        if input.is_empty() {
+            return Err(DbError::new("22007", "interval input is empty"));
+        }
+        let tokens = input.split_whitespace().collect::<Vec<_>>();
+        let mut months = 0_i64;
+        let mut days = 0_i64;
+        let mut microseconds = 0_i128;
+        let mut index = 0;
+        while index < tokens.len() {
+            let token = tokens[index];
+            if token.contains(':') {
+                microseconds = microseconds
+                    .checked_add(parse_interval_clock(token)?)
+                    .ok_or_else(|| DbError::new("22015", "interval time field overflows"))?;
+                index += 1;
+                continue;
+            }
+            let unit = tokens.get(index + 1).ok_or_else(|| {
+                DbError::new(
+                    "22007",
+                    format!("interval value `{token}` is missing its unit"),
+                )
+            })?;
+            match unit.to_ascii_lowercase().as_str() {
+                "year" | "years" => {
+                    let value = parse_interval_integer(token)?;
+                    months = months
+                        .checked_add(value.checked_mul(12).ok_or_else(|| {
+                            DbError::new("22015", "interval year field overflows")
+                        })?)
+                        .ok_or_else(|| DbError::new("22015", "interval month field overflows"))?;
+                }
+                "mon" | "mons" | "month" | "months" => {
+                    months = months
+                        .checked_add(parse_interval_integer(token)?)
+                        .ok_or_else(|| DbError::new("22015", "interval month field overflows"))?;
+                }
+                "day" | "days" => {
+                    days = days
+                        .checked_add(parse_interval_integer(token)?)
+                        .ok_or_else(|| DbError::new("22015", "interval day field overflows"))?;
+                }
+                "hour" | "hours" => {
+                    microseconds = add_interval_unit(
+                        microseconds,
+                        parse_interval_integer(token)?,
+                        3_600_000_000,
+                    )?;
+                }
+                "minute" | "minutes" | "min" | "mins" => {
+                    microseconds = add_interval_unit(
+                        microseconds,
+                        parse_interval_integer(token)?,
+                        60_000_000,
+                    )?;
+                }
+                "second" | "seconds" | "sec" | "secs" => {
+                    microseconds = microseconds
+                        .checked_add(parse_interval_seconds(token)?)
+                        .ok_or_else(|| DbError::new("22015", "interval second field overflows"))?;
+                }
+                "millisecond" | "milliseconds" | "msec" | "msecs" => {
+                    microseconds =
+                        add_interval_unit(microseconds, parse_interval_integer(token)?, 1_000)?;
+                }
+                "microsecond" | "microseconds" | "usec" | "usecs" => {
+                    microseconds =
+                        add_interval_unit(microseconds, parse_interval_integer(token)?, 1)?;
+                }
+                _ => {
+                    return Err(DbError::new(
+                        "22007",
+                        format!("interval unit `{unit}` is not recognized"),
+                    ));
+                }
+            }
+            index += 2;
+        }
+        Ok(Self {
+            months: i32::try_from(months)
+                .map_err(|_| DbError::new("22015", "interval month field is out of range"))?,
+            days: i32::try_from(days)
+                .map_err(|_| DbError::new("22015", "interval day field is out of range"))?,
+            microseconds: i64::try_from(microseconds)
+                .map_err(|_| DbError::new("22015", "interval time field is out of range"))?,
+        })
+    }
+}
+
+fn parse_interval_integer(value: &str) -> Result<i64> {
+    value
+        .parse::<i64>()
+        .map_err(|_| DbError::new("22007", format!("invalid interval field `{value}`")))
+}
+
+fn add_interval_unit(current: i128, value: i64, multiplier: i128) -> Result<i128> {
+    current
+        .checked_add(
+            i128::from(value)
+                .checked_mul(multiplier)
+                .ok_or_else(|| DbError::new("22015", "interval time field overflows"))?,
+        )
+        .ok_or_else(|| DbError::new("22015", "interval time field overflows"))
+}
+
+fn parse_interval_clock(value: &str) -> Result<i128> {
+    let negative = value.starts_with('-');
+    let unsigned = value.strip_prefix(['-', '+']).unwrap_or(value);
+    let fields = unsigned.split(':').collect::<Vec<_>>();
+    if fields.len() != 3 {
+        return Err(DbError::new(
+            "22007",
+            format!("invalid interval time `{value}`"),
+        ));
+    }
+    let hours = fields[0]
+        .parse::<i64>()
+        .map_err(|_| DbError::new("22007", format!("invalid interval hour `{}`", fields[0])))?;
+    let minutes = fields[1]
+        .parse::<u8>()
+        .map_err(|_| DbError::new("22007", format!("invalid interval minute `{}`", fields[1])))?;
+    if minutes >= 60 {
+        return Err(DbError::new("22007", "interval minute must be below 60"));
+    }
+    let seconds = parse_interval_seconds(fields[2])?;
+    if seconds.abs() >= 60_000_000 {
+        return Err(DbError::new("22007", "interval second must be below 60"));
+    }
+    let total = i128::from(hours)
+        .checked_mul(3_600_000_000)
+        .and_then(|value| value.checked_add(i128::from(minutes) * 60_000_000))
+        .and_then(|value| value.checked_add(seconds))
+        .ok_or_else(|| DbError::new("22015", "interval time field overflows"))?;
+    Ok(if negative { -total } else { total })
+}
+
+fn parse_interval_seconds(value: &str) -> Result<i128> {
+    let negative = value.starts_with('-');
+    let unsigned = value.strip_prefix(['-', '+']).unwrap_or(value);
+    let mut parts = unsigned.split('.');
+    let whole = parts
+        .next()
+        .ok_or_else(|| DbError::new("22007", "interval second is empty"))?
+        .parse::<i64>()
+        .map_err(|_| DbError::new("22007", format!("invalid interval second `{value}`")))?;
+    let fraction = parts.next().unwrap_or("");
+    if parts.next().is_some()
+        || fraction.len() > 6
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(DbError::new(
+            "22007",
+            format!("invalid interval second `{value}`"),
+        ));
+    }
+    let mut micros = if fraction.is_empty() {
+        0_i128
+    } else {
+        fraction
+            .parse::<i128>()
+            .map_err(|_| DbError::new("22007", format!("invalid interval second `{value}`")))?
+            * 10_i128.pow(u32::try_from(6 - fraction.len()).expect("bounded fraction"))
+    };
+    micros += i128::from(whole) * 1_000_000;
+    Ok(if negative { -micros } else { micros })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArrayDimension {
+    pub length: u32,
+    pub lower_bound: i32,
+}
+
+impl ArrayDimension {
+    #[must_use]
+    pub const fn new(length: u32, lower_bound: i32) -> Self {
+        Self {
+            length,
+            lower_bound,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PgArray {
+    element_type: ScalarType,
+    dimensions: Vec<ArrayDimension>,
+    values: Vec<Value>,
+}
+
+impl PgArray {
+    pub fn new(
+        element_type: ScalarType,
+        dimensions: Vec<ArrayDimension>,
+        values: Vec<Value>,
+    ) -> Result<Self> {
+        if matches!(element_type, ScalarType::Array { .. }) {
+            return Err(DbError::new(
+                "22023",
+                "PostgreSQL arrays use dimensions instead of nested array element types",
+            ));
+        }
+        if dimensions.len() > MAX_ARRAY_DIMENSIONS {
+            return Err(DbError::new(
+                "54000",
+                format!(
+                    "array has {} dimensions; maximum is {MAX_ARRAY_DIMENSIONS}",
+                    dimensions.len()
+                ),
+            ));
+        }
+        let expected = if dimensions.is_empty() {
+            0
+        } else {
+            dimensions.iter().try_fold(1_usize, |count, dimension| {
+                count
+                    .checked_mul(usize::try_from(dimension.length).map_err(|_| {
+                        DbError::new("54000", "array dimension length is not addressable")
+                    })?)
+                    .ok_or_else(|| DbError::new("54000", "array element count overflows"))
+            })?
+        };
+        if expected > MAX_ARRAY_ELEMENTS {
+            return Err(DbError::new(
+                "54000",
+                format!("array contains {expected} elements; maximum is {MAX_ARRAY_ELEMENTS}"),
+            ));
+        }
+        if expected != values.len() {
+            return Err(DbError::new(
+                "2202E",
+                format!(
+                    "array dimensions declare {expected} elements but {} values were supplied",
+                    values.len()
+                ),
+            ));
+        }
+        if values.iter().any(|value| matches!(value, Value::Array(_))) {
+            return Err(DbError::new(
+                "2202E",
+                "array values must be flattened across their declared dimensions",
+            ));
+        }
+        if let Some(value) = values.iter().find(|value| !element_type.accepts(value)) {
+            return Err(DbError::new(
+                "42804",
+                format!("array value {value:?} is not assignable to {element_type:?}"),
+            ));
+        }
+        Ok(Self {
+            element_type,
+            dimensions,
+            values,
+        })
+    }
+
+    pub fn one_dimensional(element_type: ScalarType, values: Vec<Value>) -> Result<Self> {
+        let length = u32::try_from(values.len())
+            .map_err(|_| DbError::new("54000", "array contains more than u32::MAX elements"))?;
+        Self::new(
+            element_type,
+            if values.is_empty() {
+                Vec::new()
+            } else {
+                vec![ArrayDimension::new(length, 1)]
+            },
+            values,
+        )
+    }
+
+    #[must_use]
+    pub const fn element_type(&self) -> &ScalarType {
+        &self.element_type
+    }
+
+    #[must_use]
+    pub fn dimensions(&self) -> &[ArrayDimension] {
+        &self.dimensions
+    }
+
+    #[must_use]
+    pub fn values(&self) -> &[Value] {
+        &self.values
     }
 }
 
@@ -183,6 +534,8 @@ pub enum Value {
     Date(NaiveDate),
     Time(NaiveTime),
     Timestamp(NaiveDateTime),
+    Interval(PgInterval),
+    Array(PgArray),
     Json(serde_json::Value),
     Jsonb(serde_json::Value),
     Uuid(Uuid),
@@ -215,6 +568,10 @@ impl Value {
             Self::Time(_) => Some(ScalarType::Time),
             Self::Timestamp(_) => Some(ScalarType::Timestamp {
                 with_timezone: false,
+            }),
+            Self::Interval(_) => Some(ScalarType::Interval),
+            Self::Array(value) => Some(ScalarType::Array {
+                element: Box::new(value.element_type().clone()),
             }),
             Self::Json(_) => Some(ScalarType::Json),
             Self::Jsonb(_) => Some(ScalarType::Jsonb),
@@ -373,7 +730,7 @@ mod tests {
     use rust_decimal::Decimal;
     use uuid::Uuid;
 
-    use super::{Identifier, ScalarType, Value};
+    use super::{ArrayDimension, Identifier, PgArray, PgInterval, ScalarType, Value};
 
     #[test]
     fn normalizes_unquoted_identifiers_but_preserves_quoted_names() {
@@ -421,6 +778,15 @@ mod tests {
                 NaiveDateTime::parse_from_str("2026-07-25 12:34:56", "%Y-%m-%d %H:%M:%S")
                     .expect("timestamp"),
             ),
+            Value::Interval(PgInterval::new(14, 3, 4_500_000)),
+            Value::Array(
+                PgArray::new(
+                    ScalarType::Int32,
+                    vec![ArrayDimension::new(2, 1)],
+                    vec![Value::Int32(1), Value::Null],
+                )
+                .expect("array"),
+            ),
             Value::Json(serde_json::json!({"kind": "json"})),
             Value::Jsonb(serde_json::json!({"kind": "jsonb"})),
             Value::Uuid(Uuid::parse_str("8b0e3f94-3bbf-4f7c-a931-48cd9ba86c1d").expect("uuid")),
@@ -430,5 +796,49 @@ mod tests {
         let encoded = serde_json::to_string(&values).expect("serialize values");
         let decoded: Vec<Value> = serde_json::from_str(&encoded).expect("deserialize values");
         assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn arrays_validate_dimensions_types_and_bounds() {
+        let array = PgArray::one_dimensional(
+            ScalarType::Int64,
+            vec![Value::Int32(1), Value::Int64(2), Value::Null],
+        )
+        .expect("array");
+        assert_eq!(array.dimensions(), &[ArrayDimension::new(3, 1)]);
+        assert_eq!(
+            Value::Array(array).scalar_type(),
+            Some(ScalarType::Array {
+                element: Box::new(ScalarType::Int64),
+            })
+        );
+
+        let mismatch = PgArray::new(
+            ScalarType::Int32,
+            vec![ArrayDimension::new(2, 1)],
+            vec![Value::Int32(1)],
+        )
+        .expect_err("dimension mismatch");
+        assert_eq!(mismatch.sql_state, "2202E");
+    }
+
+    #[test]
+    fn intervals_parse_and_render_postgresql_fields() {
+        let interval = "1 year 2 mons 3 days 04:05:06.75"
+            .parse::<PgInterval>()
+            .expect("interval");
+        assert_eq!(interval, PgInterval::new(14, 3, 14_706_750_000));
+        assert_eq!(interval.to_string(), "14 mons 3 days 04:05:06.750000");
+        assert_eq!(
+            "-01:02:03.000004".parse::<PgInterval>().expect("negative"),
+            PgInterval::new(0, 0, -3_723_000_004)
+        );
+        assert_eq!(
+            "1 day 2"
+                .parse::<PgInterval>()
+                .expect_err("missing unit")
+                .sql_state,
+            "22007"
+        );
     }
 }

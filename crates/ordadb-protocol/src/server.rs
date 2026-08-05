@@ -17,10 +17,15 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use ordadb_admin::{
-    Action, AuthStore, Authorizer, CancellationHandle, DbObject, QueryOutcome, SessionRegistry,
+    Action, AuthStore, Authorizer, CancellationHandle, DbObject, Principal, QueryOutcome,
+    SessionRegistry,
 };
-use ordadb_catalog::{Catalog, ColumnDefinition, RoutineKind, ViewKind};
-use ordadb_engine::{Engine, Session, StatementDescription, TransactionStatus};
+use ordadb_catalog::{
+    Catalog, ColumnDefinition, ConstraintKind, RoutineKind, UserDefinedTypeKind, ViewKind,
+};
+use ordadb_engine::{
+    Engine, Session, SessionAuthorization, StatementDescription, TransactionStatus,
+};
 use ordadb_types::{
     Batch, CommandComplete, DbError, Field, Identifier, QueryEvent, QueryProgress, Result, Row,
     ScalarType, Schema, Value,
@@ -38,7 +43,8 @@ use crate::security::{
     execute_security_statement, is_security_sql, parse_security_statement, redacted_security_sql,
 };
 use crate::value::{
-    decode_parameters, encode_text, type_oid, write_data_row, write_row_description,
+    decode_parameters_as, encode_text, type_oid, user_defined_array_oid, user_defined_type_oid,
+    write_data_row, write_row_description,
 };
 
 const DEFAULT_MAX_PREPARED: usize = 1024;
@@ -237,6 +243,12 @@ fn serve_tcp_connection_inner(
     };
     let authorizer = Authorizer::from_store(&auth)?;
     authorizer.authorize_sql(&principal, &database, "CONNECT")?;
+    let bypass_ownership = match authorizer.authorize(&principal, Action::Manage, &DbObject::Server)
+    {
+        Ok(()) => true,
+        Err(error) if error.sql_state == "42501" => false,
+        Err(error) => return Err(error),
+    };
 
     let mut secret = [0_u8; 4];
     OsRng.fill_bytes(&mut secret);
@@ -251,7 +263,7 @@ fn serve_tcp_connection_inner(
     let _guard = SessionGuard::new(Arc::clone(&registry), handle.process_id());
     write_startup_responses(&mut stream, &config, &principal.user, &handle)?;
 
-    let session = connect_postgresql_session(&engine)?;
+    let session = connect_postgresql_session(&engine, &principal, bypass_ownership)?;
     let mut connection = Connection {
         stream,
         session,
@@ -472,6 +484,7 @@ impl Drop for SessionGuard {
 struct PreparedStatement {
     sql: String,
     parameter_oids: Vec<u32>,
+    parameter_types: Vec<ScalarType>,
     schema: Schema,
 }
 
@@ -713,6 +726,7 @@ impl Connection {
             PreparedStatement {
                 sql,
                 parameter_oids,
+                parameter_types: description.parameter_types,
                 schema: description.schema,
             },
         );
@@ -739,8 +753,12 @@ impl Connection {
             .get(statement_name)
             .ok_or_else(|| DbError::new("26000", "prepared statement does not exist"))?
             .clone();
-        let parameters =
-            decode_parameters(&prepared.parameter_oids, parameter_formats, parameters)?;
+        let parameters = decode_parameters_as(
+            &prepared.parameter_oids,
+            &prepared.parameter_types,
+            parameter_formats,
+            parameters,
+        )?;
         self.portals.insert(
             portal_name,
             Portal {
@@ -1142,8 +1160,15 @@ fn transaction_status(session: &Session) -> u8 {
     }
 }
 
-fn connect_postgresql_session(engine: &Engine) -> Result<Session> {
-    engine.connect()
+fn connect_postgresql_session(
+    engine: &Engine,
+    principal: &Principal,
+    bypass_ownership: bool,
+) -> Result<Session> {
+    engine.connect_authenticated(SessionAuthorization::new(
+        principal.user.clone(),
+        bypass_ownership,
+    )?)
 }
 
 fn command_tag(complete: &CommandComplete) -> String {
@@ -1161,6 +1186,9 @@ fn command_tag(complete: &CommandComplete) -> String {
 enum CatalogQuerySource {
     Namespace,
     Class,
+    Type,
+    Enum,
+    Constraint,
     Procedure,
     Trigger,
     InformationSchemaTables,
@@ -1179,6 +1207,9 @@ fn catalog_query_source(sql: &str) -> Option<CatalogQuerySource> {
     [
         ("PG_CATALOG.PG_NAMESPACE", CatalogQuerySource::Namespace),
         ("PG_CATALOG.PG_CLASS", CatalogQuerySource::Class),
+        ("PG_CATALOG.PG_TYPE", CatalogQuerySource::Type),
+        ("PG_CATALOG.PG_ENUM", CatalogQuerySource::Enum),
+        ("PG_CATALOG.PG_CONSTRAINT", CatalogQuerySource::Constraint),
         ("PG_CATALOG.PG_PROC", CatalogQuerySource::Procedure),
         ("PG_CATALOG.PG_TRIGGER", CatalogQuerySource::Trigger),
         (
@@ -1261,6 +1292,30 @@ fn virtual_query(
         ));
     }
     None
+}
+
+const fn pg_type_category(data_type: &ScalarType) -> &'static str {
+    match data_type {
+        ScalarType::Boolean => "B",
+        ScalarType::Int16
+        | ScalarType::Int32
+        | ScalarType::Int64
+        | ScalarType::Float32
+        | ScalarType::Float64
+        | ScalarType::Decimal { .. } => "N",
+        ScalarType::Char { .. } | ScalarType::Varchar { .. } | ScalarType::Text => "S",
+        ScalarType::Date
+        | ScalarType::Time
+        | ScalarType::Timestamp { .. }
+        | ScalarType::Interval => "D",
+        ScalarType::Array { .. } => "A",
+        ScalarType::Enum { .. } => "E",
+        ScalarType::Binary
+        | ScalarType::Json
+        | ScalarType::Jsonb
+        | ScalarType::Uuid
+        | ScalarType::Vector { .. } => "U",
+    }
 }
 
 fn catalog_query_events(
@@ -1373,17 +1428,235 @@ fn catalog_query_events(
                 rows,
             )
         }
+        CatalogQuerySource::Type => {
+            let mut rows = Vec::new();
+            for schema in catalog_database.schemas() {
+                let namespace_oid = oid(SCHEMA_OID_BASE, schema.id.get());
+                for definition in schema.types() {
+                    let scalar_oid = i64::from(user_defined_type_oid(definition.id));
+                    let array_oid = i64::from(user_defined_array_oid(definition.id));
+                    let (kind, category, base_oid, not_null, default) = match &definition.definition
+                    {
+                        UserDefinedTypeKind::Enum { .. } => ("e", "E", 0_i64, false, Value::Null),
+                        UserDefinedTypeKind::Domain {
+                            base_type,
+                            base_declared_type,
+                            not_null,
+                            default,
+                            ..
+                        } => (
+                            "d",
+                            pg_type_category(base_type),
+                            i64::from(
+                                base_declared_type
+                                    .map_or_else(|| type_oid(base_type), user_defined_type_oid),
+                            ),
+                            *not_null,
+                            default.as_ref().map_or(Value::Null, |expression| {
+                                Value::Text(expression.sql.clone())
+                            }),
+                        ),
+                    };
+                    rows.push(Row::new(vec![
+                        Value::Int64(scalar_oid),
+                        Value::Text(definition.name.as_str().to_owned()),
+                        Value::Int64(namespace_oid),
+                        Value::Text(kind.into()),
+                        Value::Text(category.into()),
+                        Value::Boolean(true),
+                        Value::Int64(0),
+                        Value::Int64(array_oid),
+                        Value::Int64(base_oid),
+                        Value::Boolean(not_null),
+                        default,
+                    ]));
+                    rows.push(Row::new(vec![
+                        Value::Int64(array_oid),
+                        Value::Text(format!("_{}", definition.name.as_str())),
+                        Value::Int64(namespace_oid),
+                        Value::Text("b".into()),
+                        Value::Text("A".into()),
+                        Value::Boolean(true),
+                        Value::Int64(scalar_oid),
+                        Value::Int64(0),
+                        Value::Int64(0),
+                        Value::Boolean(false),
+                        Value::Null,
+                    ]));
+                }
+            }
+            (
+                Schema::new(vec![
+                    Field::new("oid", ScalarType::Int64, false),
+                    Field::new("typname", ScalarType::Text, false),
+                    Field::new("typnamespace", ScalarType::Int64, false),
+                    Field::new("typtype", ScalarType::Text, false),
+                    Field::new("typcategory", ScalarType::Text, false),
+                    Field::new("typisdefined", ScalarType::Boolean, false),
+                    Field::new("typelem", ScalarType::Int64, false),
+                    Field::new("typarray", ScalarType::Int64, false),
+                    Field::new("typbasetype", ScalarType::Int64, false),
+                    Field::new("typnotnull", ScalarType::Boolean, false),
+                    Field::new("typdefault", ScalarType::Text, true),
+                ]),
+                rows,
+            )
+        }
+        CatalogQuerySource::Enum => {
+            const ENUM_LABEL_OID_BASE: i64 = 1_000_000_000;
+            let rows = catalog_database
+                .schemas()
+                .flat_map(|schema| {
+                    schema.types().flat_map(|definition| {
+                        let UserDefinedTypeKind::Enum { labels } = &definition.definition else {
+                            return Vec::new().into_iter();
+                        };
+                        let type_oid = i64::from(user_defined_type_oid(definition.id));
+                        let type_offset = i64::try_from(definition.id.get())
+                            .unwrap_or(i64::MAX)
+                            .saturating_mul(1_000_000);
+                        labels
+                            .iter()
+                            .enumerate()
+                            .map(|(ordinal, label)| {
+                                Row::new(vec![
+                                    Value::Int64(
+                                        ENUM_LABEL_OID_BASE
+                                            .saturating_add(type_offset)
+                                            .saturating_add(
+                                                i64::try_from(ordinal).unwrap_or(i64::MAX),
+                                            ),
+                                    ),
+                                    Value::Int64(type_oid),
+                                    Value::Float64(
+                                        u32::try_from(ordinal)
+                                            .map_or(f64::from(u32::MAX), |value| {
+                                                f64::from(value.saturating_add(1))
+                                            }),
+                                    ),
+                                    Value::Text(label.clone()),
+                                ])
+                            })
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                    })
+                })
+                .collect();
+            (
+                Schema::new(vec![
+                    Field::new("oid", ScalarType::Int64, false),
+                    Field::new("enumtypid", ScalarType::Int64, false),
+                    Field::new("enumsortorder", ScalarType::Float64, false),
+                    Field::new("enumlabel", ScalarType::Text, false),
+                ]),
+                rows,
+            )
+        }
+        CatalogQuerySource::Constraint => {
+            const CONSTRAINT_OID_BASE: i64 = 1_100_000_000;
+            const LEGACY_DOMAIN_CONSTRAINT_OID_BASE: i64 = 1_200_000_000;
+            let mut rows = Vec::new();
+            for schema in catalog_database.schemas() {
+                let namespace_oid = oid(SCHEMA_OID_BASE, schema.id.get());
+                for table in schema.tables() {
+                    for constraint in table.constraints() {
+                        let (constraint_type, expression) = match &constraint.kind {
+                            ConstraintKind::PrimaryKey { .. } => ("p", Value::Null),
+                            ConstraintKind::Unique { .. } => ("u", Value::Null),
+                            ConstraintKind::ForeignKey { .. } => ("f", Value::Null),
+                            ConstraintKind::Check { expression } => {
+                                ("c", Value::Text(expression.sql.clone()))
+                            }
+                        };
+                        rows.push(Row::new(vec![
+                            Value::Int64(oid(CONSTRAINT_OID_BASE, constraint.id.get())),
+                            Value::Text(constraint.name.as_str().to_owned()),
+                            Value::Text(constraint_type.into()),
+                            Value::Int64(namespace_oid),
+                            Value::Int64(oid(TABLE_OID_BASE, table.id.get())),
+                            Value::Int64(0),
+                            Value::Boolean(true),
+                            expression,
+                        ]));
+                    }
+                }
+                for definition in schema.types() {
+                    let UserDefinedTypeKind::Domain { checks, .. } = &definition.definition else {
+                        continue;
+                    };
+                    for (ordinal, constraint) in checks.iter().enumerate() {
+                        let generated_name = if ordinal == 0 {
+                            format!("{}_check", definition.name.as_str())
+                        } else {
+                            format!("{}_check{}", definition.name.as_str(), ordinal + 1)
+                        };
+                        let constraint_oid = constraint.id.map_or_else(
+                            || {
+                                LEGACY_DOMAIN_CONSTRAINT_OID_BASE
+                                    .saturating_add(
+                                        i64::try_from(definition.id.get())
+                                            .unwrap_or(i64::MAX)
+                                            .saturating_mul(1_000_000),
+                                    )
+                                    .saturating_add(i64::try_from(ordinal).unwrap_or(i64::MAX))
+                            },
+                            |id| oid(CONSTRAINT_OID_BASE, id.get()),
+                        );
+                        rows.push(Row::new(vec![
+                            Value::Int64(constraint_oid),
+                            Value::Text(
+                                constraint
+                                    .name
+                                    .as_ref()
+                                    .map_or(generated_name, |name| name.as_str().to_owned()),
+                            ),
+                            Value::Text("c".into()),
+                            Value::Int64(namespace_oid),
+                            Value::Int64(0),
+                            Value::Int64(i64::from(user_defined_type_oid(definition.id))),
+                            Value::Boolean(true),
+                            Value::Text(constraint.expression.sql.clone()),
+                        ]));
+                    }
+                }
+            }
+            (
+                Schema::new(vec![
+                    Field::new("oid", ScalarType::Int64, false),
+                    Field::new("conname", ScalarType::Text, false),
+                    Field::new("contype", ScalarType::Text, false),
+                    Field::new("connamespace", ScalarType::Int64, false),
+                    Field::new("conrelid", ScalarType::Int64, false),
+                    Field::new("contypid", ScalarType::Int64, false),
+                    Field::new("convalidated", ScalarType::Boolean, false),
+                    Field::new("conbin", ScalarType::Text, true),
+                ]),
+                rows,
+            )
+        }
         CatalogQuerySource::Procedure => {
             let rows = catalog_database
                 .schemas()
                 .flat_map(|schema| {
                     let namespace_oid = oid(SCHEMA_OID_BASE, schema.id.get());
                     schema.routines().map(move |routine| {
-                        let return_oid = routine.return_type.as_ref().map_or(2278, type_oid);
+                        let return_oid = routine.return_type.as_ref().map_or(2278, |return_type| {
+                            routine
+                                .return_declared_type
+                                .map_or_else(|| type_oid(return_type), user_defined_type_oid)
+                        });
                         let argument_oids = routine
                             .arguments
                             .iter()
-                            .map(|argument| type_oid(&argument.data_type).to_string())
+                            .map(|argument| {
+                                argument
+                                    .declared_type
+                                    .map_or_else(
+                                        || type_oid(&argument.data_type),
+                                        user_defined_type_oid,
+                                    )
+                                    .to_string()
+                            })
                             .collect::<Vec<_>>()
                             .join(" ");
                         Row::new(vec![
@@ -1768,10 +2041,11 @@ fn import_csv(
         .flexible(false)
         .from_reader(bytes);
     let mut rows = 0_u64;
-    let oids: Vec<u32> = columns
+    let data_types = columns
         .iter()
-        .map(|column| type_oid(&column.data_type))
-        .collect();
+        .map(|column| column.data_type.clone())
+        .collect::<Vec<_>>();
+    let oids = data_types.iter().map(type_oid).collect::<Vec<_>>();
     for record in reader.records() {
         let record = record.map_err(|error| {
             DbError::new("22P04", "COPY CSV is invalid").with_detail(error.to_string())
@@ -1796,7 +2070,7 @@ fn import_csv(
                 }
             })
             .collect();
-        let values = decode_parameters(&oids, &[], &raw)?;
+        let values = decode_parameters_as(&oids, &data_types, &[], &raw)?;
         drain(session.execute_stream(insert, &values)?)?;
         rows = rows
             .checked_add(1)
@@ -1833,6 +2107,25 @@ mod tests {
             [crate::value::OID_INT4]
         );
 
+        let enum_type = ScalarType::Enum {
+            type_id: ordadb_types::TypeId::new(11),
+            labels: vec!["draft".into(), "published".into()],
+        };
+        let enum_oid = type_oid(&enum_type);
+        let described = resolve_parameter_oids(&[], std::slice::from_ref(&enum_type))
+            .expect("describe enum parameter");
+        assert_eq!(described, [enum_oid]);
+        assert_eq!(
+            decode_parameters_as(
+                &described,
+                std::slice::from_ref(&enum_type),
+                &[1],
+                &[Some(b"published".to_vec())],
+            )
+            .expect("execute described enum parameter"),
+            [Value::Text("published".into())]
+        );
+
         let mismatch = resolve_parameter_oids(&[crate::value::OID_TEXT], &[ScalarType::Int64])
             .expect_err("mismatched declaration");
         assert_eq!(mismatch.sql_state, "42804");
@@ -1843,6 +2136,156 @@ mod tests {
         )
         .expect_err("mismatched count");
         assert_eq!(count.sql_state, "08P01");
+    }
+
+    #[test]
+    fn user_defined_type_catalog_projection_preserves_declared_identity() {
+        use ordadb_catalog::{
+            CatalogExpression, CatalogObjectRef, DomainConstraint, NewRoutine, RoutineArgument,
+        };
+        use ordadb_types::{Identifier, TypeId};
+
+        let mut catalog = Catalog::default();
+        let mood_id = catalog
+            .create_enum_type(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("mood"),
+                vec!["sad".into(), "ok".into(), "happy".into()],
+            )
+            .expect("enum");
+        let positive_id = catalog
+            .create_domain(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("positive_int"),
+                ScalarType::Int32,
+                true,
+                Some(CatalogExpression::new("1")),
+                vec![DomainConstraint {
+                    id: None,
+                    name: Some(Identifier::unquoted("positive")),
+                    expression: CatalogExpression::new("VALUE > 0"),
+                }],
+            )
+            .expect("positive domain");
+        let nonnegative_id = catalog
+            .create_domain(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("nonnegative_int"),
+                ScalarType::Int32,
+                false,
+                None,
+                Vec::new(),
+            )
+            .expect("nonnegative domain");
+        let routine = |type_id: TypeId| NewRoutine {
+            name: Identifier::unquoted("choose_value"),
+            kind: RoutineKind::Function,
+            arguments: vec![RoutineArgument {
+                name: Some(Identifier::unquoted("value")),
+                data_type: ScalarType::Int32,
+                declared_type: Some(type_id),
+            }],
+            return_type: Some(ScalarType::Int32),
+            return_declared_type: Some(type_id),
+            returns_set: false,
+            language: "plpgsql".into(),
+            body: "BEGIN RETURN value; END".into(),
+            replace: false,
+            references: vec![CatalogObjectRef::Type(type_id)],
+        };
+        catalog
+            .create_or_replace_routine(&Identifier::unquoted("public"), routine(positive_id))
+            .expect("positive overload");
+        catalog
+            .create_or_replace_routine(&Identifier::unquoted("public"), routine(nonnegative_id))
+            .expect("nonnegative overload");
+
+        assert_eq!(
+            catalog_query_source("SELECT * FROM pg_catalog.pg_type"),
+            Some(CatalogQuerySource::Type)
+        );
+        assert_eq!(
+            catalog_query_source("SELECT * FROM pg_catalog.pg_enum"),
+            Some(CatalogQuerySource::Enum)
+        );
+        assert_eq!(
+            catalog_query_source("SELECT * FROM pg_catalog.pg_constraint"),
+            Some(CatalogQuerySource::Constraint)
+        );
+
+        let rows = |source| {
+            catalog_query_events(source, &catalog, "ordadb")
+                .into_iter()
+                .find_map(|event| match event {
+                    QueryEvent::Batch(batch) => Some(batch.rows),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        let type_rows = rows(CatalogQuerySource::Type);
+        for (name, type_id, kind) in [
+            ("mood", mood_id, "e"),
+            ("positive_int", positive_id, "d"),
+            ("nonnegative_int", nonnegative_id, "d"),
+        ] {
+            assert!(type_rows.iter().any(|row| {
+                row.values[0] == Value::Int64(i64::from(user_defined_type_oid(type_id)))
+                    && row.values[1] == Value::Text(name.into())
+                    && row.values[3] == Value::Text(kind.into())
+                    && row.values[7] == Value::Int64(i64::from(user_defined_array_oid(type_id)))
+            }));
+        }
+        let enum_rows = rows(CatalogQuerySource::Enum);
+        assert_eq!(
+            enum_rows
+                .iter()
+                .map(|row| row.values[3].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Value::Text("sad".into()),
+                Value::Text("ok".into()),
+                Value::Text("happy".into()),
+            ]
+        );
+        let procedure_rows = rows(CatalogQuerySource::Procedure);
+        let argument_oids = procedure_rows
+            .iter()
+            .filter(|row| row.values[1] == Value::Text("choose_value".into()))
+            .filter_map(|row| match &row.values[6] {
+                Value::Text(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            argument_oids,
+            BTreeSet::from([
+                user_defined_type_oid(positive_id).to_string(),
+                user_defined_type_oid(nonnegative_id).to_string(),
+            ])
+        );
+        let constraint_rows = rows(CatalogQuerySource::Constraint);
+        let constraint_oid = constraint_rows
+            .iter()
+            .find(|row| row.values[1] == Value::Text("positive".into()))
+            .map(|row| row.values[0].clone())
+            .expect("domain constraint projection");
+
+        let reopened: Catalog =
+            serde_json::from_slice(&serde_json::to_vec(&catalog).expect("serialize catalog"))
+                .expect("reopen catalog");
+        let reopened_constraint_oid =
+            catalog_query_events(CatalogQuerySource::Constraint, &reopened, "ordadb")
+                .into_iter()
+                .find_map(|event| match event {
+                    QueryEvent::Batch(batch) => batch
+                        .rows
+                        .into_iter()
+                        .find(|row| row.values[1] == Value::Text("positive".into()))
+                        .map(|row| row.values[0].clone()),
+                    _ => None,
+                })
+                .expect("reopened domain constraint projection");
+        assert_eq!(reopened_constraint_oid, constraint_oid);
     }
 
     #[test]
@@ -1921,11 +2364,31 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let engine =
             Engine::open(ordadb_engine::EngineConfig::new(directory.path())).expect("open engine");
-        let session = connect_postgresql_session(&engine).expect("connect session");
+        let principal = Principal {
+            user: "dba".into(),
+            roles: BTreeSet::new(),
+        };
+        let mut session =
+            connect_postgresql_session(&engine, &principal, false).expect("connect session");
         assert_eq!(
             session.options(),
             ordadb_engine::SessionOptions::default(),
             "PostgreSQL Wire must not negotiate a non-PostgreSQL dialect"
+        );
+        let events = session
+            .execute("CREATE SCHEMA wire_owned", &[])
+            .expect("create owned schema")
+            .collect::<Vec<_>>();
+        assert!(matches!(events.last(), Some(QueryEvent::Complete(_))));
+        let catalog = engine.catalog_snapshot().expect("catalog");
+        let schema = catalog
+            .schema(&Identifier::unquoted("wire_owned"))
+            .expect("wire-owned schema");
+        assert_eq!(
+            catalog
+                .owner_of(ordadb_catalog::CatalogObjectRef::Schema(schema.id))
+                .map(ordadb_catalog::CatalogOwner::as_str),
+            Some(principal.user.as_str())
         );
     }
 }

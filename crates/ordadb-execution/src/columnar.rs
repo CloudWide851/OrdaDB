@@ -1,6 +1,6 @@
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use ordadb_sql::BinaryOperator;
-use ordadb_types::{DbError, Result, Row, ScalarType, Value};
+use ordadb_types::{DbError, PgArray, PgInterval, Result, Row, ScalarType, Value};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -22,6 +22,8 @@ pub enum ColumnVectorKind {
     Date,
     Time,
     Timestamp,
+    Interval,
+    Array,
     Json,
     Jsonb,
     Uuid,
@@ -74,6 +76,8 @@ pub enum ColumnVector {
     Date(Vec<Option<NaiveDate>>),
     Time(Vec<Option<NaiveTime>>),
     Timestamp(Vec<Option<NaiveDateTime>>),
+    Interval(Vec<Option<PgInterval>>),
+    Array(Vec<Option<PgArray>>),
     Json(Vec<Option<serde_json::Value>>),
     Jsonb(Vec<Option<serde_json::Value>>),
     Uuid(Vec<Option<Uuid>>),
@@ -98,6 +102,8 @@ impl ColumnVector {
             Self::Date(values) => values.len(),
             Self::Time(values) => values.len(),
             Self::Timestamp(values) => values.len(),
+            Self::Interval(values) => values.len(),
+            Self::Array(values) => values.len(),
             Self::Json(values) => values.len(),
             Self::Jsonb(values) => values.len(),
             Self::Uuid(values) => values.len(),
@@ -170,6 +176,15 @@ impl ColumnVector {
                 .get(index)
                 .ok_or_else(missing)?
                 .map_or(Value::Null, Value::Timestamp),
+            Self::Interval(values) => values
+                .get(index)
+                .ok_or_else(missing)?
+                .map_or(Value::Null, Value::Interval),
+            Self::Array(values) => values
+                .get(index)
+                .ok_or_else(missing)?
+                .as_ref()
+                .map_or(Value::Null, |value| Value::Array(value.clone())),
             Self::Json(values) => values
                 .get(index)
                 .ok_or_else(missing)?
@@ -262,6 +277,16 @@ impl ColumnVector {
                 .ok_or_else(missing)?
                 .take()
                 .map_or(Value::Null, Value::Timestamp),
+            Self::Interval(values) => values
+                .get_mut(index)
+                .ok_or_else(missing)?
+                .take()
+                .map_or(Value::Null, Value::Interval),
+            Self::Array(values) => values
+                .get_mut(index)
+                .ok_or_else(missing)?
+                .take()
+                .map_or(Value::Null, Value::Array),
             Self::Json(values) => values
                 .get_mut(index)
                 .ok_or_else(missing)?
@@ -320,6 +345,7 @@ impl ColumnVector {
             (Self::Date(values), Value::Date(literal)) => compare!(values, literal),
             (Self::Time(values), Value::Time(literal)) => compare!(values, literal),
             (Self::Timestamp(values), Value::Timestamp(literal)) => compare!(values, literal),
+            (Self::Interval(values), Value::Interval(literal)) => compare!(values, literal),
             (Self::Uuid(values), Value::Uuid(literal)) => compare!(values, literal),
             (Self::Null(len), _) if index < *len => Some(Ok(Value::Null)),
             _ => None,
@@ -383,6 +409,7 @@ impl ColumnVector {
             (Self::Date(values), Value::Date(literal)) => retain!(values, literal),
             (Self::Time(values), Value::Time(literal)) => retain!(values, literal),
             (Self::Timestamp(values), Value::Timestamp(literal)) => retain!(values, literal),
+            (Self::Interval(values), Value::Interval(literal)) => retain!(values, literal),
             (Self::Uuid(values), Value::Uuid(literal)) => retain!(values, literal),
             (Self::Null(len), _) => {
                 if indexes.iter().any(|index| *index as usize >= *len) {
@@ -422,6 +449,17 @@ impl ColumnVector {
                 Self::Time(values) => values.capacity() * std::mem::size_of::<Option<NaiveTime>>(),
                 Self::Timestamp(values) => {
                     values.capacity() * std::mem::size_of::<Option<NaiveDateTime>>()
+                }
+                Self::Interval(values) => {
+                    values.capacity() * std::mem::size_of::<Option<PgInterval>>()
+                }
+                Self::Array(values) => {
+                    values.capacity() * std::mem::size_of::<Option<PgArray>>()
+                        + values
+                            .iter()
+                            .flatten()
+                            .map(estimated_array_bytes)
+                            .sum::<usize>()
                 }
                 Self::Json(values) | Self::Jsonb(values) => {
                     values.capacity() * std::mem::size_of::<Option<serde_json::Value>>()
@@ -470,6 +508,13 @@ impl ColumnVector {
                     .map(serde_json::Value::to_string)
                     .map_or(0, |value| value.len())
             }
+            Self::Array(values) => {
+                base + values
+                    .get(index)
+                    .ok_or_else(|| DbError::internal("column vector index is out of bounds"))?
+                    .as_ref()
+                    .map_or(0, estimated_array_bytes)
+            }
             Self::Vector(values) => {
                 base + values
                     .get(index)
@@ -495,6 +540,7 @@ impl ColumnVector {
             | Self::Binary(_)
             | Self::Json(_)
             | Self::Jsonb(_)
+            | Self::Array(_)
             | Self::Vector(_) => None,
             _ => Some(std::mem::size_of::<Value>()),
         }
@@ -515,6 +561,8 @@ impl ColumnVector {
             ColumnVectorKind::Date => Self::Date(Vec::with_capacity(capacity)),
             ColumnVectorKind::Time => Self::Time(Vec::with_capacity(capacity)),
             ColumnVectorKind::Timestamp => Self::Timestamp(Vec::with_capacity(capacity)),
+            ColumnVectorKind::Interval => Self::Interval(Vec::with_capacity(capacity)),
+            ColumnVectorKind::Array => Self::Array(Vec::with_capacity(capacity)),
             ColumnVectorKind::Json => Self::Json(Vec::with_capacity(capacity)),
             ColumnVectorKind::Jsonb => Self::Jsonb(Vec::with_capacity(capacity)),
             ColumnVectorKind::Uuid => Self::Uuid(Vec::with_capacity(capacity)),
@@ -538,6 +586,8 @@ impl ColumnVector {
             Self::Date(_) => ColumnVectorKind::Date,
             Self::Time(_) => ColumnVectorKind::Time,
             Self::Timestamp(_) => ColumnVectorKind::Timestamp,
+            Self::Interval(_) => ColumnVectorKind::Interval,
+            Self::Array(_) => ColumnVectorKind::Array,
             Self::Json(_) => ColumnVectorKind::Json,
             Self::Jsonb(_) => ColumnVectorKind::Jsonb,
             Self::Uuid(_) => ColumnVectorKind::Uuid,
@@ -558,12 +608,17 @@ impl ColumnVector {
                 | (ColumnVectorKind::Decimal, ScalarType::Decimal { .. })
                 | (
                     ColumnVectorKind::Text,
-                    ScalarType::Text | ScalarType::Char { .. } | ScalarType::Varchar { .. }
+                    ScalarType::Text
+                        | ScalarType::Char { .. }
+                        | ScalarType::Varchar { .. }
+                        | ScalarType::Enum { .. }
                 )
                 | (ColumnVectorKind::Binary, ScalarType::Binary)
                 | (ColumnVectorKind::Date, ScalarType::Date)
                 | (ColumnVectorKind::Time, ScalarType::Time)
                 | (ColumnVectorKind::Timestamp, ScalarType::Timestamp { .. })
+                | (ColumnVectorKind::Interval, ScalarType::Interval)
+                | (ColumnVectorKind::Array, ScalarType::Array { .. })
                 | (ColumnVectorKind::Json, ScalarType::Json)
                 | (ColumnVectorKind::Jsonb, ScalarType::Jsonb)
                 | (ColumnVectorKind::Uuid, ScalarType::Uuid)
@@ -587,6 +642,8 @@ impl ColumnVector {
             Self::Date(values) => values.clear(),
             Self::Time(values) => values.clear(),
             Self::Timestamp(values) => values.clear(),
+            Self::Interval(values) => values.clear(),
+            Self::Array(values) => values.clear(),
             Self::Json(values) => values.clear(),
             Self::Jsonb(values) => values.clear(),
             Self::Uuid(values) => values.clear(),
@@ -614,6 +671,8 @@ impl ColumnVector {
             (Self::Date(values), Value::Date(value)) => values.push(Some(*value)),
             (Self::Time(values), Value::Time(value)) => values.push(Some(*value)),
             (Self::Timestamp(values), Value::Timestamp(value)) => values.push(Some(*value)),
+            (Self::Interval(values), Value::Interval(value)) => values.push(Some(*value)),
+            (Self::Array(values), Value::Array(value)) => values.push(Some(value.clone())),
             (Self::Json(values), Value::Json(value)) => values.push(Some(value.clone())),
             (Self::Jsonb(values), Value::Jsonb(value)) => values.push(Some(value.clone())),
             (Self::Uuid(values), Value::Uuid(value)) => values.push(Some(*value)),
@@ -630,6 +689,8 @@ impl ColumnVector {
             (Self::Date(values), Value::Null) => values.push(None),
             (Self::Time(values), Value::Null) => values.push(None),
             (Self::Timestamp(values), Value::Null) => values.push(None),
+            (Self::Interval(values), Value::Null) => values.push(None),
+            (Self::Array(values), Value::Null) => values.push(None),
             (Self::Json(values), Value::Null) => values.push(None),
             (Self::Jsonb(values), Value::Null) => values.push(None),
             (Self::Uuid(values), Value::Null) => values.push(None),
@@ -1120,6 +1181,8 @@ fn take_single_column_rows(
         ColumnVector::Date(values) => take_values!(values, Value::Date),
         ColumnVector::Time(values) => take_values!(values, Value::Time),
         ColumnVector::Timestamp(values) => take_values!(values, Value::Timestamp),
+        ColumnVector::Interval(values) => take_values!(values, Value::Interval),
+        ColumnVector::Array(values) => take_values!(values, Value::Array),
         ColumnVector::Json(values) => take_values!(values, Value::Json),
         ColumnVector::Jsonb(values) => take_values!(values, Value::Jsonb),
         ColumnVector::Uuid(values) => take_values!(values, Value::Uuid),
@@ -1358,6 +1421,23 @@ fn infer_kinds(rows: &[Row]) -> Result<Vec<ColumnVectorKind>> {
         .collect()
 }
 
+fn estimated_array_bytes(array: &PgArray) -> usize {
+    std::mem::size_of::<PgArray>()
+        .saturating_add(
+            array
+                .dimensions()
+                .len()
+                .saturating_mul(std::mem::size_of::<ordadb_types::ArrayDimension>()),
+        )
+        .saturating_add(
+            array
+                .values()
+                .iter()
+                .map(estimated_value_bytes)
+                .sum::<usize>(),
+        )
+}
+
 fn value_kind(value: &Value) -> Result<ColumnVectorKind> {
     Ok(match value {
         Value::Null => ColumnVectorKind::Null,
@@ -1373,6 +1453,8 @@ fn value_kind(value: &Value) -> Result<ColumnVectorKind> {
         Value::Date(_) => ColumnVectorKind::Date,
         Value::Time(_) => ColumnVectorKind::Time,
         Value::Timestamp(_) => ColumnVectorKind::Timestamp,
+        Value::Interval(_) => ColumnVectorKind::Interval,
+        Value::Array(_) => ColumnVectorKind::Array,
         Value::Json(_) => ColumnVectorKind::Json,
         Value::Jsonb(_) => ColumnVectorKind::Jsonb,
         Value::Uuid(_) => ColumnVectorKind::Uuid,
@@ -1534,7 +1616,8 @@ mod tests {
         let rows = (0..32)
             .map(|value| Row::new(vec![Value::Int64(value), Value::Int64(value)]))
             .collect::<Vec<_>>();
-        let grant = MemoryGrant::new(256, 4_096).expect("grant");
+        let input_bytes = rows.iter().map(crate::estimated_row_bytes).sum();
+        let grant = MemoryGrant::new(256, input_bytes).expect("grant");
         let mut pool = ChunkPool::new(32, 1);
         let (mut projected, mut reservation) =
             pool.materialize(&rows, &grant).expect("input chunk");

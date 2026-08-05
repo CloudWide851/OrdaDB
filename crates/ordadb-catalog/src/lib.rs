@@ -2,11 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ordadb_types::{
     ColumnId, ConstraintId, DatabaseId, DbError, Identifier, IndexId, Result, RoutineId,
-    ScalarType, Schema, SchemaId, SequenceId, TableId, TriggerId, Value, ViewId,
+    ScalarType, Schema, SchemaId, SequenceId, TableId, TriggerId, TypeId, Value, ViewId,
 };
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::ser::SerializeSeq;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 const MAX_DEPENDENCY_OBJECTS: usize = 16_384;
+const MAX_CATALOG_OWNER_BYTES: usize = 63;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogExpression {
@@ -43,6 +46,7 @@ pub enum ReferentialAction {
 pub struct NewColumn {
     pub name: Identifier,
     pub data_type: ScalarType,
+    pub declared_type: Option<TypeId>,
     pub nullable: bool,
     pub primary_key: bool,
     pub unique: bool,
@@ -56,6 +60,7 @@ impl NewColumn {
         Self {
             name,
             data_type,
+            declared_type: None,
             nullable: true,
             primary_key: false,
             unique: false,
@@ -69,11 +74,119 @@ pub struct ColumnDefinition {
     pub id: ColumnId,
     pub name: Identifier,
     pub data_type: ScalarType,
+    #[serde(default)]
+    pub declared_type: Option<TypeId>,
     pub nullable: bool,
     pub primary_key: bool,
     pub unique: bool,
     #[serde(default)]
     pub default: Option<CatalogExpression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UserDefinedTypeKind {
+    Enum {
+        labels: Vec<String>,
+    },
+    Domain {
+        base_type: ScalarType,
+        #[serde(default)]
+        base_declared_type: Option<TypeId>,
+        not_null: bool,
+        #[serde(default)]
+        default: Option<CatalogExpression>,
+        #[serde(default)]
+        checks: Vec<DomainConstraint>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeDefinition {
+    pub id: TypeId,
+    pub schema_id: SchemaId,
+    pub name: Identifier,
+    pub definition: UserDefinedTypeKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainConstraint {
+    #[serde(default)]
+    pub id: Option<ConstraintId>,
+    pub name: Option<Identifier>,
+    pub expression: CatalogExpression,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainBaseType {
+    pub data_type: ScalarType,
+    pub declared_type: Option<TypeId>,
+}
+
+impl DomainBaseType {
+    #[must_use]
+    pub const fn new(data_type: ScalarType, declared_type: Option<TypeId>) -> Self {
+        Self {
+            data_type,
+            declared_type,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnumValuePosition {
+    Before(String),
+    After(String),
+}
+
+impl TypeDefinition {
+    #[must_use]
+    pub fn storage_type(&self) -> &ScalarType {
+        match &self.definition {
+            UserDefinedTypeKind::Enum { .. } => &ScalarType::Text,
+            UserDefinedTypeKind::Domain { base_type, .. } => base_type,
+        }
+    }
+
+    #[must_use]
+    pub fn logical_type(&self) -> ScalarType {
+        match &self.definition {
+            UserDefinedTypeKind::Enum { labels } => ScalarType::Enum {
+                type_id: self.id,
+                labels: labels.clone(),
+            },
+            UserDefinedTypeKind::Domain { base_type, .. } => base_type.clone(),
+        }
+    }
+}
+
+fn validate_enum_label(label: &str) -> Result<()> {
+    if label.is_empty() {
+        return Err(DbError::new("42601", "enum labels must not be empty"));
+    }
+    if label.len() > 63 {
+        return Err(DbError::new(
+            "42622",
+            "enum labels must not exceed 63 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn enum_neighbor_missing(label: &str) -> DbError {
+    DbError::new("22023", format!("{label:?} is not an existing enum label"))
+}
+
+fn refresh_declared_scalar_type(data_type: &mut ScalarType, logical_type: &ScalarType) {
+    let declared_as_array = matches!(data_type, ScalarType::Array { .. });
+    let logical_is_array = matches!(logical_type, ScalarType::Array { .. });
+    *data_type = if declared_as_array && !logical_is_array {
+        ScalarType::Array {
+            element: Box::new(logical_type.clone()),
+        }
+    } else {
+        logical_type.clone()
+    };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,6 +418,16 @@ pub enum RoutineKind {
 pub struct RoutineArgument {
     pub name: Option<Identifier>,
     pub data_type: ScalarType,
+    #[serde(default)]
+    pub declared_type: Option<TypeId>,
+}
+
+fn routine_arguments_have_same_type(left: &RoutineArgument, right: &RoutineArgument) -> bool {
+    match (left.declared_type, right.declared_type) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => left.data_type == right.data_type,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,6 +438,8 @@ pub struct RoutineDefinition {
     pub kind: RoutineKind,
     pub arguments: Vec<RoutineArgument>,
     pub return_type: Option<ScalarType>,
+    #[serde(default)]
+    pub return_declared_type: Option<TypeId>,
     pub returns_set: bool,
     pub language: String,
     pub body: String,
@@ -326,6 +451,7 @@ pub struct NewRoutine {
     pub kind: RoutineKind,
     pub arguments: Vec<RoutineArgument>,
     pub return_type: Option<ScalarType>,
+    pub return_declared_type: Option<TypeId>,
     pub returns_set: bool,
     pub language: String,
     pub body: String,
@@ -371,6 +497,129 @@ pub enum CatalogObjectRef {
     View(ViewId),
     Routine(RoutineId),
     Trigger(TriggerId),
+    Type(TypeId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CatalogOwner(String);
+
+impl CatalogOwner {
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > MAX_CATALOG_OWNER_BYTES
+            || value.as_bytes().contains(&0)
+        {
+            return Err(DbError::new(
+                "22023",
+                "catalog owner must contain between 1 and 63 bytes without NUL",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for CatalogOwner {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CatalogOwner {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CatalogOwnership {
+    owners: BTreeMap<CatalogObjectRef, CatalogOwner>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CatalogOwnershipEntry {
+    object: CatalogObjectRef,
+    owner: CatalogOwner,
+}
+
+impl Serialize for CatalogOwnership {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.owners.len()))?;
+        for (object, owner) in &self.owners {
+            sequence.serialize_element(&CatalogOwnershipEntry {
+                object: *object,
+                owner: owner.clone(),
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+struct CatalogOwnershipVisitor;
+
+impl<'de> Visitor<'de> for CatalogOwnershipVisitor {
+    type Value = CatalogOwnership;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded catalog ownership entry array")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut owners = BTreeMap::new();
+        while let Some(entry) = sequence.next_element::<CatalogOwnershipEntry>()? {
+            if owners.len() >= MAX_DEPENDENCY_OBJECTS {
+                return Err(de::Error::custom(
+                    "catalog ownership exceeds its object limit",
+                ));
+            }
+            if owners.insert(entry.object, entry.owner).is_some() {
+                return Err(de::Error::custom(
+                    "catalog ownership contains a duplicate object",
+                ));
+            }
+        }
+        Ok(CatalogOwnership { owners })
+    }
+}
+
+impl<'de> Deserialize<'de> for CatalogOwnership {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(CatalogOwnershipVisitor)
+    }
+}
+
+impl CatalogOwnership {
+    fn owner_of(&self, object: CatalogObjectRef) -> Option<&CatalogOwner> {
+        self.owners.get(&object)
+    }
+
+    fn assign(&mut self, object: CatalogObjectRef, owner: &CatalogOwner) {
+        self.owners.insert(object, owner.clone());
+    }
+
+    fn remove(&mut self, object: CatalogObjectRef) {
+        self.owners.remove(&object);
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -603,6 +852,29 @@ pub struct TableDefinition {
 
 impl TableDefinition {
     #[must_use]
+    pub fn expression_scope(column_name: Identifier, data_type: ScalarType) -> Self {
+        Self {
+            id: TableId::new(1),
+            schema_id: SchemaId::new(1),
+            name: Identifier::unquoted("__expression_scope"),
+            columns: vec![ColumnDefinition {
+                id: ColumnId::new(1),
+                name: column_name,
+                data_type,
+                declared_type: None,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                default: None,
+            }],
+            indexes: BTreeMap::new(),
+            constraints: BTreeMap::new(),
+            triggers: BTreeMap::new(),
+            statistics: TableStatistics::default(),
+        }
+    }
+
+    #[must_use]
     pub fn columns(&self) -> &[ColumnDefinition] {
         &self.columns
     }
@@ -667,6 +939,8 @@ pub struct SchemaDefinition {
     views: BTreeMap<Identifier, ViewDefinition>,
     #[serde(default)]
     routines: BTreeMap<Identifier, Vec<RoutineDefinition>>,
+    #[serde(default)]
+    types: BTreeMap<Identifier, TypeDefinition>,
 }
 
 impl SchemaDefinition {
@@ -708,6 +982,15 @@ impl SchemaDefinition {
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
+
+    pub fn types(&self) -> impl Iterator<Item = &TypeDefinition> {
+        self.types.values()
+    }
+
+    #[must_use]
+    pub fn user_defined_type(&self, name: &Identifier) -> Option<&TypeDefinition> {
+        self.types.get(name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -746,8 +1029,12 @@ pub struct Catalog {
     next_routine_id: u64,
     #[serde(default = "initial_object_id")]
     next_trigger_id: u64,
+    #[serde(default = "initial_object_id")]
+    next_type_id: u64,
     #[serde(default)]
     dependencies: DependencyGraph,
+    #[serde(default)]
+    ownership: CatalogOwnership,
 }
 
 const fn initial_index_id() -> u64 {
@@ -776,6 +1063,7 @@ impl Catalog {
             sequences: BTreeMap::new(),
             views: BTreeMap::new(),
             routines: BTreeMap::new(),
+            types: BTreeMap::new(),
         };
         let mut schemas = BTreeMap::new();
         schemas.insert(public_schema.name.clone(), public_schema);
@@ -795,7 +1083,9 @@ impl Catalog {
             next_view_id: initial_object_id(),
             next_routine_id: initial_object_id(),
             next_trigger_id: initial_object_id(),
+            next_type_id: initial_object_id(),
             dependencies: DependencyGraph::default(),
+            ownership: CatalogOwnership::default(),
         }
     }
 
@@ -819,6 +1109,79 @@ impl Catalog {
     #[must_use]
     pub const fn dependencies(&self) -> &DependencyGraph {
         &self.dependencies
+    }
+
+    #[must_use]
+    pub fn owner_of(&self, object: CatalogObjectRef) -> Option<&CatalogOwner> {
+        self.ownership.owner_of(object)
+    }
+
+    pub fn assign_new_object_owners(
+        &mut self,
+        previous: &Self,
+        owner: &CatalogOwner,
+    ) -> Result<()> {
+        let previous_objects = previous.object_refs();
+        let current_objects = self.object_refs();
+        for object in current_objects.difference(&previous_objects) {
+            self.ownership.assign(*object, owner);
+        }
+        if self.ownership.owners.len() > MAX_DEPENDENCY_OBJECTS {
+            return Err(DbError::new(
+                "54001",
+                "catalog ownership exceeds its object limit",
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn object_refs(&self) -> BTreeSet<CatalogObjectRef> {
+        let mut objects = BTreeSet::new();
+        for schema in self.database.schemas() {
+            objects.insert(CatalogObjectRef::Schema(schema.id));
+            for table in schema.tables() {
+                objects.insert(CatalogObjectRef::Table(table.id));
+                objects.extend(
+                    table
+                        .columns()
+                        .iter()
+                        .map(|column| CatalogObjectRef::Column(table.id, column.id)),
+                );
+                objects.extend(
+                    table
+                        .indexes()
+                        .map(|index| CatalogObjectRef::Index(index.id)),
+                );
+                objects.extend(
+                    table
+                        .constraints()
+                        .map(|constraint| CatalogObjectRef::Constraint(constraint.id)),
+                );
+                objects.extend(
+                    table
+                        .triggers()
+                        .map(|trigger| CatalogObjectRef::Trigger(trigger.id)),
+                );
+            }
+            objects.extend(
+                schema
+                    .sequences()
+                    .map(|sequence| CatalogObjectRef::Sequence(sequence.id)),
+            );
+            objects.extend(schema.views().map(|view| CatalogObjectRef::View(view.id)));
+            objects.extend(
+                schema
+                    .routines()
+                    .map(|routine| CatalogObjectRef::Routine(routine.id)),
+            );
+            objects.extend(
+                schema
+                    .types()
+                    .map(|definition| CatalogObjectRef::Type(definition.id)),
+            );
+        }
+        objects
     }
 
     #[must_use]
@@ -848,6 +1211,439 @@ impl Catalog {
         self.schema(schema_name)
             .map(|schema| schema.routines_named(routine_name))
             .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn routine_by_signature(
+        &self,
+        schema_name: &Identifier,
+        routine_name: &Identifier,
+        kind: RoutineKind,
+        arguments: &[RoutineArgument],
+    ) -> Option<&RoutineDefinition> {
+        self.routines_named(schema_name, routine_name)
+            .iter()
+            .find(|routine| {
+                routine.kind == kind
+                    && routine.arguments.len() == arguments.len()
+                    && routine
+                        .arguments
+                        .iter()
+                        .zip(arguments)
+                        .all(|(left, right)| routine_arguments_have_same_type(left, right))
+            })
+    }
+
+    #[must_use]
+    pub fn user_defined_type(
+        &self,
+        schema_name: &Identifier,
+        type_name: &Identifier,
+    ) -> Option<&TypeDefinition> {
+        self.schema(schema_name)?.user_defined_type(type_name)
+    }
+
+    #[must_use]
+    pub fn type_by_id(&self, type_id: TypeId) -> Option<&TypeDefinition> {
+        self.database
+            .schemas()
+            .flat_map(SchemaDefinition::types)
+            .find(|definition| definition.id == type_id)
+    }
+
+    pub fn create_enum_type(
+        &mut self,
+        schema_name: &Identifier,
+        name: Identifier,
+        labels: Vec<String>,
+    ) -> Result<TypeId> {
+        if labels.is_empty() {
+            return Err(DbError::new(
+                "42601",
+                "an enum type must declare at least one label",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for label in &labels {
+            validate_enum_label(label)?;
+            if !seen.insert(label) {
+                return Err(DbError::new(
+                    "42710",
+                    format!("enum label {label:?} is specified more than once"),
+                ));
+            }
+        }
+        self.create_user_defined_type(schema_name, name, UserDefinedTypeKind::Enum { labels })
+    }
+
+    pub fn alter_enum_add_value(
+        &mut self,
+        type_id: TypeId,
+        label: String,
+        position: Option<EnumValuePosition>,
+        if_not_exists: bool,
+    ) -> Result<bool> {
+        validate_enum_label(&label)?;
+        let logical_type = {
+            let definition = self.type_by_id_mut(type_id)?;
+            let UserDefinedTypeKind::Enum { labels } = &mut definition.definition else {
+                return Err(DbError::new(
+                    "42809",
+                    "ALTER TYPE ADD VALUE requires an enum type",
+                ));
+            };
+            if labels.iter().any(|existing| existing == &label) {
+                if if_not_exists {
+                    return Ok(false);
+                }
+                return Err(DbError::new(
+                    "42710",
+                    format!("enum label {label:?} already exists"),
+                ));
+            }
+            let index = match position {
+                None => labels.len(),
+                Some(EnumValuePosition::Before(neighbor)) => labels
+                    .iter()
+                    .position(|existing| existing == &neighbor)
+                    .ok_or_else(|| enum_neighbor_missing(&neighbor))?,
+                Some(EnumValuePosition::After(neighbor)) => labels
+                    .iter()
+                    .position(|existing| existing == &neighbor)
+                    .ok_or_else(|| enum_neighbor_missing(&neighbor))?
+                    .saturating_add(1),
+            };
+            labels.insert(index, label);
+            definition.logical_type()
+        };
+        self.refresh_declared_type_cache(type_id, &logical_type);
+        Ok(true)
+    }
+
+    pub fn alter_enum_rename_value(
+        &mut self,
+        type_id: TypeId,
+        old_label: &str,
+        new_label: String,
+    ) -> Result<()> {
+        validate_enum_label(&new_label)?;
+        let logical_type = {
+            let definition = self.type_by_id_mut(type_id)?;
+            let UserDefinedTypeKind::Enum { labels } = &mut definition.definition else {
+                return Err(DbError::new(
+                    "42809",
+                    "ALTER TYPE RENAME VALUE requires an enum type",
+                ));
+            };
+            if labels.iter().any(|existing| existing == &new_label) {
+                return Err(DbError::new(
+                    "42710",
+                    format!("enum label {new_label:?} already exists"),
+                ));
+            }
+            let label = labels
+                .iter_mut()
+                .find(|existing| existing.as_str() == old_label)
+                .ok_or_else(|| enum_neighbor_missing(old_label))?;
+            *label = new_label;
+            definition.logical_type()
+        };
+        self.refresh_declared_type_cache(type_id, &logical_type);
+        Ok(())
+    }
+
+    pub fn create_domain(
+        &mut self,
+        schema_name: &Identifier,
+        name: Identifier,
+        base_type: ScalarType,
+        not_null: bool,
+        default: Option<CatalogExpression>,
+        checks: Vec<DomainConstraint>,
+    ) -> Result<TypeId> {
+        self.create_domain_with_declared_type(
+            schema_name,
+            name,
+            DomainBaseType::new(base_type, None),
+            not_null,
+            default,
+            checks,
+        )
+    }
+
+    pub fn create_domain_with_declared_type(
+        &mut self,
+        schema_name: &Identifier,
+        name: Identifier,
+        base: DomainBaseType,
+        not_null: bool,
+        default: Option<CatalogExpression>,
+        mut checks: Vec<DomainConstraint>,
+    ) -> Result<TypeId> {
+        let DomainBaseType {
+            data_type: base_type,
+            declared_type: base_declared_type,
+        } = base;
+        if let Some(type_id) = base_declared_type {
+            let definition = self
+                .type_by_id(type_id)
+                .ok_or_else(|| DbError::new("42704", "domain base type does not exist"))?;
+            if matches!(definition.definition, UserDefinedTypeKind::Domain { .. }) {
+                return Err(DbError::new(
+                    "0A000",
+                    "domains whose base type is another domain are not supported yet",
+                ));
+            }
+        }
+        if checks.len() > MAX_DEPENDENCY_OBJECTS {
+            return Err(DbError::new(
+                "54000",
+                "domain constraint count exceeds the catalog limit",
+            ));
+        }
+        let mut names = BTreeSet::new();
+        let mut next_constraint_id = self.next_constraint_id;
+        for constraint in &mut checks {
+            if let Some(name) = &constraint.name
+                && !names.insert(name.clone())
+            {
+                return Err(DbError::new(
+                    "42710",
+                    format!("constraint {name} is specified more than once"),
+                ));
+            }
+            constraint.id = Some(ConstraintId::new(next_constraint_id));
+            next_constraint_id = next_constraint_id
+                .checked_add(1)
+                .ok_or_else(|| DbError::new("54000", "catalog constraint ID space is exhausted"))?;
+        }
+        let expected_id = TypeId::new(self.next_type_id);
+        let mut dependencies = self.dependencies.clone();
+        if let Some(type_id) = base_declared_type {
+            dependencies.add(
+                CatalogObjectRef::Type(expected_id),
+                CatalogObjectRef::Type(type_id),
+            )?;
+        }
+        let type_id = self.create_user_defined_type(
+            schema_name,
+            name,
+            UserDefinedTypeKind::Domain {
+                base_type,
+                base_declared_type,
+                not_null,
+                default,
+                checks,
+            },
+        )?;
+        if type_id != expected_id {
+            return Err(DbError::internal(
+                "catalog allocated an unexpected domain type ID",
+            ));
+        }
+        self.dependencies = dependencies;
+        self.next_constraint_id = next_constraint_id;
+        Ok(type_id)
+    }
+
+    pub fn alter_domain_default(
+        &mut self,
+        type_id: TypeId,
+        default: Option<CatalogExpression>,
+    ) -> Result<()> {
+        let definition = self.type_by_id_mut(type_id)?;
+        let UserDefinedTypeKind::Domain {
+            default: current, ..
+        } = &mut definition.definition
+        else {
+            return Err(DbError::new("42809", "ALTER DOMAIN requires a domain type"));
+        };
+        *current = default;
+        Ok(())
+    }
+
+    pub fn alter_domain_not_null(&mut self, type_id: TypeId, not_null: bool) -> Result<()> {
+        let definition = self.type_by_id_mut(type_id)?;
+        let UserDefinedTypeKind::Domain {
+            not_null: current, ..
+        } = &mut definition.definition
+        else {
+            return Err(DbError::new("42809", "ALTER DOMAIN requires a domain type"));
+        };
+        *current = not_null;
+        Ok(())
+    }
+
+    pub fn add_domain_constraint(
+        &mut self,
+        type_id: TypeId,
+        mut constraint: DomainConstraint,
+    ) -> Result<()> {
+        let definition = self
+            .type_by_id(type_id)
+            .ok_or_else(|| DbError::new("42704", "type does not exist"))?;
+        let UserDefinedTypeKind::Domain { checks, .. } = &definition.definition else {
+            return Err(DbError::new("42809", "ALTER DOMAIN requires a domain type"));
+        };
+        if checks.len() >= MAX_DEPENDENCY_OBJECTS {
+            return Err(DbError::new(
+                "54000",
+                "domain constraint count exceeds the catalog limit",
+            ));
+        }
+        if let Some(name) = &constraint.name
+            && checks
+                .iter()
+                .any(|existing| existing.name.as_ref() == Some(name))
+        {
+            return Err(DbError::new(
+                "42710",
+                format!("constraint {name} already exists"),
+            ));
+        }
+        let constraint_id = ConstraintId::new(self.next_constraint_id);
+        let next_constraint_id = self
+            .next_constraint_id
+            .checked_add(1)
+            .ok_or_else(|| DbError::new("54000", "catalog constraint ID space is exhausted"))?;
+        constraint.id = Some(constraint_id);
+        let definition = self.type_by_id_mut(type_id)?;
+        let UserDefinedTypeKind::Domain { checks, .. } = &mut definition.definition else {
+            return Err(DbError::internal(
+                "validated domain changed kind before constraint publication",
+            ));
+        };
+        checks.push(constraint);
+        self.next_constraint_id = next_constraint_id;
+        Ok(())
+    }
+
+    pub fn drop_domain_constraint(
+        &mut self,
+        type_id: TypeId,
+        name: &Identifier,
+        if_exists: bool,
+    ) -> Result<bool> {
+        let definition = self.type_by_id_mut(type_id)?;
+        let UserDefinedTypeKind::Domain { checks, .. } = &mut definition.definition else {
+            return Err(DbError::new("42809", "ALTER DOMAIN requires a domain type"));
+        };
+        let Some(index) = checks
+            .iter()
+            .position(|constraint| constraint.name.as_ref() == Some(name))
+        else {
+            if if_exists {
+                return Ok(false);
+            }
+            return Err(DbError::new(
+                "42704",
+                format!("constraint {name} does not exist"),
+            ));
+        };
+        checks.remove(index);
+        Ok(true)
+    }
+
+    pub fn drop_type(
+        &mut self,
+        type_id: TypeId,
+        behavior: DropBehavior,
+    ) -> Result<Vec<CatalogObjectRef>> {
+        if self.type_by_id(type_id).is_none() {
+            return Err(DbError::new("42704", "type does not exist"));
+        }
+        self.drop_catalog_object(CatalogObjectRef::Type(type_id), behavior)
+    }
+
+    fn create_user_defined_type(
+        &mut self,
+        schema_name: &Identifier,
+        name: Identifier,
+        definition: UserDefinedTypeKind,
+    ) -> Result<TypeId> {
+        let schema =
+            self.database.schemas.get_mut(schema_name).ok_or_else(|| {
+                DbError::new("3F000", format!("schema {schema_name} does not exist"))
+            })?;
+        if schema.types.contains_key(&name) {
+            return Err(DbError::new("42710", format!("type {name} already exists")));
+        }
+        let id = TypeId::new(self.next_type_id);
+        self.next_type_id = self
+            .next_type_id
+            .checked_add(1)
+            .ok_or_else(|| DbError::new("54000", "catalog type ID space is exhausted"))?;
+        schema.types.insert(
+            name.clone(),
+            TypeDefinition {
+                id,
+                schema_id: schema.id,
+                name,
+                definition,
+            },
+        );
+        Ok(id)
+    }
+
+    fn type_by_id_mut(&mut self, type_id: TypeId) -> Result<&mut TypeDefinition> {
+        self.database
+            .schemas
+            .values_mut()
+            .flat_map(|schema| schema.types.values_mut())
+            .find(|definition| definition.id == type_id)
+            .ok_or_else(|| DbError::new("42704", "type does not exist"))
+    }
+
+    fn refresh_declared_type_cache(&mut self, type_id: TypeId, logical_type: &ScalarType) {
+        let mut declared_types = vec![(type_id, logical_type.clone())];
+        for schema in self.database.schemas.values_mut() {
+            for definition in schema.types.values_mut() {
+                let UserDefinedTypeKind::Domain {
+                    base_type,
+                    base_declared_type: Some(base_type_id),
+                    ..
+                } = &mut definition.definition
+                else {
+                    continue;
+                };
+                if *base_type_id == type_id {
+                    refresh_declared_scalar_type(base_type, logical_type);
+                    declared_types.push((definition.id, definition.logical_type()));
+                }
+            }
+        }
+        for schema in self.database.schemas.values_mut() {
+            for table in schema.tables.values_mut() {
+                for column in &mut table.columns {
+                    if let Some((_, declared_type)) =
+                        declared_types.iter().find(|(declared_type_id, _)| {
+                            column.declared_type == Some(*declared_type_id)
+                        })
+                    {
+                        refresh_declared_scalar_type(&mut column.data_type, declared_type);
+                    }
+                }
+            }
+            for routine in schema.routines.values_mut().flatten() {
+                for argument in &mut routine.arguments {
+                    if let Some((_, declared_type)) =
+                        declared_types.iter().find(|(declared_type_id, _)| {
+                            argument.declared_type == Some(*declared_type_id)
+                        })
+                    {
+                        refresh_declared_scalar_type(&mut argument.data_type, declared_type);
+                    }
+                }
+                if let Some((_, declared_type)) =
+                    declared_types.iter().find(|(declared_type_id, _)| {
+                        routine.return_declared_type == Some(*declared_type_id)
+                    })
+                    && let Some(return_type) = &mut routine.return_type
+                {
+                    refresh_declared_scalar_type(return_type, declared_type);
+                }
+            }
+        }
     }
 
     #[must_use]
@@ -881,6 +1677,7 @@ impl Catalog {
                 sequences: BTreeMap::new(),
                 views: BTreeMap::new(),
                 routines: BTreeMap::new(),
+                types: BTreeMap::new(),
             },
         );
         Ok(id)
@@ -918,7 +1715,8 @@ impl Catalog {
         let is_empty = schema.tables.is_empty()
             && schema.sequences.is_empty()
             && schema.views.is_empty()
-            && schema.routines.is_empty();
+            && schema.routines.is_empty()
+            && schema.types.is_empty();
         if behavior == DropBehavior::Restrict && !is_empty {
             return Err(
                 DbError::new("2BP01", "cannot drop schema because it contains objects")
@@ -939,6 +1737,11 @@ impl Catalog {
                 schema
                     .routines()
                     .map(|routine| CatalogObjectRef::Routine(routine.id)),
+            )
+            .chain(
+                schema
+                    .types()
+                    .map(|definition| CatalogObjectRef::Type(definition.id)),
             )
             .collect::<Vec<_>>();
         roots.sort();
@@ -965,6 +1768,16 @@ impl Catalog {
             return Err(DbError::new(
                 "42601",
                 "a table must contain at least one column",
+            ));
+        }
+        if let Some(type_id) = columns
+            .iter()
+            .filter_map(|column| column.declared_type)
+            .find(|type_id| self.type_by_id(*type_id).is_none())
+        {
+            return Err(DbError::new(
+                "42704",
+                format!("declared type {} does not exist", type_id.get()),
             ));
         }
 
@@ -996,6 +1809,7 @@ impl Catalog {
                 id,
                 name: column.name,
                 data_type: column.data_type,
+                declared_type: column.declared_type,
                 nullable: column.nullable && !column.primary_key,
                 primary_key: column.primary_key,
                 unique: column.unique || column.primary_key,
@@ -1033,6 +1847,10 @@ impl Catalog {
                 );
             }
         }
+        let declared_types = definitions
+            .iter()
+            .filter_map(|column| column.declared_type.map(|type_id| (column.id, type_id)))
+            .collect::<Vec<_>>();
         schema.tables.insert(
             table_name.clone(),
             TableDefinition {
@@ -1046,6 +1864,12 @@ impl Catalog {
                 statistics: TableStatistics::default(),
             },
         );
+        for (column_id, type_id) in declared_types {
+            self.dependencies.add(
+                CatalogObjectRef::Column(table_id, column_id),
+                CatalogObjectRef::Type(type_id),
+            )?;
+        }
         Ok(table_id)
     }
 
@@ -1138,6 +1962,14 @@ impl Catalog {
     }
 
     pub fn add_column(&mut self, table_id: TableId, column: NewColumn) -> Result<ColumnId> {
+        if let Some(type_id) = column.declared_type
+            && self.type_by_id(type_id).is_none()
+        {
+            return Err(DbError::new(
+                "42704",
+                format!("declared type {} does not exist", type_id.get()),
+            ));
+        }
         if self
             .table_by_id(table_id)
             .ok_or_else(|| DbError::new("42P01", "table does not exist"))?
@@ -1151,17 +1983,25 @@ impl Catalog {
         }
         let column_id = ColumnId::new(self.next_column_id);
         self.next_column_id = self.next_column_id.saturating_add(1);
+        let declared_type = column.declared_type;
         self.table_by_id_mut(table_id)?
             .columns
             .push(ColumnDefinition {
                 id: column_id,
                 name: column.name,
                 data_type: column.data_type,
+                declared_type: column.declared_type,
                 nullable: column.nullable && !column.primary_key,
                 primary_key: column.primary_key,
                 unique: column.unique || column.primary_key,
                 default: column.default,
             });
+        if let Some(type_id) = declared_type {
+            self.dependencies.add(
+                CatalogObjectRef::Column(table_id, column_id),
+                CatalogObjectRef::Type(type_id),
+            )?;
+        }
         Ok(column_id)
     }
 
@@ -1172,7 +2012,19 @@ impl Catalog {
         data_type: Option<ScalarType>,
         nullable: Option<bool>,
         default: Option<Option<CatalogExpression>>,
+        declared_type: Option<Option<TypeId>>,
     ) -> Result<()> {
+        let mut dependencies = self.dependencies.clone();
+        if let Some(declared_type) = declared_type {
+            let object = CatalogObjectRef::Column(table_id, column_id);
+            dependencies.remove_references(object);
+            if let Some(type_id) = declared_type {
+                if self.type_by_id(type_id).is_none() {
+                    return Err(DbError::new("42704", "declared column type does not exist"));
+                }
+                dependencies.add(object, CatalogObjectRef::Type(type_id))?;
+            }
+        }
         let table = self.table_by_id_mut(table_id)?;
         let index = table
             .column_index_by_id(column_id)
@@ -1193,6 +2045,10 @@ impl Catalog {
         if let Some(default) = default {
             column.default = default;
         }
+        if let Some(declared_type) = declared_type {
+            column.declared_type = declared_type;
+        }
+        self.dependencies = dependencies;
         Ok(())
     }
 
@@ -1770,34 +2626,20 @@ impl Catalog {
             kind,
             arguments,
             return_type,
+            return_declared_type,
             returns_set,
             language,
             body,
             replace,
             references,
         } = routine;
-        let signature = arguments
-            .iter()
-            .map(|argument| argument.data_type.clone())
-            .collect::<Vec<_>>();
-        let (schema_id, existing_id) = {
-            let schema = self.schema(schema_name).ok_or_else(|| {
-                DbError::new("3F000", format!("schema {schema_name} does not exist"))
-            })?;
-            let existing_id = schema
-                .routines_named(&name)
-                .iter()
-                .find(|routine| {
-                    routine.kind == kind
-                        && routine
-                            .arguments
-                            .iter()
-                            .map(|argument| argument.data_type.clone())
-                            .eq(signature.iter().cloned())
-                })
-                .map(|routine| routine.id);
-            (schema.id, existing_id)
-        };
+        let schema_id = self
+            .schema(schema_name)
+            .ok_or_else(|| DbError::new("3F000", format!("schema {schema_name} does not exist")))?
+            .id;
+        let existing_id = self
+            .routine_by_signature(schema_name, &name, kind, &arguments)
+            .map(|routine| routine.id);
         if existing_id.is_some() && !replace {
             return Err(DbError::new(
                 "42723",
@@ -1826,11 +2668,12 @@ impl Catalog {
             .or_default();
         routines.retain(|routine| {
             !(routine.kind == kind
+                && routine.arguments.len() == arguments.len()
                 && routine
                     .arguments
                     .iter()
-                    .map(|argument| &argument.data_type)
-                    .eq(signature.iter()))
+                    .zip(&arguments)
+                    .all(|(left, right)| routine_arguments_have_same_type(left, right)))
         });
         routines.push(RoutineDefinition {
             id,
@@ -1839,6 +2682,7 @@ impl Catalog {
             kind,
             arguments,
             return_type,
+            return_declared_type,
             returns_set,
             language,
             body,
@@ -2350,6 +3194,7 @@ impl Catalog {
                 }
                 for owned in owned {
                     self.dependencies.remove(owned);
+                    self.ownership.remove(owned);
                 }
             }
             CatalogObjectRef::Column(table_id, column_id) => {
@@ -2373,17 +3218,23 @@ impl Catalog {
             CatalogObjectRef::Constraint(constraint_id) => {
                 for schema in self.database.schemas.values_mut() {
                     for table in schema.tables.values_mut() {
-                        let index_names = table
+                        let owned_indexes = table
                             .constraints
                             .values()
                             .filter(|constraint| constraint.id == constraint_id)
-                            .map(|constraint| constraint.name.clone())
+                            .filter_map(|constraint| {
+                                table
+                                    .indexes
+                                    .get(&constraint.name)
+                                    .map(|index| (constraint.name.clone(), index.id))
+                            })
                             .collect::<Vec<_>>();
                         table
                             .constraints
                             .retain(|_, constraint| constraint.id != constraint_id);
-                        for name in index_names {
+                        for (name, index_id) in owned_indexes {
                             table.indexes.remove(&name);
+                            self.ownership.remove(CatalogObjectRef::Index(index_id));
                         }
                     }
                 }
@@ -2415,8 +3266,16 @@ impl Catalog {
                     }
                 }
             }
+            CatalogObjectRef::Type(type_id) => {
+                for schema in self.database.schemas.values_mut() {
+                    schema
+                        .types
+                        .retain(|_, definition| definition.id != type_id);
+                }
+            }
         }
         self.dependencies.remove(object);
+        self.ownership.remove(object);
         Ok(())
     }
 }
@@ -2506,10 +3365,12 @@ mod tests {
     use ordadb_types::{Identifier, ScalarType, Schema, SchemaId, TableId};
 
     use super::{
-        Catalog, CatalogObjectRef, ConstraintKind, DependencyGraph, DropBehavior, FullTextAnalyzer,
-        IndexDefinition, IndexMethod, IndexOptions, NewColumn, NewConstraint, NewConstraintKind,
-        NewIndex, NewRoutine, NewSequence, NewView, ReferentialAction, RoutineArgument,
-        RoutineKind, TriggerEvent, TriggerTiming, VectorDistanceMetric, ViewKind,
+        Catalog, CatalogExpression, CatalogObjectRef, CatalogOwner, ConstraintKind,
+        DependencyGraph, DomainBaseType, DomainConstraint, DropBehavior, EnumValuePosition,
+        FullTextAnalyzer, IndexDefinition, IndexMethod, IndexOptions, NewColumn, NewConstraint,
+        NewConstraintKind, NewIndex, NewRoutine, NewSequence, NewView, ReferentialAction,
+        RoutineArgument, RoutineKind, TriggerEvent, TriggerTiming, UserDefinedTypeKind,
+        VectorDistanceMetric, ViewKind,
     };
 
     #[test]
@@ -2859,8 +3720,10 @@ mod tests {
                     arguments: vec![RoutineArgument {
                         name: Some(Identifier::unquoted("value")),
                         data_type: ScalarType::Int64,
+                        declared_type: None,
                     }],
                     return_type: Some(ScalarType::Int64),
+                    return_declared_type: None,
                     returns_set: false,
                     language: "plpgsql".into(),
                     body: "BEGIN RETURN value; END".into(),
@@ -2925,6 +3788,7 @@ mod tests {
                 None,
                 Some(false),
                 Some(Some(super::CatalogExpression::new("'untitled'"))),
+                None,
             )
             .expect("alter column");
 
@@ -2959,6 +3823,56 @@ mod tests {
             .drop_schema(schema_id, DropBehavior::Restrict)
             .expect("drop empty schema");
         assert!(catalog.schema(&Identifier::unquoted("core")).is_none());
+    }
+
+    #[test]
+    fn ownership_round_trips_and_cascade_removes_owned_children() {
+        let previous = Catalog::default();
+        let mut catalog = previous.clone();
+        let table_id = catalog
+            .create_table(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("owned_items"),
+                vec![
+                    NewColumn::new(Identifier::unquoted("id"), ScalarType::Int64),
+                    NewColumn::new(Identifier::unquoted("label"), ScalarType::Text),
+                ],
+            )
+            .expect("table");
+        let owner = CatalogOwner::new("alice").expect("owner");
+        catalog
+            .assign_new_object_owners(&previous, &owner)
+            .expect("assign ownership");
+        let created = catalog
+            .object_refs()
+            .difference(&previous.object_refs())
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(!created.is_empty());
+        assert!(created.iter().all(|object| {
+            catalog.owner_of(*object).map(CatalogOwner::as_str) == Some("alice")
+        }));
+        assert!(
+            catalog
+                .owner_of(CatalogObjectRef::Schema(SchemaId::new(1)))
+                .is_none()
+        );
+
+        let encoded = serde_json::to_vec(&catalog).expect("serialize ownership");
+        let mut reopened: Catalog =
+            serde_json::from_slice(&encoded).expect("deserialize ownership");
+        assert!(created.iter().all(|object| {
+            reopened.owner_of(*object).map(CatalogOwner::as_str) == Some("alice")
+        }));
+
+        reopened
+            .drop_table(table_id, DropBehavior::Cascade)
+            .expect("drop owned table");
+        assert!(
+            created
+                .iter()
+                .all(|object| reopened.owner_of(*object).is_none())
+        );
     }
 
     #[test]
@@ -2999,5 +3913,219 @@ mod tests {
         assert!(removed.contains(&CatalogObjectRef::View(view_id)));
         assert!(catalog.view_by_id(view_id).is_none());
         assert!(catalog.table_by_id(table_id).is_none());
+    }
+
+    #[test]
+    fn user_defined_types_round_trip_and_track_column_dependencies() {
+        let mut catalog = Catalog::default();
+        for (name, labels, sql_state) in [
+            ("empty_enum", Vec::new(), "42601"),
+            ("empty_label", vec![String::new()], "42601"),
+            (
+                "duplicate_label",
+                vec!["same".to_owned(), "same".to_owned()],
+                "42710",
+            ),
+            ("long_label", vec!["界".repeat(22)], "42622"),
+        ] {
+            let error = catalog
+                .create_enum_type(
+                    &Identifier::unquoted("public"),
+                    Identifier::unquoted(name),
+                    labels,
+                )
+                .expect_err("invalid enum labels");
+            assert_eq!(error.sql_state, sql_state);
+        }
+        let enum_id = catalog
+            .create_enum_type(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("mood"),
+                vec!["sad".into(), "ok".into(), "happy".into()],
+            )
+            .expect("enum");
+        let domain_id = catalog
+            .create_domain(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("positive_int"),
+                ScalarType::Int32,
+                true,
+                Some(CatalogExpression::new("1")),
+                vec![DomainConstraint {
+                    id: None,
+                    name: Some(Identifier::unquoted("positive")),
+                    expression: CatalogExpression::new("VALUE > 0"),
+                }],
+            )
+            .expect("domain");
+        let mut mood = NewColumn::new(Identifier::unquoted("mood"), ScalarType::Text);
+        mood.declared_type = Some(enum_id);
+        let table_id = catalog
+            .create_table(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("feelings"),
+                vec![mood],
+            )
+            .expect("table");
+        let enum_data_type = catalog
+            .type_by_id(enum_id)
+            .expect("enum type")
+            .logical_type();
+        let enum_domain_id = catalog
+            .create_domain_with_declared_type(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("cheerful_mood"),
+                DomainBaseType::new(enum_data_type.clone(), Some(enum_id)),
+                false,
+                Some(CatalogExpression::new("'ok'::mood")),
+                Vec::new(),
+            )
+            .expect("enum domain");
+        assert_eq!(
+            catalog
+                .dependencies()
+                .references(CatalogObjectRef::Type(enum_domain_id))
+                .collect::<Vec<_>>(),
+            vec![CatalogObjectRef::Type(enum_id)]
+        );
+        let mut cheerful = NewColumn::new(Identifier::unquoted("cheerful"), enum_data_type.clone());
+        cheerful.declared_type = Some(enum_domain_id);
+        let enum_domain_table_id = catalog
+            .create_table(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("cheerful_feelings"),
+                vec![cheerful],
+            )
+            .expect("enum domain table");
+        let routine_id = catalog
+            .create_or_replace_routine(
+                &Identifier::unquoted("public"),
+                NewRoutine {
+                    name: Identifier::unquoted("echo_mood"),
+                    kind: RoutineKind::Function,
+                    arguments: vec![RoutineArgument {
+                        name: Some(Identifier::unquoted("value")),
+                        data_type: enum_data_type,
+                        declared_type: Some(enum_id),
+                    }],
+                    return_type: Some(ScalarType::Int32),
+                    return_declared_type: Some(domain_id),
+                    returns_set: false,
+                    language: "plpgsql".into(),
+                    body: "BEGIN RETURN 1; END".into(),
+                    replace: false,
+                    references: vec![
+                        CatalogObjectRef::Type(enum_id),
+                        CatalogObjectRef::Type(domain_id),
+                    ],
+                },
+            )
+            .expect("routine");
+
+        assert!(
+            catalog
+                .alter_enum_add_value(
+                    enum_id,
+                    "calm".into(),
+                    Some(EnumValuePosition::Before("happy".into())),
+                    false,
+                )
+                .expect("add enum label")
+        );
+        assert!(
+            !catalog
+                .alter_enum_add_value(enum_id, "calm".into(), None, true)
+                .expect("duplicate enum label is a no-op")
+        );
+        catalog
+            .alter_enum_rename_value(enum_id, "ok", "fine".into())
+            .expect("rename enum label");
+        let expected_enum = ScalarType::Enum {
+            type_id: enum_id,
+            labels: vec!["sad".into(), "fine".into(), "calm".into(), "happy".into()],
+        };
+        assert_eq!(
+            catalog.table_by_id(table_id).expect("table").columns()[0].data_type,
+            expected_enum
+        );
+        assert_eq!(
+            catalog
+                .routine_by_id(routine_id)
+                .expect("routine")
+                .arguments[0]
+                .data_type,
+            expected_enum
+        );
+        assert!(matches!(
+            &catalog
+                .type_by_id(enum_domain_id)
+                .expect("enum domain")
+                .definition,
+            UserDefinedTypeKind::Domain {
+                base_type,
+                base_declared_type: Some(base_type_id),
+                ..
+            } if base_type == &expected_enum && *base_type_id == enum_id
+        ));
+        assert_eq!(
+            catalog
+                .table_by_id(enum_domain_table_id)
+                .expect("enum domain table")
+                .columns()[0]
+                .data_type,
+            expected_enum
+        );
+        catalog
+            .alter_domain_default(domain_id, Some(CatalogExpression::new("2")))
+            .expect("alter domain default");
+        catalog
+            .alter_domain_not_null(domain_id, false)
+            .expect("drop domain not null");
+        catalog
+            .add_domain_constraint(
+                domain_id,
+                DomainConstraint {
+                    id: None,
+                    name: Some(Identifier::unquoted("below_limit")),
+                    expression: CatalogExpression::new("VALUE < 100"),
+                },
+            )
+            .expect("add domain constraint");
+        assert!(
+            catalog
+                .drop_domain_constraint(domain_id, &Identifier::unquoted("positive"), false,)
+                .expect("drop domain constraint")
+        );
+
+        let error = catalog
+            .drop_type(enum_id, DropBehavior::Restrict)
+            .expect_err("column dependency");
+        assert_eq!(error.sql_state, "2BP01");
+        let error = catalog
+            .drop_type(domain_id, DropBehavior::Restrict)
+            .expect_err("routine return dependency");
+        assert_eq!(error.sql_state, "2BP01");
+        assert!(matches!(
+            &catalog.type_by_id(domain_id).expect("domain").definition,
+            UserDefinedTypeKind::Domain {
+                not_null: false,
+                default: Some(default),
+                checks,
+                ..
+            } if default.sql == "2"
+                && checks.len() == 1
+                && checks[0].name.as_ref().is_some_and(|name| name.as_str() == "below_limit")
+        ));
+
+        let encoded = serde_json::to_vec(&catalog).expect("serialize");
+        let decoded: Catalog = serde_json::from_slice(&encoded).expect("deserialize");
+        assert_eq!(decoded, catalog);
+        assert_eq!(
+            decoded.table_by_id(table_id).expect("table").columns()[0].declared_type,
+            Some(enum_id)
+        );
+        let routine = decoded.routine_by_id(routine_id).expect("routine");
+        assert_eq!(routine.arguments[0].declared_type, Some(enum_id));
+        assert_eq!(routine.return_declared_type, Some(domain_id));
     }
 }

@@ -1,5 +1,5 @@
 use chrono::{Datelike, NaiveDate, NaiveTime, Timelike};
-use ordadb_types::{DbError, Result, Row, Value};
+use ordadb_types::{DbError, PgArray, Result, Row, Value};
 use rust_decimal::Decimal;
 
 use crate::corruption;
@@ -21,6 +21,8 @@ const TAG_JSON: u8 = 13;
 const TAG_JSONB: u8 = 14;
 const TAG_UUID: u8 = 15;
 const TAG_VECTOR: u8 = 16;
+const TAG_INTERVAL: u8 = 17;
+const TAG_ARRAY: u8 = 18;
 
 pub const TUPLE_FORMAT_V1: u16 = 1;
 pub const TUPLE_FORMAT_V2: u16 = 2;
@@ -213,6 +215,18 @@ fn encode_value(value: &Value, bytes: &mut Vec<u8>) -> Result<()> {
             bytes.extend_from_slice(&utc.timestamp().to_le_bytes());
             bytes.extend_from_slice(&utc.timestamp_subsec_nanos().to_le_bytes());
         }
+        Value::Interval(value) => {
+            bytes.push(TAG_INTERVAL);
+            bytes.extend_from_slice(&value.months.to_le_bytes());
+            bytes.extend_from_slice(&value.days.to_le_bytes());
+            bytes.extend_from_slice(&value.microseconds.to_le_bytes());
+        }
+        Value::Array(value) => {
+            bytes.push(TAG_ARRAY);
+            let encoded = serde_json::to_vec(value)
+                .map_err(|error| corruption(format!("array encoding failed: {error}")))?;
+            write_length_prefixed(bytes, &encoded)?;
+        }
         Value::Json(value) => {
             bytes.push(TAG_JSON);
             let encoded = serde_json::to_vec(value)
@@ -298,6 +312,23 @@ fn decode_value(cursor: &mut Cursor<'_>) -> Result<Value> {
                 })?
                 .naive_utc();
             Ok(Value::Timestamp(value))
+        }
+        TAG_INTERVAL => Ok(Value::Interval(ordadb_types::PgInterval::new(
+            i32::from_le_bytes(cursor.read_array()?),
+            i32::from_le_bytes(cursor.read_array()?),
+            i64::from_le_bytes(cursor.read_array()?),
+        ))),
+        TAG_ARRAY => {
+            let payload = cursor.read_length_prefixed()?;
+            let decoded: PgArray = serde_json::from_slice(payload)
+                .map_err(|error| corruption(format!("tuple array is malformed: {error}")))?;
+            let validated = PgArray::new(
+                decoded.element_type().clone(),
+                decoded.dimensions().to_vec(),
+                decoded.values().to_vec(),
+            )
+            .map_err(|error| corruption(format!("tuple array is invalid: {}", error.message)))?;
+            Ok(Value::Array(validated))
         }
         TAG_JSON | TAG_JSONB => {
             let payload = cursor.read_length_prefixed()?;
@@ -404,7 +435,7 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use chrono::{NaiveDate, NaiveTime};
-    use ordadb_types::Value;
+    use ordadb_types::{ArrayDimension, PgArray, PgInterval, ScalarType, Value};
     use rust_decimal::Decimal;
     use serde_json::json;
     use uuid::Uuid;
@@ -429,6 +460,15 @@ mod tests {
             Value::Date(date),
             Value::Time(time),
             Value::Timestamp(date.and_time(time)),
+            Value::Interval(PgInterval::new(14, 3, 4_500_000)),
+            Value::Array(
+                PgArray::new(
+                    ScalarType::Text,
+                    vec![ArrayDimension::new(2, -1)],
+                    vec![Value::Text("a".into()), Value::Null],
+                )
+                .expect("array"),
+            ),
             Value::Json(json!({"order": [1, 2]})),
             Value::Jsonb(json!({"stable": true})),
             Value::Uuid(Uuid::from_u128(0x12345678_1234_5678_9abc_def012345678)),

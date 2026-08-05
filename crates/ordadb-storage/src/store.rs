@@ -25,7 +25,8 @@ const INDEX_REBUILD_CONTRACT_V2: u16 = 1;
 const MAX_MANIFEST_BYTES_V2: usize = 64 * 1024 * 1024;
 const MAX_MANIFEST_LAYOUT_PASSES: usize = 16;
 const DEFAULT_BUFFER_CAPACITY: usize = 64;
-const INDEX_RECORD_VERSION: u16 = 1;
+const INDEX_RECORD_VERSION_V1: u16 = 1;
+const INDEX_RECORD_VERSION: u16 = 2;
 const MAX_MANIFEST_PAGE_REFERENCES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1967,7 +1968,23 @@ fn validate_index_entries(
                     definition.id.get()
                 ))
             })?;
-        let expected_key = IndexKey::from_values(&key_values)?;
+        let key_types = definition
+            .key_columns
+            .iter()
+            .map(|column_id| {
+                owner
+                    .column_index_by_id(*column_id)
+                    .and_then(|position| owner.columns().get(position))
+                    .map(|column| column.data_type.clone())
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                corruption(format!(
+                    "index {} key types do not match its table definition",
+                    definition.id.get()
+                ))
+            })?;
+        let expected_key = IndexKey::from_typed_values(&key_values, &key_types)?;
         if entry.key != expected_key {
             return Err(corruption(format!(
                 "index {} key does not match heap row {}",
@@ -2022,7 +2039,8 @@ fn validate_index_entries(
 }
 
 fn encode_index_entry(entry: &IndexEntry) -> Result<Vec<u8>> {
-    let key = encode_row(&Row::new(entry.key.values()))?;
+    let key = serde_json::to_vec(&entry.key)
+        .map_err(|error| corruption(format!("index key encoding failed: {error}")))?;
     let included = encode_row(&Row::new(entry.included.clone()))?;
     let key_len = u32::try_from(key.len())
         .map_err(|_| DbError::new("54000", "encoded index key is too large"))?;
@@ -2041,7 +2059,7 @@ fn encode_index_entry(entry: &IndexEntry) -> Result<Vec<u8>> {
 fn decode_index_entry(bytes: &[u8]) -> Result<IndexEntry> {
     let mut offset = 0;
     let version = read_u16(bytes, &mut offset)?;
-    if version != INDEX_RECORD_VERSION {
+    if !matches!(version, INDEX_RECORD_VERSION_V1 | INDEX_RECORD_VERSION) {
         return Err(corruption(format!(
             "unsupported index record version {version}"
         )));
@@ -2053,7 +2071,12 @@ fn decode_index_entry(bytes: &[u8]) -> Result<IndexEntry> {
         .checked_add(key_len)
         .filter(|end| *end <= bytes.len())
         .ok_or_else(|| corruption("index key record is truncated"))?;
-    let key_values = decode_row(&bytes[offset..key_end])?.values;
+    let key = if version == INDEX_RECORD_VERSION_V1 {
+        IndexKey::from_values(&decode_row(&bytes[offset..key_end])?.values)?
+    } else {
+        serde_json::from_slice(&bytes[offset..key_end])
+            .map_err(|error| corruption(format!("index key is malformed: {error}")))?
+    };
     offset = key_end;
     let included_len = usize::try_from(read_u32(bytes, &mut offset)?)
         .map_err(|_| corruption("covering payload length exceeds the platform limit"))?;
@@ -2062,7 +2085,7 @@ fn decode_index_entry(bytes: &[u8]) -> Result<IndexEntry> {
         .filter(|end| *end == bytes.len())
         .ok_or_else(|| corruption("index covering record is truncated or has trailing data"))?;
     let included = decode_row(&bytes[offset..included_end])?.values;
-    IndexEntry::new(&key_values, row_id, included)
+    IndexEntry::from_key(key, row_id, included)
 }
 
 fn read_u16(bytes: &[u8], offset: &mut usize) -> Result<u16> {
@@ -2155,6 +2178,7 @@ mod tests {
                     NewColumn {
                         name: Identifier::unquoted("id"),
                         data_type: ScalarType::Int64,
+                        declared_type: None,
                         nullable: false,
                         primary_key: true,
                         unique: true,
@@ -2208,6 +2232,7 @@ mod tests {
                     vec![NewColumn {
                         name: Identifier::unquoted("id"),
                         data_type: ScalarType::Int64,
+                        declared_type: None,
                         nullable: false,
                         primary_key: true,
                         unique: true,

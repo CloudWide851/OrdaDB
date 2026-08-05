@@ -607,6 +607,10 @@ fn value_v2(value: &Value) -> ConnectorValueV2 {
         Value::Date(value) => ConnectorValueV2::Date(value.to_string()),
         Value::Time(value) => ConnectorValueV2::Time(value.to_string()),
         Value::Timestamp(value) => ConnectorValueV2::Timestamp(value.to_string()),
+        Value::Interval(value) => ConnectorValueV2::Interval(value.to_string()),
+        Value::Array(array) => {
+            ConnectorValueV2::Array(array.values().iter().map(value_v2).collect())
+        }
         Value::Json(value) | Value::Jsonb(value) => ConnectorValueV2::Json(value.clone()),
         Value::Uuid(value) => ConnectorValueV2::Uuid(value.to_string()),
         Value::Vector(values) => ConnectorValueV2::Array(
@@ -703,6 +707,10 @@ fn temporal_error(name: &str, error: impl std::fmt::Display) -> DbError {
 }
 
 fn connector_type(data_type: &ScalarType) -> ConnectorTypeV2 {
+    let element_type = match data_type {
+        ScalarType::Array { element } => Some(Box::new(connector_type(element))),
+        _ => None,
+    };
     let (vendor_name, logical_type, precision, scale, length) = match data_type {
         ScalarType::Boolean => ("boolean", ConnectorLogicalTypeV2::Boolean, None, None, None),
         ScalarType::Int16 => (
@@ -761,10 +769,18 @@ fn connector_type(data_type: &ScalarType) -> ConnectorTypeV2 {
             None,
             length.map(u64::from),
         ),
+        ScalarType::Enum { .. } => ("enum", ConnectorLogicalTypeV2::Text, None, None, None),
         ScalarType::Text => ("text", ConnectorLogicalTypeV2::Text, None, None, None),
         ScalarType::Binary => ("bytea", ConnectorLogicalTypeV2::Binary, None, None, None),
         ScalarType::Date => ("date", ConnectorLogicalTypeV2::Date, None, None, None),
         ScalarType::Time => ("time", ConnectorLogicalTypeV2::Time, None, None, None),
+        ScalarType::Interval => (
+            "interval",
+            ConnectorLogicalTypeV2::Interval,
+            None,
+            None,
+            None,
+        ),
         ScalarType::Timestamp {
             with_timezone: true,
         } => (
@@ -786,6 +802,7 @@ fn connector_type(data_type: &ScalarType) -> ConnectorTypeV2 {
         ScalarType::Json => ("json", ConnectorLogicalTypeV2::Json, None, None, None),
         ScalarType::Jsonb => ("jsonb", ConnectorLogicalTypeV2::Json, None, None, None),
         ScalarType::Uuid => ("uuid", ConnectorLogicalTypeV2::Uuid, None, None, None),
+        ScalarType::Array { .. } => ("array", ConnectorLogicalTypeV2::Array, None, None, None),
         ScalarType::Vector { dimensions } => (
             "vector",
             ConnectorLogicalTypeV2::Array,
@@ -797,7 +814,7 @@ fn connector_type(data_type: &ScalarType) -> ConnectorTypeV2 {
     ConnectorTypeV2 {
         vendor_name: vendor_name.into(),
         logical_type,
-        element_type: None,
+        element_type,
         precision,
         scale,
         length,
@@ -904,6 +921,7 @@ mod tests {
         ConnectorCapabilitiesV2, ConnectorErrorV2, ConnectorResponseV2, ConnectorTlsModeV2,
         ProtocolReadyV2,
     };
+    use ordadb_types::{PgArray, PgInterval, TypeId};
     use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
 
     use super::*;
@@ -1051,6 +1069,47 @@ mod tests {
             response,
             ConnectorResponseV1::Error { error, .. } if error.sql_state == "40001"
         ));
+    }
+
+    #[test]
+    fn v2_parameter_translation_preserves_interval_array_and_enum_types() {
+        let interval = PgInterval::new(2, 3, 4);
+        let interval_text = interval.to_string();
+        assert_eq!(
+            value_v2(&Value::Interval(interval)),
+            ConnectorValueV2::Interval(interval_text)
+        );
+
+        let array = PgArray::one_dimensional(ScalarType::Int32, vec![Value::Int32(7), Value::Null])
+            .expect("array");
+        assert_eq!(
+            value_v2(&Value::Array(array)),
+            ConnectorValueV2::Array(vec![
+                ConnectorValueV2::SignedInteger(7),
+                ConnectorValueV2::Null,
+            ])
+        );
+
+        let interval_type = connector_type(&ScalarType::Interval);
+        assert_eq!(interval_type.logical_type, ConnectorLogicalTypeV2::Interval);
+        let enum_type = connector_type(&ScalarType::Enum {
+            type_id: TypeId::new(42),
+            labels: vec!["queued".into(), "done".into()],
+        });
+        assert_eq!(enum_type.logical_type, ConnectorLogicalTypeV2::Text);
+        assert_eq!(enum_type.vendor_name, "enum");
+
+        let array_type = connector_type(&ScalarType::Array {
+            element: Box::new(ScalarType::Int32),
+        });
+        assert_eq!(array_type.logical_type, ConnectorLogicalTypeV2::Array);
+        assert_eq!(
+            array_type
+                .element_type
+                .expect("array element type")
+                .logical_type,
+            ConnectorLogicalTypeV2::SignedInteger
+        );
     }
 
     #[tokio::test]

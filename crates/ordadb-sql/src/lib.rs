@@ -10,26 +10,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use ordadb_catalog::{
-    Catalog, CatalogExpression, CatalogObjectRef, ConstraintKind, DropBehavior, FullTextAnalyzer,
-    IndexMethod, IndexOptions, NewColumn, NewConstraint, NewConstraintKind, NewIndex, NewSequence,
-    ReferentialAction, RoutineArgument, RoutineKind, TableDefinition,
-    TriggerEvent as CatalogTriggerEvent, TriggerTiming, VectorDistanceMetric, ViewDefinition,
-    ViewKind, indexable_type, text_search_type,
+    Catalog, CatalogExpression, CatalogObjectRef, ConstraintKind, DomainConstraint, DropBehavior,
+    EnumValuePosition, FullTextAnalyzer, IndexMethod, IndexOptions, NewColumn, NewConstraint,
+    NewConstraintKind, NewIndex, NewSequence, ReferentialAction, RoutineArgument, RoutineKind,
+    TableDefinition, TriggerEvent as CatalogTriggerEvent, TriggerTiming, TypeDefinition,
+    VectorDistanceMetric, ViewDefinition, ViewKind, indexable_type, text_search_type,
 };
 use ordadb_transaction::{IsolationLevel, TransactionAccessMode, TransactionCharacteristics};
 use ordadb_types::{
-    ColumnId, ConstraintId, DbError, Field, Identifier, IndexId, Result, RoutineId, ScalarType,
-    Schema, SchemaId, SequenceId, TableId, TriggerId, Value, ViewId,
+    ArrayDimension, ColumnId, ConstraintId, DbError, Field, Identifier, IndexId, PgInterval,
+    Result, RoutineId, ScalarType, Schema, SchemaId, SequenceId, TableId, TriggerId, TypeId, Value,
+    ViewId,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
     AlterColumnOperation as SqlAlterColumnOperation, AlterIndexOperation,
     AlterSchemaOperation as SqlAlterSchemaOperation, AlterTable,
-    AlterTableOperation as SqlAlterTableOperation, ArgMode, Assignment as SqlAssignment,
-    AssignmentTarget, BeginTransactionKind, BinaryOperator as SqlBinaryOperator, CharacterLength,
+    AlterTableOperation as SqlAlterTableOperation, AlterTypeAddValuePosition, AlterTypeOperation,
+    ArgMode, Array as SqlArray, ArrayElemTypeDef, Assignment as SqlAssignment, AssignmentTarget,
+    BeginTransactionKind, BinaryOperator as SqlBinaryOperator, CastKind, CharacterLength,
     ColumnDef, ColumnOption, ConflictTarget as SqlConflictTarget,
     CreateFunction as SqlCreateFunction, CreateFunctionBody, CreateTable, CreateTableOptions,
     CreateTrigger as SqlCreateTrigger, CreateView, DataType, Distinct as SqlDistinct,
@@ -46,10 +48,10 @@ use sqlparser::ast::{
     TableWithJoins, TimezoneInfo, TopQuantity, TransactionAccessMode as SqlTransactionAccessMode,
     TransactionIsolationLevel as SqlTransactionIsolationLevel, TransactionMode,
     TriggerEvent as SqlTriggerEvent, TriggerExecBodyType, TriggerObject, TriggerObjectKind,
-    TriggerPeriod, UnaryOperator as SqlUnaryOperator, Value as SqlValue,
-    WindowFrame as SqlWindowFrame, WindowFrameBound as SqlWindowFrameBound,
-    WindowFrameUnits as SqlWindowFrameUnits, WindowSpec as SqlWindowSpec, WindowType,
-    With as SqlWith,
+    TriggerPeriod, TrimWhereField, UnaryOperator as SqlUnaryOperator,
+    UserDefinedTypeRepresentation, Value as SqlValue, WindowFrame as SqlWindowFrame,
+    WindowFrameBound as SqlWindowFrameBound, WindowFrameUnits as SqlWindowFrameUnits,
+    WindowSpec as SqlWindowSpec, WindowType, With as SqlWith,
 };
 use sqlparser::dialect::{
     Dialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect,
@@ -173,6 +175,19 @@ pub enum ParsedExprKind {
         op: UnaryOperator,
         expr: Box<ParsedExpr>,
     },
+    Cast {
+        expr: Box<ParsedExpr>,
+        data_type: ScalarType,
+        declared_type: Option<ParsedObjectName>,
+    },
+    Array {
+        elements: Vec<ParsedExpr>,
+        dimensions: Vec<ArrayDimension>,
+    },
+    Function {
+        function: ScalarFunction,
+        arguments: Vec<ParsedExpr>,
+    },
     Binary {
         left: Box<ParsedExpr>,
         op: BinaryOperator,
@@ -291,6 +306,29 @@ pub enum AggregateFunction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarFunction {
+    Lower,
+    Upper,
+    CharacterLength,
+    OctetLength,
+    Abs,
+    Coalesce,
+    NullIf,
+    Concat,
+    Substring,
+    Btrim,
+    Ltrim,
+    Rtrim,
+    Replace,
+    Strpos,
+    Greatest,
+    Least,
+    JsonbTypeof,
+    ArrayLength,
+    Cardinality,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOperator {
     Not,
     Negate,
@@ -347,10 +385,18 @@ pub struct ParsedCte {
 pub struct ParsedColumn {
     pub name: ParsedIdentifier,
     pub data_type: ScalarType,
+    pub declared_type: Option<ParsedObjectName>,
     pub nullable: bool,
     pub primary_key: bool,
     pub unique: bool,
     pub default: Option<ParsedDefault>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedRoutineArgument {
+    pub name: Option<Identifier>,
+    pub data_type: ScalarType,
+    pub declared_type: Option<ParsedObjectName>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -392,6 +438,7 @@ pub enum DdlObjectKind {
     Sequence,
     View,
     MaterializedView,
+    Type,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -428,6 +475,7 @@ pub enum ParsedAlterTableOperation {
     SetDataType {
         column: ParsedIdentifier,
         data_type: ScalarType,
+        declared_type: Option<ParsedObjectName>,
     },
     AddConstraint {
         constraint: ParsedTableConstraint,
@@ -440,6 +488,19 @@ pub enum ParsedAlterTableOperation {
     SetTriggerEnabled {
         name: ParsedIdentifier,
         enabled: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParsedAlterDomainOperation {
+    SetDefault(ParsedDefault),
+    DropDefault,
+    SetNotNull,
+    DropNotNull,
+    AddConstraint(DomainConstraint),
+    DropConstraint {
+        name: ParsedIdentifier,
+        if_exists: bool,
     },
 }
 
@@ -477,6 +538,7 @@ pub enum BoundAlterTableOperation {
     SetDataType {
         column_id: ColumnId,
         data_type: ScalarType,
+        declared_type: Option<TypeId>,
     },
     AddConstraint {
         constraint: NewConstraint,
@@ -491,6 +553,16 @@ pub enum BoundAlterTableOperation {
         name: Identifier,
         enabled: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundAlterDomainOperation {
+    SetDefault(CatalogExpression),
+    DropDefault,
+    SetNotNull,
+    DropNotNull,
+    AddConstraint(DomainConstraint),
+    DropConstraint { name: Identifier, if_exists: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -619,6 +691,33 @@ pub enum ParsedStatement {
         name: ParsedIdentifier,
         if_not_exists: bool,
     },
+    CreateEnumType {
+        name: ParsedObjectName,
+        labels: Vec<String>,
+    },
+    CreateDomain {
+        name: ParsedObjectName,
+        base_type: ScalarType,
+        base_declared_type: Option<ParsedObjectName>,
+        not_null: bool,
+        default: Option<ParsedDefault>,
+        checks: Vec<DomainConstraint>,
+    },
+    AlterEnumAddValue {
+        name: ParsedObjectName,
+        label: String,
+        position: Option<EnumValuePosition>,
+        if_not_exists: bool,
+    },
+    AlterEnumRenameValue {
+        name: ParsedObjectName,
+        old_label: String,
+        new_label: String,
+    },
+    AlterDomain {
+        name: ParsedObjectName,
+        operation: ParsedAlterDomainOperation,
+    },
     AlterSchemaRename {
         name: ParsedIdentifier,
         new_name: ParsedIdentifier,
@@ -685,8 +784,9 @@ pub enum ParsedStatement {
     CreateRoutine {
         name: ParsedObjectName,
         kind: RoutineKind,
-        arguments: Vec<RoutineArgument>,
+        arguments: Vec<ParsedRoutineArgument>,
         return_type: Option<ScalarType>,
+        return_declared_type: Option<ParsedObjectName>,
         returns_set: bool,
         language: String,
         body: String,
@@ -695,7 +795,7 @@ pub enum ParsedStatement {
     DropRoutine {
         name: ParsedObjectName,
         kind: RoutineKind,
-        argument_types: Option<Vec<ScalarType>>,
+        argument_types: Option<Vec<ParsedRoutineArgument>>,
         if_exists: bool,
         behavior: DropBehavior,
     },
@@ -824,6 +924,17 @@ pub enum BoundExprKind {
     Unary {
         op: UnaryOperator,
         expr: Box<BoundExpr>,
+    },
+    Cast {
+        expr: Box<BoundExpr>,
+    },
+    Array {
+        elements: Vec<BoundExpr>,
+        dimensions: Vec<ArrayDimension>,
+    },
+    Function {
+        function: ScalarFunction,
+        arguments: Vec<BoundExpr>,
     },
     Binary {
         left: Box<BoundExpr>,
@@ -978,6 +1089,7 @@ pub enum BoundMergeAction {
 pub struct BoundOrder {
     pub column_index: usize,
     pub expression: Option<BoundExpr>,
+    pub data_type: ScalarType,
     pub ascending: bool,
     pub nulls_first: Option<bool>,
 }
@@ -1071,6 +1183,35 @@ pub enum BoundStatement {
         name: Identifier,
         if_not_exists: bool,
     },
+    CreateEnumType {
+        schema: Identifier,
+        name: Identifier,
+        labels: Vec<String>,
+    },
+    CreateDomain {
+        schema: Identifier,
+        name: Identifier,
+        base_type: ScalarType,
+        base_declared_type: Option<TypeId>,
+        not_null: bool,
+        default: Option<CatalogExpression>,
+        checks: Vec<DomainConstraint>,
+    },
+    AlterEnumAddValue {
+        type_id: TypeId,
+        label: String,
+        position: Option<EnumValuePosition>,
+        if_not_exists: bool,
+    },
+    AlterEnumRenameValue {
+        type_id: TypeId,
+        old_label: String,
+        new_label: String,
+    },
+    AlterDomain {
+        type_id: TypeId,
+        operation: BoundAlterDomainOperation,
+    },
     AlterSchemaRename {
         schema_id: SchemaId,
         new_name: Identifier,
@@ -1147,6 +1288,7 @@ pub enum BoundStatement {
         kind: RoutineKind,
         arguments: Vec<RoutineArgument>,
         return_type: Option<ScalarType>,
+        return_declared_type: Option<TypeId>,
         returns_set: bool,
         language: String,
         body: String,
@@ -1286,6 +1428,9 @@ pub fn parse_with_dialect(sql: &str, dialect: SqlDialect) -> Result<ParsedStatem
         if let Some(statement) = parse_create_procedure(sql)? {
             return Ok(statement);
         }
+        if let Some(statement) = parse_alter_domain(sql)? {
+            return Ok(statement);
+        }
         if let Some(statement) = parse_alter_view(sql)? {
             return Ok(statement);
         }
@@ -1334,6 +1479,11 @@ fn parse_source_statements(
                     .with_tokens_with_locations(tokens)
                     .parse_statements();
             }
+            if let Some(tokens) = rewrite_postgres_create_domain_not_null(sql)? {
+                return Parser::new(&PostgreSqlDialect {})
+                    .with_tokens_with_locations(tokens)
+                    .parse_statements();
+            }
             let parser_sql = materialized_view_parser_sql(sql);
             Parser::parse_sql(&PostgreSqlDialect {}, &parser_sql)
         }
@@ -1347,6 +1497,65 @@ fn parse_source_statements(
             parse_tokenized_source(sql, &MsSqlDialect {}, ParameterStyle::NamedAtP)
         }
     }
+}
+
+fn rewrite_postgres_create_domain_not_null(
+    sql: &str,
+) -> std::result::Result<Option<Vec<TokenWithSpan>>, ParserError> {
+    let dialect = PostgreSqlDialect {};
+    let mut tokens = Tokenizer::new(&dialect, sql).tokenize_with_location()?;
+    let significant_indices = tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token)| {
+            (!matches!(token.token, Token::Whitespace(_))).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let significant = significant_indices
+        .iter()
+        .map(|index| tokens[*index].token.clone())
+        .collect::<Vec<_>>();
+    let Some((not_index, null_index)) = create_domain_not_null_tokens(&significant) else {
+        return Ok(None);
+    };
+    tokens[significant_indices[not_index]].token = Token::Whitespace(Whitespace::Space);
+    tokens[significant_indices[null_index]].token = Token::Whitespace(Whitespace::Space);
+    Ok(Some(tokens))
+}
+
+fn create_domain_not_null_tokens(tokens: &[Token]) -> Option<(usize, usize)> {
+    if !tokens
+        .first()
+        .is_some_and(|token| is_unquoted_word(token, "CREATE"))
+        || !tokens
+            .get(1)
+            .is_some_and(|token| is_unquoted_word(token, "DOMAIN"))
+    {
+        return None;
+    }
+    let mut parenthesis_depth = 0_usize;
+    for index in 2..tokens.len().saturating_sub(1) {
+        match &tokens[index] {
+            Token::LParen => parenthesis_depth = parenthesis_depth.saturating_add(1),
+            Token::RParen => parenthesis_depth = parenthesis_depth.saturating_sub(1),
+            token
+                if parenthesis_depth == 0
+                    && is_unquoted_word(token, "NOT")
+                    && !tokens
+                        .get(index.wrapping_sub(1))
+                        .is_some_and(|token| is_unquoted_word(token, "IS"))
+                    && is_unquoted_word(&tokens[index + 1], "NULL") =>
+            {
+                return Some((index, index + 1));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn create_domain_is_not_null(sql: &str) -> bool {
+    create_domain_not_null_tokens(&significant_tokens(sql)).is_some()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1572,6 +1781,7 @@ fn parse_create_procedure(sql: &str) -> Result<Option<ParsedStatement>> {
         kind: RoutineKind::Procedure,
         arguments,
         return_type: None,
+        return_declared_type: None,
         returns_set: false,
         language: "plpgsql".to_owned(),
         body,
@@ -1605,6 +1815,145 @@ fn matches_keyword_sequence(value: &str, expected: &[&str]) -> bool {
             .next()
             .is_some_and(|value| value.eq_ignore_ascii_case(keyword))
     }) && actual.next().is_none()
+}
+
+fn parse_alter_domain(sql: &str) -> Result<Option<ParsedStatement>> {
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    let tokens = significant_tokens(trimmed);
+    if tokens.len() < 3
+        || !tokens
+            .first()
+            .is_some_and(|token| is_unquoted_word(token, "ALTER"))
+        || !tokens
+            .get(1)
+            .is_some_and(|token| is_unquoted_word(token, "DOMAIN"))
+    {
+        return Ok(None);
+    }
+    let mut cursor = 2usize;
+    let name = parse_token_object_name(&tokens, &mut cursor, 2)?;
+    let operation = if consume_keyword_sequence(&tokens, &mut cursor, &["SET", "DEFAULT"]) {
+        if cursor == tokens.len() {
+            return Err(DbError::new(
+                SYNTAX_ERROR,
+                "ALTER DOMAIN SET DEFAULT requires an expression",
+            ));
+        }
+        let default = parsed_default_from_tokens(&tokens[cursor..])?;
+        cursor = tokens.len();
+        ParsedAlterDomainOperation::SetDefault(default)
+    } else if consume_keyword_sequence(&tokens, &mut cursor, &["DROP", "DEFAULT"]) {
+        ParsedAlterDomainOperation::DropDefault
+    } else if consume_keyword_sequence(&tokens, &mut cursor, &["SET", "NOT", "NULL"]) {
+        ParsedAlterDomainOperation::SetNotNull
+    } else if consume_keyword_sequence(&tokens, &mut cursor, &["DROP", "NOT", "NULL"]) {
+        ParsedAlterDomainOperation::DropNotNull
+    } else if consume_keyword(&tokens, &mut cursor, "ADD") {
+        let constraint = parse_domain_constraint_tokens(&tokens, &mut cursor)?;
+        if consume_keyword_sequence(&tokens, &mut cursor, &["NOT", "VALID"]) {
+            return unsupported("ALTER DOMAIN ADD CONSTRAINT NOT VALID is not supported yet");
+        }
+        ParsedAlterDomainOperation::AddConstraint(constraint)
+    } else if consume_keyword_sequence(&tokens, &mut cursor, &["DROP", "CONSTRAINT"]) {
+        let if_exists = consume_keyword_sequence(&tokens, &mut cursor, &["IF", "EXISTS"]);
+        let name = parse_token_identifier(&tokens, &mut cursor)?;
+        if consume_keyword(&tokens, &mut cursor, "CASCADE") {
+            return unsupported("ALTER DOMAIN DROP CONSTRAINT CASCADE is not supported yet");
+        }
+        let _ = consume_keyword(&tokens, &mut cursor, "RESTRICT");
+        ParsedAlterDomainOperation::DropConstraint { name, if_exists }
+    } else {
+        return unsupported("this ALTER DOMAIN operation is not supported yet");
+    };
+    ensure_token_end(&tokens, cursor)?;
+    Ok(Some(ParsedStatement::AlterDomain { name, operation }))
+}
+
+fn parse_domain_constraint_tokens(
+    tokens: &[Token],
+    cursor: &mut usize,
+) -> Result<DomainConstraint> {
+    let name = if consume_keyword(tokens, cursor, "CONSTRAINT") {
+        Some(parse_token_identifier(tokens, cursor)?.name)
+    } else {
+        None
+    };
+    expect_keyword(tokens, cursor, "CHECK")?;
+    if tokens.get(*cursor) != Some(&Token::LParen) {
+        return Err(DbError::new(
+            SYNTAX_ERROR,
+            "domain CHECK constraint requires parentheses",
+        ));
+    }
+    *cursor += 1;
+    let expression_start = *cursor;
+    let mut depth = 1usize;
+    while *cursor < tokens.len() {
+        match tokens[*cursor] {
+            Token::LParen => depth = depth.saturating_add(1),
+            Token::RParen => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        *cursor += 1;
+    }
+    if depth != 0 {
+        return Err(DbError::new(
+            SYNTAX_ERROR,
+            "unterminated domain CHECK constraint",
+        ));
+    }
+    if expression_start == *cursor {
+        return Err(DbError::new(
+            SYNTAX_ERROR,
+            "domain CHECK constraint requires an expression",
+        ));
+    }
+    let expression = tokens_sql(&tokens[expression_start..*cursor]);
+    parse_parsed_expression(&expression)?;
+    *cursor += 1;
+    Ok(DomainConstraint {
+        id: None,
+        name,
+        expression: CatalogExpression::new(expression),
+    })
+}
+
+fn parsed_default_from_tokens(tokens: &[Token]) -> Result<ParsedDefault> {
+    let sql = tokens_sql(tokens);
+    Ok(ParsedDefault {
+        expression: parse_parsed_expression(&sql)?,
+        sql,
+    })
+}
+
+fn parse_parsed_expression(sql: &str) -> Result<ParsedExpr> {
+    let dialect = PostgreSqlDialect {};
+    let mut parser = Parser::new(&dialect)
+        .try_with_sql(sql)
+        .map_err(|error| DbError::new(SYNTAX_ERROR, error.to_string()))?;
+    let expression = parser
+        .parse_expr()
+        .map_err(|error| DbError::new(SYNTAX_ERROR, error.to_string()))?;
+    if parser.peek_token().token != Token::EOF {
+        return Err(DbError::new(
+            SYNTAX_ERROR,
+            "domain expression contains trailing SQL",
+        ));
+    }
+    convert_expr(expression, sql)
+}
+
+fn tokens_sql(tokens: &[Token]) -> String {
+    tokens
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn parse_alter_view(sql: &str) -> Result<Option<ParsedStatement>> {
@@ -1671,7 +2020,7 @@ fn parse_alter_view(sql: &str) -> Result<Option<ParsedStatement>> {
     }))
 }
 
-fn parse_procedure_arguments(value: &str) -> Result<Vec<RoutineArgument>> {
+fn parse_procedure_arguments(value: &str) -> Result<Vec<ParsedRoutineArgument>> {
     if value.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -1692,28 +2041,81 @@ fn parse_procedure_arguments(value: &str) -> Result<Vec<RoutineArgument>> {
                 ),
                 _ => return unsupported("unsupported procedure argument declaration"),
             };
-            Ok(RoutineArgument {
+            let (data_type, declared_type) = parse_procedure_data_type(data_type)?;
+            Ok(ParsedRoutineArgument {
                 name,
-                data_type: parse_simple_scalar_type(data_type)?,
+                data_type,
+                declared_type,
             })
         })
         .collect()
 }
 
-fn parse_simple_scalar_type(value: &str) -> Result<ScalarType> {
-    match value.to_ascii_uppercase().as_str() {
-        "BOOL" | "BOOLEAN" => Ok(ScalarType::Boolean),
-        "SMALLINT" | "INT2" => Ok(ScalarType::Int16),
-        "INT" | "INTEGER" | "INT4" => Ok(ScalarType::Int32),
-        "BIGINT" | "INT8" => Ok(ScalarType::Int64),
-        "REAL" | "FLOAT4" => Ok(ScalarType::Float32),
-        "DOUBLE PRECISION" | "FLOAT8" => Ok(ScalarType::Float64),
-        "TEXT" => Ok(ScalarType::Text),
-        "UUID" => Ok(ScalarType::Uuid),
-        "JSON" => Ok(ScalarType::Json),
-        "JSONB" => Ok(ScalarType::Jsonb),
-        _ => unsupported(format!("procedure argument type {value} is not supported")),
-    }
+fn parse_procedure_data_type(value: &str) -> Result<(ScalarType, Option<ParsedObjectName>)> {
+    let (value, is_array) = value
+        .strip_suffix("[]")
+        .map_or((value, false), |value| (value, true));
+    let built_in = match value.to_ascii_uppercase().as_str() {
+        "BOOL" | "BOOLEAN" => Some(ScalarType::Boolean),
+        "SMALLINT" | "INT2" => Some(ScalarType::Int16),
+        "INT" | "INTEGER" | "INT4" => Some(ScalarType::Int32),
+        "BIGINT" | "INT8" => Some(ScalarType::Int64),
+        "REAL" | "FLOAT4" => Some(ScalarType::Float32),
+        "DOUBLE PRECISION" | "FLOAT8" => Some(ScalarType::Float64),
+        "TEXT" => Some(ScalarType::Text),
+        "UUID" => Some(ScalarType::Uuid),
+        "JSON" => Some(ScalarType::Json),
+        "JSONB" => Some(ScalarType::Jsonb),
+        _ => None,
+    };
+    let (data_type, declared_type) = if let Some(data_type) = built_in {
+        (data_type, None)
+    } else {
+        let parts = value
+            .split('.')
+            .map(|part| {
+                let (name, quoted) =
+                    if part.starts_with('"') && part.ends_with('"') && part.len() >= 2 {
+                        (&part[1..part.len() - 1], true)
+                    } else {
+                        (part, false)
+                    };
+                let valid = !name.is_empty()
+                    && (quoted
+                        || (name
+                            .bytes()
+                            .next()
+                            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                            && name.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+                            })));
+                if !valid {
+                    return Err(DbError::new(
+                        SYNTAX_ERROR,
+                        format!("invalid procedure argument type name {value}"),
+                    ));
+                }
+                Ok(ParsedIdentifier {
+                    name: Identifier::new(name, quoted),
+                    position: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !(1..=2).contains(&parts.len()) {
+            return unsupported("procedure argument type names support at most one schema");
+        }
+        (ScalarType::Text, Some(ParsedObjectName { parts }))
+    };
+    Ok((
+        if is_array {
+            ScalarType::Array {
+                element: Box::new(data_type),
+            }
+        } else {
+            data_type
+        },
+        declared_type,
+    ))
 }
 
 fn parse_dollar_quoted_body(value: &str) -> Result<String> {
@@ -2098,7 +2500,34 @@ pub fn bind_catalog_expression(
     table: Option<&TableDefinition>,
     expected: Option<&ScalarType>,
 ) -> Result<BoundExpr> {
-    bind_catalog_expression_with_parameter_types(expression, table, expected, &BTreeMap::new())
+    bind_catalog_expression_with_parameter_types_and_catalog(
+        expression,
+        table,
+        expected,
+        &BTreeMap::new(),
+        None,
+    )
+}
+
+/// Bind a persisted catalog expression with access to user-defined types.
+///
+/// The original catalog-expression entry point remains available for callers
+/// that cannot contain named casts. Durable expressions owned by a catalog
+/// should use this overload so enum/domain casts are resolved from the same
+/// immutable catalog snapshot that owns the expression.
+pub fn bind_catalog_expression_with_catalog(
+    expression: &CatalogExpression,
+    table: Option<&TableDefinition>,
+    expected: Option<&ScalarType>,
+    catalog: &Catalog,
+) -> Result<BoundExpr> {
+    bind_catalog_expression_with_parameter_types_and_catalog(
+        expression,
+        table,
+        expected,
+        &BTreeMap::new(),
+        Some(catalog),
+    )
 }
 
 /// Bind a persisted expression with caller-owned positional parameter types.
@@ -2110,6 +2539,24 @@ pub fn bind_catalog_expression_with_parameter_types(
     table: Option<&TableDefinition>,
     expected: Option<&ScalarType>,
     parameter_types: &BTreeMap<usize, ScalarType>,
+) -> Result<BoundExpr> {
+    bind_catalog_expression_with_parameter_types_and_catalog(
+        expression,
+        table,
+        expected,
+        parameter_types,
+        None,
+    )
+}
+
+/// Bind a persisted expression with positional parameter types and an
+/// optional catalog used to resolve named enum/domain casts.
+pub fn bind_catalog_expression_with_parameter_types_and_catalog(
+    expression: &CatalogExpression,
+    table: Option<&TableDefinition>,
+    expected: Option<&ScalarType>,
+    parameter_types: &BTreeMap<usize, ScalarType>,
+    catalog: Option<&Catalog>,
 ) -> Result<BoundExpr> {
     let dialect = PostgreSqlDialect {};
     let mut parser = Parser::new(&dialect)
@@ -2124,18 +2571,16 @@ pub fn bind_catalog_expression_with_parameter_types(
             "catalog expression contains trailing SQL",
         ));
     }
-    bind_expr_with_parameter_types(
-        convert_expr(parsed, &expression.sql)?,
-        table,
-        expected,
-        parameter_types,
-    )
+    let mut expression = convert_expr(parsed, &expression.sql)?;
+    resolve_expr_types(&mut expression, parameter_types, catalog, 0)?;
+    bind_expr_with_parameter_types(expression, table, expected, parameter_types)
 }
 
 /// Bind an OrdaDB-owned parsed statement against an immutable catalog view.
 pub fn bind(mut statement: ParsedStatement, catalog: &Catalog) -> Result<BoundStatement> {
+    resolve_statement_types(&mut statement, &BTreeMap::new(), Some(catalog), 0)?;
     let parameter_types = ParameterTypeSolver::solve(&statement, catalog)?;
-    resolve_statement_parameter_types(&mut statement, &parameter_types, 0)?;
+    resolve_statement_types(&mut statement, &parameter_types, None, 0)?;
     bind_with_view_depth(statement, catalog, 0)
 }
 
@@ -2583,6 +3028,43 @@ impl ParameterTypeSolver {
                     self.collect_expr(expr, inputs, expected, catalog, depth + 1)
                 }
             },
+            ParsedExprKind::Cast {
+                expr, data_type, ..
+            } => {
+                if let Some(index) = parsed_parameter_index(expr) {
+                    self.constrain(index, data_type, expr.position)?;
+                    self.collect_expr(expr, inputs, Some(data_type), catalog, depth + 1)?;
+                } else {
+                    self.collect_expr(expr, inputs, None, catalog, depth + 1)?;
+                }
+                Ok(Some(data_type.clone()))
+            }
+            ParsedExprKind::Array { elements, .. } => {
+                let expected_element = match expected {
+                    Some(ScalarType::Array { element }) => Some(element.as_ref()),
+                    Some(_) => None,
+                    None => None,
+                };
+                let mut element_type = expected_element.cloned();
+                for element in elements {
+                    let candidate =
+                        self.collect_expr(element, inputs, expected_element, catalog, depth + 1)?;
+                    element_type = match (element_type, candidate) {
+                        (Some(left), Some(right)) => common_type(&left, &right),
+                        (Some(data_type), None) | (None, Some(data_type)) => Some(data_type),
+                        (None, None) => None,
+                    };
+                }
+                Ok(element_type.map(|element| ScalarType::Array {
+                    element: Box::new(element),
+                }))
+            }
+            ParsedExprKind::Function {
+                function,
+                arguments,
+            } => {
+                self.collect_scalar_function(*function, arguments, inputs, expected, catalog, depth)
+            }
             ParsedExprKind::Binary { left, op, right } => {
                 if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
                     self.collect_expr(
@@ -2765,6 +3247,146 @@ impl ParameterTypeSolver {
                 depth,
             ),
             ParsedExprKind::WindowValue { .. } => Ok(None),
+        }
+    }
+
+    fn collect_scalar_function(
+        &mut self,
+        function: ScalarFunction,
+        arguments: &[ParsedExpr],
+        inputs: &[InputColumn],
+        expected: Option<&ScalarType>,
+        catalog: &Catalog,
+        depth: usize,
+    ) -> Result<Option<ScalarType>> {
+        match function {
+            ScalarFunction::Lower
+            | ScalarFunction::Upper
+            | ScalarFunction::Btrim
+            | ScalarFunction::Ltrim
+            | ScalarFunction::Rtrim
+            | ScalarFunction::Replace
+            | ScalarFunction::Strpos => {
+                for argument in arguments {
+                    self.collect_expr(
+                        argument,
+                        inputs,
+                        Some(&ScalarType::Text),
+                        catalog,
+                        depth + 1,
+                    )?;
+                }
+                Ok(Some(if function == ScalarFunction::Strpos {
+                    ScalarType::Int32
+                } else {
+                    ScalarType::Text
+                }))
+            }
+            ScalarFunction::CharacterLength | ScalarFunction::OctetLength => {
+                let data_type =
+                    self.collect_expr(&arguments[0], inputs, None, catalog, depth + 1)?;
+                if data_type.is_none() {
+                    self.collect_expr(
+                        &arguments[0],
+                        inputs,
+                        Some(&ScalarType::Text),
+                        catalog,
+                        depth + 1,
+                    )?;
+                }
+                Ok(Some(ScalarType::Int32))
+            }
+            ScalarFunction::Abs => {
+                let data_type = self.collect_expr(
+                    &arguments[0],
+                    inputs,
+                    expected.filter(|expected| is_numeric(expected)),
+                    catalog,
+                    depth + 1,
+                )?;
+                Ok(data_type)
+            }
+            ScalarFunction::Coalesce
+            | ScalarFunction::NullIf
+            | ScalarFunction::Greatest
+            | ScalarFunction::Least => {
+                let mut common = expected.cloned();
+                for argument in arguments {
+                    let candidate =
+                        self.collect_expr(argument, inputs, None, catalog, depth + 1)?;
+                    common = match (common, candidate) {
+                        (Some(left), Some(right)) => common_type(&left, &right),
+                        (Some(data_type), None) | (None, Some(data_type)) => Some(data_type),
+                        (None, None) => None,
+                    };
+                }
+                if let Some(common) = &common {
+                    for argument in arguments {
+                        self.collect_expr(argument, inputs, Some(common), catalog, depth + 1)?;
+                    }
+                }
+                Ok(common)
+            }
+            ScalarFunction::Concat => {
+                for argument in arguments {
+                    let data_type =
+                        self.collect_expr(argument, inputs, None, catalog, depth + 1)?;
+                    if data_type.is_none() {
+                        self.collect_expr(
+                            argument,
+                            inputs,
+                            Some(&ScalarType::Text),
+                            catalog,
+                            depth + 1,
+                        )?;
+                    }
+                }
+                Ok(Some(ScalarType::Text))
+            }
+            ScalarFunction::Substring => {
+                self.collect_expr(
+                    &arguments[0],
+                    inputs,
+                    Some(&ScalarType::Text),
+                    catalog,
+                    depth + 1,
+                )?;
+                for argument in &arguments[1..] {
+                    self.collect_expr(
+                        argument,
+                        inputs,
+                        Some(&ScalarType::Int32),
+                        catalog,
+                        depth + 1,
+                    )?;
+                }
+                Ok(Some(ScalarType::Text))
+            }
+            ScalarFunction::JsonbTypeof => {
+                self.collect_expr(
+                    &arguments[0],
+                    inputs,
+                    Some(&ScalarType::Jsonb),
+                    catalog,
+                    depth + 1,
+                )?;
+                Ok(Some(ScalarType::Text))
+            }
+            ScalarFunction::ArrayLength => {
+                self.collect_expr(&arguments[0], inputs, None, catalog, depth + 1)?;
+                self.collect_expr(
+                    &arguments[1],
+                    inputs,
+                    Some(&ScalarType::Int32),
+                    catalog,
+                    depth + 1,
+                )?;
+                Ok(Some(ScalarType::Int32))
+            }
+            ScalarFunction::Cardinality => {
+                self.collect_expr(&arguments[0], inputs, None, catalog, depth + 1)?;
+                Ok(Some(ScalarType::Int32))
+            }
         }
     }
 
@@ -3123,7 +3745,7 @@ impl ParameterTypeSolver {
         depth: usize,
     ) -> Option<Schema> {
         let mut statement = statement.clone();
-        resolve_statement_parameter_types(&mut statement, &self.types, depth).ok()?;
+        resolve_statement_types(&mut statement, &self.types, None, depth).ok()?;
         let statement = if outer_inputs.is_empty() {
             bind_with_view_depth(statement, catalog, depth).ok()?
         } else {
@@ -3200,15 +3822,16 @@ fn parsed_parameter_index(expression: &ParsedExpr) -> Option<usize> {
     }
 }
 
-fn resolve_statement_parameter_types(
+fn resolve_statement_types(
     statement: &mut ParsedStatement,
     parameter_types: &BTreeMap<usize, ScalarType>,
+    catalog: Option<&Catalog>,
     depth: usize,
 ) -> Result<()> {
     if depth >= MAX_PARAMETER_SOLVER_DEPTH {
         return Err(DbError::new(
             "54001",
-            "parameter type resolution exceeded its statement depth limit",
+            "type resolution exceeded its statement depth limit",
         ));
     }
     match statement {
@@ -3219,15 +3842,16 @@ fn resolve_statement_parameter_types(
         } => {
             for column in columns {
                 if let Some(default) = &mut column.default {
-                    resolve_expr_parameter_types(
+                    resolve_expr_types(
                         &mut default.expression,
                         parameter_types,
+                        catalog,
                         depth + 1,
                     )?;
                 }
             }
             for constraint in constraints {
-                resolve_constraint_parameter_types(constraint, parameter_types, depth + 1)?;
+                resolve_constraint_types(constraint, parameter_types, catalog, depth + 1)?;
             }
         }
         ParsedStatement::AlterTable { operations, .. } => {
@@ -3235,42 +3859,56 @@ fn resolve_statement_parameter_types(
                 match operation {
                     ParsedAlterTableOperation::AddColumn { column, .. } => {
                         if let Some(default) = &mut column.default {
-                            resolve_expr_parameter_types(
+                            resolve_expr_types(
                                 &mut default.expression,
                                 parameter_types,
+                                catalog,
                                 depth + 1,
                             )?;
                         }
                     }
                     ParsedAlterTableOperation::SetDefault { default, .. } => {
-                        resolve_expr_parameter_types(
+                        resolve_expr_types(
                             &mut default.expression,
                             parameter_types,
+                            catalog,
                             depth + 1,
                         )?;
                     }
                     ParsedAlterTableOperation::AddConstraint { constraint } => {
-                        resolve_constraint_parameter_types(constraint, parameter_types, depth + 1)?;
+                        resolve_constraint_types(constraint, parameter_types, catalog, depth + 1)?;
                     }
                     _ => {}
                 }
             }
         }
+        ParsedStatement::CreateDomain {
+            default: Some(default),
+            ..
+        } => {
+            resolve_expr_types(&mut default.expression, parameter_types, catalog, depth + 1)?;
+        }
+        ParsedStatement::AlterDomain {
+            operation: ParsedAlterDomainOperation::SetDefault(default),
+            ..
+        } => {
+            resolve_expr_types(&mut default.expression, parameter_types, catalog, depth + 1)?;
+        }
         ParsedStatement::CreateView { query, .. }
         | ParsedStatement::Explain { statement: query } => {
-            resolve_statement_parameter_types(query, parameter_types, depth + 1)?;
+            resolve_statement_types(query, parameter_types, catalog, depth + 1)?;
         }
         ParsedStatement::Call { arguments, .. }
         | ParsedStatement::RoutineSelect { arguments, .. } => {
             for argument in arguments {
-                resolve_expr_parameter_types(argument, parameter_types, depth + 1)?;
+                resolve_expr_types(argument, parameter_types, catalog, depth + 1)?;
             }
         }
         ParsedStatement::SequenceValue {
             operation: ParsedSequenceOperation::SetValue { value, .. },
             ..
         } => {
-            resolve_expr_parameter_types(value, parameter_types, depth + 1)?;
+            resolve_expr_types(value, parameter_types, catalog, depth + 1)?;
         }
         ParsedStatement::Insert {
             rows,
@@ -3279,7 +3917,7 @@ fn resolve_statement_parameter_types(
             ..
         } => {
             for expression in rows.iter_mut().flatten() {
-                resolve_expr_parameter_types(expression, parameter_types, depth + 1)?;
+                resolve_expr_types(expression, parameter_types, catalog, depth + 1)?;
             }
             if let Some(on_conflict) = on_conflict
                 && let ParsedConflictAction::DoUpdate {
@@ -3288,41 +3926,41 @@ fn resolve_statement_parameter_types(
                 } = &mut on_conflict.action
             {
                 for (_, expression) in assignments {
-                    resolve_expr_parameter_types(expression, parameter_types, depth + 1)?;
+                    resolve_expr_types(expression, parameter_types, catalog, depth + 1)?;
                 }
                 if let Some(filter) = filter {
-                    resolve_expr_parameter_types(filter, parameter_types, depth + 1)?;
+                    resolve_expr_types(filter, parameter_types, catalog, depth + 1)?;
                 }
             }
-            resolve_projection_parameter_types(returning, parameter_types, depth + 1)?;
+            resolve_projection_types(returning, parameter_types, catalog, depth + 1)?;
         }
         ParsedStatement::Merge(merge) => {
-            resolve_expr_parameter_types(&mut merge.on, parameter_types, depth + 1)?;
+            resolve_expr_types(&mut merge.on, parameter_types, catalog, depth + 1)?;
             for clause in &mut merge.clauses {
                 if let Some(predicate) = &mut clause.predicate {
-                    resolve_expr_parameter_types(predicate, parameter_types, depth + 1)?;
+                    resolve_expr_types(predicate, parameter_types, catalog, depth + 1)?;
                 }
                 match &mut clause.action {
                     ParsedMergeAction::Update { assignments } => {
                         for (_, expression) in assignments {
-                            resolve_expr_parameter_types(expression, parameter_types, depth + 1)?;
+                            resolve_expr_types(expression, parameter_types, catalog, depth + 1)?;
                         }
                     }
                     ParsedMergeAction::Insert { values, .. } => {
                         for expression in values {
-                            resolve_expr_parameter_types(expression, parameter_types, depth + 1)?;
+                            resolve_expr_types(expression, parameter_types, catalog, depth + 1)?;
                         }
                     }
                     ParsedMergeAction::Delete | ParsedMergeAction::DoNothing => {}
                 }
             }
-            resolve_projection_parameter_types(&mut merge.returning, parameter_types, depth + 1)?;
+            resolve_projection_types(&mut merge.returning, parameter_types, catalog, depth + 1)?;
         }
         ParsedStatement::With { ctes, body, .. } => {
             for cte in ctes {
-                resolve_statement_parameter_types(&mut cte.query, parameter_types, depth + 1)?;
+                resolve_statement_types(&mut cte.query, parameter_types, catalog, depth + 1)?;
             }
-            resolve_statement_parameter_types(body, parameter_types, depth + 1)?;
+            resolve_statement_types(body, parameter_types, catalog, depth + 1)?;
         }
         ParsedStatement::SetOperation {
             left,
@@ -3332,11 +3970,11 @@ fn resolve_statement_parameter_types(
             limit,
             ..
         } => {
-            resolve_statement_parameter_types(left, parameter_types, depth + 1)?;
-            resolve_statement_parameter_types(right, parameter_types, depth + 1)?;
-            resolve_orders_parameter_types(order_by, parameter_types, depth + 1)?;
-            resolve_optional_expr_parameter_types(offset, parameter_types, depth + 1)?;
-            resolve_optional_expr_parameter_types(limit, parameter_types, depth + 1)?;
+            resolve_statement_types(left, parameter_types, catalog, depth + 1)?;
+            resolve_statement_types(right, parameter_types, catalog, depth + 1)?;
+            resolve_orders_types(order_by, parameter_types, catalog, depth + 1)?;
+            resolve_optional_expr_types(offset, parameter_types, catalog, depth + 1)?;
+            resolve_optional_expr_types(limit, parameter_types, catalog, depth + 1)?;
         }
         ParsedStatement::Select {
             projection,
@@ -3346,11 +3984,11 @@ fn resolve_statement_parameter_types(
             limit,
             ..
         } => {
-            resolve_projection_parameter_types(projection, parameter_types, depth + 1)?;
-            resolve_optional_expr_parameter_types(filter, parameter_types, depth + 1)?;
-            resolve_orders_parameter_types(order_by, parameter_types, depth + 1)?;
-            resolve_optional_expr_parameter_types(offset, parameter_types, depth + 1)?;
-            resolve_optional_expr_parameter_types(limit, parameter_types, depth + 1)?;
+            resolve_projection_types(projection, parameter_types, catalog, depth + 1)?;
+            resolve_optional_expr_types(filter, parameter_types, catalog, depth + 1)?;
+            resolve_orders_types(order_by, parameter_types, catalog, depth + 1)?;
+            resolve_optional_expr_types(offset, parameter_types, catalog, depth + 1)?;
+            resolve_optional_expr_types(limit, parameter_types, catalog, depth + 1)?;
         }
         ParsedStatement::AdvancedSelect {
             joins,
@@ -3365,19 +4003,19 @@ fn resolve_statement_parameter_types(
         } => {
             for join in joins {
                 if let ParsedJoinSource::Derived { query, .. } = &mut join.source {
-                    resolve_statement_parameter_types(query, parameter_types, depth + 1)?;
+                    resolve_statement_types(query, parameter_types, catalog, depth + 1)?;
                 }
-                resolve_expr_parameter_types(&mut join.on, parameter_types, depth + 1)?;
+                resolve_expr_types(&mut join.on, parameter_types, catalog, depth + 1)?;
             }
-            resolve_projection_parameter_types(projection, parameter_types, depth + 1)?;
-            resolve_optional_expr_parameter_types(filter, parameter_types, depth + 1)?;
+            resolve_projection_types(projection, parameter_types, catalog, depth + 1)?;
+            resolve_optional_expr_types(filter, parameter_types, catalog, depth + 1)?;
             for expression in group_by {
-                resolve_expr_parameter_types(expression, parameter_types, depth + 1)?;
+                resolve_expr_types(expression, parameter_types, catalog, depth + 1)?;
             }
-            resolve_optional_expr_parameter_types(having, parameter_types, depth + 1)?;
-            resolve_orders_parameter_types(order_by, parameter_types, depth + 1)?;
-            resolve_optional_expr_parameter_types(offset, parameter_types, depth + 1)?;
-            resolve_optional_expr_parameter_types(limit, parameter_types, depth + 1)?;
+            resolve_optional_expr_types(having, parameter_types, catalog, depth + 1)?;
+            resolve_orders_types(order_by, parameter_types, catalog, depth + 1)?;
+            resolve_optional_expr_types(offset, parameter_types, catalog, depth + 1)?;
+            resolve_optional_expr_types(limit, parameter_types, catalog, depth + 1)?;
         }
         ParsedStatement::Update {
             assignments,
@@ -3386,78 +4024,93 @@ fn resolve_statement_parameter_types(
             ..
         } => {
             for (_, expression) in assignments {
-                resolve_expr_parameter_types(expression, parameter_types, depth + 1)?;
+                resolve_expr_types(expression, parameter_types, catalog, depth + 1)?;
             }
-            resolve_optional_expr_parameter_types(filter, parameter_types, depth + 1)?;
-            resolve_projection_parameter_types(returning, parameter_types, depth + 1)?;
+            resolve_optional_expr_types(filter, parameter_types, catalog, depth + 1)?;
+            resolve_projection_types(returning, parameter_types, catalog, depth + 1)?;
         }
         ParsedStatement::Delete {
             filter, returning, ..
         } => {
-            resolve_optional_expr_parameter_types(filter, parameter_types, depth + 1)?;
-            resolve_projection_parameter_types(returning, parameter_types, depth + 1)?;
+            resolve_optional_expr_types(filter, parameter_types, catalog, depth + 1)?;
+            resolve_projection_types(returning, parameter_types, catalog, depth + 1)?;
         }
         _ => {}
     }
     Ok(())
 }
 
-fn resolve_constraint_parameter_types(
+fn resolve_constraint_types(
     constraint: &mut ParsedTableConstraint,
     parameter_types: &BTreeMap<usize, ScalarType>,
+    catalog: Option<&Catalog>,
     depth: usize,
 ) -> Result<()> {
     if let ParsedTableConstraint::Check { expression, .. } = constraint {
-        resolve_expr_parameter_types(expression, parameter_types, depth)?;
+        resolve_expr_types(expression, parameter_types, catalog, depth)?;
     }
     Ok(())
 }
 
-fn resolve_projection_parameter_types(
+fn resolve_projection_types(
     projection: &mut [ParsedProjection],
     parameter_types: &BTreeMap<usize, ScalarType>,
+    catalog: Option<&Catalog>,
     depth: usize,
 ) -> Result<()> {
     for item in projection {
         if let ParsedProjection::Expression { expr, .. } = item {
-            resolve_expr_parameter_types(expr, parameter_types, depth)?;
+            resolve_expr_types(expr, parameter_types, catalog, depth)?;
         }
     }
     Ok(())
 }
 
-fn resolve_orders_parameter_types(
+fn resolve_orders_types(
     order_by: &mut [ParsedOrder],
     parameter_types: &BTreeMap<usize, ScalarType>,
+    catalog: Option<&Catalog>,
     depth: usize,
 ) -> Result<()> {
     for order in order_by {
-        resolve_expr_parameter_types(&mut order.expr, parameter_types, depth)?;
+        resolve_expr_types(&mut order.expr, parameter_types, catalog, depth)?;
     }
     Ok(())
 }
 
-fn resolve_optional_expr_parameter_types(
+fn resolve_optional_expr_types(
     expression: &mut Option<ParsedExpr>,
     parameter_types: &BTreeMap<usize, ScalarType>,
+    catalog: Option<&Catalog>,
     depth: usize,
 ) -> Result<()> {
     if let Some(expression) = expression {
-        resolve_expr_parameter_types(expression, parameter_types, depth)?;
+        resolve_expr_types(expression, parameter_types, catalog, depth)?;
     }
     Ok(())
 }
 
-fn resolve_expr_parameter_types(
+fn resolve_expr_types(
     expression: &mut ParsedExpr,
     parameter_types: &BTreeMap<usize, ScalarType>,
+    catalog: Option<&Catalog>,
     depth: usize,
 ) -> Result<()> {
     if depth >= MAX_PARAMETER_SOLVER_DEPTH {
         return Err(DbError::new(
             "54001",
-            "parameter type resolution exceeded its expression depth limit",
+            "type resolution exceeded its expression depth limit",
         ));
+    }
+    if let ParsedExprKind::Cast {
+        data_type,
+        declared_type: Some(type_name),
+        ..
+    } = &mut expression.kind
+        && let Some(catalog) = catalog
+    {
+        let (resolved, _) = resolve_declared_data_type(catalog, data_type, type_name)?;
+        *data_type = resolved;
     }
     if let ParsedExprKind::Parameter(index) = expression.kind
         && let Some(data_type) = parameter_types.get(&index)
@@ -3470,20 +4123,33 @@ fn resolve_expr_parameter_types(
     }
     match &mut expression.kind {
         ParsedExprKind::Unary { expr, .. } => {
-            resolve_expr_parameter_types(expr, parameter_types, depth + 1)?;
+            resolve_expr_types(expr, parameter_types, catalog, depth + 1)?;
+        }
+        ParsedExprKind::Cast { expr, .. } => {
+            resolve_expr_types(expr, parameter_types, catalog, depth + 1)?;
+        }
+        ParsedExprKind::Array { elements, .. } => {
+            for element in elements {
+                resolve_expr_types(element, parameter_types, catalog, depth + 1)?;
+            }
+        }
+        ParsedExprKind::Function { arguments, .. } => {
+            for argument in arguments {
+                resolve_expr_types(argument, parameter_types, catalog, depth + 1)?;
+            }
         }
         ParsedExprKind::Binary { left, right, .. } => {
-            resolve_expr_parameter_types(left, parameter_types, depth + 1)?;
-            resolve_expr_parameter_types(right, parameter_types, depth + 1)?;
+            resolve_expr_types(left, parameter_types, catalog, depth + 1)?;
+            resolve_expr_types(right, parameter_types, catalog, depth + 1)?;
         }
         ParsedExprKind::InList { expr, list, .. } => {
-            resolve_expr_parameter_types(expr, parameter_types, depth + 1)?;
+            resolve_expr_types(expr, parameter_types, catalog, depth + 1)?;
             for candidate in list {
-                resolve_expr_parameter_types(candidate, parameter_types, depth + 1)?;
+                resolve_expr_types(candidate, parameter_types, catalog, depth + 1)?;
             }
         }
         ParsedExprKind::ScalarSubquery(subquery) | ParsedExprKind::Exists { subquery, .. } => {
-            resolve_statement_parameter_types(subquery, parameter_types, depth + 1)?;
+            resolve_statement_types(subquery, parameter_types, catalog, depth + 1)?;
         }
         ParsedExprKind::InSubquery { expr, subquery, .. }
         | ParsedExprKind::QuantifiedSubquery {
@@ -3491,34 +4157,34 @@ fn resolve_expr_parameter_types(
             subquery,
             ..
         } => {
-            resolve_expr_parameter_types(expr, parameter_types, depth + 1)?;
-            resolve_statement_parameter_types(subquery, parameter_types, depth + 1)?;
+            resolve_expr_types(expr, parameter_types, catalog, depth + 1)?;
+            resolve_statement_types(subquery, parameter_types, catalog, depth + 1)?;
         }
         ParsedExprKind::RowSubquery { left, subquery, .. } => {
             for expression in left {
-                resolve_expr_parameter_types(expression, parameter_types, depth + 1)?;
+                resolve_expr_types(expression, parameter_types, catalog, depth + 1)?;
             }
-            resolve_statement_parameter_types(subquery, parameter_types, depth + 1)?;
+            resolve_statement_types(subquery, parameter_types, catalog, depth + 1)?;
         }
         ParsedExprKind::Aggregate {
             argument, filter, ..
         } => {
             if let Some(argument) = argument {
-                resolve_expr_parameter_types(argument, parameter_types, depth + 1)?;
+                resolve_expr_types(argument, parameter_types, catalog, depth + 1)?;
             }
             if let Some(filter) = filter {
-                resolve_expr_parameter_types(filter, parameter_types, depth + 1)?;
+                resolve_expr_types(filter, parameter_types, catalog, depth + 1)?;
             }
         }
         ParsedExprKind::Window { call, spec } => {
-            resolve_window_parameter_types(call, spec, parameter_types, depth + 1)?;
+            resolve_window_types(call, spec, parameter_types, catalog, depth + 1)?;
         }
         ParsedExprKind::NamedWindow { call, .. } => {
             for argument in &mut call.arguments {
-                resolve_expr_parameter_types(argument, parameter_types, depth + 1)?;
+                resolve_expr_types(argument, parameter_types, catalog, depth + 1)?;
             }
             if let Some(filter) = &mut call.filter {
-                resolve_expr_parameter_types(filter, parameter_types, depth + 1)?;
+                resolve_expr_types(filter, parameter_types, catalog, depth + 1)?;
             }
         }
         ParsedExprKind::Column(_)
@@ -3531,28 +4197,29 @@ fn resolve_expr_parameter_types(
     Ok(())
 }
 
-fn resolve_window_parameter_types(
+fn resolve_window_types(
     call: &mut ParsedWindowCall,
     spec: &mut ParsedWindowSpec,
     parameter_types: &BTreeMap<usize, ScalarType>,
+    catalog: Option<&Catalog>,
     depth: usize,
 ) -> Result<()> {
     for argument in &mut call.arguments {
-        resolve_expr_parameter_types(argument, parameter_types, depth)?;
+        resolve_expr_types(argument, parameter_types, catalog, depth)?;
     }
     if let Some(filter) = &mut call.filter {
-        resolve_expr_parameter_types(filter, parameter_types, depth)?;
+        resolve_expr_types(filter, parameter_types, catalog, depth)?;
     }
     for expression in &mut spec.partition_by {
-        resolve_expr_parameter_types(expression, parameter_types, depth)?;
+        resolve_expr_types(expression, parameter_types, catalog, depth)?;
     }
-    resolve_orders_parameter_types(&mut spec.order_by, parameter_types, depth)?;
+    resolve_orders_types(&mut spec.order_by, parameter_types, catalog, depth)?;
     if let Some(frame) = &mut spec.frame {
         for bound in [&mut frame.start_bound, &mut frame.end_bound] {
             if let ParsedWindowFrameBound::Preceding(expression)
             | ParsedWindowFrameBound::Following(expression) = bound
             {
-                resolve_expr_parameter_types(expression, parameter_types, depth)?;
+                resolve_expr_types(expression, parameter_types, catalog, depth)?;
             }
         }
     }
@@ -3605,6 +4272,188 @@ fn bind_with_view_depth(
             Ok(BoundStatement::CreateSchema {
                 name: name.name,
                 if_not_exists,
+            })
+        }
+        ParsedStatement::CreateEnumType { name, labels } => {
+            let (schema, name, position) = split_table_name(&name)?;
+            if catalog.schema(&schema).is_none() {
+                return Err(DbError::new(
+                    UNDEFINED_SCHEMA,
+                    format!("schema {schema} does not exist"),
+                )
+                .with_position_opt(position));
+            }
+            if catalog.user_defined_type(&schema, &name).is_some() {
+                return Err(
+                    DbError::new("42710", format!("type {schema}.{name} already exists"))
+                        .with_position_opt(position),
+                );
+            }
+            Ok(BoundStatement::CreateEnumType {
+                schema,
+                name,
+                labels,
+            })
+        }
+        ParsedStatement::CreateDomain {
+            name,
+            base_type,
+            base_declared_type,
+            not_null,
+            default,
+            checks,
+        } => {
+            let (schema, name, position) = split_table_name(&name)?;
+            if catalog.schema(&schema).is_none() {
+                return Err(DbError::new(
+                    UNDEFINED_SCHEMA,
+                    format!("schema {schema} does not exist"),
+                )
+                .with_position_opt(position));
+            }
+            if catalog.user_defined_type(&schema, &name).is_some() {
+                return Err(
+                    DbError::new("42710", format!("type {schema}.{name} already exists"))
+                        .with_position_opt(position),
+                );
+            }
+            let (base_type, base_declared_type) = match base_declared_type {
+                Some(type_name) => {
+                    let definition = resolve_user_defined_type(&type_name, catalog)?;
+                    if matches!(
+                        definition.definition,
+                        ordadb_catalog::UserDefinedTypeKind::Domain { .. }
+                    ) {
+                        return unsupported(
+                            "domains whose base type is another domain are not supported yet",
+                        );
+                    }
+                    let (base_type, type_id) =
+                        resolve_declared_data_type(catalog, &base_type, &type_name)?;
+                    (base_type, Some(type_id))
+                }
+                None => (base_type, None),
+            };
+            let default = default
+                .map(|default| {
+                    bind_expr(default.expression, None, Some(&base_type))?;
+                    Ok(CatalogExpression::new(default.sql))
+                })
+                .transpose()?;
+            let scope =
+                TableDefinition::expression_scope(Identifier::unquoted("value"), base_type.clone());
+            for constraint in &checks {
+                bind_catalog_expression_with_catalog(
+                    &constraint.expression,
+                    Some(&scope),
+                    Some(&ScalarType::Boolean),
+                    catalog,
+                )?;
+            }
+            Ok(BoundStatement::CreateDomain {
+                schema,
+                name,
+                base_type,
+                base_declared_type,
+                not_null,
+                default,
+                checks,
+            })
+        }
+        ParsedStatement::AlterEnumAddValue {
+            name,
+            label,
+            position,
+            if_not_exists,
+        } => {
+            let definition = resolve_user_defined_type(&name, catalog)?;
+            if !matches!(
+                definition.definition,
+                ordadb_catalog::UserDefinedTypeKind::Enum { .. }
+            ) {
+                return Err(DbError::new(
+                    "42809",
+                    "ALTER TYPE ADD VALUE requires an enum type",
+                ));
+            }
+            Ok(BoundStatement::AlterEnumAddValue {
+                type_id: definition.id,
+                label,
+                position,
+                if_not_exists,
+            })
+        }
+        ParsedStatement::AlterEnumRenameValue {
+            name,
+            old_label,
+            new_label,
+        } => {
+            let definition = resolve_user_defined_type(&name, catalog)?;
+            if !matches!(
+                definition.definition,
+                ordadb_catalog::UserDefinedTypeKind::Enum { .. }
+            ) {
+                return Err(DbError::new(
+                    "42809",
+                    "ALTER TYPE RENAME VALUE requires an enum type",
+                ));
+            }
+            Ok(BoundStatement::AlterEnumRenameValue {
+                type_id: definition.id,
+                old_label,
+                new_label,
+            })
+        }
+        ParsedStatement::AlterDomain { name, operation } => {
+            let definition = resolve_user_defined_type(&name, catalog)?;
+            let ordadb_catalog::UserDefinedTypeKind::Domain {
+                base_type, checks, ..
+            } = &definition.definition
+            else {
+                return Err(DbError::new("42809", "ALTER DOMAIN requires a domain type"));
+            };
+            let operation = match operation {
+                ParsedAlterDomainOperation::SetDefault(default) => {
+                    bind_expr(default.expression, None, Some(base_type))?;
+                    BoundAlterDomainOperation::SetDefault(CatalogExpression::new(default.sql))
+                }
+                ParsedAlterDomainOperation::DropDefault => BoundAlterDomainOperation::DropDefault,
+                ParsedAlterDomainOperation::SetNotNull => BoundAlterDomainOperation::SetNotNull,
+                ParsedAlterDomainOperation::DropNotNull => BoundAlterDomainOperation::DropNotNull,
+                ParsedAlterDomainOperation::AddConstraint(constraint) => {
+                    let scope = TableDefinition::expression_scope(
+                        Identifier::unquoted("value"),
+                        base_type.clone(),
+                    );
+                    bind_catalog_expression_with_catalog(
+                        &constraint.expression,
+                        Some(&scope),
+                        Some(&ScalarType::Boolean),
+                        catalog,
+                    )?;
+                    BoundAlterDomainOperation::AddConstraint(constraint)
+                }
+                ParsedAlterDomainOperation::DropConstraint { name, if_exists } => {
+                    if !if_exists
+                        && !checks
+                            .iter()
+                            .any(|constraint| constraint.name.as_ref() == Some(&name.name))
+                    {
+                        return Err(DbError::new(
+                            "42704",
+                            format!("constraint {} does not exist", name.name),
+                        )
+                        .with_position_opt(name.position));
+                    }
+                    BoundAlterDomainOperation::DropConstraint {
+                        name: name.name,
+                        if_exists,
+                    }
+                }
+            };
+            Ok(BoundStatement::AlterDomain {
+                type_id: definition.id,
+                operation,
             })
         }
         ParsedStatement::AlterSchemaRename {
@@ -3868,6 +4717,7 @@ fn bind_with_view_depth(
             kind,
             arguments,
             return_type,
+            return_declared_type,
             returns_set,
             language,
             body,
@@ -3881,12 +4731,47 @@ fn bind_with_view_depth(
                 )
                 .with_position_opt(position));
             }
+            let arguments = arguments
+                .into_iter()
+                .map(|argument| {
+                    let (data_type, declared_type) = match argument.declared_type {
+                        Some(type_name) => {
+                            let (data_type, type_id) = resolve_declared_data_type(
+                                catalog,
+                                &argument.data_type,
+                                &type_name,
+                            )?;
+                            (data_type, Some(type_id))
+                        }
+                        None => (argument.data_type, None),
+                    };
+                    Ok(RoutineArgument {
+                        name: argument.name,
+                        data_type,
+                        declared_type,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let (return_type, return_declared_type) = match (return_type, return_declared_type) {
+                (Some(data_type), Some(type_name)) => {
+                    let (data_type, type_id) =
+                        resolve_declared_data_type(catalog, &data_type, &type_name)?;
+                    (Some(data_type), Some(type_id))
+                }
+                (return_type, None) => (return_type, None),
+                (None, Some(_)) => {
+                    return Err(DbError::internal(
+                        "routine return type name exists without a parsed data type",
+                    ));
+                }
+            };
             Ok(BoundStatement::CreateRoutine {
                 schema,
                 name,
                 kind,
                 arguments,
                 return_type,
+                return_declared_type,
                 returns_set,
                 language,
                 body,
@@ -3901,21 +4786,40 @@ fn bind_with_view_depth(
             behavior,
         } => {
             let (schema, name, position) = split_table_name(&name)?;
-            let matches = catalog
+            let mut matches = Vec::new();
+            for routine in catalog
                 .routines_named(&schema, &name)
                 .iter()
-                .filter(|routine| {
-                    routine.kind == kind
-                        && argument_types.as_ref().is_none_or(|argument_types| {
-                            routine.arguments.len() == argument_types.len()
-                                && routine
-                                    .arguments
-                                    .iter()
-                                    .zip(argument_types)
-                                    .all(|(argument, expected)| argument.data_type == *expected)
-                        })
-                })
-                .collect::<Vec<_>>();
+                .filter(|routine| routine.kind == kind)
+            {
+                let signature_matches = match argument_types.as_ref() {
+                    None => true,
+                    Some(argument_types) if routine.arguments.len() == argument_types.len() => {
+                        let mut matches = true;
+                        for (argument, expected) in routine.arguments.iter().zip(argument_types) {
+                            let expected_declared_type = expected
+                                .declared_type
+                                .as_ref()
+                                .map(|name| {
+                                    resolve_user_defined_type(name, catalog).map(|ty| ty.id)
+                                })
+                                .transpose()?;
+                            matches &= match expected_declared_type {
+                                Some(type_id) => argument.declared_type == Some(type_id),
+                                None => {
+                                    argument.declared_type.is_none()
+                                        && argument.data_type == expected.data_type
+                                }
+                            };
+                        }
+                        matches
+                    }
+                    Some(_) => false,
+                };
+                if signature_matches {
+                    matches.push(routine);
+                }
+            }
             let object_kind = match kind {
                 RoutineKind::Function => "function",
                 RoutineKind::Procedure => "procedure",
@@ -3961,20 +4865,15 @@ fn bind_with_view_depth(
                 .collect::<Vec<_>>();
             let mut matches = Vec::new();
             for routine in candidates {
-                let bound = arguments
-                    .iter()
-                    .cloned()
-                    .zip(&routine.arguments)
-                    .map(|(argument, expected)| {
-                        bind_expr(argument, None, Some(&expected.data_type))
-                    })
-                    .collect::<Result<Vec<_>>>();
-                if let Ok(bound) = bound {
-                    matches.push((routine.id, bound));
+                if let Some((bound, exact_declared_matches)) =
+                    bind_routine_candidate(&arguments, &routine.arguments, catalog)?
+                {
+                    matches.push((routine.id, bound, exact_declared_matches));
                 }
             }
+            retain_best_routine_matches(&mut matches, |candidate| candidate.2);
             match matches.as_slice() {
-                [(routine_id, arguments)] => Ok(BoundStatement::Call {
+                [(routine_id, arguments, _)] => Ok(BoundStatement::Call {
                     routine_id: *routine_id,
                     arguments: arguments.clone(),
                 }),
@@ -4011,20 +4910,15 @@ fn bind_with_view_depth(
                 .collect::<Vec<_>>();
             let mut matches = Vec::new();
             for routine in candidates {
-                let bound = arguments
-                    .iter()
-                    .cloned()
-                    .zip(&routine.arguments)
-                    .map(|(argument, expected)| {
-                        bind_expr(argument, None, Some(&expected.data_type))
-                    })
-                    .collect::<Result<Vec<_>>>();
-                if let Ok(bound) = bound {
-                    matches.push((routine, bound));
+                if let Some((bound, exact_declared_matches)) =
+                    bind_routine_candidate(&arguments, &routine.arguments, catalog)?
+                {
+                    matches.push((routine, bound, exact_declared_matches));
                 }
             }
+            retain_best_routine_matches(&mut matches, |candidate| candidate.2);
             match matches.as_slice() {
-                [(routine, arguments)] => {
+                [(routine, arguments, _)] => {
                     let return_type = routine.return_type.clone().ok_or_else(|| {
                         DbError::internal("selected function lost its return type")
                     })?;
@@ -4400,6 +5294,91 @@ fn convert_statement(statement: SqlStatement, sql: &str) -> Result<ParsedStateme
                 if_not_exists,
             })
         }
+        SqlStatement::CreateType {
+            name,
+            representation,
+        } => {
+            let Some(UserDefinedTypeRepresentation::Enum { labels }) = representation else {
+                return unsupported("only CREATE TYPE ... AS ENUM is supported");
+            };
+            Ok(ParsedStatement::CreateEnumType {
+                name: convert_object_name(name, sql)?,
+                labels: labels.into_iter().map(|label| label.value).collect(),
+            })
+        }
+        SqlStatement::AlterType(alter) => {
+            let name = convert_object_name(alter.name, sql)?;
+            match alter.operation {
+                AlterTypeOperation::Rename(_) => {
+                    unsupported("ALTER TYPE RENAME TO is not supported yet")
+                }
+                AlterTypeOperation::AddValue(operation) => {
+                    let position = operation.position.map(|position| match position {
+                        AlterTypeAddValuePosition::Before(label) => {
+                            EnumValuePosition::Before(label.value)
+                        }
+                        AlterTypeAddValuePosition::After(label) => {
+                            EnumValuePosition::After(label.value)
+                        }
+                    });
+                    Ok(ParsedStatement::AlterEnumAddValue {
+                        name,
+                        label: operation.value.value,
+                        position,
+                        if_not_exists: operation.if_not_exists,
+                    })
+                }
+                AlterTypeOperation::RenameValue(operation) => {
+                    Ok(ParsedStatement::AlterEnumRenameValue {
+                        name,
+                        old_label: operation.from.value,
+                        new_label: operation.to.value,
+                    })
+                }
+            }
+        }
+        SqlStatement::CreateDomain(domain) => {
+            if domain.collation.is_some() {
+                return unsupported("CREATE DOMAIN COLLATE is not supported yet");
+            }
+            let (base_type, base_declared_type) = convert_column_data_type(domain.data_type, sql)?;
+            let default = domain
+                .default
+                .map(|expression| {
+                    Ok(ParsedDefault {
+                        sql: expression.to_string(),
+                        expression: convert_expr(expression, sql)?,
+                    })
+                })
+                .transpose()?;
+            let checks = domain
+                .constraints
+                .into_iter()
+                .map(|constraint| {
+                    let TableConstraint::Check(check) = constraint else {
+                        return unsupported(
+                            "CREATE DOMAIN supports only CHECK constraints in this build",
+                        );
+                    };
+                    if check.enforced.is_some() {
+                        return unsupported("domain CHECK ENFORCED clauses are not supported");
+                    }
+                    Ok(DomainConstraint {
+                        id: None,
+                        name: check.name.map(|name| convert_ident(name, sql).name),
+                        expression: CatalogExpression::new(check.expr.to_string()),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ParsedStatement::CreateDomain {
+                name: convert_object_name(domain.name, sql)?,
+                base_type,
+                base_declared_type,
+                not_null: create_domain_is_not_null(sql),
+                default,
+                checks,
+            })
+        }
         SqlStatement::AlterSchema(alter) => {
             if alter.operations.len() != 1 {
                 return unsupported("ALTER SCHEMA supports one operation at a time");
@@ -4442,6 +5421,7 @@ fn convert_statement(statement: SqlStatement, sql: &str) -> Result<ParsedStateme
                 ObjectType::Sequence => DdlObjectKind::Sequence,
                 ObjectType::View => DdlObjectKind::View,
                 ObjectType::MaterializedView => DdlObjectKind::MaterializedView,
+                ObjectType::Type => DdlObjectKind::Type,
                 _ => return unsupported("this DROP object type is not supported"),
             };
             if names.is_empty() {
@@ -4786,9 +5766,11 @@ fn convert_column_definition(
     sql: &str,
 ) -> Result<(ParsedColumn, Vec<ParsedTableConstraint>)> {
     let name = convert_ident(column.name, sql);
+    let (data_type, declared_type) = convert_column_data_type(column.data_type, sql)?;
     let mut parsed = ParsedColumn {
         name: name.clone(),
-        data_type: convert_data_type(column.data_type)?,
+        data_type,
+        declared_type,
         nullable: true,
         primary_key: false,
         unique: false,
@@ -5075,9 +6057,11 @@ fn convert_alter_table(table: AlterTable, sql: &str) -> Result<ParsedStatement> 
                                 "ALTER COLUMN TYPE USING expressions are not supported",
                             );
                         }
+                        let (data_type, declared_type) = convert_column_data_type(data_type, sql)?;
                         ParsedAlterTableOperation::SetDataType {
                             column,
-                            data_type: convert_data_type(data_type)?,
+                            data_type,
+                            declared_type,
                         }
                     }
                     SqlAlterColumnOperation::AddGenerated { .. } => {
@@ -5296,20 +6280,26 @@ fn convert_create_function(function: SqlCreateFunction, sql: &str) -> Result<Par
             {
                 return unsupported("only non-defaulted IN routine arguments are supported");
             }
-            Ok(RoutineArgument {
+            let (data_type, declared_type) = convert_column_data_type(argument.data_type, sql)?;
+            Ok(ParsedRoutineArgument {
                 name: argument.name.map(|name| convert_ident(name, sql).name),
-                data_type: convert_data_type(argument.data_type)?,
+                data_type,
+                declared_type,
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let (return_type, returns_set) = match function.return_type {
+    let (return_type, return_declared_type, returns_set) = match function.return_type {
         Some(FunctionReturnType::DataType(data_type)) if is_trigger_type(&data_type) => {
-            (None, false)
+            (None, None, false)
         }
         Some(FunctionReturnType::DataType(data_type)) => {
-            (Some(convert_data_type(data_type)?), false)
+            let (data_type, declared_type) = convert_column_data_type(data_type, sql)?;
+            (Some(data_type), declared_type, false)
         }
-        Some(FunctionReturnType::SetOf(data_type)) => (Some(convert_data_type(data_type)?), true),
+        Some(FunctionReturnType::SetOf(data_type)) => {
+            let (data_type, declared_type) = convert_column_data_type(data_type, sql)?;
+            (Some(data_type), declared_type, true)
+        }
         None => return unsupported("CREATE FUNCTION requires a return type"),
     };
     let body = match function.function_body {
@@ -5327,6 +6317,7 @@ fn convert_create_function(function: SqlCreateFunction, sql: &str) -> Result<Par
         kind: RoutineKind::Function,
         arguments,
         return_type,
+        return_declared_type,
         returns_set,
         language: "plpgsql".to_owned(),
         body,
@@ -5360,7 +6351,13 @@ fn convert_drop_routine(
                             "DROP routine signatures support only non-defaulted IN arguments",
                         );
                     }
-                    convert_data_type(argument.data_type)
+                    let (data_type, declared_type) =
+                        convert_column_data_type(argument.data_type, sql)?;
+                    Ok(ParsedRoutineArgument {
+                        name: None,
+                        data_type,
+                        declared_type,
+                    })
                 })
                 .collect::<Result<Vec<_>>>()
         })
@@ -6371,7 +7368,11 @@ fn expr_has_window(expr: &ParsedExpr) -> bool {
         ParsedExprKind::Window { .. }
         | ParsedExprKind::NamedWindow { .. }
         | ParsedExprKind::WindowValue { .. } => true,
-        ParsedExprKind::Unary { expr, .. } => expr_has_window(expr),
+        ParsedExprKind::Unary { expr, .. } | ParsedExprKind::Cast { expr, .. } => {
+            expr_has_window(expr)
+        }
+        ParsedExprKind::Array { elements, .. } => elements.iter().any(expr_has_window),
+        ParsedExprKind::Function { arguments, .. } => arguments.iter().any(expr_has_window),
         ParsedExprKind::Binary { left, right, .. } => {
             expr_has_window(left) || expr_has_window(right)
         }
@@ -6404,7 +7405,11 @@ fn expr_has_subquery(expr: &ParsedExpr) -> bool {
         | ParsedExprKind::InSubquery { .. }
         | ParsedExprKind::QuantifiedSubquery { .. }
         | ParsedExprKind::RowSubquery { .. } => true,
-        ParsedExprKind::Unary { expr, .. } => expr_has_subquery(expr),
+        ParsedExprKind::Unary { expr, .. } | ParsedExprKind::Cast { expr, .. } => {
+            expr_has_subquery(expr)
+        }
+        ParsedExprKind::Array { elements, .. } => elements.iter().any(expr_has_subquery),
+        ParsedExprKind::Function { arguments, .. } => arguments.iter().any(expr_has_subquery),
         ParsedExprKind::Binary { left, right, .. } => {
             expr_has_subquery(left) || expr_has_subquery(right)
         }
@@ -6442,7 +7447,11 @@ fn expr_has_subquery(expr: &ParsedExpr) -> bool {
 fn expr_has_aggregate(expr: &ParsedExpr) -> bool {
     match &expr.kind {
         ParsedExprKind::Aggregate { .. } => true,
-        ParsedExprKind::Unary { expr, .. } => expr_has_aggregate(expr),
+        ParsedExprKind::Unary { expr, .. } | ParsedExprKind::Cast { expr, .. } => {
+            expr_has_aggregate(expr)
+        }
+        ParsedExprKind::Array { elements, .. } => elements.iter().any(expr_has_aggregate),
+        ParsedExprKind::Function { arguments, .. } => arguments.iter().any(expr_has_aggregate),
         ParsedExprKind::Binary { left, right, .. } => {
             expr_has_aggregate(left) || expr_has_aggregate(right)
         }
@@ -6473,6 +7482,39 @@ fn expr_has_aggregate(expr: &ParsedExpr) -> bool {
                     .any(|order| expr_has_aggregate(&order.expr))
         }
     }
+}
+
+fn bind_routine_candidate(
+    arguments: &[ParsedExpr],
+    expected: &[RoutineArgument],
+    catalog: &Catalog,
+) -> Result<Option<(Vec<BoundExpr>, usize)>> {
+    let mut bound = Vec::with_capacity(arguments.len());
+    let mut exact_declared_matches = 0_usize;
+    for (argument, expected) in arguments.iter().zip(expected) {
+        let declared_type = match &argument.kind {
+            ParsedExprKind::Cast {
+                declared_type: Some(name),
+                ..
+            } => Some(resolve_user_defined_type(name, catalog)?.id),
+            _ => None,
+        };
+        if declared_type.is_some() && declared_type == expected.declared_type {
+            exact_declared_matches = exact_declared_matches.saturating_add(1);
+        }
+        let Ok(argument) = bind_expr(argument.clone(), None, Some(&expected.data_type)) else {
+            return Ok(None);
+        };
+        bound.push(argument);
+    }
+    Ok(Some((bound, exact_declared_matches)))
+}
+
+fn retain_best_routine_matches<T>(matches: &mut Vec<T>, score: impl Fn(&T) -> usize) {
+    let Some(best) = matches.iter().map(&score).max() else {
+        return;
+    };
+    matches.retain(|candidate| score(candidate) == best);
 }
 
 fn convert_values_query(query: Query, sql: &str) -> Result<Vec<Vec<ParsedExpr>>> {
@@ -6569,6 +7611,93 @@ fn convert_expr(expr: SqlExpr, sql: &str) -> Result<ParsedExpr> {
             })?;
             ParsedExprKind::Literal(parse_temporal_literal(typed.data_type, &value, position)?)
         }
+        SqlExpr::Interval(interval) => {
+            if interval.leading_field.is_some()
+                || interval.leading_precision.is_some()
+                || interval.last_field.is_some()
+                || interval.fractional_seconds_precision.is_some()
+            {
+                return unsupported_at(
+                    "INTERVAL field and precision qualifiers are not supported yet",
+                    position,
+                );
+            }
+            let value = interval_literal_text(*interval.value, position)?;
+            ParsedExprKind::Literal(Value::Interval(
+                PgInterval::from_str(&value).map_err(|error| error.with_position_opt(position))?,
+            ))
+        }
+        SqlExpr::Cast {
+            kind,
+            expr,
+            data_type,
+            array,
+            format,
+        } => {
+            if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) {
+                return unsupported_at("TRY_CAST and SAFE_CAST are not supported", position);
+            }
+            if array || format.is_some() {
+                return unsupported_at("this CAST option is not supported", position);
+            }
+            let (data_type, declared_type) = convert_column_data_type(data_type, sql)?;
+            ParsedExprKind::Cast {
+                expr: Box::new(convert_expr(*expr, sql)?),
+                data_type,
+                declared_type,
+            }
+        }
+        SqlExpr::Array(array) => convert_array_expression(array, sql, position)?,
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            special: _,
+            shorthand: _,
+        } => {
+            let from = substring_from.ok_or_else(|| {
+                DbError::new(SYNTAX_ERROR, "SUBSTRING requires a start position")
+                    .with_position_opt(position)
+            })?;
+            let mut arguments = vec![convert_expr(*expr, sql)?, convert_expr(*from, sql)?];
+            if let Some(length) = substring_for {
+                arguments.push(convert_expr(*length, sql)?);
+            }
+            ParsedExprKind::Function {
+                function: ScalarFunction::Substring,
+                arguments,
+            }
+        }
+        SqlExpr::Trim {
+            expr,
+            trim_where,
+            trim_what,
+            trim_characters,
+        } => {
+            if trim_characters.is_some() {
+                return unsupported_at(
+                    "comma-separated TRIM characters are not supported",
+                    position,
+                );
+            }
+            let function = match trim_where.unwrap_or(TrimWhereField::Both) {
+                TrimWhereField::Both => ScalarFunction::Btrim,
+                TrimWhereField::Leading => ScalarFunction::Ltrim,
+                TrimWhereField::Trailing => ScalarFunction::Rtrim,
+            };
+            let mut arguments = vec![convert_expr(*expr, sql)?];
+            if let Some(trim_what) = trim_what {
+                arguments.push(convert_expr(*trim_what, sql)?);
+            }
+            ParsedExprKind::Function {
+                function,
+                arguments,
+            }
+        }
+        SqlExpr::Position { expr, r#in } => ParsedExprKind::Function {
+            function: ScalarFunction::Strpos,
+            arguments: vec![convert_expr(*r#in, sql)?, convert_expr(*expr, sql)?],
+        },
         SqlExpr::UnaryOp { op, expr } => {
             let op = match op {
                 SqlUnaryOperator::Not => UnaryOperator::Not,
@@ -6742,61 +7871,287 @@ fn convert_expr(expr: SqlExpr, sql: &str) -> Result<ParsedExpr> {
                     .map(|filter| convert_expr(*filter, sql).map(Box::new))
                     .transpose()?;
                 let function_name = function.name.to_string().to_ascii_lowercase();
-                let aggregate_function = match function_name.as_str() {
-                    "count" => AggregateFunction::Count,
-                    "sum" => AggregateFunction::Sum,
-                    "avg" => AggregateFunction::Avg,
-                    "min" => AggregateFunction::Min,
-                    "max" => AggregateFunction::Max,
-                    _ => return unsupported_at("this SQL function is not supported yet", position),
-                };
-                let FunctionArguments::List(arguments) = function.args else {
-                    return unsupported_at("aggregate arguments must use parentheses", position);
-                };
-                if !arguments.clauses.is_empty() {
-                    return unsupported_at(
-                        "ordered aggregate arguments are not supported yet",
-                        position,
-                    );
-                }
-                let distinct = matches!(
-                    arguments.duplicate_treatment,
-                    Some(DuplicateTreatment::Distinct)
-                );
-                let argument = match arguments.args.as_slice() {
-                    [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
-                        if aggregate_function == AggregateFunction::Count && !distinct =>
-                    {
-                        None
-                    }
-                    [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] => {
-                        return Err(DbError::new(
-                            SYNTAX_ERROR,
-                            "DISTINCT aggregate requires an expression",
-                        )
-                        .with_position_opt(position));
-                    }
-                    [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] => {
-                        Some(Box::new(convert_expr(argument.clone(), sql)?))
-                    }
-                    _ => {
+                if let Some(scalar_function) = scalar_function_from_name(&function_name) {
+                    if filter.is_some() {
                         return unsupported_at(
-                            "aggregate requires one expression, or COUNT(*)",
+                            "FILTER is supported only for aggregate functions",
                             position,
                         );
                     }
-                };
-                ParsedExprKind::Aggregate {
-                    function: aggregate_function,
-                    argument,
-                    distinct,
-                    filter,
+                    let arguments =
+                        convert_scalar_function_arguments(function.args, sql, position)?;
+                    validate_scalar_function_arity(scalar_function, arguments.len(), position)?;
+                    ParsedExprKind::Function {
+                        function: scalar_function,
+                        arguments,
+                    }
+                } else {
+                    let aggregate_function = match function_name.as_str() {
+                        "count" => AggregateFunction::Count,
+                        "sum" => AggregateFunction::Sum,
+                        "avg" => AggregateFunction::Avg,
+                        "min" => AggregateFunction::Min,
+                        "max" => AggregateFunction::Max,
+                        _ => {
+                            return unsupported_at(
+                                "this SQL function is not supported yet",
+                                position,
+                            );
+                        }
+                    };
+                    let FunctionArguments::List(arguments) = function.args else {
+                        return unsupported_at(
+                            "aggregate arguments must use parentheses",
+                            position,
+                        );
+                    };
+                    if !arguments.clauses.is_empty() {
+                        return unsupported_at(
+                            "ordered aggregate arguments are not supported yet",
+                            position,
+                        );
+                    }
+                    let distinct = matches!(
+                        arguments.duplicate_treatment,
+                        Some(DuplicateTreatment::Distinct)
+                    );
+                    let argument = match arguments.args.as_slice() {
+                        [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
+                            if aggregate_function == AggregateFunction::Count && !distinct =>
+                        {
+                            None
+                        }
+                        [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] => {
+                            return Err(DbError::new(
+                                SYNTAX_ERROR,
+                                "DISTINCT aggregate requires an expression",
+                            )
+                            .with_position_opt(position));
+                        }
+                        [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] => {
+                            Some(Box::new(convert_expr(argument.clone(), sql)?))
+                        }
+                        _ => {
+                            return unsupported_at(
+                                "aggregate requires one expression, or COUNT(*)",
+                                position,
+                            );
+                        }
+                    };
+                    ParsedExprKind::Aggregate {
+                        function: aggregate_function,
+                        argument,
+                        distinct,
+                        filter,
+                    }
                 }
             }
         }
         _ => return unsupported_at("this SQL expression is not supported yet", position),
     };
     Ok(ParsedExpr { kind, position })
+}
+
+fn scalar_function_from_name(name: &str) -> Option<ScalarFunction> {
+    let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    match name {
+        "lower" => Some(ScalarFunction::Lower),
+        "upper" => Some(ScalarFunction::Upper),
+        "length" | "char_length" | "character_length" => Some(ScalarFunction::CharacterLength),
+        "octet_length" => Some(ScalarFunction::OctetLength),
+        "abs" => Some(ScalarFunction::Abs),
+        "coalesce" => Some(ScalarFunction::Coalesce),
+        "nullif" => Some(ScalarFunction::NullIf),
+        "concat" => Some(ScalarFunction::Concat),
+        "substring" | "substr" => Some(ScalarFunction::Substring),
+        "btrim" | "trim" => Some(ScalarFunction::Btrim),
+        "ltrim" => Some(ScalarFunction::Ltrim),
+        "rtrim" => Some(ScalarFunction::Rtrim),
+        "replace" => Some(ScalarFunction::Replace),
+        "strpos" => Some(ScalarFunction::Strpos),
+        "greatest" => Some(ScalarFunction::Greatest),
+        "least" => Some(ScalarFunction::Least),
+        "jsonb_typeof" => Some(ScalarFunction::JsonbTypeof),
+        "array_length" => Some(ScalarFunction::ArrayLength),
+        "cardinality" => Some(ScalarFunction::Cardinality),
+        _ => None,
+    }
+}
+
+fn convert_scalar_function_arguments(
+    arguments: FunctionArguments,
+    sql: &str,
+    position: Option<usize>,
+) -> Result<Vec<ParsedExpr>> {
+    let FunctionArguments::List(arguments) = arguments else {
+        return unsupported_at("scalar function arguments must use parentheses", position);
+    };
+    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+        return unsupported_at(
+            "this scalar function argument option is not supported",
+            position,
+        );
+    }
+    arguments
+        .args
+        .into_iter()
+        .map(|argument| match argument {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) => {
+                convert_expr(expression, sql)
+            }
+            _ => unsupported_at(
+                "scalar functions require positional expression arguments",
+                position,
+            ),
+        })
+        .collect()
+}
+
+fn validate_scalar_function_arity(
+    function: ScalarFunction,
+    count: usize,
+    position: Option<usize>,
+) -> Result<()> {
+    let valid = match function {
+        ScalarFunction::Lower
+        | ScalarFunction::Upper
+        | ScalarFunction::CharacterLength
+        | ScalarFunction::OctetLength
+        | ScalarFunction::Abs
+        | ScalarFunction::JsonbTypeof
+        | ScalarFunction::Cardinality => count == 1,
+        ScalarFunction::NullIf | ScalarFunction::ArrayLength | ScalarFunction::Strpos => count == 2,
+        ScalarFunction::Btrim | ScalarFunction::Ltrim | ScalarFunction::Rtrim => {
+            matches!(count, 1 | 2)
+        }
+        ScalarFunction::Replace => count == 3,
+        ScalarFunction::Substring => matches!(count, 2 | 3),
+        ScalarFunction::Coalesce
+        | ScalarFunction::Concat
+        | ScalarFunction::Greatest
+        | ScalarFunction::Least => count > 0,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(DbError::new(
+            "42883",
+            format!("function {function:?} does not accept {count} arguments"),
+        )
+        .with_position_opt(position))
+    }
+}
+
+fn interval_literal_text(expression: SqlExpr, position: Option<usize>) -> Result<String> {
+    let SqlExpr::Value(value) = expression else {
+        return unsupported_at("INTERVAL requires a string literal", position);
+    };
+    match value.value {
+        SqlValue::SingleQuotedString(value)
+        | SqlValue::EscapedStringLiteral(value)
+        | SqlValue::UnicodeStringLiteral(value)
+        | SqlValue::NationalStringLiteral(value) => Ok(value),
+        _ => unsupported_at("INTERVAL requires a string literal", position),
+    }
+}
+
+fn convert_array_expression(
+    array: SqlArray,
+    sql: &str,
+    position: Option<usize>,
+) -> Result<ParsedExprKind> {
+    if !array.named {
+        return unsupported_at("array constructors must use ARRAY[...]", position);
+    }
+    let (elements, dimensions) = flatten_array_elements(array.elem, sql, position, 0)?;
+    Ok(ParsedExprKind::Array {
+        elements,
+        dimensions,
+    })
+}
+
+fn flatten_array_elements(
+    expressions: Vec<SqlExpr>,
+    sql: &str,
+    position: Option<usize>,
+    depth: usize,
+) -> Result<(Vec<ParsedExpr>, Vec<ArrayDimension>)> {
+    const MAX_ARRAY_DIMENSIONS: usize = 6;
+    const MAX_ARRAY_ELEMENTS: usize = 1_000_000;
+    if depth >= MAX_ARRAY_DIMENSIONS {
+        return Err(DbError::new(
+            "54000",
+            format!("array exceeds the maximum of {MAX_ARRAY_DIMENSIONS} dimensions"),
+        )
+        .with_position_opt(position));
+    }
+    if expressions.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let nested = matches!(expressions.first(), Some(SqlExpr::Array(_)));
+    if expressions
+        .iter()
+        .any(|expression| matches!(expression, SqlExpr::Array(_)) != nested)
+    {
+        return Err(DbError::new(
+            "2202E",
+            "multidimensional arrays must have matching dimensions",
+        )
+        .with_position_opt(position));
+    }
+    let length = u32::try_from(expressions.len()).map_err(|_| {
+        DbError::new("54000", "array dimension is too large").with_position_opt(position)
+    })?;
+    if !nested {
+        if expressions.len() > MAX_ARRAY_ELEMENTS {
+            return Err(DbError::new(
+                "54000",
+                format!("array exceeds the maximum of {MAX_ARRAY_ELEMENTS} elements"),
+            )
+            .with_position_opt(position));
+        }
+        return Ok((
+            expressions
+                .into_iter()
+                .map(|expression| convert_expr(expression, sql))
+                .collect::<Result<Vec<_>>>()?,
+            vec![ArrayDimension::new(length, 1)],
+        ));
+    }
+
+    let mut flattened = Vec::new();
+    let mut child_dimensions: Option<Vec<ArrayDimension>> = None;
+    for expression in expressions {
+        let SqlExpr::Array(child) = expression else {
+            return Err(DbError::internal(
+                "validated nested array lost its child array",
+            ));
+        };
+        let (mut child_elements, dimensions) =
+            flatten_array_elements(child.elem, sql, position, depth + 1)?;
+        if child_dimensions
+            .as_ref()
+            .is_some_and(|expected| expected != &dimensions)
+        {
+            return Err(DbError::new(
+                "2202E",
+                "multidimensional arrays must have matching dimensions",
+            )
+            .with_position_opt(position));
+        }
+        child_dimensions.get_or_insert(dimensions);
+        flattened.append(&mut child_elements);
+        if flattened.len() > MAX_ARRAY_ELEMENTS {
+            return Err(DbError::new(
+                "54000",
+                format!("array exceeds the maximum of {MAX_ARRAY_ELEMENTS} elements"),
+            )
+            .with_position_opt(position));
+        }
+    }
+    let mut dimensions = vec![ArrayDimension::new(length, 1)];
+    dimensions.extend(child_dimensions.unwrap_or_default());
+    Ok((flattened, dimensions))
 }
 
 fn convert_row_items(
@@ -7244,7 +8599,13 @@ fn resolve_named_window_expr(
             continue;
         }
         match &mut expression.kind {
-            ParsedExprKind::Unary { expr, .. } => pending.push(expr),
+            ParsedExprKind::Unary { expr, .. } | ParsedExprKind::Cast { expr, .. } => {
+                pending.push(expr);
+            }
+            ParsedExprKind::Array { elements, .. } => pending.extend(elements.iter_mut().rev()),
+            ParsedExprKind::Function { arguments, .. } => {
+                pending.extend(arguments.iter_mut().rev());
+            }
             ParsedExprKind::Binary { left, right, .. } => {
                 pending.push(right);
                 pending.push(left);
@@ -7471,11 +8832,81 @@ fn parse_temporal_literal(
             .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f"))
             .map(Value::Timestamp)
             .map_err(|_| invalid()),
+        DataType::Timestamp(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => {
+            DateTime::parse_from_rfc3339(value)
+                .or_else(|_| DateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f%:z"))
+                .map(|value| Value::Timestamp(value.naive_utc()))
+                .map_err(|_| invalid())
+        }
+        DataType::Interval {
+            fields: None,
+            precision: None,
+        } => PgInterval::from_str(value)
+            .map(Value::Interval)
+            .map_err(|error| error.with_position_opt(position)),
+        DataType::Interval { .. } => unsupported_at(
+            "INTERVAL field and precision qualifiers are not supported yet",
+            position,
+        ),
         _ => unsupported_at("this typed literal is not supported yet", position),
     }
 }
 
 fn convert_data_type(data_type: DataType) -> Result<ScalarType> {
+    convert_data_type_with_array_depth(data_type, 0)
+}
+
+fn convert_column_data_type(
+    data_type: DataType,
+    sql: &str,
+) -> Result<(ScalarType, Option<ParsedObjectName>)> {
+    convert_column_data_type_with_array_depth(data_type, sql, 0)
+}
+
+fn convert_column_data_type_with_array_depth(
+    data_type: DataType,
+    sql: &str,
+    array_depth: usize,
+) -> Result<(ScalarType, Option<ParsedObjectName>)> {
+    match data_type {
+        DataType::Custom(name, modifiers)
+            if modifiers.is_empty()
+                && !name.to_string().eq_ignore_ascii_case("uniqueidentifier")
+                && !name.to_string().eq_ignore_ascii_case("vector") =>
+        {
+            Ok((ScalarType::Text, Some(convert_object_name(name, sql)?)))
+        }
+        DataType::Array(ArrayElemTypeDef::SquareBracket(element, _)) => {
+            const MAX_ARRAY_DIMENSIONS: usize = 6;
+            if array_depth >= MAX_ARRAY_DIMENSIONS {
+                return Err(DbError::new(
+                    "54000",
+                    format!("array type exceeds the maximum of {MAX_ARRAY_DIMENSIONS} dimensions"),
+                ));
+            }
+            let (element, declared_type) =
+                convert_column_data_type_with_array_depth(*element, sql, array_depth + 1)?;
+            Ok((
+                match element {
+                    ScalarType::Array { .. } => element,
+                    element => ScalarType::Array {
+                        element: Box::new(element),
+                    },
+                },
+                declared_type,
+            ))
+        }
+        data_type => Ok((
+            convert_data_type_with_array_depth(data_type, array_depth)?,
+            None,
+        )),
+    }
+}
+
+fn convert_data_type_with_array_depth(
+    data_type: DataType,
+    array_depth: usize,
+) -> Result<ScalarType> {
     match data_type {
         DataType::Bool | DataType::Boolean => Ok(ScalarType::Boolean),
         DataType::Int2(_) | DataType::SmallInt(_) | DataType::TinyInt(_) => Ok(ScalarType::Int16),
@@ -7517,6 +8948,30 @@ fn convert_data_type(data_type: DataType) -> Result<ScalarType> {
         DataType::Datetime(_) => Ok(ScalarType::Timestamp {
             with_timezone: false,
         }),
+        DataType::Interval {
+            fields: None,
+            precision: None,
+        } => Ok(ScalarType::Interval),
+        DataType::Interval { .. } => {
+            unsupported("INTERVAL field and precision qualifiers are not supported yet")
+        }
+        DataType::Array(ArrayElemTypeDef::SquareBracket(element, _)) => {
+            const MAX_ARRAY_DIMENSIONS: usize = 6;
+            if array_depth >= MAX_ARRAY_DIMENSIONS {
+                return Err(DbError::new(
+                    "54000",
+                    format!("array type exceeds the maximum of {MAX_ARRAY_DIMENSIONS} dimensions"),
+                ));
+            }
+            let element = convert_data_type_with_array_depth(*element, array_depth + 1)?;
+            Ok(match element {
+                ScalarType::Array { .. } => element,
+                element => ScalarType::Array {
+                    element: Box::new(element),
+                },
+            })
+        }
+        DataType::Array(_) => unsupported("only PostgreSQL type[] array syntax is supported"),
         DataType::JSON => Ok(ScalarType::Json),
         DataType::JSONB => Ok(ScalarType::Jsonb),
         DataType::Uuid => Ok(ScalarType::Uuid),
@@ -7695,6 +9150,52 @@ fn convert_ident(ident: Ident, sql: &str) -> ParsedIdentifier {
     }
 }
 
+fn resolve_declared_data_type(
+    catalog: &Catalog,
+    parsed_data_type: &ScalarType,
+    declared_type: &ParsedObjectName,
+) -> Result<(ScalarType, TypeId)> {
+    let (type_schema, type_name, type_position) = split_table_name(declared_type)?;
+    let definition = catalog
+        .user_defined_type(&type_schema, &type_name)
+        .ok_or_else(|| {
+            DbError::new(
+                "42704",
+                format!("type {type_schema}.{type_name} does not exist"),
+            )
+            .with_position_opt(type_position)
+        })?;
+    let logical_type = definition.logical_type();
+    let data_type = if matches!(parsed_data_type, ScalarType::Array { .. }) {
+        match logical_type {
+            ScalarType::Array { .. } => logical_type,
+            element => ScalarType::Array {
+                element: Box::new(element),
+            },
+        }
+    } else {
+        logical_type
+    };
+    Ok((data_type, definition.id))
+}
+
+fn resolve_user_defined_type<'a>(
+    name: &ParsedObjectName,
+    catalog: &'a Catalog,
+) -> Result<&'a TypeDefinition> {
+    let (schema, name, position) = split_table_name(name)?;
+    if catalog.schema(&schema).is_none() {
+        return Err(
+            DbError::new(UNDEFINED_SCHEMA, format!("schema {schema} does not exist"))
+                .with_position_opt(position),
+        );
+    }
+    catalog.user_defined_type(&schema, &name).ok_or_else(|| {
+        DbError::new("42704", format!("type {schema}.{name} does not exist"))
+            .with_position_opt(position)
+    })
+}
+
 fn bind_create_table(
     name: ParsedObjectName,
     columns: Vec<ParsedColumn>,
@@ -7731,16 +9232,25 @@ fn bind_create_table(
                 )
                 .with_position_opt(column.name.position));
             }
+            let (data_type, declared_type) = match column.declared_type {
+                Some(type_name) => {
+                    let (data_type, type_id) =
+                        resolve_declared_data_type(catalog, &column.data_type, &type_name)?;
+                    (data_type, Some(type_id))
+                }
+                None => (column.data_type, None),
+            };
             let default = column
                 .default
                 .map(|default| {
-                    bind_expr(default.expression, None, Some(&column.data_type))?;
+                    bind_expr(default.expression, None, Some(&data_type))?;
                     Ok(CatalogExpression::new(default.sql))
                 })
                 .transpose()?;
             Ok(NewColumn {
                 name: column.name.name,
-                data_type: column.data_type,
+                data_type,
+                declared_type,
                 nullable: column.nullable,
                 primary_key: column.primary_key,
                 unique: column.unique,
@@ -7919,7 +9429,11 @@ fn validate_check_expression(
                     .with_position_opt(column.position));
                 }
             }
-            ParsedExprKind::Unary { expr, .. } => stack.push(expr),
+            ParsedExprKind::Unary { expr, .. } | ParsedExprKind::Cast { expr, .. } => {
+                stack.push(expr);
+            }
+            ParsedExprKind::Array { elements, .. } => stack.extend(elements),
+            ParsedExprKind::Function { arguments, .. } => stack.extend(arguments),
             ParsedExprKind::Binary { left, right, .. } => {
                 stack.push(right);
                 stack.push(left);
@@ -8199,7 +9713,9 @@ fn bound_expr_references_column_at_or_after(expr: &BoundExpr, first_index: usize
     while let Some(expr) = pending.pop() {
         match &expr.kind {
             BoundExprKind::Column { index } if *index >= first_index => return true,
-            BoundExprKind::Unary { expr, .. } => pending.push(expr),
+            BoundExprKind::Unary { expr, .. } | BoundExprKind::Cast { expr } => pending.push(expr),
+            BoundExprKind::Array { elements, .. } => pending.extend(elements),
+            BoundExprKind::Function { arguments, .. } => pending.extend(arguments),
             BoundExprKind::Binary { left, right, .. } => {
                 pending.push(right);
                 pending.push(left);
@@ -8451,6 +9967,35 @@ fn qualify_conflict_expr(mut expr: ParsedExpr, target_binding: &Identifier) -> P
         ParsedExprKind::Unary { op, expr } => ParsedExprKind::Unary {
             op,
             expr: Box::new(qualify_conflict_expr(*expr, target_binding)),
+        },
+        ParsedExprKind::Cast {
+            expr,
+            data_type,
+            declared_type,
+        } => ParsedExprKind::Cast {
+            expr: Box::new(qualify_conflict_expr(*expr, target_binding)),
+            data_type,
+            declared_type,
+        },
+        ParsedExprKind::Array {
+            elements,
+            dimensions,
+        } => ParsedExprKind::Array {
+            elements: elements
+                .into_iter()
+                .map(|expr| qualify_conflict_expr(expr, target_binding))
+                .collect(),
+            dimensions,
+        },
+        ParsedExprKind::Function {
+            function,
+            arguments,
+        } => ParsedExprKind::Function {
+            function,
+            arguments: arguments
+                .into_iter()
+                .map(|expr| qualify_conflict_expr(expr, target_binding))
+                .collect(),
         },
         ParsedExprKind::Binary { left, op, right } => ParsedExprKind::Binary {
             left: Box::new(qualify_conflict_expr(*left, target_binding)),
@@ -8873,6 +10418,16 @@ fn bind_drop_objects(
                             .with_position_opt(position)
                     })
             }
+            DdlObjectKind::Type => {
+                let (schema, type_name, position) = split_table_name(&name)?;
+                catalog
+                    .user_defined_type(&schema, &type_name)
+                    .map(|definition| CatalogObjectRef::Type(definition.id))
+                    .ok_or_else(|| {
+                        DbError::new("42704", format!("type {schema}.{type_name} does not exist"))
+                            .with_position_opt(position)
+                    })
+            }
         };
         match found {
             Ok(object) => objects.push(object),
@@ -8913,6 +10468,7 @@ fn bind_alter_table(
         .map(|column| NewColumn {
             name: column.name.clone(),
             data_type: column.data_type.clone(),
+            declared_type: column.declared_type,
             nullable: column.nullable,
             primary_key: column.primary_key,
             unique: column.unique,
@@ -8974,16 +10530,25 @@ fn bind_alter_table(
                     )
                     .with_position_opt(column.name.position));
                 }
+                let (data_type, declared_type) = match column.declared_type {
+                    Some(type_name) => {
+                        let (data_type, type_id) =
+                            resolve_declared_data_type(catalog, &column.data_type, &type_name)?;
+                        (data_type, Some(type_id))
+                    }
+                    None => (column.data_type, None),
+                };
                 let default = column
                     .default
                     .map(|default| {
-                        bind_expr(default.expression, None, Some(&column.data_type))?;
+                        bind_expr(default.expression, None, Some(&data_type))?;
                         Ok(CatalogExpression::new(default.sql))
                     })
                     .transpose()?;
                 let column = NewColumn {
                     name: column.name.name,
-                    data_type: column.data_type,
+                    data_type,
+                    declared_type,
                     nullable: column.nullable,
                     primary_key: column.primary_key,
                     unique: column.unique,
@@ -9049,10 +10614,23 @@ fn bind_alter_table(
                     column_id: resolve_column_id(&table, column)?,
                 });
             }
-            ParsedAlterTableOperation::SetDataType { column, data_type } => {
+            ParsedAlterTableOperation::SetDataType {
+                column,
+                data_type,
+                declared_type,
+            } => {
+                let (data_type, declared_type) = match declared_type {
+                    Some(type_name) => {
+                        let (data_type, type_id) =
+                            resolve_declared_data_type(catalog, &data_type, &type_name)?;
+                        (data_type, Some(type_id))
+                    }
+                    None => (data_type, None),
+                };
                 bound.push(BoundAlterTableOperation::SetDataType {
                     column_id: resolve_column_id(&table, column)?,
                     data_type,
+                    declared_type,
                 });
             }
             ParsedAlterTableOperation::AddConstraint { constraint } => {
@@ -9268,6 +10846,7 @@ fn ddl_object_label(kind: DdlObjectKind) -> &'static str {
         DdlObjectKind::Sequence => "SEQUENCE",
         DdlObjectKind::View => "VIEW",
         DdlObjectKind::MaterializedView => "MATERIALIZED VIEW",
+        DdlObjectKind::Type => "TYPE",
     }
 }
 
@@ -9450,6 +11029,7 @@ fn create_cte_relation(
             .map(|field| NewColumn {
                 name: Identifier::unquoted(field.name.clone()),
                 data_type: field.data_type.clone(),
+                declared_type: None,
                 nullable: field.nullable,
                 primary_key: false,
                 unique: false,
@@ -9646,7 +11226,11 @@ fn parsed_expr_references_table(
     let mut pending = vec![expression];
     while let Some(expression) = pending.pop() {
         match &expression.kind {
-            ParsedExprKind::Unary { expr, .. } => pending.push(expr),
+            ParsedExprKind::Unary { expr, .. } | ParsedExprKind::Cast { expr, .. } => {
+                pending.push(expr);
+            }
+            ParsedExprKind::Array { elements, .. } => pending.extend(elements),
+            ParsedExprKind::Function { arguments, .. } => pending.extend(arguments),
             ParsedExprKind::Binary { left, right, .. } => {
                 pending.push(right);
                 pending.push(left);
@@ -9856,7 +11440,11 @@ fn rewrite_cte_expr(
     let mut pending = vec![expression];
     while let Some(expression) = pending.pop() {
         match &mut expression.kind {
-            ParsedExprKind::Unary { expr, .. } => pending.push(expr),
+            ParsedExprKind::Unary { expr, .. } | ParsedExprKind::Cast { expr, .. } => {
+                pending.push(expr);
+            }
+            ParsedExprKind::Array { elements, .. } => pending.extend(elements),
+            ParsedExprKind::Function { arguments, .. } => pending.extend(arguments),
             ParsedExprKind::Binary { left, right, .. } => {
                 pending.push(right);
                 pending.push(left);
@@ -10060,6 +11648,7 @@ fn bind_set_order(order: ParsedOrder, schema: &Schema) -> Result<BoundOrder> {
     Ok(BoundOrder {
         column_index,
         expression: None,
+        data_type: schema.fields[column_index].data_type.clone(),
         ascending: order.ascending,
         nulls_first: order.nulls_first,
     })
@@ -10139,6 +11728,7 @@ fn bind_projected_order(
     Ok(BoundOrder {
         column_index: position,
         expression: None,
+        data_type: projection[position].expr.data_type.clone(),
         ascending: order.ascending,
         nulls_first: order.nulls_first,
     })
@@ -10202,6 +11792,7 @@ fn bound_expression_order(order: ParsedOrder, expression: BoundExpr) -> Result<B
         )
         .with_position_opt(order.expr.position));
     }
+    let data_type = expression.data_type.clone();
     let (column_index, expression) = match &expression.kind {
         BoundExprKind::Column { index } => (*index, None),
         _ => (usize::MAX, Some(expression)),
@@ -10209,6 +11800,7 @@ fn bound_expression_order(order: ParsedOrder, expression: BoundExpr) -> Result<B
     Ok(BoundOrder {
         column_index,
         expression,
+        data_type,
         ascending: order.ascending,
         nulls_first: order.nulls_first,
     })
@@ -10296,6 +11888,41 @@ fn lower_apply_expr(
             expr: Box::new(lower_apply_expr(
                 *expr, catalog, inputs, apply_base, applies, view_depth,
             )?),
+        },
+        ParsedExprKind::Cast {
+            expr,
+            data_type,
+            declared_type,
+        } => ParsedExprKind::Cast {
+            expr: Box::new(lower_apply_expr(
+                *expr, catalog, inputs, apply_base, applies, view_depth,
+            )?),
+            data_type,
+            declared_type,
+        },
+        ParsedExprKind::Array {
+            elements,
+            dimensions,
+        } => ParsedExprKind::Array {
+            elements: elements
+                .into_iter()
+                .map(|expr| {
+                    lower_apply_expr(expr, catalog, inputs, apply_base, applies, view_depth)
+                })
+                .collect::<Result<Vec<_>>>()?,
+            dimensions,
+        },
+        ParsedExprKind::Function {
+            function,
+            arguments,
+        } => ParsedExprKind::Function {
+            function,
+            arguments: arguments
+                .into_iter()
+                .map(|expr| {
+                    lower_apply_expr(expr, catalog, inputs, apply_base, applies, view_depth)
+                })
+                .collect::<Result<Vec<_>>>()?,
         },
         ParsedExprKind::Binary { left, op, right } => ParsedExprKind::Binary {
             left: Box::new(lower_apply_expr(
@@ -10825,6 +12452,35 @@ fn lower_window_expr(
             op,
             expr: Box::new(lower_window_expr(*expr, inputs, windows)?),
         },
+        ParsedExprKind::Cast {
+            expr,
+            data_type,
+            declared_type,
+        } => ParsedExprKind::Cast {
+            expr: Box::new(lower_window_expr(*expr, inputs, windows)?),
+            data_type,
+            declared_type,
+        },
+        ParsedExprKind::Array {
+            elements,
+            dimensions,
+        } => ParsedExprKind::Array {
+            elements: elements
+                .into_iter()
+                .map(|element| lower_window_expr(element, inputs, windows))
+                .collect::<Result<Vec<_>>>()?,
+            dimensions,
+        },
+        ParsedExprKind::Function {
+            function,
+            arguments,
+        } => ParsedExprKind::Function {
+            function,
+            arguments: arguments
+                .into_iter()
+                .map(|argument| lower_window_expr(argument, inputs, windows))
+                .collect::<Result<Vec<_>>>()?,
+        },
         ParsedExprKind::Binary { left, op, right } => ParsedExprKind::Binary {
             left: Box::new(lower_window_expr(*left, inputs, windows)?),
             op,
@@ -10997,7 +12653,13 @@ fn finalize_window_values(
             continue;
         }
         match &mut expression.kind {
-            ParsedExprKind::Unary { expr, .. } => pending.push(expr),
+            ParsedExprKind::Unary { expr, .. } | ParsedExprKind::Cast { expr, .. } => {
+                pending.push(expr);
+            }
+            ParsedExprKind::Array { elements, .. } => pending.extend(elements.iter_mut().rev()),
+            ParsedExprKind::Function { arguments, .. } => {
+                pending.extend(arguments.iter_mut().rev());
+            }
             ParsedExprKind::Binary { left, right, .. } => {
                 pending.push(right);
                 pending.push(left);
@@ -11579,6 +13241,105 @@ fn bind_expr_multi(
                 }
             }
         }
+        ParsedExprKind::Cast {
+            expr, data_type, ..
+        } => {
+            if let Some(expected) = expected {
+                ensure_types_compatible(&data_type, expected, position)?;
+            }
+            let source_type = infer_multi_type(&expr, inputs)?;
+            let bound = bind_expr_multi(
+                *expr,
+                inputs,
+                source_type.is_none().then_some(&data_type),
+                allow_aggregate,
+            )?;
+            ensure_explicit_cast_supported(&bound.data_type, &data_type, position)?;
+            let nullable = bound.nullable;
+            Ok(BoundExpr {
+                kind: BoundExprKind::Cast {
+                    expr: Box::new(bound),
+                },
+                data_type,
+                nullable,
+            })
+        }
+        ParsedExprKind::Array {
+            elements,
+            dimensions,
+        } => {
+            let expected_element = match expected {
+                Some(ScalarType::Array { element }) => Some(element.as_ref().clone()),
+                Some(expected) => {
+                    return Err(DbError::new(
+                        DATATYPE_MISMATCH,
+                        format!("array cannot be assigned to {expected:?}"),
+                    )
+                    .with_position_opt(position));
+                }
+                None => None,
+            };
+            let mut element_type = expected_element;
+            for element in &elements {
+                let Some(candidate) = infer_multi_type(element, inputs)? else {
+                    continue;
+                };
+                element_type = Some(match element_type {
+                    Some(current) => common_type(&current, &candidate).ok_or_else(|| {
+                        DbError::new(
+                            DATATYPE_MISMATCH,
+                            format!(
+                                "array element types {current:?} and {candidate:?} cannot be matched"
+                            ),
+                        )
+                        .with_position_opt(position)
+                    })?,
+                    None => candidate,
+                });
+            }
+            let element_type = element_type.ok_or_else(|| {
+                DbError::new(
+                    INDETERMINATE_DATATYPE,
+                    "cannot determine type of empty array",
+                )
+                .with_hint("Explicitly cast the array, for example ARRAY[]::integer[].")
+                .with_position_opt(position)
+            })?;
+            if matches!(element_type, ScalarType::Array { .. }) {
+                return Err(DbError::new(
+                    DATATYPE_MISMATCH,
+                    "nested array values must use one flattened PostgreSQL array type",
+                )
+                .with_position_opt(position));
+            }
+            let elements = elements
+                .into_iter()
+                .map(|element| {
+                    bind_expr_multi(element, inputs, Some(&element_type), allow_aggregate)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(BoundExpr {
+                kind: BoundExprKind::Array {
+                    elements,
+                    dimensions,
+                },
+                data_type: ScalarType::Array {
+                    element: Box::new(element_type),
+                },
+                nullable: false,
+            })
+        }
+        ParsedExprKind::Function {
+            function,
+            arguments,
+        } => bind_scalar_function_multi(
+            function,
+            arguments,
+            inputs,
+            expected,
+            allow_aggregate,
+            position,
+        ),
         ParsedExprKind::Binary { left, op, right } => bind_multi_binary(
             *left,
             op,
@@ -11756,6 +13517,51 @@ fn bind_expr_multi(
     }
 }
 
+fn bind_scalar_function_multi(
+    function: ScalarFunction,
+    arguments: Vec<ParsedExpr>,
+    inputs: &[InputColumn],
+    expected: Option<&ScalarType>,
+    allow_aggregate: bool,
+    position: Option<usize>,
+) -> Result<BoundExpr> {
+    let inferred = infer_scalar_function_type(
+        function,
+        &arguments,
+        |argument| infer_multi_type(argument, inputs),
+        position,
+    )?;
+    if let (Some(actual), Some(expected)) = (&inferred, expected) {
+        ensure_types_compatible(actual, expected, position)?;
+    }
+    let common = matches!(
+        function,
+        ScalarFunction::Coalesce
+            | ScalarFunction::NullIf
+            | ScalarFunction::Greatest
+            | ScalarFunction::Least
+    )
+    .then_some(inferred.as_ref())
+    .flatten();
+    let arguments = arguments
+        .into_iter()
+        .enumerate()
+        .map(|(index, argument)| {
+            let expected = scalar_function_argument_type(function, index, common);
+            bind_expr_multi(argument, inputs, expected, allow_aggregate)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (data_type, nullable) = validate_bound_scalar_function(function, &arguments, position)?;
+    Ok(BoundExpr {
+        kind: BoundExprKind::Function {
+            function,
+            arguments,
+        },
+        data_type,
+        nullable,
+    })
+}
+
 fn bind_multi_binary(
     left: ParsedExpr,
     op: BinaryOperator,
@@ -11839,6 +13645,39 @@ fn infer_multi_type(expr: &ParsedExpr, inputs: &[InputColumn]) -> Result<Option<
             UnaryOperator::Not => Ok(Some(ScalarType::Boolean)),
             UnaryOperator::Negate => infer_multi_type(expr, inputs),
         },
+        ParsedExprKind::Cast { data_type, .. } => Ok(Some(data_type.clone())),
+        ParsedExprKind::Array { elements, .. } => {
+            let mut element_type = None;
+            for element in elements {
+                let Some(candidate) = infer_multi_type(element, inputs)? else {
+                    continue;
+                };
+                element_type = Some(match element_type {
+                    Some(current) => common_type(&current, &candidate).ok_or_else(|| {
+                        DbError::new(
+                            DATATYPE_MISMATCH,
+                            format!(
+                                "array element types {current:?} and {candidate:?} cannot be matched"
+                            ),
+                        )
+                        .with_position_opt(expr.position)
+                    })?,
+                    None => candidate,
+                });
+            }
+            Ok(element_type.map(|element| ScalarType::Array {
+                element: Box::new(element),
+            }))
+        }
+        ParsedExprKind::Function {
+            function,
+            arguments,
+        } => infer_scalar_function_type(
+            *function,
+            arguments,
+            |argument| infer_multi_type(argument, inputs),
+            expr.position,
+        ),
         ParsedExprKind::Binary { left, op, right } => {
             if is_arithmetic_operator(*op) {
                 let left = infer_multi_type(left, inputs)?;
@@ -11938,7 +13777,11 @@ fn resolve_input_column<'a>(
 fn bound_expr_has_aggregate(expr: &BoundExpr) -> bool {
     match &expr.kind {
         BoundExprKind::Aggregate { .. } => true,
-        BoundExprKind::Unary { expr, .. } => bound_expr_has_aggregate(expr),
+        BoundExprKind::Unary { expr, .. } | BoundExprKind::Cast { expr } => {
+            bound_expr_has_aggregate(expr)
+        }
+        BoundExprKind::Array { elements, .. } => elements.iter().any(bound_expr_has_aggregate),
+        BoundExprKind::Function { arguments, .. } => arguments.iter().any(bound_expr_has_aggregate),
         BoundExprKind::Binary { left, right, .. } => {
             bound_expr_has_aggregate(left) || bound_expr_has_aggregate(right)
         }
@@ -11983,7 +13826,9 @@ fn bound_expr_has_window_slot(expr: &BoundExpr, windows: &[BoundWindow]) -> bool
             {
                 return true;
             }
-            BoundExprKind::Unary { expr, .. } => pending.push(expr),
+            BoundExprKind::Unary { expr, .. } | BoundExprKind::Cast { expr } => pending.push(expr),
+            BoundExprKind::Array { elements, .. } => pending.extend(elements),
+            BoundExprKind::Function { arguments, .. } => pending.extend(arguments),
             BoundExprKind::Binary { left, right, .. } => {
                 pending.push(right);
                 pending.push(left);
@@ -12108,7 +13953,21 @@ fn validate_grouped_expr(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()>
             "42803",
             "column must appear in GROUP BY or be used in an aggregate function",
         )),
-        BoundExprKind::Unary { expr, .. } => validate_grouped_expr(expr, group_by),
+        BoundExprKind::Unary { expr, .. } | BoundExprKind::Cast { expr } => {
+            validate_grouped_expr(expr, group_by)
+        }
+        BoundExprKind::Array { elements, .. } => {
+            for element in elements {
+                validate_grouped_expr(element, group_by)?;
+            }
+            Ok(())
+        }
+        BoundExprKind::Function { arguments, .. } => {
+            for argument in arguments {
+                validate_grouped_expr(argument, group_by)?;
+            }
+            Ok(())
+        }
         BoundExprKind::Binary { left, right, .. } => {
             validate_grouped_expr(left, group_by)?;
             validate_grouped_expr(right, group_by)
@@ -12587,6 +14446,111 @@ fn bind_expr_with_parameter_types(
                 })
             }
         },
+        ParsedExprKind::Cast {
+            expr, data_type, ..
+        } => {
+            if let Some(expected) = expected {
+                ensure_types_compatible(&data_type, expected, position)?;
+            }
+            let source_type = infer_expr_type(&expr, table, parameter_types)?;
+            let bound = bind_expr_with_parameter_types(
+                *expr,
+                table,
+                source_type.is_none().then_some(&data_type),
+                parameter_types,
+            )?;
+            ensure_explicit_cast_supported(&bound.data_type, &data_type, position)?;
+            let nullable = bound.nullable;
+            Ok(BoundExpr {
+                kind: BoundExprKind::Cast {
+                    expr: Box::new(bound),
+                },
+                data_type,
+                nullable,
+            })
+        }
+        ParsedExprKind::Array {
+            elements,
+            dimensions,
+        } => {
+            let expected_element = match expected {
+                Some(ScalarType::Array { element }) => Some(element.as_ref().clone()),
+                Some(expected) => {
+                    return Err(DbError::new(
+                        DATATYPE_MISMATCH,
+                        format!("array cannot be assigned to {expected:?}"),
+                    )
+                    .with_position_opt(position));
+                }
+                None => None,
+            };
+            let mut element_type = expected_element;
+            for element in &elements {
+                let Some(candidate) = infer_expr_type(element, table, parameter_types)? else {
+                    continue;
+                };
+                element_type = Some(match element_type {
+                    Some(current) => common_type_with_literal(&current, &candidate, None, element)
+                        .ok_or_else(|| {
+                        DbError::new(
+                            DATATYPE_MISMATCH,
+                            format!(
+                                "array element types {current:?} and {candidate:?} cannot be matched"
+                            ),
+                        )
+                        .with_position_opt(position)
+                    })?,
+                    None => candidate,
+                });
+            }
+            let element_type = element_type.ok_or_else(|| {
+                DbError::new(
+                    INDETERMINATE_DATATYPE,
+                    "cannot determine type of empty array",
+                )
+                .with_hint("Explicitly cast the array, for example ARRAY[]::integer[].")
+                .with_position_opt(position)
+            })?;
+            if matches!(element_type, ScalarType::Array { .. }) {
+                return Err(DbError::new(
+                    DATATYPE_MISMATCH,
+                    "nested array values must use one flattened PostgreSQL array type",
+                )
+                .with_position_opt(position));
+            }
+            let elements = elements
+                .into_iter()
+                .map(|element| {
+                    bind_expr_with_parameter_types(
+                        element,
+                        table,
+                        Some(&element_type),
+                        parameter_types,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(BoundExpr {
+                kind: BoundExprKind::Array {
+                    elements,
+                    dimensions,
+                },
+                data_type: ScalarType::Array {
+                    element: Box::new(element_type),
+                },
+                nullable: false,
+            })
+        }
+        ParsedExprKind::Function {
+            function,
+            arguments,
+        } => bind_scalar_function(
+            function,
+            arguments,
+            table,
+            expected,
+            parameter_types,
+            position,
+        ),
         ParsedExprKind::Binary { left, op, right } => bind_binary(
             *left,
             op,
@@ -12615,15 +14579,18 @@ fn bind_expr_with_parameter_types(
                     continue;
                 };
                 operand_type = Some(match operand_type {
-                    Some(current) => common_type(&current, &candidate_type).ok_or_else(|| {
-                        DbError::new(
+                    Some(current) => {
+                        common_type_with_literal(&current, &candidate_type, Some(&expr), candidate)
+                            .ok_or_else(|| {
+                                DbError::new(
                             DATATYPE_MISMATCH,
                             format!(
                                 "IN types {current:?} and {candidate_type:?} cannot be matched"
                             ),
                         )
                         .with_position_opt(position)
-                    })?,
+                            })?
+                    }
                     None => candidate_type,
                 });
             }
@@ -12696,6 +14663,51 @@ fn bind_expr_with_parameter_types(
     }
 }
 
+fn bind_scalar_function(
+    function: ScalarFunction,
+    arguments: Vec<ParsedExpr>,
+    table: Option<&TableDefinition>,
+    expected: Option<&ScalarType>,
+    parameter_types: &BTreeMap<usize, ScalarType>,
+    position: Option<usize>,
+) -> Result<BoundExpr> {
+    let inferred = infer_scalar_function_type(
+        function,
+        &arguments,
+        |argument| infer_expr_type(argument, table, parameter_types),
+        position,
+    )?;
+    if let (Some(actual), Some(expected)) = (&inferred, expected) {
+        ensure_types_compatible(actual, expected, position)?;
+    }
+    let common = matches!(
+        function,
+        ScalarFunction::Coalesce
+            | ScalarFunction::NullIf
+            | ScalarFunction::Greatest
+            | ScalarFunction::Least
+    )
+    .then_some(inferred.as_ref())
+    .flatten();
+    let arguments = arguments
+        .into_iter()
+        .enumerate()
+        .map(|(index, argument)| {
+            let expected = scalar_function_argument_type(function, index, common);
+            bind_expr_with_parameter_types(argument, table, expected, parameter_types)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (data_type, nullable) = validate_bound_scalar_function(function, &arguments, position)?;
+    Ok(BoundExpr {
+        kind: BoundExprKind::Function {
+            function,
+            arguments,
+        },
+        data_type,
+        nullable,
+    })
+}
+
 fn bind_binary(
     left: ParsedExpr,
     op: BinaryOperator,
@@ -12739,13 +14751,17 @@ fn bind_binary(
     let left_type = infer_expr_type(&left, table, parameter_types)?;
     let right_type = infer_expr_type(&right, table, parameter_types)?;
     let mut operand_type = match (left_type, right_type) {
-        (Some(left), Some(right)) => common_type(&left, &right).ok_or_else(|| {
-            DbError::new(
-                DATATYPE_MISMATCH,
-                format!("operator cannot match {left:?} with {right:?}"),
-            )
-            .with_position_opt(position)
-        })?,
+        (Some(left_type), Some(right_type)) => {
+            common_type_with_literal(&left_type, &right_type, Some(&left), &right).ok_or_else(
+                || {
+                    DbError::new(
+                        DATATYPE_MISMATCH,
+                        format!("operator cannot match {left_type:?} with {right_type:?}"),
+                    )
+                    .with_position_opt(position)
+                },
+            )?
+        }
         (Some(data_type), None) | (None, Some(data_type)) => data_type,
         (None, None) => {
             return Err(DbError::new(
@@ -12810,6 +14826,39 @@ fn infer_expr_type(
             UnaryOperator::Not => Ok(Some(ScalarType::Boolean)),
             UnaryOperator::Negate => infer_expr_type(inner, table, parameter_types),
         },
+        ParsedExprKind::Cast { data_type, .. } => Ok(Some(data_type.clone())),
+        ParsedExprKind::Array { elements, .. } => {
+            let mut element_type = None;
+            for element in elements {
+                let Some(candidate) = infer_expr_type(element, table, parameter_types)? else {
+                    continue;
+                };
+                element_type = Some(match element_type {
+                    Some(current) => common_type(&current, &candidate).ok_or_else(|| {
+                        DbError::new(
+                            DATATYPE_MISMATCH,
+                            format!(
+                                "array element types {current:?} and {candidate:?} cannot be matched"
+                            ),
+                        )
+                        .with_position_opt(expr.position)
+                    })?,
+                    None => candidate,
+                });
+            }
+            Ok(element_type.map(|element| ScalarType::Array {
+                element: Box::new(element),
+            }))
+        }
+        ParsedExprKind::Function {
+            function,
+            arguments,
+        } => infer_scalar_function_type(
+            *function,
+            arguments,
+            |argument| infer_expr_type(argument, table, parameter_types),
+            expr.position,
+        ),
         ParsedExprKind::Binary { left, op, right } => {
             if is_arithmetic_operator(*op) {
                 let left = infer_expr_type(left, table, parameter_types)?;
@@ -12855,6 +14904,13 @@ fn bind_literal(
     let data_type = match expected {
         Some(expected) => {
             if !expected.accepts(&value) {
+                if let (ScalarType::Enum { .. }, Value::Text(label)) = (expected, &value) {
+                    return Err(DbError::new(
+                        "22P02",
+                        format!("invalid input value for enum: {label}"),
+                    )
+                    .with_position_opt(position));
+                }
                 return Err(DbError::new(
                     DATATYPE_MISMATCH,
                     format!("value cannot be assigned to {expected:?}"),
@@ -12941,6 +14997,201 @@ fn projection_name(expr: &ParsedExpr) -> String {
     "?column?".to_owned()
 }
 
+fn infer_scalar_function_type<F>(
+    function: ScalarFunction,
+    arguments: &[ParsedExpr],
+    mut infer: F,
+    position: Option<usize>,
+) -> Result<Option<ScalarType>>
+where
+    F: FnMut(&ParsedExpr) -> Result<Option<ScalarType>>,
+{
+    match function {
+        ScalarFunction::Lower
+        | ScalarFunction::Upper
+        | ScalarFunction::Concat
+        | ScalarFunction::Substring
+        | ScalarFunction::Btrim
+        | ScalarFunction::Ltrim
+        | ScalarFunction::Rtrim
+        | ScalarFunction::Replace
+        | ScalarFunction::JsonbTypeof => Ok(Some(ScalarType::Text)),
+        ScalarFunction::CharacterLength
+        | ScalarFunction::OctetLength
+        | ScalarFunction::ArrayLength
+        | ScalarFunction::Cardinality
+        | ScalarFunction::Strpos => Ok(Some(ScalarType::Int32)),
+        ScalarFunction::Abs => infer(&arguments[0]),
+        ScalarFunction::Coalesce
+        | ScalarFunction::NullIf
+        | ScalarFunction::Greatest
+        | ScalarFunction::Least => {
+            let mut common = None;
+            for argument in arguments {
+                let Some(candidate) = infer(argument)? else {
+                    continue;
+                };
+                common = Some(match common {
+                    Some(current) => common_type(&current, &candidate).ok_or_else(|| {
+                        DbError::new(
+                            DATATYPE_MISMATCH,
+                            format!(
+                                "function argument types {current:?} and {candidate:?} cannot be matched"
+                            ),
+                        )
+                        .with_position_opt(position)
+                    })?,
+                    None => candidate,
+                });
+            }
+            Ok(common)
+        }
+    }
+}
+
+fn scalar_function_argument_type(
+    function: ScalarFunction,
+    index: usize,
+    common: Option<&ScalarType>,
+) -> Option<&ScalarType> {
+    match function {
+        ScalarFunction::Lower
+        | ScalarFunction::Upper
+        | ScalarFunction::Btrim
+        | ScalarFunction::Ltrim
+        | ScalarFunction::Rtrim
+        | ScalarFunction::Replace
+        | ScalarFunction::Strpos => Some(&ScalarType::Text),
+        ScalarFunction::Substring if index == 0 => Some(&ScalarType::Text),
+        ScalarFunction::Substring => Some(&ScalarType::Int32),
+        ScalarFunction::JsonbTypeof => Some(&ScalarType::Jsonb),
+        ScalarFunction::ArrayLength if index == 1 => Some(&ScalarType::Int32),
+        ScalarFunction::Coalesce
+        | ScalarFunction::NullIf
+        | ScalarFunction::Greatest
+        | ScalarFunction::Least => common,
+        ScalarFunction::CharacterLength
+        | ScalarFunction::OctetLength
+        | ScalarFunction::Abs
+        | ScalarFunction::Concat
+        | ScalarFunction::ArrayLength
+        | ScalarFunction::Cardinality => None,
+    }
+}
+
+fn validate_bound_scalar_function(
+    function: ScalarFunction,
+    arguments: &[BoundExpr],
+    position: Option<usize>,
+) -> Result<(ScalarType, bool)> {
+    let invalid = |message: String| DbError::new("42883", message).with_position_opt(position);
+    match function {
+        ScalarFunction::Lower | ScalarFunction::Upper => {
+            if !is_textual(&arguments[0].data_type) {
+                return Err(invalid(format!(
+                    "function {function:?} requires a textual argument"
+                )));
+            }
+            Ok((ScalarType::Text, arguments[0].nullable))
+        }
+        ScalarFunction::CharacterLength | ScalarFunction::OctetLength => {
+            if !is_textual(&arguments[0].data_type) && arguments[0].data_type != ScalarType::Binary
+            {
+                return Err(invalid(format!(
+                    "function {function:?} requires text or bytea"
+                )));
+            }
+            Ok((ScalarType::Int32, arguments[0].nullable))
+        }
+        ScalarFunction::Abs => {
+            if !is_numeric(&arguments[0].data_type) {
+                return Err(invalid("ABS requires a numeric argument".to_owned()));
+            }
+            Ok((arguments[0].data_type.clone(), arguments[0].nullable))
+        }
+        ScalarFunction::Coalesce => {
+            let data_type = arguments
+                .first()
+                .map(|argument| argument.data_type.clone())
+                .ok_or_else(|| invalid("COALESCE requires an argument".to_owned()))?;
+            Ok((
+                data_type,
+                arguments.iter().all(|argument| argument.nullable),
+            ))
+        }
+        ScalarFunction::NullIf => Ok((arguments[0].data_type.clone(), true)),
+        ScalarFunction::Concat => Ok((ScalarType::Text, false)),
+        ScalarFunction::Substring => Ok((
+            ScalarType::Text,
+            arguments.iter().any(|argument| argument.nullable),
+        )),
+        ScalarFunction::Btrim | ScalarFunction::Ltrim | ScalarFunction::Rtrim => {
+            if arguments
+                .iter()
+                .any(|argument| !is_textual(&argument.data_type))
+            {
+                return Err(invalid(format!(
+                    "function {function:?} requires textual arguments"
+                )));
+            }
+            Ok((
+                ScalarType::Text,
+                arguments.iter().any(|argument| argument.nullable),
+            ))
+        }
+        ScalarFunction::Replace | ScalarFunction::Strpos => {
+            if arguments
+                .iter()
+                .any(|argument| !is_textual(&argument.data_type))
+            {
+                return Err(invalid(format!(
+                    "function {function:?} requires textual arguments"
+                )));
+            }
+            Ok((
+                if function == ScalarFunction::Strpos {
+                    ScalarType::Int32
+                } else {
+                    ScalarType::Text
+                },
+                arguments.iter().any(|argument| argument.nullable),
+            ))
+        }
+        ScalarFunction::Greatest | ScalarFunction::Least => {
+            let data_type = arguments
+                .first()
+                .map(|argument| argument.data_type.clone())
+                .ok_or_else(|| invalid(format!("function {function:?} requires an argument")))?;
+            if arguments
+                .iter()
+                .any(|argument| argument.data_type != data_type)
+            {
+                return Err(invalid(format!(
+                    "function {function:?} arguments must have a common type"
+                )));
+            }
+            Ok((
+                data_type,
+                arguments.iter().all(|argument| argument.nullable),
+            ))
+        }
+        ScalarFunction::JsonbTypeof => {
+            if arguments[0].data_type != ScalarType::Jsonb {
+                return Err(invalid("JSONB_TYPEOF requires a jsonb argument".to_owned()));
+            }
+            Ok((ScalarType::Text, arguments[0].nullable))
+        }
+        ScalarFunction::ArrayLength | ScalarFunction::Cardinality => {
+            if !matches!(arguments[0].data_type, ScalarType::Array { .. }) {
+                return Err(invalid(format!(
+                    "function {function:?} requires an array argument"
+                )));
+            }
+            Ok((ScalarType::Int32, true))
+        }
+    }
+}
+
 fn common_type(left: &ScalarType, right: &ScalarType) -> Option<ScalarType> {
     if left == right {
         return Some(left.clone());
@@ -12958,6 +15209,59 @@ fn common_type(left: &ScalarType, right: &ScalarType) -> Option<ScalarType> {
     None
 }
 
+fn common_type_with_literal(
+    left: &ScalarType,
+    right: &ScalarType,
+    left_expr: Option<&ParsedExpr>,
+    right_expr: &ParsedExpr,
+) -> Option<ScalarType> {
+    common_type(left, right).or_else(|| match (left, right) {
+        (ScalarType::Enum { .. }, ScalarType::Text) if is_unknown_text_literal(right_expr) => {
+            Some(left.clone())
+        }
+        (ScalarType::Text, ScalarType::Enum { .. })
+            if left_expr.is_some_and(is_unknown_text_literal) =>
+        {
+            Some(right.clone())
+        }
+        (
+            ScalarType::Array {
+                element: left_element,
+            },
+            ScalarType::Array {
+                element: right_element,
+            },
+        ) if is_unknown_text_literal(right_expr)
+            && matches!(left_element.as_ref(), ScalarType::Enum { .. })
+            && matches!(right_element.as_ref(), ScalarType::Text) =>
+        {
+            Some(left.clone())
+        }
+        (
+            ScalarType::Array {
+                element: left_element,
+            },
+            ScalarType::Array {
+                element: right_element,
+            },
+        ) if left_expr.is_some_and(is_unknown_text_literal)
+            && matches!(left_element.as_ref(), ScalarType::Text)
+            && matches!(right_element.as_ref(), ScalarType::Enum { .. }) =>
+        {
+            Some(right.clone())
+        }
+        _ => None,
+    })
+}
+
+fn is_unknown_text_literal(expression: &ParsedExpr) -> bool {
+    match &expression.kind {
+        ParsedExprKind::Literal(Value::Text(_) | Value::Null) => true,
+        ParsedExprKind::Array { elements, .. } => elements.iter().all(is_unknown_text_literal),
+        _ => false,
+    }
+}
+
 fn ensure_types_compatible(
     actual: &ScalarType,
     expected: &ScalarType,
@@ -12971,6 +15275,63 @@ fn ensure_types_compatible(
         .with_position_opt(position));
     }
     Ok(())
+}
+
+fn ensure_explicit_cast_supported(
+    source: &ScalarType,
+    target: &ScalarType,
+    position: Option<usize>,
+) -> Result<()> {
+    let supported = source == target
+        || (is_numeric(source) && is_numeric(target))
+        || is_textual(target)
+        || (is_textual(source)
+            && matches!(
+                target,
+                ScalarType::Boolean
+                    | ScalarType::Int16
+                    | ScalarType::Int32
+                    | ScalarType::Int64
+                    | ScalarType::Float32
+                    | ScalarType::Float64
+                    | ScalarType::Decimal { .. }
+                    | ScalarType::Binary
+                    | ScalarType::Date
+                    | ScalarType::Time
+                    | ScalarType::Timestamp { .. }
+                    | ScalarType::Interval
+                    | ScalarType::Json
+                    | ScalarType::Jsonb
+                    | ScalarType::Uuid
+                    | ScalarType::Enum { .. }
+            ))
+        || matches!(
+            (source, target),
+            (
+                ScalarType::Date,
+                ScalarType::Timestamp {
+                    with_timezone: false
+                }
+            ) | (
+                ScalarType::Timestamp { .. },
+                ScalarType::Date | ScalarType::Time
+            ) | (ScalarType::Timestamp { .. }, ScalarType::Timestamp { .. })
+                | (ScalarType::Json, ScalarType::Jsonb)
+                | (ScalarType::Jsonb, ScalarType::Json)
+        )
+        || matches!(
+            (source, target),
+            (ScalarType::Array { .. }, ScalarType::Array { .. })
+        );
+    if supported {
+        Ok(())
+    } else {
+        Err(DbError::new(
+            "42846",
+            format!("cannot cast type {source:?} to {target:?}"),
+        )
+        .with_position_opt(position))
+    }
 }
 
 const fn is_arithmetic_operator(operator: BinaryOperator) -> bool {
@@ -13342,6 +15703,7 @@ mod tests {
                     NewColumn {
                         name: Identifier::unquoted("id"),
                         data_type: ScalarType::Int64,
+                        declared_type: None,
                         nullable: false,
                         primary_key: true,
                         unique: true,
@@ -13350,6 +15712,7 @@ mod tests {
                     NewColumn {
                         name: Identifier::unquoted("title"),
                         data_type: ScalarType::Text,
+                        declared_type: None,
                         nullable: false,
                         primary_key: false,
                         unique: false,
@@ -13387,6 +15750,118 @@ mod tests {
         assert_eq!(order_by[0].column_index, 0);
         assert!(!order_by[0].ascending);
         assert!(limit.is_some());
+    }
+
+    #[test]
+    fn parses_and_binds_interval_arrays_and_explicit_casts() {
+        let catalog = catalog_with_documents();
+        let statement = bind(
+            parse(
+                "SELECT ARRAY[[1, 2], [3, 4]]::BIGINT[] AS values, \
+                 INTERVAL '1 day 02:03:04.5' AS duration FROM documents",
+            )
+            .expect("parse typed expressions"),
+            &catalog,
+        )
+        .expect("bind typed expressions");
+        let projection = match statement {
+            BoundStatement::Select { projection, .. }
+            | BoundStatement::AdvancedSelect { projection, .. } => projection,
+            other => panic!("unexpected statement: {other:?}"),
+        };
+        assert_eq!(
+            projection[0].expr.data_type,
+            ScalarType::Array {
+                element: Box::new(ScalarType::Int64),
+            }
+        );
+        let BoundExprKind::Cast { expr } = &projection[0].expr.kind else {
+            panic!("array cast");
+        };
+        assert!(matches!(
+            &expr.kind,
+            BoundExprKind::Array { dimensions, elements }
+                if dimensions == &[
+                    ArrayDimension::new(2, 1),
+                    ArrayDimension::new(2, 1),
+                ] && elements.len() == 4
+        ));
+        assert_eq!(projection[1].expr.data_type, ScalarType::Interval);
+
+        let ddl = bind(
+            parse(
+                "CREATE TABLE typed_values (ids BIGINT[], elapsed INTERVAL, observed TIMESTAMPTZ)",
+            )
+            .expect("parse typed DDL"),
+            &Catalog::default(),
+        )
+        .expect("bind typed DDL");
+        let BoundStatement::CreateTable { columns, .. } = ddl else {
+            panic!("create table");
+        };
+        assert_eq!(
+            columns[0].data_type,
+            ScalarType::Array {
+                element: Box::new(ScalarType::Int64),
+            }
+        );
+        assert_eq!(columns[1].data_type, ScalarType::Interval);
+        assert_eq!(
+            columns[2].data_type,
+            ScalarType::Timestamp {
+                with_timezone: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_and_binds_common_scalar_functions() {
+        let statement = bind(
+            parse(
+                "SELECT LOWER(title), UPPER(title), LENGTH(title), OCTET_LENGTH(title), \
+                 ABS(id), COALESCE(title, 'fallback'), NULLIF(id, 0), \
+                 CONCAT(title, id), SUBSTRING(title FROM 1 FOR 2), \
+                 JSONB_TYPEOF('{\"a\":1}'::JSONB), ARRAY_LENGTH(ARRAY[[1,2],[3,4]], 2), \
+                 CARDINALITY(ARRAY[1,2,3]), BTRIM('xyhelloxy', 'xy'), \
+                 LTRIM('  hello'), RTRIM('hello  '), REPLACE(title, 'a', 'b'), \
+                 STRPOS('åbcå', 'c'), GREATEST(id, 0), LEAST(id, 0), \
+                 TRIM(BOTH 'xy' FROM 'xyhelloxy'), POSITION('c' IN 'åbcå') FROM documents",
+            )
+            .expect("parse scalar functions"),
+            &catalog_with_documents(),
+        )
+        .expect("bind scalar functions");
+        let projection = match statement {
+            BoundStatement::Select { projection, .. }
+            | BoundStatement::AdvancedSelect { projection, .. } => projection,
+            other => panic!("unexpected statement: {other:?}"),
+        };
+        assert_eq!(projection.len(), 21);
+        assert_eq!(projection[0].expr.data_type, ScalarType::Text);
+        assert_eq!(projection[2].expr.data_type, ScalarType::Int32);
+        assert_eq!(projection[4].expr.data_type, ScalarType::Int64);
+        assert_eq!(projection[7].expr.data_type, ScalarType::Text);
+        assert_eq!(projection[9].expr.data_type, ScalarType::Text);
+        assert_eq!(projection[10].expr.data_type, ScalarType::Int32);
+        assert_eq!(projection[12].expr.data_type, ScalarType::Text);
+        assert_eq!(projection[16].expr.data_type, ScalarType::Int32);
+        assert_eq!(projection[17].expr.data_type, ScalarType::Int64);
+        assert_eq!(projection[18].expr.data_type, ScalarType::Int64);
+        assert_eq!(projection[19].expr.data_type, ScalarType::Text);
+        assert_eq!(projection[20].expr.data_type, ScalarType::Int32);
+
+        let parameter = bind(
+            parse("SELECT LOWER($1) FROM documents").expect("parse function parameter"),
+            &catalog_with_documents(),
+        )
+        .expect("bind function parameter");
+        let BoundStatement::Select { projection, .. } = parameter else {
+            panic!("parameter select");
+        };
+        let BoundExprKind::Function { arguments, .. } = &projection[0].expr.kind else {
+            panic!("lower call");
+        };
+        assert_eq!(arguments[0].data_type, ScalarType::Text);
     }
 
     #[test]
@@ -14707,7 +17182,7 @@ mod tests {
     #[test]
     fn parses_procedure_options_across_arbitrary_whitespace() {
         let procedure = parse(
-            "CREATE PROCEDURE public.refresh_items(value BIGINT)
+            "CREATE PROCEDURE public.refresh_items(value public.mood, count BIGINT)
              LANGUAGE
              plpgsql
              AS $body$
@@ -14724,7 +17199,10 @@ mod tests {
                 arguments,
                 body,
                 ..
-            } if arguments.len() == 1 && body.contains("RETURN")
+            } if arguments.len() == 2
+                && arguments[0].declared_type.is_some()
+                && arguments[1].declared_type.is_none()
+                && body.contains("RETURN")
         ));
     }
 
@@ -15465,6 +17943,7 @@ mod tests {
                     NewColumn {
                         name: Identifier::unquoted("id"),
                         data_type: ScalarType::Int64,
+                        declared_type: None,
                         nullable: false,
                         primary_key: true,
                         unique: true,
@@ -15473,6 +17952,7 @@ mod tests {
                     NewColumn {
                         name: Identifier::unquoted("title"),
                         data_type: ScalarType::Text,
+                        declared_type: None,
                         nullable: false,
                         primary_key: false,
                         unique: false,
@@ -15686,6 +18166,374 @@ mod tests {
         assert!(error.message.contains("SQL Server"), "{error:?}");
     }
 
+    #[test]
+    fn parses_and_binds_enum_domain_and_named_column_types() {
+        let enum_statement =
+            parse("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')").expect("parse enum");
+        assert!(matches!(
+            enum_statement,
+            ParsedStatement::CreateEnumType { ref labels, .. }
+                if labels == &["sad", "ok", "happy"]
+        ));
+
+        let domain_statement = parse(
+            "CREATE DOMAIN positive_int AS integer DEFAULT 1 NOT NULL \
+             CONSTRAINT positive CHECK (VALUE > 0)",
+        )
+        .expect("parse domain");
+        assert!(matches!(
+            bind(domain_statement, &Catalog::default()).expect("bind domain"),
+            BoundStatement::CreateDomain { not_null: true, ref checks, .. }
+                if checks.len() == 1
+                    && checks[0].name.as_ref().is_some_and(|name| name.as_str() == "positive")
+        ));
+
+        let mut catalog = catalog_with_documents();
+        let type_id = catalog
+            .create_enum_type(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("mood"),
+                vec!["sad".into(), "ok".into(), "happy".into()],
+            )
+            .expect("catalog enum");
+        let domain_id = catalog
+            .create_domain(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("positive_int"),
+                ScalarType::Int32,
+                true,
+                None,
+                Vec::new(),
+            )
+            .expect("catalog domain");
+        let add_value = bind(
+            parse("ALTER TYPE mood ADD VALUE IF NOT EXISTS 'calm' BEFORE 'happy'")
+                .expect("parse enum add value"),
+            &catalog,
+        )
+        .expect("bind enum add value");
+        assert!(matches!(
+            add_value,
+            BoundStatement::AlterEnumAddValue {
+                type_id: altered_type_id,
+                ref label,
+                position: Some(EnumValuePosition::Before(ref neighbor)),
+                if_not_exists: true,
+            } if altered_type_id == type_id && label == "calm" && neighbor == "happy"
+        ));
+        assert!(matches!(
+            bind(
+                parse("ALTER TYPE mood RENAME VALUE 'ok' TO 'fine'")
+                    .expect("parse enum rename value"),
+                &catalog,
+            )
+            .expect("bind enum rename value"),
+            BoundStatement::AlterEnumRenameValue {
+                type_id: altered_type_id,
+                ref old_label,
+                ref new_label,
+            } if altered_type_id == type_id && old_label == "ok" && new_label == "fine"
+        ));
+        assert!(matches!(
+            bind(
+                parse("ALTER DOMAIN positive_int SET DEFAULT 2")
+                    .expect("parse domain default"),
+                &catalog,
+            )
+            .expect("bind domain default"),
+            BoundStatement::AlterDomain {
+                type_id: altered_type_id,
+                operation: BoundAlterDomainOperation::SetDefault(ref default),
+            } if altered_type_id == domain_id && default.sql == "2"
+        ));
+        assert!(matches!(
+            bind(
+                parse(
+                    "ALTER DOMAIN positive_int ADD CONSTRAINT below_limit CHECK (VALUE < 100)",
+                )
+                .expect("parse domain constraint"),
+                &catalog,
+            )
+            .expect("bind domain constraint"),
+            BoundStatement::AlterDomain {
+                type_id: altered_type_id,
+                operation: BoundAlterDomainOperation::AddConstraint(ref constraint),
+            } if altered_type_id == domain_id
+                && constraint.name.as_ref().is_some_and(|name| name.as_str() == "below_limit")
+        ));
+        assert_eq!(
+            bind(
+                parse("ALTER DOMAIN mood SET NOT NULL").expect("parse wrong domain kind"),
+                &catalog,
+            )
+            .expect_err("enum is not a domain")
+            .sql_state,
+            "42809"
+        );
+        let bound = bind(
+            parse("CREATE TABLE feelings (current_mood mood NOT NULL)").expect("parse table"),
+            &catalog,
+        )
+        .expect("bind table");
+        assert!(matches!(
+            bound,
+            BoundStatement::CreateTable { ref columns, .. }
+                if columns[0].declared_type == Some(type_id)
+                    && columns[0].data_type == ScalarType::Enum {
+                        type_id,
+                        labels: vec!["sad".into(), "ok".into(), "happy".into()],
+                    }
+        ));
+
+        let cast = bind(
+            parse(
+                "SELECT $1::mood, 'sad'::mood, $2::positive_int, \
+                 ARRAY['sad', 'happy']::mood[] FROM documents",
+            )
+            .expect("parse named casts"),
+            &catalog,
+        )
+        .expect("bind named casts");
+        let BoundStatement::Select { projection, .. } = cast else {
+            panic!("expected named cast select");
+        };
+        let enum_type = ScalarType::Enum {
+            type_id,
+            labels: vec!["sad".into(), "ok".into(), "happy".into()],
+        };
+        assert_eq!(projection[0].expr.data_type, enum_type);
+        assert_eq!(projection[1].expr.data_type, enum_type);
+        assert_eq!(projection[2].expr.data_type, ScalarType::Int32);
+        assert_eq!(
+            projection[3].expr.data_type,
+            ScalarType::Array {
+                element: Box::new(enum_type),
+            }
+        );
+
+        let function = bind(
+            parse(
+                "CREATE FUNCTION echo_mood(value mood) RETURNS mood \
+                 LANGUAGE plpgsql AS $$ BEGIN RETURN value; END $$",
+            )
+            .expect("parse named type function"),
+            &catalog,
+        )
+        .expect("bind named type function");
+        assert!(matches!(
+            function,
+            BoundStatement::CreateRoutine {
+                ref arguments,
+                return_declared_type: Some(return_type_id),
+                ..
+            } if arguments[0].declared_type == Some(type_id) && return_type_id == type_id
+        ));
+
+        let alter = bind(
+            parse("ALTER TABLE documents ALTER COLUMN title TYPE mood")
+                .expect("parse named type alter"),
+            &catalog,
+        )
+        .expect("bind named type alter");
+        assert!(matches!(
+            alter,
+            BoundStatement::AlterTable { ref operations, .. }
+                if matches!(
+                    operations.as_slice(),
+                    [BoundAlterTableOperation::SetDataType {
+                        declared_type: Some(alter_type_id),
+                        ..
+                    }] if *alter_type_id == type_id
+                )
+        ));
+
+        let error = bind(
+            parse("SELECT 'value'::missing_type FROM documents").expect("parse missing named cast"),
+            &catalog,
+        )
+        .expect_err("undefined named cast type");
+        assert_eq!(error.sql_state, "42704");
+
+        let drop = bind(parse("DROP TYPE mood").expect("parse drop"), &catalog).expect("bind drop");
+        assert!(matches!(
+            drop,
+            BoundStatement::DropObjects {
+                kind: DdlObjectKind::Type,
+                ..
+            }
+        ));
+
+        let error = bind(
+            parse("CREATE TABLE missing_type (value unknown_named_type)")
+                .expect("parse unknown type"),
+            &catalog,
+        )
+        .expect_err("undefined named type");
+        assert_eq!(error.sql_state, "42704");
+
+        let error = bind(
+            parse("CREATE DOMAIN bad_check AS integer CHECK (missing > 0)")
+                .expect("parse invalid domain check"),
+            &catalog,
+        )
+        .expect_err("invalid domain check");
+        assert_eq!(error.sql_state, UNDEFINED_COLUMN);
+
+        assert!(!create_domain_is_not_null(
+            "CREATE DOMAIN nullable_flag AS boolean DEFAULT NULL IS NOT NULL"
+        ));
+
+        for sql in [
+            "CREATE TYPE shell_type",
+            "CREATE TYPE inventory_item AS (name text)",
+        ] {
+            let error = parse(sql).expect_err("unsupported type definition");
+            assert_eq!(error.sql_state, FEATURE_NOT_SUPPORTED, "{sql}");
+        }
+    }
+
+    #[test]
+    fn binds_named_domain_bases_catalog_expressions_and_routine_identity() {
+        use ordadb_catalog::{DomainBaseType, NewRoutine};
+
+        let mut catalog = Catalog::default();
+        let mood_id = catalog
+            .create_enum_type(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("mood"),
+                vec!["sad".into(), "ok".into(), "happy".into()],
+            )
+            .expect("create mood");
+        let mood_type = catalog.type_by_id(mood_id).expect("mood").logical_type();
+        let mood_domain = bind(
+            parse(
+                "CREATE DOMAIN cheerful_mood AS mood DEFAULT 'ok'::mood \
+                 CHECK (VALUE <> 'sad'::mood)",
+            )
+            .expect("parse enum domain"),
+            &catalog,
+        )
+        .expect("bind enum domain");
+        assert!(matches!(
+            mood_domain,
+            BoundStatement::CreateDomain {
+                base_declared_type: Some(type_id),
+                ref base_type,
+                ..
+            } if type_id == mood_id && base_type == &mood_type
+        ));
+        let cheerful_id = catalog
+            .create_domain_with_declared_type(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("cheerful_mood"),
+                DomainBaseType::new(mood_type, Some(mood_id)),
+                false,
+                Some(CatalogExpression::new("'ok'::mood")),
+                Vec::new(),
+            )
+            .expect("create enum domain");
+        assert!(matches!(
+            bind(
+                parse("ALTER DOMAIN cheerful_mood SET DEFAULT 'happy'::mood")
+                    .expect("parse named domain default"),
+                &catalog,
+            )
+            .expect("bind named domain default"),
+            BoundStatement::AlterDomain {
+                type_id,
+                operation: BoundAlterDomainOperation::SetDefault(ref default),
+            } if type_id == cheerful_id && default.sql == "'happy' :: mood"
+        ));
+        assert_eq!(
+            bind(
+                parse("CREATE DOMAIN nested_mood AS cheerful_mood").expect("parse nested domain"),
+                &catalog,
+            )
+            .expect_err("nested domain base is explicit unsupported")
+            .sql_state,
+            FEATURE_NOT_SUPPORTED
+        );
+
+        let positive_id = catalog
+            .create_domain(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("positive_int"),
+                ScalarType::Int32,
+                false,
+                None,
+                Vec::new(),
+            )
+            .expect("positive domain");
+        let nonnegative_id = catalog
+            .create_domain(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("nonnegative_int"),
+                ScalarType::Int32,
+                false,
+                None,
+                Vec::new(),
+            )
+            .expect("nonnegative domain");
+        let create_routine = |name: &str, type_id: TypeId| NewRoutine {
+            name: Identifier::unquoted(name),
+            kind: RoutineKind::Function,
+            arguments: vec![RoutineArgument {
+                name: Some(Identifier::unquoted("value")),
+                data_type: ScalarType::Int32,
+                declared_type: Some(type_id),
+            }],
+            return_type: Some(ScalarType::Int32),
+            return_declared_type: None,
+            returns_set: false,
+            language: "plpgsql".into(),
+            body: "BEGIN RETURN value; END".into(),
+            replace: false,
+            references: vec![CatalogObjectRef::Type(type_id)],
+        };
+        let positive_routine = catalog
+            .create_or_replace_routine(
+                &Identifier::unquoted("public"),
+                create_routine("choose_value", positive_id),
+            )
+            .expect("positive overload");
+        catalog
+            .create_or_replace_routine(
+                &Identifier::unquoted("public"),
+                create_routine("choose_value", nonnegative_id),
+            )
+            .expect("nonnegative overload");
+
+        assert!(matches!(
+            bind(
+                parse("SELECT choose_value(1::positive_int)")
+                    .expect("parse exact overload"),
+                &catalog,
+            )
+            .expect("bind exact overload"),
+            BoundStatement::RoutineSelect { routine_id, .. }
+                if routine_id == positive_routine
+        ));
+        assert_eq!(
+            bind(
+                parse("SELECT choose_value(1)").expect("parse ambiguous overload"),
+                &catalog,
+            )
+            .expect_err("same-base domains remain ambiguous without an exact declared type")
+            .sql_state,
+            "42725"
+        );
+        assert!(matches!(
+            bind(
+                parse("DROP FUNCTION choose_value(positive_int)")
+                    .expect("parse named drop signature"),
+                &catalog,
+            )
+            .expect("bind named drop signature"),
+            BoundStatement::DropRoutine { routine_id, .. }
+                if routine_id == positive_routine
+        ));
+    }
+
     fn parameter_indices(expression: &ParsedExpr) -> Vec<usize> {
         let mut parameters = Vec::new();
         let mut stack = vec![expression];
@@ -15693,7 +18541,11 @@ mod tests {
             match &expression.kind {
                 ParsedExprKind::Parameter(index)
                 | ParsedExprKind::ResolvedParameter { index, .. } => parameters.push(*index),
-                ParsedExprKind::Unary { expr, .. } => stack.push(expr),
+                ParsedExprKind::Unary { expr, .. } | ParsedExprKind::Cast { expr, .. } => {
+                    stack.push(expr);
+                }
+                ParsedExprKind::Array { elements, .. } => stack.extend(elements),
+                ParsedExprKind::Function { arguments, .. } => stack.extend(arguments),
                 ParsedExprKind::Binary { left, right, .. } => {
                     stack.push(right);
                     stack.push(left);

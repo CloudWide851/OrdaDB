@@ -10,4 +10,5 @@ authors.workspace = true
 chrono.workspace = true
 ordadb-types = { path = "../ordadb-types" }
 rust_decimal.workspace = true
+serde.workspace = true
 uuid.workspace = true

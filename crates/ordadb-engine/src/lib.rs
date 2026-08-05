@@ -12,9 +12,10 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 use ordadb_catalog::{
-    Catalog, CatalogExpression, CatalogObjectRef, ColumnStatistics, ConstraintKind, DropBehavior,
-    IndexMethod, NewColumn, NewRoutine, NewView, ReferentialAction, SequenceAlteration,
-    TableDefinition, TableStatistics, TriggerEvent, TriggerTiming, ViewKind, indexable_type,
+    Catalog, CatalogExpression, CatalogObjectRef, CatalogOwner, ColumnDefinition, ColumnStatistics,
+    ConstraintKind, DomainBaseType, DropBehavior, IndexMethod, NewColumn, NewRoutine, NewView,
+    ReferentialAction, SequenceAlteration, TableDefinition, TableStatistics, TriggerEvent,
+    TriggerTiming, UserDefinedTypeKind, ViewKind, indexable_type,
 };
 use ordadb_execution::{
     AdvancedExecutionCursor, AdvancedExecutionPlan, ApplyExecutionKind, ApplyExecutionPlan,
@@ -37,12 +38,13 @@ pub use ordadb_search::{
 };
 use ordadb_search::{SearchCatalog, SearchLimits};
 use ordadb_sql::{
-    BinaryOperator, BoundAlterTableOperation, BoundApply, BoundApplyKind, BoundConflictAction,
-    BoundCte, BoundExpr, BoundExprKind, BoundJoin, BoundJoinSource, BoundMerge, BoundMergeAction,
-    BoundMergeClauseKind, BoundOnConflict, BoundOrder, BoundProjection, BoundReturning,
-    BoundSequenceOperation, BoundStatement, BoundTable, BoundWindow, BoundWindowFrameBound,
-    DdlObjectKind, JoinKind, ParsedStatement, QuerySetOperator, SqlDialect, SubqueryQuantifier,
-    TransactionChain, bind, bind_catalog_expression, bind_catalog_expression_with_parameter_types,
+    BinaryOperator, BoundAlterDomainOperation, BoundAlterTableOperation, BoundApply,
+    BoundApplyKind, BoundConflictAction, BoundCte, BoundExpr, BoundExprKind, BoundJoin,
+    BoundJoinSource, BoundMerge, BoundMergeAction, BoundMergeClauseKind, BoundOnConflict,
+    BoundOrder, BoundProjection, BoundReturning, BoundSequenceOperation, BoundStatement,
+    BoundTable, BoundWindow, BoundWindowFrameBound, DdlObjectKind, JoinKind, ParsedStatement,
+    QuerySetOperator, SqlDialect, SubqueryQuantifier, TransactionChain, bind,
+    bind_catalog_expression_with_catalog, bind_catalog_expression_with_parameter_types_and_catalog,
     parse, parse_with_dialect,
 };
 use ordadb_storage::{
@@ -58,8 +60,8 @@ use ordadb_transaction::{
     TransactionStatusStore, WalManager, WriterCoordinator, WriterLease, tuple_visible,
 };
 use ordadb_types::{
-    Batch, CommandComplete, DbError, Field, Identifier, IndexId, QueryEvent, QueryProgress, Result,
-    Row, ScalarType, Schema, SequenceId, TableId, Value, ViewId,
+    Batch, CommandComplete, DbError, Field, Identifier, IndexId, PgArray, QueryEvent,
+    QueryProgress, Result, Row, ScalarType, Schema, SequenceId, TableId, TypeId, Value, ViewId,
 };
 
 const MAX_RECURSIVE_CTE_ITERATIONS: usize = 10_000;
@@ -83,6 +85,31 @@ pub struct EngineConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionOptions {
     pub dialect: SqlDialect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAuthorization {
+    owner: CatalogOwner,
+    bypass_ownership: bool,
+}
+
+impl SessionAuthorization {
+    pub fn new(owner: impl Into<String>, bypass_ownership: bool) -> Result<Self> {
+        Ok(Self {
+            owner: CatalogOwner::new(owner)?,
+            bypass_ownership,
+        })
+    }
+
+    #[must_use]
+    pub const fn owner(&self) -> &CatalogOwner {
+        &self.owner
+    }
+
+    #[must_use]
+    pub const fn bypasses_ownership(&self) -> bool {
+        self.bypass_ownership
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -349,6 +376,26 @@ impl Engine {
     }
 
     pub fn connect_with_options(&self, options: SessionOptions) -> Result<Session> {
+        self.connect_session(options, None)
+    }
+
+    pub fn connect_authenticated(&self, authorization: SessionAuthorization) -> Result<Session> {
+        self.connect_authenticated_with_options(SessionOptions::default(), authorization)
+    }
+
+    pub fn connect_authenticated_with_options(
+        &self,
+        options: SessionOptions,
+        authorization: SessionAuthorization,
+    ) -> Result<Session> {
+        self.connect_session(options, Some(authorization))
+    }
+
+    fn connect_session(
+        &self,
+        options: SessionOptions,
+        authorization: Option<SessionAuthorization>,
+    ) -> Result<Session> {
         Ok(Session {
             state: Arc::clone(&self.state),
             store: Arc::clone(&self.store),
@@ -363,6 +410,7 @@ impl Engine {
             sql_transaction: SqlTransactionState::Idle,
             sequence_currvals: BTreeMap::new(),
             options,
+            authorization,
         })
     }
 
@@ -543,6 +591,7 @@ pub struct Session {
     sql_transaction: SqlTransactionState,
     sequence_currvals: BTreeMap<SequenceId, i64>,
     options: SessionOptions,
+    authorization: Option<SessionAuthorization>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -831,6 +880,7 @@ impl Session {
             commits_since_checkpoint: &self.commits_since_checkpoint,
             sequence_currvals: &mut self.sequence_currvals,
             dialect: self.options.dialect,
+            authorization: self.authorization.clone(),
             transaction,
             base: None,
             working: None,
@@ -1371,8 +1421,14 @@ impl Session {
         let write_scope = statement_write_scope(&statement);
         let maintenance =
             maintenance_context(self.transactions.as_ref(), self.transaction_status.as_ref())?;
-        let (_, events, dirty) =
-            execute_bound_candidate(&snapshot, statement, params, None, maintenance)?;
+        let (_, events, dirty) = execute_bound_candidate(
+            &snapshot,
+            statement,
+            params,
+            self.authorization.as_ref(),
+            None,
+            maintenance,
+        )?;
         if !dirty {
             return TryQueryStream::buffered(events);
         }
@@ -1392,6 +1448,7 @@ impl Session {
                     sql,
                     params,
                     self.options.dialect,
+                    self.authorization.as_ref(),
                     Some(version_mutation_context(&transaction)?),
                     maintenance,
                 )?;
@@ -1431,6 +1488,7 @@ impl Session {
             sql,
             params,
             self.options.dialect,
+            self.authorization.as_ref(),
             Some(version_mutation_context(&transaction)?),
             maintenance,
         )?;
@@ -1514,6 +1572,7 @@ impl Session {
             &snapshot,
             statement,
             params,
+            self.authorization.as_ref(),
             Some(version_mutation_context(&transaction.transaction)?),
             maintenance,
         )?;
@@ -1560,6 +1619,7 @@ impl Session {
                             sql,
                             params,
                             self.options.dialect,
+                            self.authorization.as_ref(),
                             Some(version_mutation_context(&transaction.transaction)?),
                             maintenance,
                         )?;
@@ -1650,6 +1710,7 @@ impl Session {
                         sql,
                         params,
                         self.options.dialect,
+                        self.authorization.as_ref(),
                         Some(version_mutation_context(&transaction.transaction)?),
                         maintenance,
                     )?;
@@ -1713,6 +1774,7 @@ impl Session {
             sql,
             params,
             self.options.dialect,
+            self.authorization.as_ref(),
             Some(version_mutation_context(&transaction.transaction)?),
             maintenance,
         )?;
@@ -1821,6 +1883,11 @@ fn bound_statement_schema(statement: &BoundStatement) -> Schema {
         | BoundStatement::Vacuum { .. }
         | BoundStatement::NoOp { .. }
         | BoundStatement::CreateSchema { .. }
+        | BoundStatement::CreateEnumType { .. }
+        | BoundStatement::CreateDomain { .. }
+        | BoundStatement::AlterEnumAddValue { .. }
+        | BoundStatement::AlterEnumRenameValue { .. }
+        | BoundStatement::AlterDomain { .. }
         | BoundStatement::AlterSchemaRename { .. }
         | BoundStatement::DropObjects { .. }
         | BoundStatement::CreateTable { .. }
@@ -2013,6 +2080,11 @@ fn bound_statement_parameter_types(statement: &BoundStatement) -> Result<Vec<Sca
             | BoundStatement::Analyze { .. }
             | BoundStatement::Vacuum { .. }
             | BoundStatement::CreateSchema { .. }
+            | BoundStatement::CreateEnumType { .. }
+            | BoundStatement::CreateDomain { .. }
+            | BoundStatement::AlterEnumAddValue { .. }
+            | BoundStatement::AlterEnumRenameValue { .. }
+            | BoundStatement::AlterDomain { .. }
             | BoundStatement::AlterSchemaRename { .. }
             | BoundStatement::DropObjects { .. }
             | BoundStatement::CreateTable { .. }
@@ -2049,7 +2121,11 @@ fn bound_statement_parameter_types(statement: &BoundStatement) -> Result<Vec<Sca
                     parameters.insert(*index, expression.data_type.clone());
                 }
             }
-            BoundExprKind::Unary { expr, .. } => expressions.push(expr),
+            BoundExprKind::Unary { expr, .. } | BoundExprKind::Cast { expr } => {
+                expressions.push(expr);
+            }
+            BoundExprKind::Array { elements, .. } => expressions.extend(elements),
+            BoundExprKind::Function { arguments, .. } => expressions.extend(arguments),
             BoundExprKind::Binary { left, right, .. } => {
                 expressions.extend([left.as_ref(), right.as_ref()]);
             }
@@ -2133,6 +2209,7 @@ pub struct Transaction<'session> {
     commits_since_checkpoint: &'session Arc<AtomicU64>,
     sequence_currvals: &'session mut BTreeMap<SequenceId, i64>,
     dialect: SqlDialect,
+    authorization: Option<SessionAuthorization>,
     transaction: DurableTransaction,
     base: Option<DatabaseState>,
     working: Option<DatabaseState>,
@@ -2280,6 +2357,7 @@ impl Transaction<'_> {
             &snapshot,
             statement,
             params,
+            self.authorization.as_ref(),
             Some(version_mutation_context(&self.transaction)?),
             maintenance,
         )?;
@@ -2328,6 +2406,7 @@ impl Transaction<'_> {
                         sql,
                         params,
                         self.dialect,
+                        self.authorization.as_ref(),
                         Some(version_mutation_context(&self.transaction)?),
                         maintenance,
                     )?;
@@ -2385,6 +2464,7 @@ impl Transaction<'_> {
             sql,
             params,
             self.dialect,
+            self.authorization.as_ref(),
             Some(version_mutation_context(&self.transaction)?),
             maintenance,
         )?;
@@ -2669,6 +2749,7 @@ struct DatabaseState {
     triggers_fired: usize,
     routine_depth: usize,
     cancellation: Option<Arc<AtomicBool>>,
+    authorization: Option<SessionAuthorization>,
 }
 
 struct SelectExecution {
@@ -2710,6 +2791,8 @@ enum SetValueKey {
     Date(String),
     Time(String),
     Timestamp(String),
+    Interval(i32, i32, i64),
+    Array(String),
     Jsonb(String),
     Uuid([u8; 16]),
     Vector(Vec<u32>),
@@ -2879,6 +2962,7 @@ impl DatabaseState {
                 triggers_fired: 0,
                 routine_depth: 0,
                 cancellation: None,
+                authorization: None,
             };
             validate_database_rows(&state)?;
             for table_id in catalog_table_ids {
@@ -2914,6 +2998,7 @@ impl DatabaseState {
             triggers_fired: 0,
             routine_depth: 0,
             cancellation: None,
+            authorization: None,
         })
     }
 
@@ -2970,6 +3055,7 @@ impl DatabaseState {
             triggers_fired: 0,
             routine_depth: 0,
             cancellation: None,
+            authorization: None,
         };
         (state.versions, state.visible_versions) = frozen_version_state(&state.rows)?;
         validate_database_rows(&state)?;
@@ -3538,6 +3624,7 @@ fn execute_bound_candidate(
     state: &DatabaseState,
     statement: BoundStatement,
     params: &[Value],
+    authorization: Option<&SessionAuthorization>,
     version_context: Option<VersionMutationContext>,
     maintenance: MaintenanceContext<'_>,
 ) -> Result<(DatabaseState, Vec<QueryEvent>, bool)> {
@@ -3545,6 +3632,7 @@ fn execute_bound_candidate(
     candidate.trigger_depth = 0;
     candidate.triggers_fired = 0;
     candidate.routine_depth = 0;
+    candidate.authorization = authorization.cloned();
     let reconciles_versions = !matches!(
         &statement,
         BoundStatement::Analyze { .. } | BoundStatement::Vacuum { .. }
@@ -3557,6 +3645,7 @@ fn execute_bound_candidate(
         reconcile_version_changes(state, &mut candidate, version_context)?;
     }
     candidate.cancellation = None;
+    candidate.authorization = None;
     Ok((candidate, events, dirty))
 }
 
@@ -3565,6 +3654,7 @@ fn execute_candidate(
     sql: &str,
     params: &[Value],
     dialect: SqlDialect,
+    authorization: Option<&SessionAuthorization>,
     version_context: Option<VersionMutationContext>,
     maintenance: MaintenanceContext<'_>,
 ) -> Result<(DatabaseState, Vec<QueryEvent>, bool)> {
@@ -3574,6 +3664,7 @@ fn execute_candidate(
     candidate.trigger_depth = 0;
     candidate.triggers_fired = 0;
     candidate.routine_depth = 0;
+    candidate.authorization = authorization.cloned();
     let reconciles_versions = !matches!(
         &statement,
         BoundStatement::Analyze { .. } | BoundStatement::Vacuum { .. }
@@ -3586,6 +3677,7 @@ fn execute_candidate(
         reconcile_version_changes(state, &mut candidate, version_context)?;
     }
     candidate.cancellation = None;
+    candidate.authorization = None;
     Ok((candidate, events, dirty))
 }
 
@@ -4135,12 +4227,165 @@ fn execute_root_bound(
     maintenance: MaintenanceContext<'_>,
 ) -> Result<(Vec<QueryEvent>, bool)> {
     match statement {
-        BoundStatement::Analyze { table_id } => execute_analyze(state, table_id),
+        BoundStatement::Analyze { table_id } => {
+            authorize_statement_ownership(
+                &state.catalog,
+                &BoundStatement::Analyze { table_id },
+                state.authorization.as_ref(),
+            )?;
+            execute_analyze(state, table_id)
+        }
         BoundStatement::Vacuum { table_id, analyze } => {
+            authorize_statement_ownership(
+                &state.catalog,
+                &BoundStatement::Vacuum { table_id, analyze },
+                state.authorization.as_ref(),
+            )?;
             execute_vacuum(state, table_id, analyze, maintenance)
         }
-        statement => execute_bound(state, statement, params),
+        statement => execute_bound_with_ownership(state, statement, params),
     }
+}
+
+fn execute_bound_with_ownership(
+    state: &mut DatabaseState,
+    statement: BoundStatement,
+    params: &[Value],
+) -> Result<(Vec<QueryEvent>, bool)> {
+    let authorization = state.authorization.clone();
+    authorize_statement_ownership(&state.catalog, &statement, authorization.as_ref())?;
+    let previous_catalog = authorization
+        .as_ref()
+        .filter(|_| statement_may_create_catalog_objects(&statement))
+        .map(|_| Arc::clone(&state.catalog));
+    let (events, dirty) = execute_bound(state, statement, params)?;
+    if dirty
+        && let (Some(authorization), Some(previous_catalog)) =
+            (authorization.as_ref(), previous_catalog.as_deref())
+    {
+        Arc::make_mut(&mut state.catalog)
+            .assign_new_object_owners(previous_catalog, authorization.owner())?;
+    }
+    Ok((events, dirty))
+}
+
+fn authorize_statement_ownership(
+    catalog: &Catalog,
+    statement: &BoundStatement,
+    authorization: Option<&SessionAuthorization>,
+) -> Result<()> {
+    let Some(authorization) =
+        authorization.filter(|authorization| !authorization.bypasses_ownership())
+    else {
+        return Ok(());
+    };
+    let mut objects = Vec::new();
+    let schema_object = |schema: &Identifier| {
+        catalog
+            .schema(schema)
+            .map(|schema| CatalogObjectRef::Schema(schema.id))
+    };
+    match statement {
+        BoundStatement::CreateEnumType { schema, .. }
+        | BoundStatement::CreateDomain { schema, .. }
+        | BoundStatement::CreateTable { schema, .. }
+        | BoundStatement::CreateSequence { schema, .. } => {
+            objects.extend(schema_object(schema));
+        }
+        BoundStatement::CreateView {
+            schema, existing, ..
+        } => match existing {
+            Some(view_id) => objects.push(CatalogObjectRef::View(*view_id)),
+            None => objects.extend(schema_object(schema)),
+        },
+        BoundStatement::CreateRoutine {
+            schema,
+            name,
+            kind,
+            arguments,
+            replace,
+            ..
+        } => {
+            if *replace
+                && let Some(routine) = catalog.routine_by_signature(schema, name, *kind, arguments)
+            {
+                objects.push(CatalogObjectRef::Routine(routine.id));
+            } else {
+                objects.extend(schema_object(schema));
+            }
+        }
+        BoundStatement::AlterEnumAddValue { type_id, .. }
+        | BoundStatement::AlterEnumRenameValue { type_id, .. }
+        | BoundStatement::AlterDomain { type_id, .. } => {
+            objects.push(CatalogObjectRef::Type(*type_id));
+        }
+        BoundStatement::AlterSchemaRename { schema_id, .. } => {
+            objects.push(CatalogObjectRef::Schema(*schema_id));
+        }
+        BoundStatement::Analyze {
+            table_id: Some(table_id),
+        }
+        | BoundStatement::Vacuum {
+            table_id: Some(table_id),
+            ..
+        } => objects.push(CatalogObjectRef::Table(*table_id)),
+        BoundStatement::DropObjects {
+            objects: dropped, ..
+        } => objects.extend(dropped.iter().copied()),
+        BoundStatement::AlterTable { table_id, .. }
+        | BoundStatement::CreateIndex { table_id, .. }
+        | BoundStatement::CreateTrigger { table_id, .. } => {
+            objects.push(CatalogObjectRef::Table(*table_id));
+        }
+        BoundStatement::AlterIndexRename { index_id, .. } => {
+            objects.push(CatalogObjectRef::Index(*index_id));
+        }
+        BoundStatement::AlterSequenceRename { sequence_id, .. }
+        | BoundStatement::AlterSequence { sequence_id, .. } => {
+            objects.push(CatalogObjectRef::Sequence(*sequence_id));
+        }
+        BoundStatement::AlterViewRename { view_id, .. }
+        | BoundStatement::RefreshMaterializedView { view_id, .. } => {
+            objects.push(CatalogObjectRef::View(*view_id));
+        }
+        BoundStatement::DropRoutine { routine_id, .. } => {
+            objects.push(CatalogObjectRef::Routine(*routine_id));
+        }
+        BoundStatement::DropTrigger { trigger_id, .. } => {
+            objects.push(CatalogObjectRef::Trigger(*trigger_id));
+        }
+        _ => {}
+    }
+    for object in objects {
+        let Some(owner) = catalog.owner_of(object) else {
+            continue;
+        };
+        if owner != authorization.owner() {
+            return Err(
+                DbError::new("42501", "must be owner of catalog object").with_detail(format!(
+                    "authenticated role {} does not own {object:?}",
+                    authorization.owner().as_str()
+                )),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn statement_may_create_catalog_objects(statement: &BoundStatement) -> bool {
+    matches!(
+        statement,
+        BoundStatement::CreateSchema { .. }
+            | BoundStatement::CreateEnumType { .. }
+            | BoundStatement::CreateDomain { .. }
+            | BoundStatement::CreateTable { .. }
+            | BoundStatement::AlterTable { .. }
+            | BoundStatement::CreateIndex { .. }
+            | BoundStatement::CreateSequence { .. }
+            | BoundStatement::CreateView { .. }
+            | BoundStatement::CreateRoutine { .. }
+            | BoundStatement::CreateTrigger { .. }
+    )
 }
 
 fn execute_analyze(
@@ -4361,6 +4606,106 @@ fn execute_bound(
                 true,
             ))
         }
+        BoundStatement::CreateEnumType {
+            schema,
+            name,
+            labels,
+        } => {
+            Arc::make_mut(&mut state.catalog).create_enum_type(&schema, name, labels)?;
+            Ok((
+                command_events(Schema::empty(), "CREATE TYPE", 0, None),
+                true,
+            ))
+        }
+        BoundStatement::CreateDomain {
+            schema,
+            name,
+            base_type,
+            base_declared_type,
+            not_null,
+            default,
+            checks,
+        } => {
+            Arc::make_mut(&mut state.catalog).create_domain_with_declared_type(
+                &schema,
+                name,
+                DomainBaseType::new(base_type, base_declared_type),
+                not_null,
+                default,
+                checks,
+            )?;
+            Ok((
+                command_events(Schema::empty(), "CREATE DOMAIN", 0, None),
+                true,
+            ))
+        }
+        BoundStatement::AlterEnumAddValue {
+            type_id,
+            label,
+            position,
+            if_not_exists,
+        } => {
+            let changed = Arc::make_mut(&mut state.catalog).alter_enum_add_value(
+                type_id,
+                label,
+                position,
+                if_not_exists,
+            )?;
+            if changed {
+                rewrite_enum_values(state, type_id, None)?;
+            }
+            Ok((
+                command_events(Schema::empty(), "ALTER TYPE", 0, None),
+                changed,
+            ))
+        }
+        BoundStatement::AlterEnumRenameValue {
+            type_id,
+            old_label,
+            new_label,
+        } => {
+            Arc::make_mut(&mut state.catalog).alter_enum_rename_value(
+                type_id,
+                &old_label,
+                new_label.clone(),
+            )?;
+            rewrite_enum_values(state, type_id, Some((&old_label, &new_label)))?;
+            Ok((command_events(Schema::empty(), "ALTER TYPE", 0, None), true))
+        }
+        BoundStatement::AlterDomain { type_id, operation } => {
+            let changed = match operation {
+                BoundAlterDomainOperation::SetDefault(default) => {
+                    Arc::make_mut(&mut state.catalog)
+                        .alter_domain_default(type_id, Some(default))?;
+                    true
+                }
+                BoundAlterDomainOperation::DropDefault => {
+                    Arc::make_mut(&mut state.catalog).alter_domain_default(type_id, None)?;
+                    true
+                }
+                BoundAlterDomainOperation::SetNotNull => {
+                    Arc::make_mut(&mut state.catalog).alter_domain_not_null(type_id, true)?;
+                    true
+                }
+                BoundAlterDomainOperation::DropNotNull => {
+                    Arc::make_mut(&mut state.catalog).alter_domain_not_null(type_id, false)?;
+                    true
+                }
+                BoundAlterDomainOperation::AddConstraint(constraint) => {
+                    Arc::make_mut(&mut state.catalog).add_domain_constraint(type_id, constraint)?;
+                    true
+                }
+                BoundAlterDomainOperation::DropConstraint { name, if_exists } => {
+                    Arc::make_mut(&mut state.catalog)
+                        .drop_domain_constraint(type_id, &name, if_exists)?
+                }
+            };
+            validate_database_rows(state)?;
+            Ok((
+                command_events(Schema::empty(), "ALTER DOMAIN", 0, None),
+                changed,
+            ))
+        }
         BoundStatement::AlterSchemaRename {
             schema_id,
             new_name,
@@ -4554,6 +4899,7 @@ fn execute_bound(
             kind,
             arguments,
             return_type,
+            return_declared_type,
             returns_set,
             language,
             body,
@@ -4571,6 +4917,11 @@ fn execute_bound(
                 ordadb_catalog::RoutineKind::Function => "CREATE FUNCTION",
                 ordadb_catalog::RoutineKind::Procedure => "CREATE PROCEDURE",
             };
+            let referenced_types = arguments
+                .iter()
+                .filter_map(|argument| argument.declared_type)
+                .chain(return_declared_type)
+                .collect::<BTreeSet<_>>();
             Arc::make_mut(&mut state.catalog).create_or_replace_routine(
                 &schema,
                 NewRoutine {
@@ -4578,11 +4929,15 @@ fn execute_bound(
                     kind,
                     arguments,
                     return_type,
+                    return_declared_type,
                     returns_set,
                     language,
                     body,
                     replace,
-                    references: Vec::new(),
+                    references: referenced_types
+                        .into_iter()
+                        .map(CatalogObjectRef::Type)
+                        .collect(),
                 },
             )?;
             Ok((command_events(Schema::empty(), tag, 0, None), true))
@@ -5198,6 +5553,7 @@ fn execute_drop_objects(
             }
         }
     }
+    cleanup_removed_columns(state, &catalog_before, &removed)?;
     cleanup_removed_state(state, &removed);
     reconcile_search_catalog(state)?;
     Ok((
@@ -5236,6 +5592,9 @@ fn drop_catalog_root(
         CatalogObjectRef::Trigger(id) if catalog.trigger_by_id(id).is_some() => {
             catalog.drop_trigger(id, behavior)
         }
+        CatalogObjectRef::Type(id) if catalog.type_by_id(id).is_some() => {
+            catalog.drop_type(id, behavior)
+        }
         CatalogObjectRef::Column(_, _) => Err(internal_error(
             "column drops must be routed through ALTER TABLE",
         )),
@@ -5263,6 +5622,50 @@ fn cleanup_removed_state(state: &mut DatabaseState, removed: &[CatalogObjectRef]
         .retain(|index_id, _| state.catalog.index_by_id(*index_id).is_some());
 }
 
+fn cleanup_removed_columns(
+    state: &mut DatabaseState,
+    catalog_before: &Catalog,
+    removed: &[CatalogObjectRef],
+) -> Result<()> {
+    let mut positions_by_table = BTreeMap::<TableId, Vec<usize>>::new();
+    for object in removed {
+        let CatalogObjectRef::Column(table_id, column_id) = object else {
+            continue;
+        };
+        if state.catalog.table_by_id(*table_id).is_none() {
+            continue;
+        }
+        let position = catalog_before
+            .table_by_id(*table_id)
+            .and_then(|table| table.column_index_by_id(*column_id))
+            .ok_or_else(|| internal_error("dropped column is absent from the prior catalog"))?;
+        positions_by_table
+            .entry(*table_id)
+            .or_default()
+            .push(position);
+    }
+    for (table_id, positions) in &mut positions_by_table {
+        positions.sort_unstable_by(|left, right| right.cmp(left));
+        positions.dedup();
+        for row in Arc::make_mut(
+            state
+                .rows
+                .entry(*table_id)
+                .or_insert_with(|| Arc::new(Vec::new())),
+        ) {
+            for position in positions.iter().copied() {
+                if position >= row.values.len() {
+                    return Err(internal_error(
+                        "dropped column position exceeds the stored row width",
+                    ));
+                }
+                row.values.remove(position);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn drop_command_tag(kind: DdlObjectKind) -> &'static str {
     match kind {
         DdlObjectKind::Schema => "DROP SCHEMA",
@@ -5271,6 +5674,102 @@ fn drop_command_tag(kind: DdlObjectKind) -> &'static str {
         DdlObjectKind::Sequence => "DROP SEQUENCE",
         DdlObjectKind::View => "DROP VIEW",
         DdlObjectKind::MaterializedView => "DROP MATERIALIZED VIEW",
+        DdlObjectKind::Type => "DROP TYPE",
+    }
+}
+
+fn rewrite_enum_values(
+    state: &mut DatabaseState,
+    type_id: TypeId,
+    renamed_label: Option<(&str, &str)>,
+) -> Result<()> {
+    let affected = state
+        .catalog
+        .database()
+        .schemas()
+        .flat_map(|schema| schema.tables())
+        .filter_map(|table| {
+            let columns = table
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| {
+                    column.declared_type.is_some_and(|declared_type| {
+                        declared_type == type_id
+                            || state
+                                .catalog
+                                .type_by_id(declared_type)
+                                .is_some_and(|definition| {
+                                    matches!(
+                                        definition.definition,
+                                        UserDefinedTypeKind::Domain {
+                                            base_declared_type: Some(base_type_id),
+                                            ..
+                                        } if base_type_id == type_id
+                                    )
+                                })
+                    })
+                })
+                .map(|(index, column)| (index, column.data_type.clone()))
+                .collect::<Vec<_>>();
+            (!columns.is_empty()).then_some((table.id, columns))
+        })
+        .collect::<Vec<_>>();
+    for (table_id, columns) in affected {
+        for row in Arc::make_mut(
+            state
+                .rows
+                .entry(table_id)
+                .or_insert_with(|| Arc::new(Vec::new())),
+        ) {
+            for (index, data_type) in &columns {
+                let value = row.values.get_mut(*index).ok_or_else(|| {
+                    internal_error("enum column position exceeds the stored row width")
+                })?;
+                rewrite_enum_column_value(value, data_type, renamed_label)?;
+            }
+        }
+        rebuild_table_derived(state, table_id)?;
+    }
+    validate_database_rows(state)
+}
+
+fn rewrite_enum_column_value(
+    value: &mut Value,
+    data_type: &ScalarType,
+    renamed_label: Option<(&str, &str)>,
+) -> Result<()> {
+    match value {
+        Value::Null => Ok(()),
+        Value::Text(label) => {
+            if let Some((old_label, new_label)) = renamed_label
+                && label == old_label
+            {
+                *label = new_label.to_owned();
+            }
+            Ok(())
+        }
+        Value::Array(array) => {
+            let ScalarType::Array { element } = data_type else {
+                return Err(internal_error(
+                    "enum array value is paired with a non-array declared type",
+                ));
+            };
+            let mut values = array.values().to_vec();
+            for value in &mut values {
+                if let (Value::Text(label), Some((old_label, new_label))) = (value, renamed_label)
+                    && label == old_label
+                {
+                    *label = new_label.to_owned();
+                }
+            }
+            *array = PgArray::new((**element).clone(), array.dimensions().to_vec(), values)?;
+            Ok(())
+        }
+        _ => Err(DbError::new(
+            "42804",
+            "stored value is not assignable to the altered enum type",
+        )),
     }
 }
 
@@ -5301,7 +5800,7 @@ fn execute_alter_table(
                 {
                     continue;
                 }
-                let value = catalog_default_value(column.default.as_ref(), &column.data_type)?;
+                let value = new_column_default_value(&state.catalog, &column)?;
                 Arc::make_mut(&mut state.catalog).add_column(table_id, column)?;
                 for row in Arc::make_mut(
                     state
@@ -5351,6 +5850,7 @@ fn execute_alter_table(
                     None,
                     Some(false),
                     None,
+                    None,
                 )?;
             }
             BoundAlterTableOperation::DropNotNull { column_id } => {
@@ -5359,6 +5859,7 @@ fn execute_alter_table(
                     column_id,
                     None,
                     Some(true),
+                    None,
                     None,
                 )?;
             }
@@ -5369,6 +5870,7 @@ fn execute_alter_table(
                     None,
                     None,
                     Some(Some(default)),
+                    None,
                 )?;
             }
             BoundAlterTableOperation::DropDefault { column_id } => {
@@ -5378,11 +5880,13 @@ fn execute_alter_table(
                     None,
                     None,
                     Some(None),
+                    None,
                 )?;
             }
             BoundAlterTableOperation::SetDataType {
                 column_id,
                 data_type,
+                declared_type,
             } => {
                 let position = table_definition(state, table_id)?
                     .column_index_by_id(column_id)
@@ -5402,6 +5906,7 @@ fn execute_alter_table(
                     Some(data_type),
                     None,
                     None,
+                    Some(declared_type),
                 )?;
             }
             BoundAlterTableOperation::AddConstraint { constraint } => {
@@ -5439,14 +5944,53 @@ fn execute_alter_table(
 }
 
 fn catalog_default_value(
+    catalog: &Catalog,
     expression: Option<&CatalogExpression>,
     data_type: &ScalarType,
 ) -> Result<Value> {
     let Some(expression) = expression else {
         return Ok(Value::Null);
     };
-    let bound = bind_catalog_expression(expression, None, Some(data_type))?;
+    let bound = bind_catalog_expression_with_catalog(expression, None, Some(data_type), catalog)?;
     evaluate_scalar(&bound, &[], &[])
+}
+
+fn column_default_value(catalog: &Catalog, column: &ColumnDefinition) -> Result<Value> {
+    declared_column_default_value(
+        catalog,
+        column.default.as_ref(),
+        column.declared_type,
+        &column.data_type,
+    )
+}
+
+fn new_column_default_value(catalog: &Catalog, column: &NewColumn) -> Result<Value> {
+    declared_column_default_value(
+        catalog,
+        column.default.as_ref(),
+        column.declared_type,
+        &column.data_type,
+    )
+}
+
+fn declared_column_default_value(
+    catalog: &Catalog,
+    explicit_default: Option<&CatalogExpression>,
+    declared_type: Option<TypeId>,
+    data_type: &ScalarType,
+) -> Result<Value> {
+    let domain_default =
+        if explicit_default.is_none() && !matches!(data_type, ScalarType::Array { .. }) {
+            declared_type
+                .and_then(|type_id| catalog.type_by_id(type_id))
+                .and_then(|definition| match &definition.definition {
+                    UserDefinedTypeKind::Domain { default, .. } => default.as_ref(),
+                    UserDefinedTypeKind::Enum { .. } => None,
+                })
+        } else {
+            None
+        };
+    catalog_default_value(catalog, explicit_default.or(domain_default), data_type)
 }
 
 fn execute_create_view(
@@ -5508,6 +6052,7 @@ fn execute_create_view(
             .map(|field| NewColumn {
                 name: Identifier::unquoted(field.name.clone()),
                 data_type: field.data_type.clone(),
+                declared_type: None,
                 nullable: field.nullable,
                 primary_key: false,
                 unique: false,
@@ -5590,7 +6135,7 @@ impl PlpgsqlHost for EnginePlpgsqlHost<'_> {
                 "transaction control is not allowed inside PL/pgSQL routines",
             ));
         }
-        let (events, _) = execute_bound(self.state, statement, &parameters)?;
+        let (events, _) = execute_bound_with_ownership(self.state, statement, &parameters)?;
         Ok(Box::new(events.into_iter().map(Ok)))
     }
 
@@ -5618,11 +6163,12 @@ impl PlpgsqlHost for EnginePlpgsqlHost<'_> {
             }
         }
         let expression = CatalogExpression::new(sql);
-        let bound = bind_catalog_expression_with_parameter_types(
+        let bound = bind_catalog_expression_with_parameter_types_and_catalog(
             &expression,
             None,
             None,
             &parameter_types,
+            Some(&self.state.catalog),
         )?;
         evaluate_scalar(&bound, &[], &parameters)
     }
@@ -5685,32 +6231,7 @@ impl PlpgsqlHost for EnginePlpgsqlHost<'_> {
 }
 
 fn scalar_type_of_value(value: &Value) -> Option<ScalarType> {
-    match value {
-        Value::Null => None,
-        Value::Boolean(_) => Some(ScalarType::Boolean),
-        Value::Int16(_) => Some(ScalarType::Int16),
-        Value::Int32(_) => Some(ScalarType::Int32),
-        Value::Int64(_) => Some(ScalarType::Int64),
-        Value::Float32(_) => Some(ScalarType::Float32),
-        Value::Float64(_) => Some(ScalarType::Float64),
-        Value::Decimal(_) => Some(ScalarType::Decimal {
-            precision: None,
-            scale: None,
-        }),
-        Value::Text(_) => Some(ScalarType::Text),
-        Value::Binary(_) => Some(ScalarType::Binary),
-        Value::Date(_) => Some(ScalarType::Date),
-        Value::Time(_) => Some(ScalarType::Time),
-        Value::Timestamp(_) => Some(ScalarType::Timestamp {
-            with_timezone: false,
-        }),
-        Value::Json(_) => Some(ScalarType::Json),
-        Value::Jsonb(_) => Some(ScalarType::Jsonb),
-        Value::Uuid(_) => Some(ScalarType::Uuid),
-        Value::Vector(values) => Some(ScalarType::Vector {
-            dimensions: Some(values.len()),
-        }),
-    }
+    value.scalar_type()
 }
 
 fn trigger_field_reference(expression: &str) -> Option<(usize, &str)> {
@@ -6278,7 +6799,7 @@ fn execute_merge_insert(
     let mut values = table
         .columns()
         .iter()
-        .map(|column| catalog_default_value(column.default.as_ref(), &column.data_type))
+        .map(|column| column_default_value(&state.catalog, column))
         .collect::<Result<Vec<_>>>()?;
     for (expression, column_index) in expressions.iter().zip(column_indexes) {
         values[*column_index] = evaluate_scalar(expression, &input.values, params)?;
@@ -6295,7 +6816,7 @@ fn execute_merge_insert(
         RowTriggerOutcome::Proceed(Some(row)) => row,
         RowTriggerOutcome::Proceed(None) | RowTriggerOutcome::Suppress => return Ok(None),
     };
-    validate_rows(table, std::slice::from_ref(&inserted))?;
+    validate_rows(&state.catalog, table, std::slice::from_ref(&inserted))?;
     Arc::make_mut(
         state
             .rows
@@ -6349,7 +6870,7 @@ fn execute_insert(
         let mut values = table
             .columns()
             .iter()
-            .map(|column| catalog_default_value(column.default.as_ref(), &column.data_type))
+            .map(|column| column_default_value(&state.catalog, column))
             .collect::<Result<Vec<_>>>()?;
         for (expression, column_index) in expressions.into_iter().zip(&column_indexes) {
             values[*column_index] = evaluate_scalar(&expression, &[], params)?;
@@ -6366,7 +6887,7 @@ fn execute_insert(
             RowTriggerOutcome::Proceed(Some(row)) => row,
             RowTriggerOutcome::Proceed(None) | RowTriggerOutcome::Suppress => continue,
         };
-        validate_rows(&table, std::slice::from_ref(&inserted_row))?;
+        validate_rows(&state.catalog, &table, std::slice::from_ref(&inserted_row))?;
         if let Some(on_conflict) = &on_conflict
             && let Some(position) = conflicting_row_position(
                 state,
@@ -6504,7 +7025,11 @@ fn conflicting_row_position(
         if values.iter().any(Value::is_null) {
             continue;
         }
-        let key = IndexKey::from_values(&values)?;
+        let key_types = positions
+            .iter()
+            .map(|position| table.columns()[*position].data_type.clone())
+            .collect::<Vec<_>>();
+        let key = IndexKey::from_typed_values(&values, &key_types)?;
         let tree = state
             .indexes
             .get(&definition.id)
@@ -6973,6 +7498,14 @@ fn set_row_key(row: &Row) -> Result<SetRowKey> {
             Value::Date(value) => Ok(SetValueKey::Date(value.to_string())),
             Value::Time(value) => Ok(SetValueKey::Time(value.to_string())),
             Value::Timestamp(value) => Ok(SetValueKey::Timestamp(value.to_string())),
+            Value::Interval(value) => Ok(SetValueKey::Interval(
+                value.months,
+                value.days,
+                value.microseconds,
+            )),
+            Value::Array(value) => serde_json::to_string(value)
+                .map(SetValueKey::Array)
+                .map_err(|error| internal_error(format!("failed to canonicalize array: {error}"))),
             Value::Json(_) => Err(DbError::new(
                 "42883",
                 "could not identify an equality operator for type json",
@@ -7025,6 +7558,7 @@ fn estimated_set_value_key_bytes(key: &SetValueKey) -> usize {
             | SetValueKey::Date(value)
             | SetValueKey::Time(value)
             | SetValueKey::Timestamp(value)
+            | SetValueKey::Array(value)
             | SetValueKey::Jsonb(value) => value.len(),
             SetValueKey::Binary(value) => value.len(),
             SetValueKey::Vector(values) => values.len().saturating_mul(mem::size_of::<u32>()),
@@ -7035,6 +7569,7 @@ fn estimated_set_value_key_bytes(key: &SetValueKey) -> usize {
             | SetValueKey::Int64(_)
             | SetValueKey::Float32(_)
             | SetValueKey::Float64(_)
+            | SetValueKey::Interval(_, _, _)
             | SetValueKey::Uuid(_) => 0,
         }
 }
@@ -7405,14 +7940,14 @@ fn build_query_execution_plan(
             offset,
             limit,
         } => Ok(QueryExecutionPlan::Simple {
-            plan: optimize_select(
+            plan: Box::new(optimize_select(
                 table_definition(state, table_id)?,
                 projection,
                 filter,
                 order_by,
                 offset,
                 limit,
-            ),
+            )),
             schema,
         }),
         BoundStatement::AdvancedSelect {
@@ -7610,7 +8145,9 @@ fn collect_expr_correlations(
                     indexes.insert(*index);
                 }
             }
-            BoundExprKind::Unary { expr, .. } => pending.push(expr),
+            BoundExprKind::Unary { expr, .. } | BoundExprKind::Cast { expr } => pending.push(expr),
+            BoundExprKind::Array { elements, .. } => pending.extend(elements.iter().rev()),
+            BoundExprKind::Function { arguments, .. } => pending.extend(arguments.iter().rev()),
             BoundExprKind::Binary { left, right, .. } => {
                 pending.push(right);
                 pending.push(left);
@@ -7914,7 +8451,11 @@ fn rewrite_expr_correlations(
             continue;
         }
         match &mut expression.kind {
-            BoundExprKind::Unary { expr, .. } => pending.push(expr),
+            BoundExprKind::Unary { expr, .. } | BoundExprKind::Cast { expr } => pending.push(expr),
+            BoundExprKind::Array { elements, .. } => pending.extend(elements.iter_mut().rev()),
+            BoundExprKind::Function { arguments, .. } => {
+                pending.extend(arguments.iter_mut().rev());
+            }
             BoundExprKind::Binary { left, right, .. } => {
                 pending.push(right);
                 pending.push(left);
@@ -8579,7 +9120,7 @@ fn apply_referential_actions(
                                 Value::Null
                             } else {
                                 let column = &child_table.columns()[*child];
-                                catalog_default_value(column.default.as_ref(), &column.data_type)?
+                                column_default_value(&state.catalog, column)?
                             };
                         }
                         queue.push_back(ReferentialChange::Update {
@@ -8596,7 +9137,7 @@ fn apply_referential_actions(
     Ok(())
 }
 
-fn validate_rows(table: &TableDefinition, rows: &[Row]) -> Result<()> {
+fn validate_rows(catalog: &Catalog, table: &TableDefinition, rows: &[Row]) -> Result<()> {
     for row in rows {
         if row.values.len() != table.columns().len() {
             return Err(internal_error("row width does not match table metadata"));
@@ -8612,6 +9153,84 @@ fn validate_rows(table: &TableDefinition, rows: &[Row]) -> Result<()> {
                 ));
             }
             coerce_execution_value(value.clone(), &column.data_type)?;
+        }
+    }
+    for (column_index, column) in table.columns().iter().enumerate() {
+        let Some(type_id) = column.declared_type else {
+            continue;
+        };
+        let definition = catalog.type_by_id(type_id).ok_or_else(|| {
+            DbError::new(
+                "XX001",
+                format!("column {} references a missing declared type", column.name),
+            )
+        })?;
+        match &definition.definition {
+            UserDefinedTypeKind::Enum { labels } => {
+                for row in rows {
+                    validate_enum_value(&row.values[column_index], labels, &definition.name)?;
+                }
+            }
+            UserDefinedTypeKind::Domain {
+                base_type,
+                not_null,
+                checks,
+                ..
+            } => {
+                let scope = TableDefinition::expression_scope(
+                    Identifier::unquoted("value"),
+                    base_type.clone(),
+                );
+                let checks = checks
+                    .iter()
+                    .map(|constraint| {
+                        Ok((
+                            constraint.name.as_ref(),
+                            bind_catalog_expression_with_catalog(
+                                &constraint.expression,
+                                Some(&scope),
+                                Some(&ScalarType::Boolean),
+                                catalog,
+                            )?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for row in rows {
+                    let value = &row.values[column_index];
+                    let domain_values = match value {
+                        Value::Array(array) => array.values().iter().collect::<Vec<_>>(),
+                        Value::Null if matches!(column.data_type, ScalarType::Array { .. }) => {
+                            Vec::new()
+                        }
+                        value => vec![value],
+                    };
+                    for value in domain_values {
+                        if *not_null && value.is_null() {
+                            return Err(DbError::new(
+                                "23502",
+                                format!("domain {} does not allow null values", definition.name),
+                            ));
+                        }
+                        for (constraint_name, check) in &checks {
+                            if evaluate_scalar(check, std::slice::from_ref(value), &[])?
+                                == Value::Boolean(false)
+                            {
+                                let label = constraint_name.map_or_else(
+                                    || format!("domain {}", definition.name),
+                                    |name| format!("constraint {name}"),
+                                );
+                                return Err(DbError::new(
+                                    "23514",
+                                    format!(
+                                        "value for domain {} violates {label}",
+                                        definition.name
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     for (column_index, column) in table.columns().iter().enumerate() {
@@ -8682,8 +9301,12 @@ fn validate_rows(table: &TableDefinition, rows: &[Row]) -> Result<()> {
                 }
             }
             ConstraintKind::Check { expression } => {
-                let bound =
-                    bind_catalog_expression(expression, Some(table), Some(&ScalarType::Boolean))?;
+                let bound = bind_catalog_expression_with_catalog(
+                    expression,
+                    Some(table),
+                    Some(&ScalarType::Boolean),
+                    catalog,
+                )?;
                 for row in rows {
                     if evaluate_scalar(&bound, &row.values, &[])? == Value::Boolean(false) {
                         return Err(DbError::new(
@@ -8699,6 +9322,27 @@ fn validate_rows(table: &TableDefinition, rows: &[Row]) -> Result<()> {
     Ok(())
 }
 
+fn validate_enum_value(value: &Value, labels: &[String], type_name: &Identifier) -> Result<()> {
+    match value {
+        Value::Null => Ok(()),
+        Value::Text(value) if labels.iter().any(|label| label == value) => Ok(()),
+        Value::Array(array) => {
+            for value in array.values() {
+                validate_enum_value(value, labels, type_name)?;
+            }
+            Ok(())
+        }
+        Value::Text(value) => Err(DbError::new(
+            "22P02",
+            format!("invalid input value for enum {type_name}: {value:?}"),
+        )),
+        _ => Err(DbError::new(
+            "42804",
+            format!("value is not assignable to enum {type_name}"),
+        )),
+    }
+}
+
 fn validate_database_rows(state: &DatabaseState) -> Result<()> {
     for schema in state.catalog.database().schemas() {
         for table in schema.tables() {
@@ -8706,7 +9350,7 @@ fn validate_database_rows(state: &DatabaseState) -> Result<()> {
                 .rows
                 .get(&table.id)
                 .map_or(&[][..], |rows| rows.as_slice());
-            validate_rows(table, rows)?;
+            validate_rows(&state.catalog, table, rows)?;
             for constraint in table.constraints() {
                 let ConstraintKind::ForeignKey {
                     columns,
@@ -8783,6 +9427,10 @@ fn rebuild_table_derived(state: &mut DatabaseState, table_id: TableId) -> Result
                     .ok_or_else(|| internal_error("index key column is absent from its table"))
             })
             .collect::<Result<Vec<_>>>()?;
+        let key_types = key_positions
+            .iter()
+            .map(|position| table.columns()[*position].data_type.clone())
+            .collect::<Vec<_>>();
         let include_positions = definition
             .include_columns
             .iter()
@@ -8807,7 +9455,7 @@ fn rebuild_table_derived(state: &mut DatabaseState, table_id: TableId) -> Result
                     .iter()
                     .map(|position| row.values[*position].clone())
                     .collect();
-                IndexEntry::new(&key_values, row_id, included)
+                IndexEntry::new_typed(&key_values, &key_types, row_id, included)
             })
             .collect::<Result<Vec<_>>>()?;
         let tree = BPlusTree::from_entries(definition.unique, entries)?;
@@ -8858,7 +9506,11 @@ fn compute_statistics(table: &TableDefinition, rows: &[Row]) -> Result<TableStat
             let mut minimum: Option<(IndexKey, Value)> = None;
             let mut maximum: Option<(IndexKey, Value)> = None;
             for value in values.iter().filter(|value| !value.is_null()) {
-                let key = IndexKey::from_values(&[(*value).clone()])?;
+                let typed_value = (*value).clone();
+                let key = IndexKey::from_typed_values(
+                    std::slice::from_ref(&typed_value),
+                    std::slice::from_ref(&column.data_type),
+                )?;
                 if minimum.as_ref().is_none_or(|(minimum, _)| key < *minimum) {
                     minimum = Some((key.clone(), (*value).clone()));
                 }
@@ -8934,10 +9586,11 @@ fn evaluate_search_filter(
     filter: &ScalarSearchFilter,
 ) -> Result<AllowedRows> {
     let table = table_definition(state, table_id)?;
-    let expression = bind_catalog_expression(
+    let expression = bind_catalog_expression_with_catalog(
         &CatalogExpression::new(&filter.expression),
         Some(table),
         Some(&ScalarType::Boolean),
+        &state.catalog,
     )?;
     let rows = state
         .rows
@@ -9035,6 +9688,111 @@ mod tests {
             )",
             &[],
         );
+    }
+
+    #[test]
+    fn enum_and_domain_ddl_validate_values_and_reopen() {
+        let (directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')",
+            &[],
+        );
+        execute(
+            &mut session,
+            "CREATE DOMAIN positive_int AS integer DEFAULT 1 NOT NULL \
+             CONSTRAINT positive CHECK (VALUE > 0)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "CREATE TABLE feelings (current_mood mood NOT NULL, score positive_int)",
+            &[],
+        );
+        execute(
+            &mut session,
+            "CREATE TABLE typed_arrays (id bigint, moods mood[], scores positive_int[])",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO feelings (current_mood) VALUES ('happy')",
+            &[],
+        );
+        execute(
+            &mut session,
+            "INSERT INTO typed_arrays VALUES (1, ARRAY['sad', 'happy'], ARRAY[1, 2])",
+            &[],
+        );
+
+        let error = match session.execute("INSERT INTO feelings VALUES ('angry', 1)", &[]) {
+            Ok(_) => panic!("invalid enum value was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.sql_state, "22P02");
+        let error = match session.execute("INSERT INTO feelings VALUES ('ok', 0)", &[]) {
+            Ok(_) => panic!("invalid domain value was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.sql_state, "23514");
+        let error = match session.execute("INSERT INTO feelings VALUES ('ok', NULL)", &[]) {
+            Ok(_) => panic!("null domain value was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.sql_state, "23502");
+        let error = match session.execute(
+            "INSERT INTO typed_arrays VALUES (2, ARRAY['ok', 'angry'], ARRAY[1])",
+            &[],
+        ) {
+            Ok(_) => panic!("invalid enum array value was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.sql_state, "22P02");
+        let error = match session.execute(
+            "INSERT INTO typed_arrays VALUES (2, ARRAY['ok'], ARRAY[1, 0])",
+            &[],
+        ) {
+            Ok(_) => panic!("invalid domain array value was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.sql_state, "23514");
+        let error = match session.execute(
+            "INSERT INTO typed_arrays VALUES (2, ARRAY['ok'], ARRAY[1, NULL])",
+            &[],
+        ) {
+            Ok(_) => panic!("null domain array element was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.sql_state, "23502");
+        let error = match session.execute("DROP TYPE mood", &[]) {
+            Ok(_) => panic!("dependent enum type was dropped"),
+            Err(error) => error,
+        };
+        assert_eq!(error.sql_state, "2BP01");
+
+        drop(session);
+        drop(engine);
+        let reopened = Engine::open(EngineConfig::new(directory.path())).expect("reopen engine");
+        let mut session = reopened.connect().expect("reconnect");
+        let events = execute(
+            &mut session,
+            "SELECT current_mood, score FROM feelings",
+            &[],
+        );
+        assert_eq!(
+            rows(&events),
+            vec![Row::new(vec![Value::Text("happy".into()), Value::Int32(1)])]
+        );
+        execute(&mut session, "DROP TYPE mood CASCADE", &[]);
+        let events = execute(&mut session, "SELECT score FROM feelings", &[]);
+        assert_eq!(rows(&events), vec![Row::new(vec![Value::Int32(1)])]);
+        let events = execute(&mut session, "SELECT id, scores FROM typed_arrays", &[]);
+        assert_eq!(rows(&events).len(), 1);
+        let error = session
+            .execute("SELECT current_mood FROM feelings", &[])
+            .expect_err("cascade removed enum column");
+        assert_eq!(error.sql_state, "42703");
     }
 
     #[test]
