@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use ordadb_catalog::{IndexMethod, TableDefinition};
 use ordadb_sql::{BinaryOperator, BoundExpr, BoundExprKind, BoundOrder, BoundProjection};
-use ordadb_types::{IndexId, TableId};
+use ordadb_types::{IndexId, ScalarType, TableId};
 
 const ROWS_PER_PAGE: f64 = 64.0;
 const SEQUENTIAL_PAGE_COST: f64 = 1.0;
@@ -20,6 +20,7 @@ pub enum AccessPath {
     Index {
         index_id: IndexId,
         column_index: usize,
+        data_type: ScalarType,
         operator: BinaryOperator,
         value: BoundExpr,
     },
@@ -256,6 +257,7 @@ fn index_candidate(table: &TableDefinition, predicate: &BoundExpr) -> Option<(Ac
         AccessPath::Index {
             index_id: index.id,
             column_index,
+            data_type: column.data_type.clone(),
             operator,
             value,
         },
@@ -268,7 +270,19 @@ fn collect_columns(expr: &BoundExpr, columns: &mut BTreeSet<usize>) {
         BoundExprKind::Column { index } => {
             columns.insert(*index);
         }
-        BoundExprKind::Unary { expr, .. } => collect_columns(expr, columns),
+        BoundExprKind::Unary { expr, .. } | BoundExprKind::Cast { expr } => {
+            collect_columns(expr, columns);
+        }
+        BoundExprKind::Array { elements, .. } => {
+            for element in elements {
+                collect_columns(element, columns);
+            }
+        }
+        BoundExprKind::Function { arguments, .. } => {
+            for argument in arguments {
+                collect_columns(argument, columns);
+            }
+        }
         BoundExprKind::Binary { left, right, .. } => {
             collect_columns(left, columns);
             collect_columns(right, columns);

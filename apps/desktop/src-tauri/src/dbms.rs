@@ -2444,6 +2444,18 @@ fn value_text(value: Value) -> Option<String> {
         Value::Date(value) => Some(value.to_string()),
         Value::Time(value) => Some(value.to_string()),
         Value::Timestamp(value) => Some(value.to_string()),
+        Value::Interval(value) => Some(value.to_string()),
+        Value::Array(array) => Some(
+            serde_json::Value::Array(
+                array
+                    .values()
+                    .iter()
+                    .cloned()
+                    .map(|value| value_text(value).map_or(serde_json::Value::Null, Into::into))
+                    .collect(),
+            )
+            .to_string(),
+        ),
         Value::Json(value) | Value::Jsonb(value) => Some(value.to_string()),
         Value::Uuid(value) => Some(value.to_string()),
         Value::Vector(value) => Some(format!(
@@ -2711,6 +2723,8 @@ fn invalid(message: impl Into<String>) -> DbError {
 
 #[cfg(test)]
 mod tests {
+    use ordadb_types::{PgArray, PgInterval, ScalarType};
+
     use super::*;
 
     #[test]
@@ -2959,6 +2973,15 @@ mod tests {
         assert_eq!(
             value_text(Value::Vector(vec![1.0, 2.0])),
             Some("[1, 2]".into())
+        );
+        let interval = PgInterval::new(2, 3, 4);
+        let interval_text = interval.to_string();
+        assert_eq!(value_text(Value::Interval(interval)), Some(interval_text));
+        let array = PgArray::one_dimensional(ScalarType::Int32, vec![Value::Int32(7), Value::Null])
+            .expect("array");
+        assert_eq!(
+            value_text(Value::Array(array)),
+            Some(r#"["7",null]"#.into())
         );
     }
 

@@ -9,7 +9,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use ordadb_catalog::TableDefinition;
 use ordadb_engine::Engine;
-use ordadb_types::{DbError, Identifier, QueryEvent, Result, ScalarType, Value};
+use ordadb_types::{DbError, Identifier, PgArray, QueryEvent, Result, ScalarType, Value};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number};
@@ -415,6 +415,19 @@ fn json_to_value(value: &serde_json::Value, data_type: &ScalarType) -> Result<Va
         ScalarType::Float64 => json_float(value, "FLOAT8").map(Value::Float64),
         ScalarType::Json => Ok(Value::Json(value.clone())),
         ScalarType::Jsonb => Ok(Value::Jsonb(value.clone())),
+        ScalarType::Array { element } => {
+            let array: PgArray = serde_json::from_value(value.clone())
+                .map_err(|error| json_error("invalid array value", error))?;
+            if array.element_type() != element.as_ref() {
+                return Err(type_error("array element type does not match its column"));
+            }
+            PgArray::new(
+                array.element_type().clone(),
+                array.dimensions().to_vec(),
+                array.values().to_vec(),
+            )
+            .map(Value::Array)
+        }
         ScalarType::Vector { dimensions } => {
             let values = value
                 .as_array()
@@ -473,6 +486,12 @@ fn text_to_value(value: &str, data_type: &ScalarType) -> Result<Value> {
         ScalarType::Char { .. } | ScalarType::Varchar { .. } | ScalarType::Text => {
             Value::Text(value.to_owned())
         }
+        ScalarType::Enum { labels, .. } => {
+            if !labels.iter().any(|label| label == value) {
+                return Err(type_error(format!("invalid input value for enum: {value}")));
+            }
+            Value::Text(value.to_owned())
+        }
         ScalarType::Binary => Value::Binary(
             BASE64
                 .decode(value)
@@ -491,6 +510,20 @@ fn text_to_value(value: &str, data_type: &ScalarType) -> Result<Value> {
                 .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f"))
                 .map_err(|_| type_error("TIMESTAMP text is invalid"))?,
         ),
+        ScalarType::Interval => Value::Interval(value.parse()?),
+        ScalarType::Array { element } => {
+            let array: PgArray = serde_json::from_str(value).map_err(|error| {
+                json_error("array text must use the logical array object", error)
+            })?;
+            if array.element_type() != element.as_ref() {
+                return Err(type_error("array element type does not match its column"));
+            }
+            Value::Array(PgArray::new(
+                array.element_type().clone(),
+                array.dimensions().to_vec(),
+                array.values().to_vec(),
+            )?)
+        }
         ScalarType::Json => Value::Json(
             serde_json::from_str(value).map_err(|error| json_error("invalid JSON text", error))?,
         ),
@@ -530,6 +563,8 @@ fn value_to_csv(value: &Value) -> String {
         Value::Date(value) => value.format("%Y-%m-%d").to_string(),
         Value::Time(value) => value.format("%H:%M:%S%.f").to_string(),
         Value::Timestamp(value) => value.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
+        Value::Interval(value) => value.to_string(),
+        Value::Array(value) => serde_json::to_string(value).unwrap_or_else(|_| "{}".into()),
         Value::Json(value) | Value::Jsonb(value) => value.to_string(),
         Value::Uuid(value) => value.to_string(),
         Value::Vector(value) => serde_json::to_string(value).unwrap_or_else(|_| "[]".into()),
@@ -557,6 +592,8 @@ fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Timestamp(value) => {
             serde_json::Value::String(value.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
         }
+        Value::Interval(value) => serde_json::Value::String(value.to_string()),
+        Value::Array(value) => serde_json::to_value(value).unwrap_or(serde_json::Value::Null),
         Value::Json(value) | Value::Jsonb(value) => value.clone(),
         Value::Uuid(value) => serde_json::Value::String(value.to_string()),
         Value::Vector(value) => serde_json::to_value(value).unwrap_or(serde_json::Value::Null),

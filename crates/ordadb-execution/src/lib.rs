@@ -7,17 +7,23 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use ordadb_index::{BPlusTree, BPlusTreeOwnedIter, IndexKey};
 use ordadb_optimizer::{AccessPath, PlanKind, PlanNode};
 use ordadb_sql::{
     AggregateFunction, BinaryOperator, BoundExpr, BoundExprKind, BoundOrder, BoundProjection,
-    UnaryOperator,
+    ScalarFunction, UnaryOperator,
 };
-use ordadb_types::{Batch, DbError, IndexId, Result, Row, ScalarType, Schema, TableId, Value};
+use ordadb_types::{
+    ArrayDimension, Batch, DbError, IndexId, PgArray, PgInterval, Result, Row, ScalarType, Schema,
+    TableId, Value,
+};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -173,8 +179,13 @@ impl ExpressionStack {
         self.values.len()
     }
 
-    fn collapse_in_list(&mut self, count: usize, negated: bool) -> Result<()> {
-        <Self as ExpressionValues>::collapse_in_list(self, count, negated)
+    fn collapse_in_list(
+        &mut self,
+        count: usize,
+        negated: bool,
+        operand_type: &ScalarType,
+    ) -> Result<()> {
+        <Self as ExpressionValues>::collapse_in_list(self, count, negated, operand_type)
     }
 }
 
@@ -183,7 +194,12 @@ trait ExpressionValues {
     fn push_value(&mut self, value: Value) -> Result<()>;
     fn pop_value(&mut self) -> Option<Value>;
     fn value_count(&self) -> usize;
-    fn collapse_in_list(&mut self, count: usize, negated: bool) -> Result<()>;
+    fn collapse_in_list(
+        &mut self,
+        count: usize,
+        negated: bool,
+        operand_type: &ScalarType,
+    ) -> Result<()>;
 }
 
 impl ExpressionValues for Vec<Value> {
@@ -205,8 +221,13 @@ impl ExpressionValues for Vec<Value> {
         self.len()
     }
 
-    fn collapse_in_list(&mut self, count: usize, negated: bool) -> Result<()> {
-        let result = evaluate_in_list_stack(self, count, negated)?;
+    fn collapse_in_list(
+        &mut self,
+        count: usize,
+        negated: bool,
+        operand_type: &ScalarType,
+    ) -> Result<()> {
+        let result = evaluate_in_list_stack(self, count, negated, operand_type)?;
         self.truncate(self.len().saturating_sub(count.saturating_add(1)));
         self.push(result);
         Ok(())
@@ -239,8 +260,13 @@ impl ExpressionValues for ExpressionStack {
         self.len()
     }
 
-    fn collapse_in_list(&mut self, count: usize, negated: bool) -> Result<()> {
-        let result = evaluate_in_list_stack(&self.values, count, negated)?;
+    fn collapse_in_list(
+        &mut self,
+        count: usize,
+        negated: bool,
+        operand_type: &ScalarType,
+    ) -> Result<()> {
+        let result = evaluate_in_list_stack(&self.values, count, negated, operand_type)?;
         self.values
             .truncate(self.values.len().saturating_sub(count.saturating_add(1)));
         self.push(result)
@@ -279,7 +305,7 @@ impl BatchPool {
 
 #[derive(Debug, Clone)]
 enum OperatorFrame {
-    Filter(ExpressionProgram),
+    Filter(Box<ExpressionProgram>),
     Projection(Vec<ExpressionProgram>),
     Sort(Vec<BoundOrder>),
     Offset { remaining: usize },
@@ -979,7 +1005,10 @@ fn apply_chunk_frames(
                         literal,
                         literal_type,
                         target,
-                    }) if column_type == literal_type && matches!(target, ScalarType::Boolean) => {
+                    }) if column_type == literal_type
+                        && matches!(target, ScalarType::Boolean)
+                        && !matches!(column_type, ScalarType::Enum { .. }) =>
+                    {
                         chunk
                             .chunk_mut()
                             .retain_literal_comparison(*column, literal, *operator)
@@ -1139,13 +1168,13 @@ fn build_pipeline(
                 )?;
             }
             PlanKind::Filter { predicate, input } => {
-                let id = arena.insert(OperatorFrame::Filter(
+                let id = arena.insert(OperatorFrame::Filter(Box::new(
                     ExpressionProgram::compile_with_limit(
                         predicate,
                         false,
                         options.max_expression_depth,
                     )?,
-                ));
+                )));
                 frames.push(id);
                 node = input;
             }
@@ -1213,13 +1242,14 @@ fn build_source(
         },
         AccessPath::Index {
             index_id,
+            data_type,
             operator,
             value,
             ..
         } => {
             let program =
                 ExpressionProgram::compile_with_limit(value, false, max_expression_depth)?;
-            let value = program.evaluate(&[], context.params)?;
+            let value = coerce_value(program.evaluate(&[], context.params)?, data_type)?;
             if value.is_null() {
                 return Ok(SourceCursor::Empty);
             }
@@ -1228,7 +1258,10 @@ fn build_source(
                 .get(&table_id)
                 .cloned()
                 .unwrap_or_else(|| Arc::new(Vec::new()));
-            let key = IndexKey::from_values(&[value])?;
+            let key = IndexKey::from_typed_values(
+                std::slice::from_ref(&value),
+                std::slice::from_ref(data_type),
+            )?;
             let tree = context
                 .indexes
                 .get(index_id)
@@ -1577,6 +1610,17 @@ pub(crate) fn estimated_value_bytes(value: &Value) -> usize {
             Value::Text(value) => value.len(),
             Value::Binary(value) => value.len(),
             Value::Json(value) | Value::Jsonb(value) => value.to_string().len(),
+            Value::Array(value) => value
+                .dimensions()
+                .len()
+                .saturating_mul(std::mem::size_of::<ordadb_types::ArrayDimension>())
+                .saturating_add(
+                    value
+                        .values()
+                        .iter()
+                        .map(estimated_value_bytes)
+                        .sum::<usize>(),
+                ),
             Value::Vector(value) => value.len().saturating_mul(std::mem::size_of::<f32>()),
             _ => 0,
         }
@@ -1597,14 +1641,29 @@ enum ExpressionInstruction {
     LoadLiteral(Value),
     LoadParameter(usize),
     Unary(UnaryOperator),
-    Binary(BinaryOperator),
+    Binary {
+        operator: BinaryOperator,
+        operand_type: ScalarType,
+    },
     InList {
         count: usize,
         negated: bool,
+        operand_type: ScalarType,
+    },
+    Cast(ScalarType),
+    MakeArray {
+        count: usize,
+        element_type: ScalarType,
+        dimensions: Vec<ArrayDimension>,
+    },
+    Function {
+        function: ScalarFunction,
+        count: usize,
     },
     Aggregate {
         function: AggregateFunction,
         argument: Option<Vec<ExpressionInstruction>>,
+        argument_type: Option<ScalarType>,
     },
     Coerce(ScalarType),
 }
@@ -1614,6 +1673,7 @@ pub struct ExpressionProgram {
     instructions: Vec<ExpressionInstruction>,
     fast_path: Option<FastExpression>,
     max_stack_slots: usize,
+    result_type: ScalarType,
 }
 
 #[derive(Debug, Clone)]
@@ -1663,13 +1723,49 @@ impl ExpressionProgram {
                     BoundExprKind::Unary { op, .. } => {
                         instructions.push(ExpressionInstruction::Unary(*op));
                     }
-                    BoundExprKind::Binary { op, .. } => {
-                        instructions.push(ExpressionInstruction::Binary(*op));
+                    BoundExprKind::Binary { left, op, .. } => {
+                        instructions.push(ExpressionInstruction::Binary {
+                            operator: *op,
+                            operand_type: left.data_type.clone(),
+                        });
                     }
-                    BoundExprKind::InList { list, negated, .. } => {
+                    BoundExprKind::InList {
+                        expr,
+                        list,
+                        negated,
+                    } => {
                         instructions.push(ExpressionInstruction::InList {
                             count: list.len(),
                             negated: *negated,
+                            operand_type: expr.data_type.clone(),
+                        });
+                    }
+                    BoundExprKind::Cast { .. } => {
+                        instructions
+                            .push(ExpressionInstruction::Cast(expression.data_type.clone()));
+                    }
+                    BoundExprKind::Array {
+                        elements,
+                        dimensions,
+                    } => {
+                        let ScalarType::Array { element } = &expression.data_type else {
+                            return Err(DbError::internal(
+                                "array expression lost its array result type",
+                            ));
+                        };
+                        instructions.push(ExpressionInstruction::MakeArray {
+                            count: elements.len(),
+                            element_type: element.as_ref().clone(),
+                            dimensions: dimensions.clone(),
+                        });
+                    }
+                    BoundExprKind::Function {
+                        function,
+                        arguments,
+                    } => {
+                        instructions.push(ExpressionInstruction::Function {
+                            function: *function,
+                            count: arguments.len(),
                         });
                     }
                     _ => {
@@ -1707,6 +1803,22 @@ impl ExpressionProgram {
                     pending.push((expression, true, depth));
                     pending.push((expr, false, depth + 1));
                 }
+                BoundExprKind::Cast { expr } => {
+                    pending.push((expression, true, depth));
+                    pending.push((expr, false, depth + 1));
+                }
+                BoundExprKind::Array { elements, .. } => {
+                    pending.push((expression, true, depth));
+                    for element in elements.iter().rev() {
+                        pending.push((element, false, depth + 1));
+                    }
+                }
+                BoundExprKind::Function { arguments, .. } => {
+                    pending.push((expression, true, depth));
+                    for argument in arguments.iter().rev() {
+                        pending.push((argument, false, depth + 1));
+                    }
+                }
                 BoundExprKind::Binary { left, right, .. } => {
                     pending.push((expression, true, depth));
                     pending.push((right, false, depth + 1));
@@ -1734,9 +1846,16 @@ impl ExpressionProgram {
                                 .map(|program| program.instructions)
                         })
                         .transpose()?;
+                    let argument_type = argument.as_ref().and_then(|_| match &expression.kind {
+                        BoundExprKind::Aggregate { argument, .. } => argument
+                            .as_deref()
+                            .map(|argument| argument.data_type.clone()),
+                        _ => None,
+                    });
                     instructions.push(ExpressionInstruction::Aggregate {
                         function: *function,
                         argument,
+                        argument_type,
                     });
                     instructions.push(ExpressionInstruction::Coerce(expression.data_type.clone()));
                 }
@@ -1753,7 +1872,12 @@ impl ExpressionProgram {
             instructions,
             fast_path: detect_fast_expression(expr),
             max_stack_slots,
+            result_type: expr.data_type.clone(),
         })
+    }
+
+    fn result_type(&self) -> &ScalarType {
+        &self.result_type
     }
 
     fn column_projection(&self) -> Option<(usize, ScalarType)> {
@@ -1784,6 +1908,7 @@ impl ExpressionProgram {
             }) => {
                 if column_type == literal_type
                     && matches!(target, ScalarType::Boolean)
+                    && !matches!(column_type, ScalarType::Enum { .. })
                     && let Some(value) =
                         chunk.compare_literal(*column, physical_row, literal, *operator)
                 {
@@ -1791,7 +1916,10 @@ impl ExpressionProgram {
                 }
                 let left = coerce_value(chunk.value(*column, physical_row)?, column_type)?;
                 let right = coerce_value(literal.clone(), literal_type)?;
-                coerce_value(evaluate_binary(left, *operator, right)?, target)
+                coerce_value(
+                    evaluate_binary_as(left, *operator, right, column_type)?,
+                    target,
+                )
             }
             Some(
                 fast_path @ (FastExpression::Literal { .. } | FastExpression::Parameter { .. }),
@@ -1847,14 +1975,16 @@ fn expression_stack_slots(instructions: &[ExpressionInstruction]) -> Result<usiz
                 })?;
                 maximum = maximum.max(depth);
             }
-            ExpressionInstruction::Unary(_) | ExpressionInstruction::Coerce(_) => {
+            ExpressionInstruction::Unary(_)
+            | ExpressionInstruction::Cast(_)
+            | ExpressionInstruction::Coerce(_) => {
                 if depth == 0 {
                     return Err(DbError::internal(
                         "expression compiler produced a stack underflow",
                     ));
                 }
             }
-            ExpressionInstruction::Binary(_) => {
+            ExpressionInstruction::Binary { .. } => {
                 if depth < 2 {
                     return Err(DbError::internal(
                         "expression compiler produced a stack underflow",
@@ -1870,6 +2000,29 @@ fn expression_stack_slots(instructions: &[ExpressionInstruction]) -> Result<usiz
                     ));
                 }
                 depth -= *count;
+            }
+            ExpressionInstruction::MakeArray { count, .. } => {
+                if *count == 0 {
+                    depth = depth.checked_add(1).ok_or_else(|| {
+                        program_limit_error("expression value stack depth overflowed")
+                    })?;
+                    maximum = maximum.max(depth);
+                } else {
+                    if depth < *count {
+                        return Err(DbError::internal(
+                            "expression compiler produced an array stack underflow",
+                        ));
+                    }
+                    depth = depth - *count + 1;
+                }
+            }
+            ExpressionInstruction::Function { count, .. } => {
+                if *count == 0 || depth < *count {
+                    return Err(DbError::internal(
+                        "expression compiler produced a function stack underflow",
+                    ));
+                }
+                depth = depth - *count + 1;
             }
         }
     }
@@ -1947,12 +2100,20 @@ fn evaluate_fast_expression(
             })?;
             let left = coerce_value(left, column_type)?;
             let right = coerce_value(literal.clone(), literal_type)?;
-            coerce_value(evaluate_binary(left, *operator, right)?, target)
+            coerce_value(
+                evaluate_binary_as(left, *operator, right, column_type)?,
+                target,
+            )
         }
     }
 }
 
-fn evaluate_in_list_stack(values: &[Value], count: usize, negated: bool) -> Result<Value> {
+fn evaluate_in_list_stack(
+    values: &[Value],
+    count: usize,
+    negated: bool,
+    operand_type: &ScalarType,
+) -> Result<Value> {
     let required = count
         .checked_add(1)
         .ok_or_else(|| program_limit_error("IN list stack width overflowed"))?;
@@ -1968,7 +2129,12 @@ fn evaluate_in_list_stack(values: &[Value], count: usize, negated: bool) -> Resu
     }
     let mut saw_null = false;
     for candidate in &values[start + 1..] {
-        match evaluate_binary(operand.clone(), BinaryOperator::Eq, candidate.clone())? {
+        match evaluate_binary_as(
+            operand.clone(),
+            BinaryOperator::Eq,
+            candidate.clone(),
+            operand_type,
+        )? {
             Value::Boolean(true) => return Ok(Value::Boolean(!negated)),
             Value::Boolean(false) => {}
             Value::Null => saw_null = true,
@@ -2019,25 +2185,71 @@ fn evaluate_instructions_reusing<S: ExpressionValues>(
                     .ok_or_else(|| DbError::internal("expression value stack underflow"))?;
                 values.push_value(evaluate_unary(*operator, value)?)?;
             }
-            ExpressionInstruction::Binary(operator) => {
+            ExpressionInstruction::Binary {
+                operator,
+                operand_type,
+            } => {
                 let right = values
                     .pop_value()
                     .ok_or_else(|| DbError::internal("expression value stack underflow"))?;
                 let left = values
                     .pop_value()
                     .ok_or_else(|| DbError::internal("expression value stack underflow"))?;
-                values.push_value(evaluate_binary(left, *operator, right)?)?;
+                values.push_value(evaluate_binary_as(left, *operator, right, operand_type)?)?;
             }
-            ExpressionInstruction::InList { count, negated } => {
-                values.collapse_in_list(*count, *negated)?;
+            ExpressionInstruction::InList {
+                count,
+                negated,
+                operand_type,
+            } => {
+                values.collapse_in_list(*count, *negated, operand_type)?;
             }
-            ExpressionInstruction::Aggregate { function, argument } => {
+            ExpressionInstruction::Cast(target) => {
+                let value = values
+                    .pop_value()
+                    .ok_or_else(|| DbError::internal("expression value stack underflow"))?;
+                values.push_value(cast_value(value, target)?)?;
+            }
+            ExpressionInstruction::MakeArray {
+                count,
+                element_type,
+                dimensions,
+            } => {
+                let mut elements = Vec::with_capacity(*count);
+                for _ in 0..*count {
+                    elements.push(values.pop_value().ok_or_else(|| {
+                        DbError::internal("expression array value stack underflow")
+                    })?);
+                }
+                elements.reverse();
+                values.push_value(Value::Array(PgArray::new(
+                    element_type.clone(),
+                    dimensions.clone(),
+                    elements,
+                )?))?;
+            }
+            ExpressionInstruction::Function { function, count } => {
+                let mut arguments = Vec::with_capacity(*count);
+                for _ in 0..*count {
+                    arguments.push(values.pop_value().ok_or_else(|| {
+                        DbError::internal("expression function value stack underflow")
+                    })?);
+                }
+                arguments.reverse();
+                values.push_value(evaluate_scalar_function(*function, arguments)?)?;
+            }
+            ExpressionInstruction::Aggregate {
+                function,
+                argument,
+                argument_type,
+            } => {
                 let rows = group_rows.ok_or_else(|| {
                     DbError::internal("aggregate expression requires grouped rows")
                 })?;
                 values.push_value(evaluate_aggregate_program(
                     *function,
                     argument.as_deref(),
+                    argument_type.as_ref(),
                     rows,
                     params,
                 )?)?;
@@ -2080,6 +2292,7 @@ pub fn evaluate_group(
 fn evaluate_aggregate_program(
     function: AggregateFunction,
     argument: Option<&[ExpressionInstruction]>,
+    argument_type: Option<&ScalarType>,
     rows: &[Row],
     params: &[Value],
 ) -> Result<Value> {
@@ -2119,9 +2332,12 @@ fn evaluate_aggregate_program(
             Ok(Value::Float64(sum / values.len() as f64))
         }
         AggregateFunction::Min | AggregateFunction::Max => {
+            let argument_type = argument_type.ok_or_else(|| {
+                DbError::internal("MIN/MAX aggregate argument type is unavailable")
+            })?;
             let mut selected = values[0].clone();
             for value in values.iter().skip(1) {
-                let ordering = compare_values(value, &selected)?;
+                let ordering = compare_values_as(value, &selected, argument_type)?;
                 let replace = if function == AggregateFunction::Min {
                     ordering == Ordering::Less
                 } else {
@@ -2204,6 +2420,22 @@ fn evaluate_unary(operator: UnaryOperator, value: Value) -> Result<Value> {
         (UnaryOperator::Negate, Value::Float32(value)) => Ok(Value::Float32(-value)),
         (UnaryOperator::Negate, Value::Float64(value)) => Ok(Value::Float64(-value)),
         (UnaryOperator::Negate, Value::Decimal(value)) => Ok(Value::Decimal(-value)),
+        (UnaryOperator::Negate, Value::Interval(value)) => {
+            Ok(Value::Interval(ordadb_types::PgInterval::new(
+                value
+                    .months
+                    .checked_neg()
+                    .ok_or_else(|| DbError::new("22015", "interval field is out of range"))?,
+                value
+                    .days
+                    .checked_neg()
+                    .ok_or_else(|| DbError::new("22015", "interval field is out of range"))?,
+                value
+                    .microseconds
+                    .checked_neg()
+                    .ok_or_else(|| DbError::new("22015", "interval field is out of range"))?,
+            )))
+        }
         _ => Err(DbError::new(
             "42804",
             "unary operator received an incompatible value",
@@ -2212,6 +2444,19 @@ fn evaluate_unary(operator: UnaryOperator, value: Value) -> Result<Value> {
 }
 
 fn evaluate_binary(left: Value, operator: BinaryOperator, right: Value) -> Result<Value> {
+    let operand_type = left
+        .scalar_type()
+        .or_else(|| right.scalar_type())
+        .unwrap_or(ScalarType::Text);
+    evaluate_binary_as(left, operator, right, &operand_type)
+}
+
+fn evaluate_binary_as(
+    left: Value,
+    operator: BinaryOperator,
+    right: Value,
+    operand_type: &ScalarType,
+) -> Result<Value> {
     if matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
         return evaluate_boolean_binary(left, operator, right);
     }
@@ -2228,12 +2473,18 @@ fn evaluate_binary(left: Value, operator: BinaryOperator, right: Value) -> Resul
     ) {
         return evaluate_arithmetic_binary(left, operator, right);
     }
+    let equals = match (&left, &right) {
+        (Value::Interval(left), Value::Interval(right)) => {
+            interval_comparison_key(*left) == interval_comparison_key(*right)
+        }
+        _ => left == right,
+    };
     match operator {
-        BinaryOperator::Eq => return Ok(Value::Boolean(left == right)),
-        BinaryOperator::NotEq => return Ok(Value::Boolean(left != right)),
+        BinaryOperator::Eq => return Ok(Value::Boolean(equals)),
+        BinaryOperator::NotEq => return Ok(Value::Boolean(!equals)),
         _ => {}
     }
-    let ordering = compare_values(&left, &right)?;
+    let ordering = compare_values_as(&left, &right, operand_type)?;
     Ok(Value::Boolean(match operator {
         BinaryOperator::Lt => ordering == Ordering::Less,
         BinaryOperator::LtEq => ordering != Ordering::Greater,
@@ -2400,6 +2651,630 @@ fn evaluate_offset_program(program: &ExpressionProgram, params: &[Value]) -> Res
     }
 }
 
+fn evaluate_scalar_function(function: ScalarFunction, arguments: Vec<Value>) -> Result<Value> {
+    match function {
+        ScalarFunction::Coalesce => Ok(arguments
+            .into_iter()
+            .find(|value| !value.is_null())
+            .unwrap_or(Value::Null)),
+        ScalarFunction::NullIf => {
+            let mut arguments = arguments.into_iter();
+            let left = arguments
+                .next()
+                .ok_or_else(|| DbError::internal("NULLIF lost its first argument"))?;
+            let right = arguments
+                .next()
+                .ok_or_else(|| DbError::internal("NULLIF lost its second argument"))?;
+            if left.is_null() || right.is_null() {
+                return Ok(left);
+            }
+            match evaluate_binary(left.clone(), BinaryOperator::Eq, right)? {
+                Value::Boolean(true) => Ok(Value::Null),
+                Value::Boolean(false) | Value::Null => Ok(left),
+                _ => Err(DbError::internal("NULLIF equality did not return boolean")),
+            }
+        }
+        ScalarFunction::Concat => {
+            let mut output = String::new();
+            for argument in arguments {
+                if !argument.is_null() {
+                    output.push_str(&value_to_cast_text(&argument)?);
+                }
+            }
+            Ok(Value::Text(output))
+        }
+        ScalarFunction::Greatest | ScalarFunction::Least => {
+            let select_greatest = function == ScalarFunction::Greatest;
+            let mut best = None;
+            for argument in arguments {
+                if argument.is_null() {
+                    continue;
+                }
+                best = Some(match best {
+                    None => argument,
+                    Some(current) => {
+                        let ordering = compare_values(&argument, &current)?;
+                        if (select_greatest && ordering == Ordering::Greater)
+                            || (!select_greatest && ordering == Ordering::Less)
+                        {
+                            argument
+                        } else {
+                            current
+                        }
+                    }
+                });
+            }
+            Ok(best.unwrap_or(Value::Null))
+        }
+        _ if arguments.iter().any(Value::is_null) => Ok(Value::Null),
+        ScalarFunction::Lower | ScalarFunction::Upper => {
+            let Value::Text(value) = &arguments[0] else {
+                return Err(DbError::new(
+                    "42883",
+                    "text function requires a textual argument",
+                ));
+            };
+            Ok(Value::Text(if function == ScalarFunction::Lower {
+                value.to_lowercase()
+            } else {
+                value.to_uppercase()
+            }))
+        }
+        ScalarFunction::CharacterLength => match &arguments[0] {
+            Value::Text(value) => i32::try_from(value.chars().count())
+                .map(Value::Int32)
+                .map_err(|_| DbError::new("22003", "character length exceeds INTEGER range")),
+            Value::Binary(value) => i32::try_from(value.len())
+                .map(Value::Int32)
+                .map_err(|_| DbError::new("22003", "bytea length exceeds INTEGER range")),
+            _ => Err(DbError::new("42883", "length requires text or bytea")),
+        },
+        ScalarFunction::OctetLength => match &arguments[0] {
+            Value::Text(value) => i32::try_from(value.len())
+                .map(Value::Int32)
+                .map_err(|_| DbError::new("22003", "octet length exceeds INTEGER range")),
+            Value::Binary(value) => i32::try_from(value.len())
+                .map(Value::Int32)
+                .map_err(|_| DbError::new("22003", "bytea length exceeds INTEGER range")),
+            _ => Err(DbError::new("42883", "octet_length requires text or bytea")),
+        },
+        ScalarFunction::Abs => match arguments[0] {
+            Value::Int16(value) => value
+                .checked_abs()
+                .map(Value::Int16)
+                .ok_or_else(|| DbError::new("22003", "smallint out of range")),
+            Value::Int32(value) => value
+                .checked_abs()
+                .map(Value::Int32)
+                .ok_or_else(|| DbError::new("22003", "integer out of range")),
+            Value::Int64(value) => value
+                .checked_abs()
+                .map(Value::Int64)
+                .ok_or_else(|| DbError::new("22003", "bigint out of range")),
+            Value::Float32(value) => Ok(Value::Float32(value.abs())),
+            Value::Float64(value) => Ok(Value::Float64(value.abs())),
+            Value::Decimal(value) => Ok(Value::Decimal(value.abs())),
+            _ => Err(DbError::new("42883", "ABS requires a numeric argument")),
+        },
+        ScalarFunction::Substring => evaluate_substring(&arguments),
+        ScalarFunction::Btrim | ScalarFunction::Ltrim | ScalarFunction::Rtrim => {
+            let Value::Text(value) = &arguments[0] else {
+                return Err(DbError::new("42883", "trim requires textual arguments"));
+            };
+            let characters = arguments
+                .get(1)
+                .map(|argument| match argument {
+                    Value::Text(characters) => Ok(characters.as_str()),
+                    _ => Err(DbError::new("42883", "trim characters must be text")),
+                })
+                .transpose()?;
+            let trimmed = match (function, characters) {
+                (ScalarFunction::Btrim, Some(characters)) => {
+                    value.trim_matches(|character| characters.contains(character))
+                }
+                (ScalarFunction::Ltrim, Some(characters)) => {
+                    value.trim_start_matches(|character| characters.contains(character))
+                }
+                (ScalarFunction::Rtrim, Some(characters)) => {
+                    value.trim_end_matches(|character| characters.contains(character))
+                }
+                (ScalarFunction::Btrim, None) => value.trim(),
+                (ScalarFunction::Ltrim, None) => value.trim_start(),
+                (ScalarFunction::Rtrim, None) => value.trim_end(),
+                _ => return Err(DbError::internal("unexpected trim function")),
+            };
+            Ok(Value::Text(trimmed.to_owned()))
+        }
+        ScalarFunction::Replace => {
+            let (Value::Text(value), Value::Text(from), Value::Text(to)) =
+                (&arguments[0], &arguments[1], &arguments[2])
+            else {
+                return Err(DbError::new(
+                    "42883",
+                    "replace requires three textual arguments",
+                ));
+            };
+            Ok(Value::Text(value.replace(from, to)))
+        }
+        ScalarFunction::Strpos => {
+            let (Value::Text(value), Value::Text(needle)) = (&arguments[0], &arguments[1]) else {
+                return Err(DbError::new(
+                    "42883",
+                    "strpos requires two textual arguments",
+                ));
+            };
+            let position = value.find(needle).map_or(0_usize, |byte_offset| {
+                value[..byte_offset].chars().count().saturating_add(1)
+            });
+            i32::try_from(position)
+                .map(Value::Int32)
+                .map_err(|_| DbError::new("22003", "text position exceeds INTEGER range"))
+        }
+        ScalarFunction::JsonbTypeof => {
+            let Value::Jsonb(value) = &arguments[0] else {
+                return Err(DbError::new("42883", "jsonb_typeof requires jsonb"));
+            };
+            let name = match value {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "boolean",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => "object",
+            };
+            Ok(Value::Text(name.to_owned()))
+        }
+        ScalarFunction::ArrayLength => {
+            let (Value::Array(array), Value::Int32(dimension)) = (&arguments[0], &arguments[1])
+            else {
+                return Err(DbError::new(
+                    "42883",
+                    "array_length requires array, integer",
+                ));
+            };
+            let Some(index) = dimension
+                .checked_sub(1)
+                .and_then(|value| usize::try_from(value).ok())
+            else {
+                return Ok(Value::Null);
+            };
+            array
+                .dimensions()
+                .get(index)
+                .map_or(Ok(Value::Null), |dimension| {
+                    i32::try_from(dimension.length)
+                        .map(Value::Int32)
+                        .map_err(|_| DbError::new("22003", "array length exceeds INTEGER range"))
+                })
+        }
+        ScalarFunction::Cardinality => {
+            let Value::Array(array) = &arguments[0] else {
+                return Err(DbError::new("42883", "cardinality requires an array"));
+            };
+            i32::try_from(array.values().len())
+                .map(Value::Int32)
+                .map_err(|_| DbError::new("22003", "array cardinality exceeds INTEGER range"))
+        }
+    }
+}
+
+fn evaluate_substring(arguments: &[Value]) -> Result<Value> {
+    let (Value::Text(value), Value::Int32(start)) = (&arguments[0], &arguments[1]) else {
+        return Err(DbError::new("42883", "substring requires text, integer"));
+    };
+    let requested_length = arguments
+        .get(2)
+        .map(|value| match value {
+            Value::Int32(length) if *length >= 0 => Ok(i64::from(*length)),
+            Value::Int32(_) => Err(DbError::new(
+                "22011",
+                "negative substring length not allowed",
+            )),
+            _ => Err(DbError::new("42883", "substring length must be integer")),
+        })
+        .transpose()?;
+    let start = i64::from(*start) - 1;
+    let end = requested_length.and_then(|length| start.checked_add(length));
+    let begin = usize::try_from(start.max(0)).unwrap_or(usize::MAX);
+    let take = end.map_or(usize::MAX, |end| {
+        usize::try_from(end.max(0).saturating_sub(start.max(0))).unwrap_or(usize::MAX)
+    });
+    Ok(Value::Text(value.chars().skip(begin).take(take).collect()))
+}
+
+pub fn cast_value(value: Value, target: &ScalarType) -> Result<Value> {
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if matches!(target, ScalarType::Enum { .. })
+        || matches!(target, ScalarType::Array { element } if matches!(element.as_ref(), ScalarType::Enum { .. }))
+    {
+        return coerce_value(value, target);
+    }
+    if let Ok(value) = coerce_value(value.clone(), target) {
+        return Ok(value);
+    }
+    if matches!(
+        target,
+        ScalarType::Text | ScalarType::Char { .. } | ScalarType::Varchar { .. }
+    ) {
+        return cast_text_result(value_to_cast_text(&value)?, target);
+    }
+    if value.scalar_type().as_ref().is_some_and(is_numeric_type) && is_numeric_type(target) {
+        return cast_numeric(value, target);
+    }
+    match (value, target) {
+        (Value::Text(value), ScalarType::Boolean) => parse_boolean_text(&value).map(Value::Boolean),
+        (Value::Text(value), target) if is_numeric_type(target) => {
+            cast_numeric_text(&value, target)
+        }
+        (Value::Text(value), ScalarType::Binary) => parse_bytea_text(&value).map(Value::Binary),
+        (Value::Text(value), ScalarType::Date) => NaiveDate::parse_from_str(&value, "%Y-%m-%d")
+            .map(Value::Date)
+            .map_err(|_| invalid_text_cast(&value, target)),
+        (Value::Text(value), ScalarType::Time) => NaiveTime::parse_from_str(&value, "%H:%M:%S%.f")
+            .map(Value::Time)
+            .map_err(|_| invalid_text_cast(&value, target)),
+        (Value::Text(value), ScalarType::Timestamp { .. }) => {
+            NaiveDateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S%.f")
+                .or_else(|_| NaiveDateTime::parse_from_str(&value, "%Y-%m-%dT%H:%M:%S%.f"))
+                .map(Value::Timestamp)
+                .map_err(|_| invalid_text_cast(&value, target))
+        }
+        (Value::Text(value), ScalarType::Interval) => PgInterval::from_str(&value)
+            .map(Value::Interval)
+            .map_err(|error| DbError::new(error.sql_state, error.message)),
+        (Value::Text(value), ScalarType::Json) => serde_json::from_str(&value)
+            .map(Value::Json)
+            .map_err(|_| invalid_text_cast(&value, target)),
+        (Value::Text(value), ScalarType::Jsonb) => serde_json::from_str(&value)
+            .map(Value::Jsonb)
+            .map_err(|_| invalid_text_cast(&value, target)),
+        (Value::Text(value), ScalarType::Uuid) => uuid::Uuid::parse_str(&value)
+            .map(Value::Uuid)
+            .map_err(|_| invalid_text_cast(&value, target)),
+        (Value::Date(value), ScalarType::Timestamp { .. }) => value
+            .and_hms_opt(0, 0, 0)
+            .map(Value::Timestamp)
+            .ok_or_else(|| DbError::new("22008", "date is outside timestamp range")),
+        (Value::Timestamp(value), ScalarType::Date) => Ok(Value::Date(value.date())),
+        (Value::Timestamp(value), ScalarType::Time) => Ok(Value::Time(value.time())),
+        (Value::Timestamp(value), ScalarType::Timestamp { .. }) => Ok(Value::Timestamp(value)),
+        (Value::Json(value), ScalarType::Jsonb) => Ok(Value::Jsonb(value)),
+        (Value::Jsonb(value), ScalarType::Json) => Ok(Value::Json(value)),
+        (Value::Array(value), ScalarType::Array { element }) => {
+            let dimensions = value.dimensions().to_vec();
+            let values = value
+                .values()
+                .iter()
+                .cloned()
+                .map(|value| cast_value(value, element))
+                .collect::<Result<Vec<_>>>()?;
+            PgArray::new(element.as_ref().clone(), dimensions, values).map(Value::Array)
+        }
+        (value, target) => Err(DbError::new(
+            "42846",
+            format!("cannot cast value {value:?} to {target:?}"),
+        )),
+    }
+}
+
+fn is_numeric_type(data_type: &ScalarType) -> bool {
+    matches!(
+        data_type,
+        ScalarType::Int16
+            | ScalarType::Int32
+            | ScalarType::Int64
+            | ScalarType::Float32
+            | ScalarType::Float64
+            | ScalarType::Decimal { .. }
+    )
+}
+
+fn cast_numeric(value: Value, target: &ScalarType) -> Result<Value> {
+    match target {
+        ScalarType::Int16 => numeric_to_i128(&value)
+            .and_then(|value| i16::try_from(value).map_err(|_| cast_numeric_out_of_range(target)))
+            .map(Value::Int16),
+        ScalarType::Int32 => numeric_to_i128(&value)
+            .and_then(|value| i32::try_from(value).map_err(|_| cast_numeric_out_of_range(target)))
+            .map(Value::Int32),
+        ScalarType::Int64 => numeric_to_i128(&value)
+            .and_then(|value| i64::try_from(value).map_err(|_| cast_numeric_out_of_range(target)))
+            .map(Value::Int64),
+        ScalarType::Float32 => {
+            let value = numeric_to_f64(&value)?;
+            let narrowed = value as f32;
+            if narrowed.is_finite() || value == 0.0 {
+                Ok(Value::Float32(narrowed))
+            } else {
+                Err(cast_numeric_out_of_range(target))
+            }
+        }
+        ScalarType::Float64 => numeric_to_f64(&value).map(Value::Float64),
+        ScalarType::Decimal { .. } => numeric_to_decimal(&value).map(Value::Decimal),
+        _ => Err(DbError::internal(
+            "numeric cast received a non-numeric target",
+        )),
+    }
+}
+
+fn numeric_to_i128(value: &Value) -> Result<i128> {
+    match value {
+        Value::Int16(value) => Ok(i128::from(*value)),
+        Value::Int32(value) => Ok(i128::from(*value)),
+        Value::Int64(value) => Ok(i128::from(*value)),
+        Value::Float32(value) if value.is_finite() => (*value as f64)
+            .round()
+            .to_i128()
+            .ok_or_else(|| cast_numeric_out_of_range(&ScalarType::Int64)),
+        Value::Float64(value) if value.is_finite() => value
+            .round()
+            .to_i128()
+            .ok_or_else(|| cast_numeric_out_of_range(&ScalarType::Int64)),
+        Value::Decimal(value) => value
+            .round()
+            .to_i128()
+            .ok_or_else(|| cast_numeric_out_of_range(&ScalarType::Int64)),
+        _ => Err(cast_numeric_out_of_range(&ScalarType::Int64)),
+    }
+}
+
+fn numeric_to_f64(value: &Value) -> Result<f64> {
+    let value = match value {
+        Value::Int16(value) => f64::from(*value),
+        Value::Int32(value) => f64::from(*value),
+        Value::Int64(value) => *value as f64,
+        Value::Float32(value) => f64::from(*value),
+        Value::Float64(value) => *value,
+        Value::Decimal(value) => value
+            .to_f64()
+            .ok_or_else(|| cast_numeric_out_of_range(&ScalarType::Float64))?,
+        _ => {
+            return Err(DbError::internal(
+                "numeric conversion received a non-numeric value",
+            ));
+        }
+    };
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(cast_numeric_out_of_range(&ScalarType::Float64))
+    }
+}
+
+fn numeric_to_decimal(value: &Value) -> Result<Decimal> {
+    match value {
+        Value::Int16(value) => Ok(Decimal::from(*value)),
+        Value::Int32(value) => Ok(Decimal::from(*value)),
+        Value::Int64(value) => Ok(Decimal::from(*value)),
+        Value::Float32(value) => Decimal::from_f32(*value).ok_or_else(|| {
+            cast_numeric_out_of_range(&ScalarType::Decimal {
+                precision: None,
+                scale: None,
+            })
+        }),
+        Value::Float64(value) => Decimal::from_f64(*value).ok_or_else(|| {
+            cast_numeric_out_of_range(&ScalarType::Decimal {
+                precision: None,
+                scale: None,
+            })
+        }),
+        Value::Decimal(value) => Ok(*value),
+        _ => Err(DbError::internal(
+            "decimal conversion received a non-numeric value",
+        )),
+    }
+}
+
+fn cast_numeric_text(value: &str, target: &ScalarType) -> Result<Value> {
+    let invalid = || invalid_text_cast(value, target);
+    match target {
+        ScalarType::Int16 => value
+            .parse::<i16>()
+            .map(Value::Int16)
+            .map_err(|_| invalid()),
+        ScalarType::Int32 => value
+            .parse::<i32>()
+            .map(Value::Int32)
+            .map_err(|_| invalid()),
+        ScalarType::Int64 => value
+            .parse::<i64>()
+            .map(Value::Int64)
+            .map_err(|_| invalid()),
+        ScalarType::Float32 => value
+            .parse::<f32>()
+            .map_err(|_| invalid())
+            .and_then(|value| {
+                value
+                    .is_finite()
+                    .then_some(Value::Float32(value))
+                    .ok_or_else(invalid)
+            }),
+        ScalarType::Float64 => value
+            .parse::<f64>()
+            .map_err(|_| invalid())
+            .and_then(|value| {
+                value
+                    .is_finite()
+                    .then_some(Value::Float64(value))
+                    .ok_or_else(invalid)
+            }),
+        ScalarType::Decimal { .. } => Decimal::from_str(value)
+            .map(Value::Decimal)
+            .map_err(|_| invalid()),
+        _ => Err(DbError::internal(
+            "text numeric cast received a non-numeric target",
+        )),
+    }
+}
+
+fn parse_boolean_text(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "t" | "yes" | "y" | "on" | "1" => Ok(true),
+        "false" | "f" | "no" | "n" | "off" | "0" => Ok(false),
+        _ => Err(DbError::new(
+            "22P02",
+            format!("invalid input syntax for type boolean: {value:?}"),
+        )),
+    }
+}
+
+fn cast_text_result(value: String, target: &ScalarType) -> Result<Value> {
+    let limit = match target {
+        ScalarType::Char { length } | ScalarType::Varchar { length } => *length,
+        ScalarType::Text => None,
+        _ => return Err(DbError::internal("text cast received a non-text target")),
+    };
+    let value = limit.map_or(value.clone(), |length| {
+        value
+            .chars()
+            .take(usize::try_from(length).unwrap_or(usize::MAX))
+            .collect()
+    });
+    Ok(Value::Text(value))
+}
+
+fn value_to_cast_text(value: &Value) -> Result<String> {
+    match value {
+        Value::Null => Ok(String::new()),
+        Value::Boolean(value) => Ok(if *value { "true" } else { "false" }.to_owned()),
+        Value::Int16(value) => Ok(value.to_string()),
+        Value::Int32(value) => Ok(value.to_string()),
+        Value::Int64(value) => Ok(value.to_string()),
+        Value::Float32(value) => Ok(value.to_string()),
+        Value::Float64(value) => Ok(value.to_string()),
+        Value::Decimal(value) => Ok(value.to_string()),
+        Value::Text(value) => Ok(value.clone()),
+        Value::Binary(value) => Ok(format_bytea(value)),
+        Value::Date(value) => Ok(value.format("%Y-%m-%d").to_string()),
+        Value::Time(value) => Ok(value.format("%H:%M:%S%.f").to_string()),
+        Value::Timestamp(value) => Ok(value.format("%Y-%m-%d %H:%M:%S%.f").to_string()),
+        Value::Interval(value) => Ok(value.to_string()),
+        Value::Array(value) => array_to_text(value),
+        Value::Json(value) | Value::Jsonb(value) => serde_json::to_string(value)
+            .map_err(|error| DbError::internal(format!("JSON serialization failed: {error}"))),
+        Value::Uuid(value) => Ok(value.to_string()),
+        Value::Vector(values) => Ok(format!(
+            "[{}]",
+            values
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )),
+    }
+}
+
+fn parse_bytea_text(value: &str) -> Result<Vec<u8>> {
+    let Some(hex) = value.strip_prefix("\\x") else {
+        return Ok(value.as_bytes().to_vec());
+    };
+    if hex.len() % 2 != 0 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(DbError::new("22P02", "invalid hexadecimal bytea input"));
+    }
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair)
+                .map_err(|_| DbError::new("22P02", "invalid hexadecimal bytea input"))?;
+            u8::from_str_radix(text, 16)
+                .map_err(|_| DbError::new("22P02", "invalid hexadecimal bytea input"))
+        })
+        .collect()
+}
+
+fn format_bytea(value: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(value.len().saturating_mul(2).saturating_add(2));
+    output.push_str("\\x");
+    for byte in value {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn array_to_text(array: &PgArray) -> Result<String> {
+    if array.dimensions().is_empty() {
+        return Ok("{}".to_owned());
+    }
+    let mut output = String::new();
+    if array
+        .dimensions()
+        .iter()
+        .any(|dimension| dimension.lower_bound != 1)
+    {
+        for dimension in array.dimensions() {
+            let upper = i64::from(dimension.lower_bound)
+                .checked_add(i64::from(dimension.length))
+                .and_then(|value| value.checked_sub(1))
+                .ok_or_else(|| DbError::new("2202E", "array bounds overflow"))?;
+            output.push_str(&format!("[{}:{upper}]", dimension.lower_bound));
+        }
+        output.push('=');
+    }
+    let mut cursor = 0_usize;
+    write_array_dimension(array, 0, &mut cursor, &mut output)?;
+    Ok(output)
+}
+
+fn write_array_dimension(
+    array: &PgArray,
+    dimension: usize,
+    cursor: &mut usize,
+    output: &mut String,
+) -> Result<()> {
+    let current = array
+        .dimensions()
+        .get(dimension)
+        .ok_or_else(|| DbError::internal("array text writer lost its dimension"))?;
+    output.push('{');
+    for index in 0..current.length {
+        if index > 0 {
+            output.push(',');
+        }
+        if dimension + 1 < array.dimensions().len() {
+            write_array_dimension(array, dimension + 1, cursor, output)?;
+        } else {
+            let value = array
+                .values()
+                .get(*cursor)
+                .ok_or_else(|| DbError::internal("array text writer exceeded its values"))?;
+            *cursor += 1;
+            if value.is_null() {
+                output.push_str("NULL");
+            } else {
+                let text = value_to_cast_text(value)?;
+                output.push('"');
+                for character in text.chars() {
+                    if matches!(character, '"' | '\\') {
+                        output.push('\\');
+                    }
+                    output.push(character);
+                }
+                output.push('"');
+            }
+        }
+    }
+    output.push('}');
+    Ok(())
+}
+
+fn invalid_text_cast(value: &str, target: &ScalarType) -> DbError {
+    DbError::new(
+        "22P02",
+        format!("invalid input syntax for type {target:?}: {value:?}"),
+    )
+}
+
+fn cast_numeric_out_of_range(target: &ScalarType) -> DbError {
+    DbError::new(
+        "22003",
+        format!("numeric value is out of range for {target:?}"),
+    )
+}
+
 pub fn coerce_value(value: Value, target: &ScalarType) -> Result<Value> {
     if value.is_null() {
         return Ok(value);
@@ -2432,6 +3307,16 @@ pub fn coerce_value(value: Value, target: &ScalarType) -> Result<Value> {
             Value::Text(value),
             ScalarType::Text | ScalarType::Char { .. } | ScalarType::Varchar { .. },
         ) => Ok(Value::Text(value)),
+        (Value::Text(value), ScalarType::Enum { labels, .. }) => {
+            if labels.iter().any(|label| label == &value) {
+                Ok(Value::Text(value))
+            } else {
+                Err(DbError::new(
+                    "22P02",
+                    format!("invalid input value for enum: {value}"),
+                ))
+            }
+        }
         (Value::Binary(value), ScalarType::Binary) => Ok(Value::Binary(value)),
         (Value::Date(value), ScalarType::Date) => Ok(Value::Date(value)),
         (Value::Time(value), ScalarType::Time) => Ok(Value::Time(value)),
@@ -2441,6 +3326,24 @@ pub fn coerce_value(value: Value, target: &ScalarType) -> Result<Value> {
                 with_timezone: false,
             },
         ) => Ok(Value::Timestamp(value)),
+        (
+            Value::Timestamp(value),
+            ScalarType::Timestamp {
+                with_timezone: true,
+            },
+        ) => Ok(Value::Timestamp(value)),
+        (Value::Interval(value), ScalarType::Interval) => Ok(Value::Interval(value)),
+        (Value::Array(value), ScalarType::Array { element }) => {
+            let dimensions = value.dimensions().to_vec();
+            let values = value
+                .values()
+                .iter()
+                .cloned()
+                .map(|value| coerce_value(value, element))
+                .collect::<Result<Vec<_>>>()?;
+            ordadb_types::PgArray::new(element.as_ref().clone(), dimensions, values)
+                .map(Value::Array)
+        }
         (Value::Json(value), ScalarType::Json) => Ok(Value::Json(value)),
         (Value::Jsonb(value), ScalarType::Jsonb) => Ok(Value::Jsonb(value)),
         (Value::Uuid(value), ScalarType::Uuid) => Ok(Value::Uuid(value)),
@@ -2477,7 +3380,7 @@ fn compare_rows(left: &Row, right: &Row, order_by: &[BoundOrder]) -> Result<Orde
                 }
             }
             (false, false) => {
-                let ordering = compare_values(left_value, right_value)?;
+                let ordering = compare_values_as(left_value, right_value, &order.data_type)?;
                 if order.ascending {
                     ordering
                 } else {
@@ -2510,12 +3413,124 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<Ordering> {
         (Value::Date(left), Value::Date(right)) => Ok(left.cmp(right)),
         (Value::Time(left), Value::Time(right)) => Ok(left.cmp(right)),
         (Value::Timestamp(left), Value::Timestamp(right)) => Ok(left.cmp(right)),
+        (Value::Interval(left), Value::Interval(right)) => {
+            Ok(interval_comparison_key(*left).cmp(&interval_comparison_key(*right)))
+        }
+        (Value::Array(left), Value::Array(right)) => compare_arrays(left, right),
         (Value::Uuid(left), Value::Uuid(right)) => Ok(left.cmp(right)),
         _ => Err(DbError::new(
             "42883",
             "values do not have a compatible ordering operator",
         )),
     }
+}
+
+pub fn compare_values_as(left: &Value, right: &Value, data_type: &ScalarType) -> Result<Ordering> {
+    match data_type {
+        ScalarType::Enum { labels, .. } => {
+            let (Value::Text(left), Value::Text(right)) = (left, right) else {
+                return Err(DbError::new(
+                    "42804",
+                    "enum comparison requires enum text values",
+                ));
+            };
+            let left = labels
+                .iter()
+                .position(|label| label == left)
+                .ok_or_else(|| {
+                    DbError::new("22P02", format!("invalid input value for enum: {left}"))
+                })?;
+            let right = labels
+                .iter()
+                .position(|label| label == right)
+                .ok_or_else(|| {
+                    DbError::new("22P02", format!("invalid input value for enum: {right}"))
+                })?;
+            Ok(left.cmp(&right))
+        }
+        ScalarType::Array { element } => compare_arrays_as(left, right, element),
+        _ => compare_values(left, right),
+    }
+}
+
+fn compare_arrays_as(left: &Value, right: &Value, element: &ScalarType) -> Result<Ordering> {
+    let (Value::Array(left), Value::Array(right)) = (left, right) else {
+        return Err(DbError::new(
+            "42804",
+            "array comparison requires array values",
+        ));
+    };
+    if left.element_type() != element || right.element_type() != element {
+        return Err(DbError::new(
+            "42883",
+            "arrays do not have compatible element types",
+        ));
+    }
+    for (left, right) in left.values().iter().zip(right.values()) {
+        let ordering = match (left.is_null(), right.is_null()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => compare_values_as(left, right, element)?,
+        };
+        if ordering != Ordering::Equal {
+            return Ok(ordering);
+        }
+    }
+    let length_ordering = left.values().len().cmp(&right.values().len());
+    if length_ordering != Ordering::Equal {
+        return Ok(length_ordering);
+    }
+    Ok(left
+        .dimensions()
+        .iter()
+        .map(|dimension| (dimension.length, dimension.lower_bound))
+        .cmp(
+            right
+                .dimensions()
+                .iter()
+                .map(|dimension| (dimension.length, dimension.lower_bound)),
+        ))
+}
+
+fn interval_comparison_key(value: ordadb_types::PgInterval) -> i128 {
+    const MICROS_PER_DAY: i128 = 86_400_000_000;
+    (i128::from(value.months) * 30 + i128::from(value.days)) * MICROS_PER_DAY
+        + i128::from(value.microseconds)
+}
+
+fn compare_arrays(left: &ordadb_types::PgArray, right: &ordadb_types::PgArray) -> Result<Ordering> {
+    if left.element_type() != right.element_type() {
+        return Err(DbError::new(
+            "42883",
+            "arrays do not have compatible element types",
+        ));
+    }
+    for (left, right) in left.values().iter().zip(right.values()) {
+        let ordering = match (left.is_null(), right.is_null()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => compare_values(left, right)?,
+        };
+        if ordering != Ordering::Equal {
+            return Ok(ordering);
+        }
+    }
+    let length_ordering = left.values().len().cmp(&right.values().len());
+    if length_ordering != Ordering::Equal {
+        return Ok(length_ordering);
+    }
+    Ok(left
+        .dimensions()
+        .iter()
+        .map(|dimension| (dimension.length, dimension.lower_bound))
+        .cmp(
+            right
+                .dimensions()
+                .iter()
+                .map(|dimension| (dimension.length, dimension.lower_bound)),
+        ))
 }
 
 #[cfg(test)]
@@ -2526,21 +3541,265 @@ mod tests {
     use ordadb_catalog::{Catalog, NewColumn};
     use ordadb_optimizer::{AccessPath, PlanKind, PlanNode, optimize_select};
     use ordadb_sql::{
-        BinaryOperator, BoundExpr, BoundExprKind, BoundOrder, BoundStatement, UnaryOperator, bind,
-        parse,
+        BinaryOperator, BoundExpr, BoundExprKind, BoundOrder, BoundStatement, ScalarFunction,
+        UnaryOperator, bind, parse,
     };
-    use ordadb_types::{Identifier, Row, ScalarType, Schema, TableId, Value};
+    use ordadb_types::{
+        ArrayDimension, Identifier, Row, ScalarType, Schema, TableId, TypeId, Value,
+    };
     use tempfile::TempDir;
 
     use super::{
         DEFAULT_MAX_EXPRESSION_DEPTH, DEFAULT_MAX_PLAN_DEPTH, ExecutionContext, ExecutionCursor,
         ExecutionOptions, ExpressionProgram, ExpressionStack, MAX_SPILL_MERGE_FAN_IN, MemoryGrant,
-        SPILL_MAGIC, SPILL_VERSION, SpillManager, SpillMergeCursor, SpillRun, execute,
+        SPILL_MAGIC, SPILL_VERSION, SpillManager, SpillMergeCursor, SpillRun, evaluate, execute,
     };
 
     type TestTables = BTreeMap<TableId, Arc<Vec<Row>>>;
     type TestIndexes = BTreeMap<ordadb_types::IndexId, Arc<ordadb_index::BPlusTree>>;
     type TestFixture = (PlanNode, Schema, TestTables, TestIndexes);
+
+    #[test]
+    fn evaluates_explicit_scalar_and_multidimensional_array_casts() {
+        let scalar = BoundExpr {
+            kind: BoundExprKind::Cast {
+                expr: Box::new(BoundExpr {
+                    kind: BoundExprKind::Literal(Value::Text("42".to_owned())),
+                    data_type: ScalarType::Text,
+                    nullable: false,
+                }),
+            },
+            data_type: ScalarType::Int64,
+            nullable: false,
+        };
+        assert_eq!(
+            evaluate(&scalar, &[], &[]).expect("cast scalar"),
+            Value::Int64(42)
+        );
+
+        let source_type = ScalarType::Array {
+            element: Box::new(ScalarType::Int32),
+        };
+        let array = BoundExpr {
+            kind: BoundExprKind::Array {
+                elements: [1, 2, 3, 4]
+                    .into_iter()
+                    .map(|value| BoundExpr {
+                        kind: BoundExprKind::Literal(Value::Int32(value)),
+                        data_type: ScalarType::Int32,
+                        nullable: false,
+                    })
+                    .collect(),
+                dimensions: vec![ArrayDimension::new(2, 1), ArrayDimension::new(2, 1)],
+            },
+            data_type: source_type,
+            nullable: false,
+        };
+        let cast = BoundExpr {
+            kind: BoundExprKind::Cast {
+                expr: Box::new(array),
+            },
+            data_type: ScalarType::Array {
+                element: Box::new(ScalarType::Int64),
+            },
+            nullable: false,
+        };
+        let Value::Array(value) = evaluate(&cast, &[], &[]).expect("cast array") else {
+            panic!("array result");
+        };
+        assert_eq!(
+            value.values(),
+            [
+                Value::Int64(1),
+                Value::Int64(2),
+                Value::Int64(3),
+                Value::Int64(4),
+            ]
+        );
+        assert_eq!(
+            value.dimensions(),
+            [ArrayDimension::new(2, 1), ArrayDimension::new(2, 1)]
+        );
+
+        let enum_type = ScalarType::Enum {
+            type_id: TypeId::new(7),
+            labels: vec!["sad".into(), "happy".into()],
+        };
+        let invalid_enum = BoundExpr {
+            kind: BoundExprKind::Cast {
+                expr: Box::new(BoundExpr {
+                    kind: BoundExprKind::Literal(Value::Text("angry".into())),
+                    data_type: ScalarType::Text,
+                    nullable: false,
+                }),
+            },
+            data_type: enum_type.clone(),
+            nullable: false,
+        };
+        assert_eq!(
+            evaluate(&invalid_enum, &[], &[])
+                .expect_err("invalid enum cast")
+                .sql_state,
+            "22P02"
+        );
+
+        let invalid_enum_array = BoundExpr {
+            kind: BoundExprKind::Cast {
+                expr: Box::new(BoundExpr {
+                    kind: BoundExprKind::Array {
+                        elements: vec![BoundExpr {
+                            kind: BoundExprKind::Literal(Value::Text("angry".into())),
+                            data_type: ScalarType::Text,
+                            nullable: false,
+                        }],
+                        dimensions: vec![ArrayDimension::new(1, 1)],
+                    },
+                    data_type: ScalarType::Array {
+                        element: Box::new(ScalarType::Text),
+                    },
+                    nullable: false,
+                }),
+            },
+            data_type: ScalarType::Array {
+                element: Box::new(enum_type),
+            },
+            nullable: false,
+        };
+        assert_eq!(
+            evaluate(&invalid_enum_array, &[], &[])
+                .expect_err("invalid enum array cast")
+                .sql_state,
+            "22P02"
+        );
+    }
+
+    #[test]
+    fn evaluates_common_scalar_functions_on_the_expression_stack() {
+        let text = |value: &str| BoundExpr {
+            kind: BoundExprKind::Literal(Value::Text(value.to_owned())),
+            data_type: ScalarType::Text,
+            nullable: false,
+        };
+        let integer = |value| BoundExpr {
+            kind: BoundExprKind::Literal(Value::Int32(value)),
+            data_type: ScalarType::Int32,
+            nullable: false,
+        };
+        let lower = BoundExpr {
+            kind: BoundExprKind::Function {
+                function: ScalarFunction::Lower,
+                arguments: vec![text("ÄBC")],
+            },
+            data_type: ScalarType::Text,
+            nullable: false,
+        };
+        assert_eq!(
+            evaluate(&lower, &[], &[]).expect("lower"),
+            Value::Text("äbc".to_owned())
+        );
+
+        let substring = BoundExpr {
+            kind: BoundExprKind::Function {
+                function: ScalarFunction::Substring,
+                arguments: vec![text("abcdef"), integer(2), integer(3)],
+            },
+            data_type: ScalarType::Text,
+            nullable: false,
+        };
+        assert_eq!(
+            evaluate(&substring, &[], &[]).expect("substring"),
+            Value::Text("bcd".to_owned())
+        );
+
+        let coalesce = BoundExpr {
+            kind: BoundExprKind::Function {
+                function: ScalarFunction::Coalesce,
+                arguments: vec![
+                    BoundExpr {
+                        kind: BoundExprKind::Literal(Value::Null),
+                        data_type: ScalarType::Text,
+                        nullable: true,
+                    },
+                    text("fallback"),
+                ],
+            },
+            data_type: ScalarType::Text,
+            nullable: false,
+        };
+        assert_eq!(
+            evaluate(&coalesce, &[], &[]).expect("coalesce"),
+            Value::Text("fallback".to_owned())
+        );
+
+        let scalar = |function, arguments, data_type| BoundExpr {
+            kind: BoundExprKind::Function {
+                function,
+                arguments,
+            },
+            data_type,
+            nullable: false,
+        };
+        assert_eq!(
+            evaluate(
+                &scalar(
+                    ScalarFunction::Btrim,
+                    vec![text("xyhelloxy"), text("xy")],
+                    ScalarType::Text,
+                ),
+                &[],
+                &[],
+            )
+            .expect("btrim"),
+            Value::Text("hello".to_owned())
+        );
+        assert_eq!(
+            evaluate(
+                &scalar(
+                    ScalarFunction::Replace,
+                    vec![text("café"), text("fé"), text("ke")],
+                    ScalarType::Text,
+                ),
+                &[],
+                &[],
+            )
+            .expect("replace"),
+            Value::Text("cake".to_owned())
+        );
+        assert_eq!(
+            evaluate(
+                &scalar(
+                    ScalarFunction::Strpos,
+                    vec![text("åbcå"), text("c")],
+                    ScalarType::Int32,
+                ),
+                &[],
+                &[],
+            )
+            .expect("strpos"),
+            Value::Int32(3)
+        );
+        assert_eq!(
+            evaluate(
+                &scalar(
+                    ScalarFunction::Greatest,
+                    vec![
+                        integer(3),
+                        BoundExpr {
+                            kind: BoundExprKind::Literal(Value::Null),
+                            data_type: ScalarType::Int32,
+                            nullable: true,
+                        },
+                        integer(8),
+                    ],
+                    ScalarType::Int32,
+                ),
+                &[],
+                &[],
+            )
+            .expect("greatest"),
+            Value::Int32(8)
+        );
+    }
 
     fn fixture(query: &str, rows: Vec<Row>) -> TestFixture {
         let mut catalog = Catalog::default();
@@ -2749,6 +4008,7 @@ mod tests {
             let order_by = vec![BoundOrder {
                 column_index: 0,
                 expression: None,
+                data_type: ScalarType::Int64,
                 ascending: true,
                 nulls_first: None,
             }];
@@ -2814,6 +4074,7 @@ mod tests {
         let order_by = vec![BoundOrder {
             column_index: 0,
             expression: None,
+            data_type: ScalarType::Json,
             ascending: true,
             nulls_first: None,
         }];

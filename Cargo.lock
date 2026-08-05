@@ -3498,6 +3498,7 @@ dependencies = [
  "chrono",
  "ordadb-types",
  "rust_decimal",
+ "serde",
  "uuid",
 ]
 

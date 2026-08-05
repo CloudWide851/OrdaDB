@@ -13,8 +13,8 @@ use ordadb_index::BPlusTree;
 use ordadb_optimizer::{JoinStrategy, PlanNode, choose_join_strategy};
 use ordadb_sql::{
     AggregateFunction, BinaryOperator, BoundExpr, BoundExprKind, BoundOrder, BoundProjection,
-    BoundTable, BoundWindow, BoundWindowFrame, BoundWindowFrameBound, JoinKind, SubqueryQuantifier,
-    UnaryOperator, WindowFrameUnits, WindowFunction,
+    BoundTable, BoundWindow, BoundWindowFrame, BoundWindowFrameBound, JoinKind, ScalarFunction,
+    SubqueryQuantifier, UnaryOperator, WindowFrameUnits, WindowFunction,
 };
 use ordadb_types::{Batch, DbError, IndexId, Result, Row, ScalarType, Schema, TableId, Value};
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ const HASH_PARTITIONS: usize = 32;
 
 #[derive(Debug, Clone)]
 pub enum QueryExecutionPlan {
-    Simple { plan: PlanNode, schema: Schema },
+    Simple { plan: Box<PlanNode>, schema: Schema },
     Advanced(Box<AdvancedExecutionPlan>),
 }
 
@@ -186,7 +186,7 @@ enum CachedApplyKind {
     Scalar(Value),
     Exists(bool),
     Quantified {
-        left: ExpressionProgram,
+        left: Box<ExpressionProgram>,
         op: BinaryOperator,
         quantifier: SubqueryQuantifier,
         negated: bool,
@@ -214,7 +214,7 @@ enum DynamicApplyKind {
         negated: bool,
     },
     Quantified {
-        left: ExpressionProgram,
+        left: Box<ExpressionProgram>,
         op: BinaryOperator,
         quantifier: SubqueryQuantifier,
         negated: bool,
@@ -374,7 +374,9 @@ impl DynamicApplyKind {
             ApplyExecutionKind::Scalar => Ok(Self::Scalar),
             ApplyExecutionKind::Exists { negated } => Ok(Self::Exists { negated }),
             ApplyExecutionKind::In { left, negated } => Ok(Self::Quantified {
-                left: ExpressionProgram::compile_with_limit(&left, false, max_depth)?,
+                left: Box::new(ExpressionProgram::compile_with_limit(
+                    &left, false, max_depth,
+                )?),
                 op: BinaryOperator::Eq,
                 quantifier: SubqueryQuantifier::Any,
                 negated,
@@ -384,7 +386,9 @@ impl DynamicApplyKind {
                 op,
                 quantifier,
             } => Ok(Self::Quantified {
-                left: ExpressionProgram::compile_with_limit(&left, false, max_depth)?,
+                left: Box::new(ExpressionProgram::compile_with_limit(
+                    &left, false, max_depth,
+                )?),
                 op,
                 quantifier,
                 negated: false,
@@ -2798,10 +2802,14 @@ impl WindowProgram {
         }
         let partition_count = self.partition_by.len();
         let order_count = self.order_by.len();
-        let mut sort_orders = (0..partition_count)
-            .map(|column_index| BoundOrder {
+        let mut sort_orders = self
+            .partition_by
+            .iter()
+            .enumerate()
+            .map(|(column_index, program)| BoundOrder {
                 column_index,
                 expression: None,
+                data_type: program.result_type().clone(),
                 ascending: true,
                 nulls_first: Some(true),
             })
@@ -2813,6 +2821,7 @@ impl WindowProgram {
                 .map(|(ordinal, order)| BoundOrder {
                     column_index: partition_count.saturating_add(ordinal),
                     expression: None,
+                    data_type: order.data_type.clone(),
                     ascending: order.ascending,
                     nulls_first: order.nulls_first,
                 }),
@@ -2820,6 +2829,7 @@ impl WindowProgram {
         sort_orders.push(BoundOrder {
             column_index: partition_count.saturating_add(order_count),
             expression: None,
+            data_type: ScalarType::Int64,
             ascending: true,
             nulls_first: Some(false),
         });
@@ -3717,6 +3727,7 @@ fn range_threshold_boundary(
     let compare_order = BoundOrder {
         column_index: 0,
         expression: None,
+        data_type: order.data_type.clone(),
         ascending: order.ascending,
         nulls_first: order.nulls_first,
     };
@@ -3936,8 +3947,25 @@ enum GroupInstruction {
     LoadLiteral(Value),
     LoadParameter(usize),
     Unary(UnaryOperator),
-    Binary(BinaryOperator),
-    InList { count: usize, negated: bool },
+    Binary {
+        operator: BinaryOperator,
+        operand_type: ScalarType,
+    },
+    InList {
+        count: usize,
+        negated: bool,
+        operand_type: ScalarType,
+    },
+    Cast(ScalarType),
+    MakeArray {
+        count: usize,
+        element_type: ScalarType,
+        dimensions: Vec<ordadb_types::ArrayDimension>,
+    },
+    Function {
+        function: ScalarFunction,
+        count: usize,
+    },
     AggregateValue(usize),
     Coerce(ordadb_types::ScalarType),
 }
@@ -3961,13 +3989,48 @@ impl GroupProgram {
                     BoundExprKind::Unary { op, .. } => {
                         instructions.push(GroupInstruction::Unary(*op));
                     }
-                    BoundExprKind::Binary { op, .. } => {
-                        instructions.push(GroupInstruction::Binary(*op));
+                    BoundExprKind::Binary { left, op, .. } => {
+                        instructions.push(GroupInstruction::Binary {
+                            operator: *op,
+                            operand_type: left.data_type.clone(),
+                        });
                     }
-                    BoundExprKind::InList { list, negated, .. } => {
+                    BoundExprKind::InList {
+                        expr,
+                        list,
+                        negated,
+                    } => {
                         instructions.push(GroupInstruction::InList {
                             count: list.len(),
                             negated: *negated,
+                            operand_type: expr.data_type.clone(),
+                        });
+                    }
+                    BoundExprKind::Cast { .. } => {
+                        instructions.push(GroupInstruction::Cast(expression.data_type.clone()));
+                    }
+                    BoundExprKind::Array {
+                        elements,
+                        dimensions,
+                    } => {
+                        let ScalarType::Array { element } = &expression.data_type else {
+                            return Err(DbError::internal(
+                                "array group expression lost its array result type",
+                            ));
+                        };
+                        instructions.push(GroupInstruction::MakeArray {
+                            count: elements.len(),
+                            element_type: element.as_ref().clone(),
+                            dimensions: dimensions.clone(),
+                        });
+                    }
+                    BoundExprKind::Function {
+                        function,
+                        arguments,
+                    } => {
+                        instructions.push(GroupInstruction::Function {
+                            function: *function,
+                            count: arguments.len(),
                         });
                     }
                     _ => {
@@ -4004,6 +4067,22 @@ impl GroupProgram {
                 BoundExprKind::Unary { expr, .. } => {
                     pending.push((expression, true, depth));
                     pending.push((expr, false, depth + 1));
+                }
+                BoundExprKind::Cast { expr } => {
+                    pending.push((expression, true, depth));
+                    pending.push((expr, false, depth + 1));
+                }
+                BoundExprKind::Array { elements, .. } => {
+                    pending.push((expression, true, depth));
+                    for element in elements.iter().rev() {
+                        pending.push((element, false, depth + 1));
+                    }
+                }
+                BoundExprKind::Function { arguments, .. } => {
+                    pending.push((expression, true, depth));
+                    for argument in arguments.iter().rev() {
+                        pending.push((argument, false, depth + 1));
+                    }
                 }
                 BoundExprKind::Binary { left, right, .. } => {
                     pending.push((expression, true, depth));
@@ -4101,17 +4180,63 @@ impl GroupProgram {
                         .ok_or_else(|| DbError::internal("group value stack underflow"))?;
                     values.push(evaluate_unary(*operator, value)?)?;
                 }
-                GroupInstruction::Binary(operator) => {
+                GroupInstruction::Binary {
+                    operator,
+                    operand_type,
+                } => {
                     let right = values
                         .pop()
                         .ok_or_else(|| DbError::internal("group value stack underflow"))?;
                     let left = values
                         .pop()
                         .ok_or_else(|| DbError::internal("group value stack underflow"))?;
-                    values.push(evaluate_binary(left, *operator, right)?)?;
+                    values.push(super::evaluate_binary_as(
+                        left,
+                        *operator,
+                        right,
+                        operand_type,
+                    )?)?;
                 }
-                GroupInstruction::InList { count, negated } => {
-                    values.collapse_in_list(*count, *negated)?;
+                GroupInstruction::InList {
+                    count,
+                    negated,
+                    operand_type,
+                } => {
+                    values.collapse_in_list(*count, *negated, operand_type)?;
+                }
+                GroupInstruction::Cast(target) => {
+                    let value = values
+                        .pop()
+                        .ok_or_else(|| DbError::internal("group value stack underflow"))?;
+                    values.push(super::cast_value(value, target)?)?;
+                }
+                GroupInstruction::MakeArray {
+                    count,
+                    element_type,
+                    dimensions,
+                } => {
+                    let mut elements = Vec::with_capacity(*count);
+                    for _ in 0..*count {
+                        elements.push(values.pop().ok_or_else(|| {
+                            DbError::internal("group array value stack underflow")
+                        })?);
+                    }
+                    elements.reverse();
+                    values.push(Value::Array(ordadb_types::PgArray::new(
+                        element_type.clone(),
+                        dimensions.clone(),
+                        elements,
+                    )?))?;
+                }
+                GroupInstruction::Function { function, count } => {
+                    let mut arguments = Vec::with_capacity(*count);
+                    for _ in 0..*count {
+                        arguments.push(values.pop().ok_or_else(|| {
+                            DbError::internal("group function value stack underflow")
+                        })?);
+                    }
+                    arguments.reverse();
+                    values.push(super::evaluate_scalar_function(*function, arguments)?)?;
                 }
                 GroupInstruction::AggregateValue(slot) => {
                     values.push(
@@ -4154,14 +4279,16 @@ fn group_stack_slots(instructions: &[GroupInstruction]) -> Result<usize> {
                     .ok_or_else(|| program_limit_error("group value stack depth overflowed"))?;
                 maximum = maximum.max(depth);
             }
-            GroupInstruction::Unary(_) | GroupInstruction::Coerce(_) => {
+            GroupInstruction::Unary(_)
+            | GroupInstruction::Cast(_)
+            | GroupInstruction::Coerce(_) => {
                 if depth == 0 {
                     return Err(DbError::internal(
                         "group expression compiler produced a stack underflow",
                     ));
                 }
             }
-            GroupInstruction::Binary(_) => {
+            GroupInstruction::Binary { .. } => {
                 if depth < 2 {
                     return Err(DbError::internal(
                         "group expression compiler produced a stack underflow",
@@ -4177,6 +4304,29 @@ fn group_stack_slots(instructions: &[GroupInstruction]) -> Result<usize> {
                     ));
                 }
                 depth -= *count;
+            }
+            GroupInstruction::MakeArray { count, .. } => {
+                if *count == 0 {
+                    depth = depth
+                        .checked_add(1)
+                        .ok_or_else(|| program_limit_error("group value stack depth overflowed"))?;
+                    maximum = maximum.max(depth);
+                } else {
+                    if depth < *count {
+                        return Err(DbError::internal(
+                            "group expression compiler produced an array stack underflow",
+                        ));
+                    }
+                    depth = depth - *count + 1;
+                }
+            }
+            GroupInstruction::Function { count, .. } => {
+                if *count == 0 || depth < *count {
+                    return Err(DbError::internal(
+                        "group expression compiler produced a function stack underflow",
+                    ));
+                }
+                depth = depth - *count + 1;
             }
         }
     }
@@ -4245,10 +4395,9 @@ impl GroupAccumulator {
         if self.aggregates.len() != specs.len() || other.aggregates.len() != specs.len() {
             return Err(DbError::internal("aggregate spill state width changed"));
         }
-        for ((state, incoming), _spec) in
-            self.aggregates.iter_mut().zip(other.aggregates).zip(specs)
+        for ((state, incoming), spec) in self.aggregates.iter_mut().zip(other.aggregates).zip(specs)
         {
-            state.merge(incoming)?;
+            state.merge(incoming, spec)?;
         }
         Ok(())
     }
@@ -4347,14 +4496,24 @@ impl AggregateState {
                         .ok_or_else(|| DbError::new("22003", "AVG count is out of range"))?;
                 }
             }
-            Self::Min(selected) => select_value(selected, value, Ordering::Less)?,
-            Self::Max(selected) => select_value(selected, value, Ordering::Greater)?,
+            Self::Min(selected) => select_value(
+                selected,
+                value,
+                Ordering::Less,
+                aggregate_argument_type(spec)?,
+            )?,
+            Self::Max(selected) => select_value(
+                selected,
+                value,
+                Ordering::Greater,
+                aggregate_argument_type(spec)?,
+            )?,
             Self::Distinct(_) => unreachable!("DISTINCT aggregate handled before state update"),
         }
         Ok(())
     }
 
-    fn merge(&mut self, incoming: Self) -> Result<()> {
+    fn merge(&mut self, incoming: Self, spec: &AggregateSpec) -> Result<()> {
         match (self, incoming) {
             (Self::Count(left), Self::Count(right)) => {
                 *left = left
@@ -4385,10 +4544,15 @@ impl AggregateState {
                     .ok_or_else(|| DbError::new("22003", "AVG count is out of range"))?;
             }
             (Self::Min(left), Self::Min(right)) => {
-                select_value(left, right, Ordering::Less)?;
+                select_value(left, right, Ordering::Less, aggregate_argument_type(spec)?)?;
             }
             (Self::Max(left), Self::Max(right)) => {
-                select_value(left, right, Ordering::Greater)?;
+                select_value(
+                    left,
+                    right,
+                    Ordering::Greater,
+                    aggregate_argument_type(spec)?,
+                )?;
             }
             (Self::Distinct(left), Self::Distinct(right)) => {
                 for (key, value) in right {
@@ -4410,7 +4574,7 @@ impl AggregateState {
             }
             Self::Avg { sum: _, count } if *count == 0 => Ok(Value::Null),
             Self::Avg { sum, count } => Ok(Value::Float64(*sum / *count as f64)),
-            Self::Distinct(values) => distinct_aggregate_value(spec.function, values),
+            Self::Distinct(values) => distinct_aggregate_value(spec, values),
         }
     }
 
@@ -4443,6 +4607,12 @@ enum DistinctValueKey {
     Date(String),
     Time(String),
     Timestamp(String),
+    Interval(i32, i32, i64),
+    Array {
+        element_type: String,
+        dimensions: Vec<(u32, i32)>,
+        values: Vec<DistinctValueKey>,
+    },
     Json(String),
     Jsonb(String),
     Uuid([u8; 16]),
@@ -4492,6 +4662,18 @@ fn distinct_value_key(value: &Value) -> DistinctValueKey {
         Value::Date(value) => DistinctValueKey::Date(value.to_string()),
         Value::Time(value) => DistinctValueKey::Time(value.to_string()),
         Value::Timestamp(value) => DistinctValueKey::Timestamp(value.to_string()),
+        Value::Interval(value) => {
+            DistinctValueKey::Interval(value.months, value.days, value.microseconds)
+        }
+        Value::Array(value) => DistinctValueKey::Array {
+            element_type: format!("{:?}", value.element_type()),
+            dimensions: value
+                .dimensions()
+                .iter()
+                .map(|dimension| (dimension.length, dimension.lower_bound))
+                .collect(),
+            values: value.values().iter().map(distinct_value_key).collect(),
+        },
         Value::Json(value) => DistinctValueKey::Json(value.to_string()),
         Value::Jsonb(value) => DistinctValueKey::Jsonb(value.to_string()),
         Value::Uuid(value) => DistinctValueKey::Uuid(*value.as_bytes()),
@@ -4533,6 +4715,26 @@ fn distinct_key_dynamic_bytes(key: &DistinctValueKey) -> usize {
         | DistinctValueKey::Timestamp(value)
         | DistinctValueKey::Json(value)
         | DistinctValueKey::Jsonb(value) => value.len(),
+        DistinctValueKey::Array {
+            element_type,
+            dimensions,
+            values,
+        } => element_type
+            .len()
+            .saturating_add(
+                dimensions
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(u32, i32)>()),
+            )
+            .saturating_add(
+                values
+                    .iter()
+                    .map(|value| {
+                        std::mem::size_of::<DistinctValueKey>()
+                            .saturating_add(distinct_key_dynamic_bytes(value))
+                    })
+                    .sum::<usize>(),
+            ),
         DistinctValueKey::Binary(value) => value.len(),
         DistinctValueKey::Vector(value) => value.len().saturating_mul(std::mem::size_of::<u32>()),
         DistinctValueKey::Boolean(_)
@@ -4542,6 +4744,7 @@ fn distinct_key_dynamic_bytes(key: &DistinctValueKey) -> usize {
         | DistinctValueKey::Int64(_)
         | DistinctValueKey::Float32(_)
         | DistinctValueKey::Float64(_)
+        | DistinctValueKey::Interval(_, _, _)
         | DistinctValueKey::Uuid(_) => 0,
     }
 }
@@ -4558,10 +4761,10 @@ fn estimated_distinct_row_key_bytes(key: &DistinctRowKey) -> usize {
 }
 
 fn distinct_aggregate_value(
-    function: AggregateFunction,
+    spec: &AggregateSpec,
     values: &BTreeMap<DistinctValueKey, Value>,
 ) -> Result<Value> {
-    match function {
+    match spec.function {
         AggregateFunction::Count => i64::try_from(values.len())
             .map(Value::Int64)
             .map_err(|_| DbError::new("22003", "COUNT result is out of range")),
@@ -4586,31 +4789,46 @@ fn distinct_aggregate_value(
             Ok(Value::Float64(sum / values.len() as f64))
         }
         AggregateFunction::Min | AggregateFunction::Max => {
-            let desired = if function == AggregateFunction::Min {
+            let desired = if spec.function == AggregateFunction::Min {
                 Ordering::Less
             } else {
                 Ordering::Greater
             };
             let mut selected = None;
             for value in values.values().cloned() {
-                select_value(&mut selected, Some(value), desired)?;
+                select_value(
+                    &mut selected,
+                    Some(value),
+                    desired,
+                    aggregate_argument_type(spec)?,
+                )?;
             }
             Ok(selected.unwrap_or(Value::Null))
         }
     }
 }
 
+fn aggregate_argument_type(spec: &AggregateSpec) -> Result<&ScalarType> {
+    spec.argument
+        .as_ref()
+        .map(ExpressionProgram::result_type)
+        .ok_or_else(|| DbError::internal("aggregate argument type is unavailable"))
+}
+
 fn select_value(
     selected: &mut Option<Value>,
     value: Option<Value>,
     desired: Ordering,
+    data_type: &ScalarType,
 ) -> Result<()> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
         return Ok(());
     };
     let replace = selected
         .as_ref()
-        .map(|current| super::compare_values(&value, current).map(|order| order == desired))
+        .map(|current| {
+            super::compare_values_as(&value, current, data_type).map(|order| order == desired)
+        })
         .transpose()?
         .unwrap_or(true);
     if replace {
@@ -5175,6 +5393,7 @@ mod tests {
             order_by: vec![BoundOrder {
                 column_index: 0,
                 expression: None,
+                data_type: ScalarType::Int64,
                 ascending: true,
                 nulls_first: None,
             }],
@@ -5282,6 +5501,7 @@ mod tests {
         ordered.order_by = vec![BoundOrder {
             column_index: 2,
             expression: None,
+            data_type: ScalarType::Int64,
             ascending: false,
             nulls_first: None,
         }];
@@ -5319,6 +5539,7 @@ mod tests {
             order_by: vec![BoundOrder {
                 column_index: 0,
                 expression: None,
+                data_type: ScalarType::Int64,
                 ascending: true,
                 nulls_first: None,
             }],
@@ -5427,6 +5648,7 @@ mod tests {
                 order_by: vec![BoundOrder {
                     column_index: 0,
                     expression: None,
+                    data_type: ScalarType::Int64,
                     ascending: true,
                     nulls_first: None,
                 }],
@@ -5516,6 +5738,7 @@ mod tests {
                 order_by: vec![BoundOrder {
                     column_index: 0,
                     expression: None,
+                    data_type: ScalarType::Int64,
                     ascending: true,
                     nulls_first: None,
                 }],
@@ -5918,6 +6141,7 @@ mod tests {
             order_by: vec![BoundOrder {
                 column_index: 0,
                 expression: None,
+                data_type: ScalarType::Int64,
                 ascending: true,
                 nulls_first: None,
             }],
@@ -5993,6 +6217,7 @@ mod tests {
                 order_by: vec![BoundOrder {
                     column_index: 0,
                     expression: None,
+                    data_type: ScalarType::Int64,
                     ascending: true,
                     nulls_first: None,
                 }],
@@ -6021,6 +6246,7 @@ mod tests {
             order_by: vec![BoundOrder {
                 column_index: 0,
                 expression: None,
+                data_type: ScalarType::Int64,
                 ascending: true,
                 nulls_first: None,
             }],
@@ -6348,6 +6574,7 @@ mod tests {
             order_by: vec![BoundOrder {
                 column_index: 0,
                 expression: None,
+                data_type: ScalarType::Int64,
                 ascending: true,
                 nulls_first: None,
             }],
