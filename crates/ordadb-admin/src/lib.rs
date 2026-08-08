@@ -8,7 +8,8 @@ mod registry;
 
 pub use api::{AdminState, ApiEnvelope, api_router};
 pub use auth::{
-    AUTH_FORMAT_VERSION, AuthStore, Principal, ScramVerifier, TokenResponse, TokenStore,
+    AUTH_FORMAT_VERSION, AuthStore, POSTGRES_ROLE_OID_FIRST_USER, Principal, SafeRoleMetadata,
+    SafeRoleMetadataSnapshot, ScramVerifier, TokenResponse, TokenStore,
 };
 pub use operations::{
     OperationKind, OperationManager, OperationRecord, OperationState, StartOperation,

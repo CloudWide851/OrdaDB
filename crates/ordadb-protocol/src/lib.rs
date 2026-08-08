@@ -5,6 +5,7 @@ mod codec;
 mod scram;
 mod security;
 mod server;
+mod settings;
 mod value;
 
 pub use client::{

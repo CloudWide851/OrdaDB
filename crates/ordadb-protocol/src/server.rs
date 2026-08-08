@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use csv::{ReaderBuilder, WriterBuilder};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use rustls::pki_types::pem::{Error as PemError, PemObject};
@@ -20,11 +19,10 @@ use ordadb_admin::{
     Action, AuthStore, Authorizer, CancellationHandle, DbObject, Principal, QueryOutcome,
     SessionRegistry,
 };
-use ordadb_catalog::{
-    Catalog, ColumnDefinition, ConstraintKind, RoutineKind, UserDefinedTypeKind, ViewKind,
-};
+use ordadb_catalog::ColumnDefinition;
 use ordadb_engine::{
-    Engine, Session, SessionAuthorization, StatementDescription, TransactionStatus,
+    CatalogRoleMetadata, CatalogVisibility, CatalogVisibilityScope, Engine, Session,
+    SessionAuthorization, SessionRuntimeMetadata, StatementDescription, TransactionStatus,
 };
 use ordadb_types::{
     Batch, CommandComplete, DbError, Field, Identifier, QueryEvent, QueryProgress, Result, Row,
@@ -42,9 +40,9 @@ use crate::scram::authenticate;
 use crate::security::{
     execute_security_statement, is_security_sql, parse_security_statement, redacted_security_sql,
 };
+use crate::settings::{PgSessionSettings, PgSettingStatement, parse_setting_statement};
 use crate::value::{
-    decode_parameters_as, encode_text, type_oid, user_defined_array_oid, user_defined_type_oid,
-    write_data_row, write_row_description,
+    decode_parameters_as, encode_text, type_oid, write_data_row, write_row_description,
 };
 
 const DEFAULT_MAX_PREPARED: usize = 1024;
@@ -75,7 +73,7 @@ impl Default for PgServerConfig {
             max_prepared_statements: DEFAULT_MAX_PREPARED,
             max_portals: DEFAULT_MAX_PORTALS,
             max_copy_bytes: DEFAULT_MAX_COPY_BYTES,
-            server_version: format!("16.0 (OrdaDB {})", env!("CARGO_PKG_VERSION")),
+            server_version: format!("18.0 (OrdaDB {})", env!("CARGO_PKG_VERSION")),
         }
     }
 }
@@ -222,6 +220,11 @@ fn serve_tcp_connection_inner(
                 "startup negotiation did not yield a startup packet",
             ));
         }
+        StartupPacket::GssEncRequest => {
+            return Err(protocol(
+                "GSS encryption negotiation did not yield a startup packet",
+            ));
+        }
     };
     let parameters: BTreeMap<String, String> = parameters.into_iter().collect();
     let user = parameters
@@ -241,6 +244,11 @@ fn serve_tcp_connection_inner(
             return Err(error);
         }
     };
+    let settings = PgSessionSettings::from_startup(
+        config.server_version.clone(),
+        &principal.user,
+        &parameters,
+    )?;
     let authorizer = Authorizer::from_store(&auth)?;
     authorizer.authorize_sql(&principal, &database, "CONNECT")?;
     let bypass_ownership = match authorizer.authorize(&principal, Action::Manage, &DbObject::Server)
@@ -261,9 +269,11 @@ fn serve_tcp_connection_inner(
         secret_key,
     )?;
     let _guard = SessionGuard::new(Arc::clone(&registry), handle.process_id());
-    write_startup_responses(&mut stream, &config, &principal.user, &handle)?;
+    write_startup_responses(&mut stream, &settings, &handle)?;
 
-    let session = connect_postgresql_session(&engine, &principal, bypass_ownership)?;
+    let mut session = connect_postgresql_session(&engine, &principal, bypass_ownership)?;
+    session.set_runtime_metadata(session_runtime_metadata(&settings, &database, &principal)?);
+    refresh_system_catalog_metadata(&mut session, &auth, &settings, &principal, &database)?;
     let mut connection = Connection {
         stream,
         session,
@@ -274,9 +284,10 @@ fn serve_tcp_connection_inner(
         database,
         handle,
         config,
+        settings,
         prepared: BTreeMap::new(),
         portals: BTreeMap::new(),
-        extended_failed: false,
+        extended_state: ExtendedQueryState::Ready,
         shutdown: connection_shutdown,
     };
     connection.run()
@@ -287,43 +298,61 @@ fn negotiate_startup(
     tls: Option<Arc<RustlsServerConfig>>,
     max_frame_bytes: usize,
 ) -> Result<(ConnectionStream, StartupPacket)> {
+    let mut negotiation = StartupNegotiation::default();
     loop {
         match read_startup(&mut stream, max_frame_bytes)? {
-            StartupPacket::SslRequest => match tls {
-                Some(config) => {
-                    stream
-                        .write_all(b"S")
-                        .map_err(|error| io_error("failed to accept TLS negotiation", error))?;
-                    stream
-                        .flush()
-                        .map_err(|error| io_error("failed to flush TLS negotiation", error))?;
-                    let connection = ServerConnection::new(config).map_err(|error| {
-                        invalid(format!("failed to create TLS session: {error}"))
-                    })?;
-                    let mut tls_stream =
-                        ConnectionStream::Tls(Box::new(StreamOwned::new(connection, stream)));
-                    let startup = read_startup(&mut tls_stream, max_frame_bytes)?;
-                    if matches!(startup, StartupPacket::SslRequest) {
-                        return Err(protocol("nested SSLRequest is invalid"));
+            StartupPacket::SslRequest => {
+                negotiation.record(EncryptionRequest::Ssl)?;
+                match tls {
+                    Some(config) => {
+                        stream
+                            .write_all(b"S")
+                            .map_err(|error| io_error("failed to accept TLS negotiation", error))?;
+                        stream
+                            .flush()
+                            .map_err(|error| io_error("failed to flush TLS negotiation", error))?;
+                        let connection = ServerConnection::new(config).map_err(|error| {
+                            invalid(format!("failed to create TLS session: {error}"))
+                        })?;
+                        let mut tls_stream =
+                            ConnectionStream::Tls(Box::new(StreamOwned::new(connection, stream)));
+                        let startup = read_startup(&mut tls_stream, max_frame_bytes)?;
+                        if matches!(
+                            startup,
+                            StartupPacket::SslRequest | StartupPacket::GssEncRequest
+                        ) {
+                            return Err(protocol(
+                                "nested encryption negotiation request is invalid",
+                            ));
+                        }
+                        if let StartupPacket::CancelRequest {
+                            process_id: _,
+                            secret_key: _,
+                        } = startup
+                        {
+                            return Err(protocol("TLS cancel request must use a fresh connection"));
+                        }
+                        return Ok((tls_stream, startup));
                     }
-                    if let StartupPacket::CancelRequest {
-                        process_id: _,
-                        secret_key: _,
-                    } = startup
-                    {
-                        return Err(protocol("TLS cancel request must use a fresh connection"));
+                    None => {
+                        stream
+                            .write_all(b"N")
+                            .map_err(|error| io_error("failed to reject TLS negotiation", error))?;
+                        stream
+                            .flush()
+                            .map_err(|error| io_error("failed to flush TLS rejection", error))?;
                     }
-                    return Ok((tls_stream, startup));
                 }
-                None => {
-                    stream
-                        .write_all(b"N")
-                        .map_err(|error| io_error("failed to reject TLS negotiation", error))?;
-                    stream
-                        .flush()
-                        .map_err(|error| io_error("failed to flush TLS rejection", error))?;
-                }
-            },
+            }
+            StartupPacket::GssEncRequest => {
+                negotiation.record(EncryptionRequest::Gss)?;
+                stream
+                    .write_all(b"N")
+                    .map_err(|error| io_error("failed to reject GSS encryption", error))?;
+                stream
+                    .flush()
+                    .map_err(|error| io_error("failed to flush GSS encryption rejection", error))?;
+            }
             StartupPacket::CancelRequest {
                 process_id,
                 secret_key,
@@ -338,6 +367,39 @@ fn negotiate_startup(
             }
             startup @ StartupPacket::Startup(_) => {
                 return Ok((ConnectionStream::Plain(stream), startup));
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncryptionRequest {
+    Gss,
+    Ssl,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct StartupNegotiation {
+    saw_gss: bool,
+    saw_ssl: bool,
+}
+
+impl StartupNegotiation {
+    fn record(&mut self, request: EncryptionRequest) -> Result<()> {
+        match request {
+            EncryptionRequest::Gss if self.saw_gss || self.saw_ssl => {
+                Err(protocol("repeated or out-of-order GSS encryption request"))
+            }
+            EncryptionRequest::Gss => {
+                self.saw_gss = true;
+                Ok(())
+            }
+            EncryptionRequest::Ssl if self.saw_ssl => {
+                Err(protocol("repeated SSLRequest is invalid"))
+            }
+            EncryptionRequest::Ssl => {
+                self.saw_ssl = true;
+                Ok(())
             }
         }
     }
@@ -438,19 +500,10 @@ impl Write for ConnectionStream {
 
 fn write_startup_responses<W: Write>(
     writer: &mut W,
-    config: &PgServerConfig,
-    user: &str,
+    settings: &PgSessionSettings,
     handle: &CancellationHandle,
 ) -> Result<()> {
-    for (name, value) in [
-        ("server_version", config.server_version.as_str()),
-        ("server_encoding", "UTF8"),
-        ("client_encoding", "UTF8"),
-        ("DateStyle", "ISO, YMD"),
-        ("integer_datetimes", "on"),
-        ("standard_conforming_strings", "on"),
-        ("session_authorization", user),
-    ] {
+    for (name, value) in settings.parameter_statuses() {
         write_parameter_status(writer, name, value)?;
     }
     write_backend_key(writer, handle.process_id(), handle.secret_key())?;
@@ -542,6 +595,7 @@ fn parameter_oid_can_coerce(source: u32, target: u32) -> bool {
 }
 
 struct Portal {
+    statement_name: String,
     sql: String,
     parameters: Vec<Value>,
     result_formats: Vec<i16>,
@@ -551,6 +605,74 @@ struct Portal {
     completed: bool,
     query_id: Option<String>,
     rows_processed: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtendedQueryState {
+    Ready,
+    FailedUntilSync,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailedMessageAction {
+    Synchronize,
+    Terminate,
+    Flush,
+    Ignore,
+}
+
+fn failed_message_action(message: &FrontendMessage) -> FailedMessageAction {
+    match message {
+        FrontendMessage::Sync => FailedMessageAction::Synchronize,
+        FrontendMessage::Terminate => FailedMessageAction::Terminate,
+        FrontendMessage::Flush => FailedMessageAction::Flush,
+        _ => FailedMessageAction::Ignore,
+    }
+}
+
+fn ensure_prepared_statement_slot(
+    prepared: &BTreeMap<String, PreparedStatement>,
+    name: &str,
+    limit: usize,
+) -> Result<()> {
+    if !name.is_empty() && prepared.contains_key(name) {
+        return Err(DbError::new(
+            "42P05",
+            format!("prepared statement {name} already exists"),
+        ));
+    }
+    if !prepared.contains_key(name) && prepared.len() >= limit {
+        return Err(DbError::new(
+            "54000",
+            "prepared statement count exceeds the configured limit",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_portal_slot(portals: &BTreeMap<String, Portal>, name: &str, limit: usize) -> Result<()> {
+    if !name.is_empty() && portals.contains_key(name) {
+        return Err(DbError::new(
+            "42P03",
+            format!("portal {name} already exists"),
+        ));
+    }
+    if !portals.contains_key(name) && portals.len() >= limit {
+        return Err(DbError::new(
+            "54000",
+            "portal count exceeds the configured limit",
+        ));
+    }
+    Ok(())
+}
+
+fn retire_portal(registry: &SessionRegistry, portal: Portal, outcome: QueryOutcome) -> Result<()> {
+    if !portal.completed
+        && let Some(query_id) = portal.query_id
+    {
+        registry.finish_query(&query_id, outcome)?;
+    }
+    Ok(())
 }
 
 struct Connection {
@@ -563,9 +685,10 @@ struct Connection {
     database: String,
     handle: CancellationHandle,
     config: PgServerConfig,
+    settings: PgSessionSettings,
     prepared: BTreeMap<String, PreparedStatement>,
     portals: BTreeMap<String, Portal>,
-    extended_failed: bool,
+    extended_state: ExtendedQueryState,
     shutdown: Option<CancellationToken>,
 }
 
@@ -576,15 +699,15 @@ impl Connection {
             else {
                 return Ok(());
             };
-            if self.extended_failed {
-                match message {
-                    FrontendMessage::Sync => {
-                        self.extended_failed = false;
+            if self.extended_state == ExtendedQueryState::FailedUntilSync {
+                match failed_message_action(&message) {
+                    FailedMessageAction::Synchronize => {
+                        self.extended_state = ExtendedQueryState::Ready;
                         write_ready(&mut self.stream, transaction_status(&self.session))?;
                     }
-                    FrontendMessage::Terminate => return Ok(()),
-                    FrontendMessage::Flush => self.flush()?,
-                    _ => {}
+                    FailedMessageAction::Terminate => return Ok(()),
+                    FailedMessageAction::Flush => self.flush()?,
+                    FailedMessageAction::Ignore => {}
                 }
                 continue;
             }
@@ -596,7 +719,7 @@ impl Connection {
             if let Err(error) = result {
                 write_error(&mut self.stream, &error)?;
                 if extended {
-                    self.extended_failed = true;
+                    self.extended_state = ExtendedQueryState::FailedUntilSync;
                 } else {
                     write_ready(&mut self.stream, transaction_status(&self.session))?;
                 }
@@ -645,6 +768,10 @@ impl Connection {
     }
 
     fn simple_query(&mut self, sql: &str) -> Result<()> {
+        self.prepared.remove("");
+        if let Some(portal) = self.portals.remove("") {
+            retire_portal(&self.registry, portal, QueryOutcome::Cancelled)?;
+        }
         let statements = split_statements(sql)?;
         if statements.is_empty() {
             write_empty_query(&mut self.stream)?;
@@ -694,7 +821,7 @@ impl Connection {
                             .update_query_rows(&query_id, progress.rows_processed)?;
                     }
                     QueryEvent::Notice(notice) => {
-                        write_notice(&mut self.stream, &notice.sql_state, &notice.message)?;
+                        write_notice(&mut self.stream, &notice)?;
                     }
                     QueryEvent::Complete(complete) => {
                         write_command_complete(&mut self.stream, &command_tag(&complete))?;
@@ -708,19 +835,15 @@ impl Connection {
     }
 
     fn parse(&mut self, name: String, sql: String, parameter_oids: Vec<u32>) -> Result<()> {
-        if !self.prepared.contains_key(&name)
-            && self.prepared.len() >= self.config.max_prepared_statements
-        {
-            return Err(DbError::new(
-                "54000",
-                "prepared statement count exceeds the configured limit",
-            ));
-        }
+        ensure_prepared_statement_slot(&self.prepared, &name, self.config.max_prepared_statements)?;
         if sql.len() > self.config.max_frame_bytes {
             return Err(protocol("prepared SQL exceeds frame limit"));
         }
         let description = self.statement_description(&sql)?;
         let parameter_oids = resolve_parameter_oids(&parameter_oids, &description.parameter_types)?;
+        if name.is_empty() {
+            self.retire_portals_for_statement("")?;
+        }
         self.prepared.insert(
             name,
             PreparedStatement {
@@ -741,13 +864,7 @@ impl Connection {
         parameters: &[Option<Vec<u8>>],
         result_formats: Vec<i16>,
     ) -> Result<()> {
-        if !self.portals.contains_key(&portal_name) && self.portals.len() >= self.config.max_portals
-        {
-            return Err(DbError::new(
-                "54000",
-                "portal count exceeds the configured limit",
-            ));
-        }
+        ensure_portal_slot(&self.portals, &portal_name, self.config.max_portals)?;
         let prepared = self
             .prepared
             .get(statement_name)
@@ -759,9 +876,10 @@ impl Connection {
             parameter_formats,
             parameters,
         )?;
-        self.portals.insert(
+        let replaced = self.portals.insert(
             portal_name,
             Portal {
+                statement_name: statement_name.to_owned(),
                 sql: prepared.sql,
                 parameters,
                 result_formats,
@@ -773,6 +891,9 @@ impl Connection {
                 rows_processed: 0,
             },
         );
+        if let Some(portal) = replaced {
+            retire_portal(&self.registry, portal, QueryOutcome::Cancelled)?;
+        }
         write_bind_complete(&mut self.stream)
     }
 
@@ -884,7 +1005,7 @@ impl Connection {
                     }
                 }
                 Ok(QueryEvent::Notice(notice)) => {
-                    write_notice(&mut self.stream, &notice.sql_state, &notice.message)?;
+                    write_notice(&mut self.stream, &notice)?;
                 }
                 Ok(QueryEvent::Complete(complete)) => {
                     write_command_complete(&mut self.stream, &command_tag(&complete))?;
@@ -914,14 +1035,37 @@ impl Connection {
     fn close(&mut self, kind: u8, name: &str) -> Result<()> {
         match kind {
             b'S' => {
-                self.prepared.remove(name);
+                self.prepared
+                    .remove(name)
+                    .ok_or_else(|| DbError::new("26000", "prepared statement does not exist"))?;
+                self.retire_portals_for_statement(name)?;
             }
             b'P' => {
-                self.portals.remove(name);
+                let portal = self
+                    .portals
+                    .remove(name)
+                    .ok_or_else(|| DbError::new("34000", "portal does not exist"))?;
+                retire_portal(&self.registry, portal, QueryOutcome::Cancelled)?;
             }
             _ => return Err(protocol("Close kind must be S or P")),
         }
         write_close_complete(&mut self.stream)
+    }
+
+    fn retire_portals_for_statement(&mut self, statement_name: &str) -> Result<()> {
+        let names = self
+            .portals
+            .iter()
+            .filter_map(|(name, portal)| {
+                (portal.statement_name == statement_name).then_some(name.clone())
+            })
+            .collect::<Vec<_>>();
+        for name in names {
+            if let Some(portal) = self.portals.remove(&name) {
+                retire_portal(&self.registry, portal, QueryOutcome::Cancelled)?;
+            }
+        }
+        Ok(())
     }
 
     fn statement_stream(
@@ -929,6 +1073,13 @@ impl Connection {
         sql: &str,
         parameters: &[Value],
     ) -> Result<Box<dyn Iterator<Item = Result<QueryEvent>>>> {
+        refresh_system_catalog_metadata(
+            &mut self.session,
+            &self.auth,
+            &self.settings,
+            &self.principal,
+            &self.database,
+        )?;
         if let Some(statement) = parse_security_statement(sql)? {
             if !parameters.is_empty() {
                 return Err(DbError::new(
@@ -953,10 +1104,17 @@ impl Connection {
             ];
             return Ok(Box::new(events.into_iter().map(Ok)));
         }
-        let catalog = self.engine.catalog_snapshot()?;
         if !matches!(self.session.transaction_status(), TransactionStatus::Failed)
-            && let Some(events) = virtual_query(sql, &self.principal.user, &self.database, &catalog)
+            && let Some(events) = session_setting_events(sql, &mut self.settings)?
         {
+            self.refresh_runtime_metadata()?;
+            refresh_system_catalog_metadata(
+                &mut self.session,
+                &self.auth,
+                &self.settings,
+                &self.principal,
+                &self.database,
+            )?;
             return Ok(Box::new(events.into_iter().map(Ok)));
         }
         Ok(Box::new(self.session.execute_stream_with_cancellation(
@@ -976,32 +1134,25 @@ impl Connection {
                 parameter_types: Vec::new(),
             });
         }
-        let catalog = self.engine.catalog_snapshot()?;
-        if let Some(events) = virtual_query(sql, &self.principal.user, &self.database, &catalog) {
-            let schema = events
-                .into_iter()
-                .find_map(|event| match event {
-                    QueryEvent::Schema(schema) => Some(schema),
-                    _ => None,
-                })
-                .ok_or_else(|| DbError::new("XX000", "virtual query has no schema event"))?;
-            return Ok(StatementDescription {
-                schema,
-                parameter_types: Vec::new(),
-            });
+        if let Some(description) = session_setting_description(sql, &self.settings)? {
+            return Ok(description);
         }
         self.session.describe_statement(sql)
+    }
+
+    fn refresh_runtime_metadata(&mut self) -> Result<()> {
+        self.session.set_runtime_metadata(session_runtime_metadata(
+            &self.settings,
+            &self.database,
+            &self.principal,
+        )?);
+        Ok(())
     }
 
     fn authorize(&self, sql: &str) -> Result<()> {
         let authorizer = Authorizer::from_store(&self.auth)?;
         if is_security_sql(sql) {
             authorizer.authorize(&self.principal, Action::Manage, &DbObject::Server)
-        } else if catalog_query_source(sql).is_some() {
-            // PostgreSQL exposes system catalogs to authenticated sessions.
-            // The projection below contains metadata only and deliberately
-            // excludes routine bodies and authentication material.
-            Ok(())
         } else {
             authorizer.authorize_sql(&self.principal, &self.database, sql)
         }
@@ -1038,13 +1189,18 @@ impl Connection {
 
     fn execute_copy(&mut self, copy: CopyCommand) -> Result<()> {
         match copy.direction {
-            CopyDirection::ToStdout => self.copy_to_stdout(&copy.table),
-            CopyDirection::FromStdin => self.copy_from_stdin(&copy.table),
+            CopyDirection::ToStdout => self.copy_to_stdout(&copy),
+            CopyDirection::FromStdin => self.copy_from_stdin(&copy),
         }
     }
 
-    fn copy_to_stdout(&mut self, table: &str) -> Result<()> {
-        let sql = format!("SELECT * FROM {table}");
+    fn copy_to_stdout(&mut self, copy: &CopyCommand) -> Result<()> {
+        let projection = if copy.columns.is_empty() {
+            "*".to_owned()
+        } else {
+            copy.columns.join(", ")
+        };
+        let sql = format!("SELECT {projection} FROM {}", copy.table);
         self.authorize(&sql)?;
         let mut stream = self.session.execute_stream(&sql, &[])?;
         let schema = match stream.next() {
@@ -1060,39 +1216,31 @@ impl Connection {
                 return Err(DbError::new("XX000", "COPY source ended before its schema"));
             }
         };
-        let mut rows = 0_u64;
         write_copy_response(&mut self.stream, b'H', schema.fields.len())?;
-        for event in stream {
-            self.check_cancelled()?;
-            match event? {
-                QueryEvent::Schema(_) => {
-                    return Err(DbError::new(
-                        "XX000",
-                        "COPY source emitted more than one schema",
-                    ));
-                }
-                QueryEvent::Batch(batch) => {
-                    for row in &batch.rows {
-                        let csv = encode_csv_row(&schema, row)?;
-                        write_message(&mut self.stream, b'd', &csv)?;
-                        rows = rows.saturating_add(1);
-                    }
-                }
-                QueryEvent::Notice(notice) => {
-                    write_notice(&mut self.stream, &notice.sql_state, &notice.message)?;
-                }
-                QueryEvent::Progress(_) | QueryEvent::Complete(_) => {}
-            }
+        if copy.options.header {
+            let header = encode_copy_header(&schema, &copy.options)?;
+            write_message(&mut self.stream, b'd', &header)?;
         }
+        let handle = &self.handle;
+        let shutdown = self.shutdown.as_ref();
+        let rows = write_copy_stream(&mut self.stream, &schema, &copy.options, stream, || {
+            if shutdown.is_some_and(CancellationToken::is_cancelled) {
+                return Err(DbError::new("57P01", "server is shutting down"));
+            }
+            if handle.is_cancelled() {
+                return Err(DbError::new("57014", "query cancelled"));
+            }
+            Ok(())
+        })?;
         write_message(&mut self.stream, b'c', &[])?;
         write_command_complete(&mut self.stream, &format!("COPY {rows}"))
     }
 
-    fn copy_from_stdin(&mut self, table: &str) -> Result<()> {
-        self.authorize(&format!("COPY {table} FROM STDIN"))?;
-        let columns = copy_columns(&self.engine, table)?;
-        let insert = insert_statement(table, columns.len());
-        drain(self.session.execute_stream("BEGIN", &[])?)?;
+    fn copy_from_stdin(&mut self, copy: &CopyCommand) -> Result<()> {
+        self.authorize(&format!("COPY {} FROM STDIN", copy.table))?;
+        let columns = copy_columns(&self.engine, &copy.table, &copy.columns)?;
+        let insert = insert_statement(&copy.table, &columns);
+        let owns_transaction = begin_copy_transaction(&mut self.session)?;
         write_copy_response(&mut self.stream, b'G', columns.len())?;
         self.flush()?;
         let mut bytes = Vec::new();
@@ -1124,24 +1272,99 @@ impl Connection {
             }
         };
         if let Err(error) = receive {
-            self.rollback_copy();
+            abort_copy_transaction(&mut self.session, owns_transaction);
             return Err(error);
         }
-        let rows = match import_csv(&mut self.session, &insert, &columns, &bytes) {
+        let rows = match import_copy(&mut self.session, &insert, &columns, &copy.options, &bytes) {
             Ok(rows) => rows,
             Err(error) => {
-                self.rollback_copy();
+                abort_copy_transaction(&mut self.session, owns_transaction);
                 return Err(error);
             }
         };
-        drain(self.session.execute_stream("COMMIT", &[])?)?;
+        complete_copy_transaction(&mut self.session, owns_transaction)?;
         write_command_complete(&mut self.stream, &format!("COPY {rows}"))
     }
+}
 
-    fn rollback_copy(&mut self) {
-        if let Ok(stream) = self.session.execute_stream("ROLLBACK", &[]) {
+fn write_copy_stream<W, I, F>(
+    writer: &mut W,
+    schema: &Schema,
+    options: &CopyOptions,
+    stream: I,
+    mut check_cancelled: F,
+) -> Result<u64>
+where
+    W: Write,
+    I: IntoIterator<Item = Result<QueryEvent>>,
+    F: FnMut() -> Result<()>,
+{
+    let mut rows = 0_u64;
+    let mut completed = false;
+    for event in stream {
+        check_cancelled()?;
+        if completed {
+            return Err(DbError::new(
+                "XX000",
+                "COPY source emitted an event after completion",
+            ));
+        }
+        match event? {
+            QueryEvent::Schema(_) => {
+                return Err(DbError::new(
+                    "XX000",
+                    "COPY source emitted more than one schema",
+                ));
+            }
+            QueryEvent::Batch(batch) => {
+                for row in &batch.rows {
+                    let encoded = encode_copy_row(schema, row, options)?;
+                    write_message(writer, b'd', &encoded)?;
+                    rows = rows.saturating_add(1);
+                }
+            }
+            QueryEvent::Notice(notice) => write_notice(writer, &notice)?,
+            QueryEvent::Progress(_) => {}
+            QueryEvent::Complete(_) => completed = true,
+        }
+    }
+    if !completed {
+        return Err(DbError::new(
+            "XX000",
+            "COPY source ended without a completion event",
+        ));
+    }
+    Ok(rows)
+}
+
+fn begin_copy_transaction(session: &mut Session) -> Result<bool> {
+    match session.transaction_status() {
+        TransactionStatus::Idle => {
+            drain(session.execute_stream("BEGIN", &[])?)?;
+            Ok(true)
+        }
+        TransactionStatus::Active => Ok(false),
+        TransactionStatus::Failed => Err(DbError::new(
+            "25P02",
+            "the current transaction is aborted; commands are ignored until ROLLBACK",
+        )),
+    }
+}
+
+fn complete_copy_transaction(session: &mut Session, owns_transaction: bool) -> Result<()> {
+    if owns_transaction {
+        drain(session.execute_stream("COMMIT", &[])?)?;
+    }
+    Ok(())
+}
+
+fn abort_copy_transaction(session: &mut Session, owns_transaction: bool) {
+    if owns_transaction {
+        if let Ok(stream) = session.execute_stream("ROLLBACK", &[]) {
             let _ = drain(stream);
         }
+    } else {
+        session.mark_transaction_failed();
     }
 }
 
@@ -1160,6 +1383,96 @@ fn transaction_status(session: &Session) -> u8 {
     }
 }
 
+fn session_setting_events(
+    sql: &str,
+    settings: &mut PgSessionSettings,
+) -> Result<Option<Vec<QueryEvent>>> {
+    let Some(statement) = parse_setting_statement(sql)? else {
+        return Ok(None);
+    };
+    match statement {
+        PgSettingStatement::Show { name } => {
+            let value = settings.get(&name).ok_or_else(|| {
+                DbError::new(
+                    "42704",
+                    format!("unrecognized configuration parameter {name}"),
+                )
+            })?;
+            let schema = Schema::new(vec![Field::new(&name, ScalarType::Text, false)]);
+            Ok(Some(result_events(
+                schema,
+                vec![Row::new(vec![Value::Text(value.to_owned())])],
+                "SHOW",
+            )))
+        }
+        PgSettingStatement::Set { name, value } => {
+            settings.set(&name, &value)?;
+            Ok(Some(command_events("SET", 0)))
+        }
+        PgSettingStatement::SetConfig {
+            name,
+            value,
+            is_local,
+            result_name,
+        } => {
+            if is_local {
+                return Err(DbError::new(
+                    "0A000",
+                    "transaction-local set_config settings are not supported yet",
+                ));
+            }
+            settings.set(&name, &value)?;
+            let value = settings.get(&name).ok_or_else(|| {
+                DbError::internal("set_config updated a setting that cannot be read back")
+            })?;
+            let schema = Schema::new(vec![Field::new(result_name, ScalarType::Text, false)]);
+            Ok(Some(result_events(
+                schema,
+                vec![Row::new(vec![Value::Text(value.to_owned())])],
+                "SELECT 1",
+            )))
+        }
+        PgSettingStatement::Reset { name } => {
+            settings.reset(&name)?;
+            Ok(Some(command_events("RESET", 0)))
+        }
+        PgSettingStatement::ResetAll => {
+            settings.reset_all();
+            Ok(Some(command_events("RESET", 0)))
+        }
+    }
+}
+
+fn session_setting_description(
+    sql: &str,
+    settings: &PgSessionSettings,
+) -> Result<Option<StatementDescription>> {
+    let Some(statement) = parse_setting_statement(sql)? else {
+        return Ok(None);
+    };
+    let schema = match statement {
+        PgSettingStatement::Show { name } => {
+            if settings.get(&name).is_none() {
+                return Err(DbError::new(
+                    "42704",
+                    format!("unrecognized configuration parameter {name}"),
+                ));
+            }
+            Schema::new(vec![Field::new(name, ScalarType::Text, false)])
+        }
+        PgSettingStatement::Set { .. }
+        | PgSettingStatement::Reset { .. }
+        | PgSettingStatement::ResetAll => Schema::empty(),
+        PgSettingStatement::SetConfig { result_name, .. } => {
+            Schema::new(vec![Field::new(result_name, ScalarType::Text, false)])
+        }
+    };
+    Ok(Some(StatementDescription {
+        schema,
+        parameter_types: Vec::new(),
+    }))
+}
+
 fn connect_postgresql_session(
     engine: &Engine,
     principal: &Principal,
@@ -1171,6 +1484,94 @@ fn connect_postgresql_session(
     )?)
 }
 
+fn session_runtime_metadata(
+    settings: &PgSessionSettings,
+    database: &str,
+    principal: &Principal,
+) -> Result<SessionRuntimeMetadata> {
+    let server_version = settings
+        .get("server_version")
+        .ok_or_else(|| DbError::internal("PostgreSQL session has no server_version setting"))?;
+    SessionRuntimeMetadata::postgres_compatible(
+        server_version,
+        database,
+        principal.user.as_str(),
+        principal.user.as_str(),
+    )?
+    .with_settings(settings.runtime_values())
+}
+
+fn refresh_system_catalog_metadata(
+    session: &mut Session,
+    auth: &AuthStore,
+    settings: &PgSessionSettings,
+    principal: &Principal,
+    database: &str,
+) -> Result<()> {
+    let roles = auth
+        .safe_role_metadata_snapshot()?
+        .roles
+        .into_iter()
+        .map(|role| CatalogRoleMetadata {
+            postgres_oid: role.postgres_oid,
+            name: role.name,
+            can_login: role.can_login,
+            login_enabled: role.login_enabled,
+        })
+        .collect();
+    let authorizer = Authorizer::from_store(auth)?;
+    let visibility = CatalogVisibility::from_scopes(
+        authorizer
+            .discovery_objects(principal)?
+            .into_iter()
+            .filter_map(|object| catalog_visibility_scope(object, database)),
+    )?;
+    session.refresh_system_catalog_metadata(roles, settings.system_catalog_metadata(), visibility)
+}
+
+fn catalog_visibility_scope(object: DbObject, database: &str) -> Option<CatalogVisibilityScope> {
+    match object {
+        DbObject::Server => Some(CatalogVisibilityScope::All),
+        DbObject::Database(name) => name
+            .eq_ignore_ascii_case(database)
+            .then_some(CatalogVisibilityScope::All),
+        DbObject::Schema(name) => {
+            let parts = name.split('.').collect::<Vec<_>>();
+            match parts.as_slice() {
+                [schema] => Some(CatalogVisibilityScope::Schema {
+                    schema: (*schema).to_owned(),
+                }),
+                [scope_database, schema] if scope_database.eq_ignore_ascii_case(database) => {
+                    Some(CatalogVisibilityScope::Schema {
+                        schema: (*schema).to_owned(),
+                    })
+                }
+                _ => None,
+            }
+        }
+        DbObject::Table(name) | DbObject::Sequence(name) | DbObject::Function(name) => {
+            let parts = name.split('.').collect::<Vec<_>>();
+            match parts.as_slice() {
+                [name] => Some(CatalogVisibilityScope::Object {
+                    schema: "public".to_owned(),
+                    name: (*name).to_owned(),
+                }),
+                [schema, name] => Some(CatalogVisibilityScope::Object {
+                    schema: (*schema).to_owned(),
+                    name: (*name).to_owned(),
+                }),
+                [scope_database, schema, name] if scope_database.eq_ignore_ascii_case(database) => {
+                    Some(CatalogVisibilityScope::Object {
+                        schema: (*schema).to_owned(),
+                        name: (*name).to_owned(),
+                    })
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
 fn command_tag(complete: &CommandComplete) -> String {
     let upper = complete.tag.to_ascii_uppercase();
     if upper == "INSERT" {
@@ -1180,605 +1581,6 @@ fn command_tag(complete: &CommandComplete) -> String {
     } else {
         complete.tag.clone()
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CatalogQuerySource {
-    Namespace,
-    Class,
-    Type,
-    Enum,
-    Constraint,
-    Procedure,
-    Trigger,
-    InformationSchemaTables,
-}
-
-fn catalog_query_source(sql: &str) -> Option<CatalogQuerySource> {
-    let normalized = sql
-        .split_ascii_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace('"', "")
-        .to_ascii_uppercase();
-    if !normalized.trim_start().starts_with("SELECT ") {
-        return None;
-    }
-    [
-        ("PG_CATALOG.PG_NAMESPACE", CatalogQuerySource::Namespace),
-        ("PG_CATALOG.PG_CLASS", CatalogQuerySource::Class),
-        ("PG_CATALOG.PG_TYPE", CatalogQuerySource::Type),
-        ("PG_CATALOG.PG_ENUM", CatalogQuerySource::Enum),
-        ("PG_CATALOG.PG_CONSTRAINT", CatalogQuerySource::Constraint),
-        ("PG_CATALOG.PG_PROC", CatalogQuerySource::Procedure),
-        ("PG_CATALOG.PG_TRIGGER", CatalogQuerySource::Trigger),
-        (
-            "INFORMATION_SCHEMA.TABLES",
-            CatalogQuerySource::InformationSchemaTables,
-        ),
-    ]
-    .into_iter()
-    .find_map(|(relation, source)| {
-        normalized
-            .contains(&format!("FROM {relation}"))
-            .then_some(source)
-    })
-}
-
-fn virtual_query(
-    sql: &str,
-    user: &str,
-    database: &str,
-    catalog: &Catalog,
-) -> Option<Vec<QueryEvent>> {
-    let normalized = sql
-        .split_ascii_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim_end_matches(';')
-        .to_ascii_uppercase();
-    let text_result = |name: &str, value: String, tag: &str| {
-        let schema = Schema::new(vec![Field::new(name, ScalarType::Text, false)]);
-        result_events(schema, vec![Row::new(vec![Value::Text(value)])], tag)
-    };
-    if normalized.starts_with("SET ") || normalized.starts_with("RESET ") {
-        return Some(command_events("SET", 0));
-    }
-    if normalized == "SHOW SERVER_VERSION" {
-        return Some(text_result(
-            "server_version",
-            format!("16.0 (OrdaDB {})", env!("CARGO_PKG_VERSION")),
-            "SHOW",
-        ));
-    }
-    if normalized == "SHOW TRANSACTION_ISOLATION"
-        || normalized == "SHOW DEFAULT_TRANSACTION_ISOLATION"
-    {
-        return Some(text_result(
-            "transaction_isolation",
-            "read committed".into(),
-            "SHOW",
-        ));
-    }
-    if let Some(source) = catalog_query_source(sql) {
-        return Some(catalog_query_events(source, catalog, database));
-    }
-    if normalized.contains("VERSION()") {
-        return Some(text_result(
-            "version",
-            format!(
-                "PostgreSQL 16 compatible OrdaDB {} on x86_64-pc-windows-msvc",
-                env!("CARGO_PKG_VERSION")
-            ),
-            "SELECT",
-        ));
-    }
-    if normalized.contains("CURRENT_DATABASE()") {
-        return Some(text_result(
-            "current_database",
-            database.to_owned(),
-            "SELECT",
-        ));
-    }
-    if normalized == "SELECT CURRENT_USER" || normalized == "SELECT SESSION_USER" {
-        return Some(text_result("current_user", user.to_owned(), "SELECT"));
-    }
-    if normalized == "SELECT 1" {
-        let schema = Schema::new(vec![Field::new("?column?", ScalarType::Int32, false)]);
-        return Some(result_events(
-            schema,
-            vec![Row::new(vec![Value::Int32(1)])],
-            "SELECT",
-        ));
-    }
-    None
-}
-
-const fn pg_type_category(data_type: &ScalarType) -> &'static str {
-    match data_type {
-        ScalarType::Boolean => "B",
-        ScalarType::Int16
-        | ScalarType::Int32
-        | ScalarType::Int64
-        | ScalarType::Float32
-        | ScalarType::Float64
-        | ScalarType::Decimal { .. } => "N",
-        ScalarType::Char { .. } | ScalarType::Varchar { .. } | ScalarType::Text => "S",
-        ScalarType::Date
-        | ScalarType::Time
-        | ScalarType::Timestamp { .. }
-        | ScalarType::Interval => "D",
-        ScalarType::Array { .. } => "A",
-        ScalarType::Enum { .. } => "E",
-        ScalarType::Binary
-        | ScalarType::Json
-        | ScalarType::Jsonb
-        | ScalarType::Uuid
-        | ScalarType::Vector { .. } => "U",
-    }
-}
-
-fn catalog_query_events(
-    source: CatalogQuerySource,
-    catalog: &Catalog,
-    connection_database: &str,
-) -> Vec<QueryEvent> {
-    const SCHEMA_OID_BASE: i64 = 10_000_000;
-    const TABLE_OID_BASE: i64 = 20_000_000;
-    const VIEW_OID_BASE: i64 = 30_000_000;
-    const ROUTINE_OID_BASE: i64 = 40_000_000;
-    const TRIGGER_OID_BASE: i64 = 50_000_000;
-    const SEQUENCE_OID_BASE: i64 = 60_000_000;
-    const INDEX_OID_BASE: i64 = 70_000_000;
-
-    let oid = |base: i64, id: u64| base.saturating_add(i64::try_from(id).unwrap_or(i64::MAX));
-    let catalog_database = catalog.database();
-    let (schema, rows) = match source {
-        CatalogQuerySource::Namespace => (
-            Schema::new(vec![
-                Field::new("oid", ScalarType::Int64, false),
-                Field::new("nspname", ScalarType::Text, false),
-            ]),
-            catalog_database
-                .schemas()
-                .map(|schema| {
-                    Row::new(vec![
-                        Value::Int64(oid(SCHEMA_OID_BASE, schema.id.get())),
-                        Value::Text(schema.name.as_str().to_owned()),
-                    ])
-                })
-                .collect(),
-        ),
-        CatalogQuerySource::Class => {
-            let mut rows = Vec::new();
-            for schema in catalog_database.schemas() {
-                let namespace_oid = oid(SCHEMA_OID_BASE, schema.id.get());
-                let materialized_tables = schema
-                    .views()
-                    .filter_map(|view| view.materialized_table_id)
-                    .collect::<BTreeSet<_>>();
-                for table in schema
-                    .tables()
-                    .filter(|table| !materialized_tables.contains(&table.id))
-                {
-                    rows.push(Row::new(vec![
-                        Value::Int64(oid(TABLE_OID_BASE, table.id.get())),
-                        Value::Text(table.name.as_str().to_owned()),
-                        Value::Int64(namespace_oid),
-                        Value::Text("r".into()),
-                        Value::Text("p".into()),
-                        Value::Int32(i32::try_from(table.columns().len()).unwrap_or(i32::MAX)),
-                        Value::Boolean(table.indexes().next().is_some()),
-                    ]));
-                    rows.extend(table.indexes().map(|index| {
-                        Row::new(vec![
-                            Value::Int64(oid(INDEX_OID_BASE, index.id.get())),
-                            Value::Text(index.name.as_str().to_owned()),
-                            Value::Int64(namespace_oid),
-                            Value::Text("i".into()),
-                            Value::Text("p".into()),
-                            Value::Int32(0),
-                            Value::Boolean(false),
-                        ])
-                    }));
-                }
-                rows.extend(schema.sequences().map(|sequence| {
-                    Row::new(vec![
-                        Value::Int64(oid(SEQUENCE_OID_BASE, sequence.id.get())),
-                        Value::Text(sequence.name.as_str().to_owned()),
-                        Value::Int64(namespace_oid),
-                        Value::Text("S".into()),
-                        Value::Text("p".into()),
-                        Value::Int32(0),
-                        Value::Boolean(false),
-                    ])
-                }));
-                rows.extend(schema.views().map(|view| {
-                    Row::new(vec![
-                        Value::Int64(oid(VIEW_OID_BASE, view.id.get())),
-                        Value::Text(view.name.as_str().to_owned()),
-                        Value::Int64(namespace_oid),
-                        Value::Text(
-                            match view.kind {
-                                ViewKind::Regular => "v",
-                                ViewKind::Materialized => "m",
-                            }
-                            .into(),
-                        ),
-                        Value::Text("p".into()),
-                        Value::Int32(i32::try_from(view.output.fields.len()).unwrap_or(i32::MAX)),
-                        Value::Boolean(view.materialized_table_id.is_some_and(|table_id| {
-                            catalog
-                                .table_by_id(table_id)
-                                .is_some_and(|table| table.indexes().next().is_some())
-                        })),
-                    ])
-                }));
-            }
-            (
-                Schema::new(vec![
-                    Field::new("oid", ScalarType::Int64, false),
-                    Field::new("relname", ScalarType::Text, false),
-                    Field::new("relnamespace", ScalarType::Int64, false),
-                    Field::new("relkind", ScalarType::Text, false),
-                    Field::new("relpersistence", ScalarType::Text, false),
-                    Field::new("relnatts", ScalarType::Int32, false),
-                    Field::new("relhasindex", ScalarType::Boolean, false),
-                ]),
-                rows,
-            )
-        }
-        CatalogQuerySource::Type => {
-            let mut rows = Vec::new();
-            for schema in catalog_database.schemas() {
-                let namespace_oid = oid(SCHEMA_OID_BASE, schema.id.get());
-                for definition in schema.types() {
-                    let scalar_oid = i64::from(user_defined_type_oid(definition.id));
-                    let array_oid = i64::from(user_defined_array_oid(definition.id));
-                    let (kind, category, base_oid, not_null, default) = match &definition.definition
-                    {
-                        UserDefinedTypeKind::Enum { .. } => ("e", "E", 0_i64, false, Value::Null),
-                        UserDefinedTypeKind::Domain {
-                            base_type,
-                            base_declared_type,
-                            not_null,
-                            default,
-                            ..
-                        } => (
-                            "d",
-                            pg_type_category(base_type),
-                            i64::from(
-                                base_declared_type
-                                    .map_or_else(|| type_oid(base_type), user_defined_type_oid),
-                            ),
-                            *not_null,
-                            default.as_ref().map_or(Value::Null, |expression| {
-                                Value::Text(expression.sql.clone())
-                            }),
-                        ),
-                    };
-                    rows.push(Row::new(vec![
-                        Value::Int64(scalar_oid),
-                        Value::Text(definition.name.as_str().to_owned()),
-                        Value::Int64(namespace_oid),
-                        Value::Text(kind.into()),
-                        Value::Text(category.into()),
-                        Value::Boolean(true),
-                        Value::Int64(0),
-                        Value::Int64(array_oid),
-                        Value::Int64(base_oid),
-                        Value::Boolean(not_null),
-                        default,
-                    ]));
-                    rows.push(Row::new(vec![
-                        Value::Int64(array_oid),
-                        Value::Text(format!("_{}", definition.name.as_str())),
-                        Value::Int64(namespace_oid),
-                        Value::Text("b".into()),
-                        Value::Text("A".into()),
-                        Value::Boolean(true),
-                        Value::Int64(scalar_oid),
-                        Value::Int64(0),
-                        Value::Int64(0),
-                        Value::Boolean(false),
-                        Value::Null,
-                    ]));
-                }
-            }
-            (
-                Schema::new(vec![
-                    Field::new("oid", ScalarType::Int64, false),
-                    Field::new("typname", ScalarType::Text, false),
-                    Field::new("typnamespace", ScalarType::Int64, false),
-                    Field::new("typtype", ScalarType::Text, false),
-                    Field::new("typcategory", ScalarType::Text, false),
-                    Field::new("typisdefined", ScalarType::Boolean, false),
-                    Field::new("typelem", ScalarType::Int64, false),
-                    Field::new("typarray", ScalarType::Int64, false),
-                    Field::new("typbasetype", ScalarType::Int64, false),
-                    Field::new("typnotnull", ScalarType::Boolean, false),
-                    Field::new("typdefault", ScalarType::Text, true),
-                ]),
-                rows,
-            )
-        }
-        CatalogQuerySource::Enum => {
-            const ENUM_LABEL_OID_BASE: i64 = 1_000_000_000;
-            let rows = catalog_database
-                .schemas()
-                .flat_map(|schema| {
-                    schema.types().flat_map(|definition| {
-                        let UserDefinedTypeKind::Enum { labels } = &definition.definition else {
-                            return Vec::new().into_iter();
-                        };
-                        let type_oid = i64::from(user_defined_type_oid(definition.id));
-                        let type_offset = i64::try_from(definition.id.get())
-                            .unwrap_or(i64::MAX)
-                            .saturating_mul(1_000_000);
-                        labels
-                            .iter()
-                            .enumerate()
-                            .map(|(ordinal, label)| {
-                                Row::new(vec![
-                                    Value::Int64(
-                                        ENUM_LABEL_OID_BASE
-                                            .saturating_add(type_offset)
-                                            .saturating_add(
-                                                i64::try_from(ordinal).unwrap_or(i64::MAX),
-                                            ),
-                                    ),
-                                    Value::Int64(type_oid),
-                                    Value::Float64(
-                                        u32::try_from(ordinal)
-                                            .map_or(f64::from(u32::MAX), |value| {
-                                                f64::from(value.saturating_add(1))
-                                            }),
-                                    ),
-                                    Value::Text(label.clone()),
-                                ])
-                            })
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                    })
-                })
-                .collect();
-            (
-                Schema::new(vec![
-                    Field::new("oid", ScalarType::Int64, false),
-                    Field::new("enumtypid", ScalarType::Int64, false),
-                    Field::new("enumsortorder", ScalarType::Float64, false),
-                    Field::new("enumlabel", ScalarType::Text, false),
-                ]),
-                rows,
-            )
-        }
-        CatalogQuerySource::Constraint => {
-            const CONSTRAINT_OID_BASE: i64 = 1_100_000_000;
-            const LEGACY_DOMAIN_CONSTRAINT_OID_BASE: i64 = 1_200_000_000;
-            let mut rows = Vec::new();
-            for schema in catalog_database.schemas() {
-                let namespace_oid = oid(SCHEMA_OID_BASE, schema.id.get());
-                for table in schema.tables() {
-                    for constraint in table.constraints() {
-                        let (constraint_type, expression) = match &constraint.kind {
-                            ConstraintKind::PrimaryKey { .. } => ("p", Value::Null),
-                            ConstraintKind::Unique { .. } => ("u", Value::Null),
-                            ConstraintKind::ForeignKey { .. } => ("f", Value::Null),
-                            ConstraintKind::Check { expression } => {
-                                ("c", Value::Text(expression.sql.clone()))
-                            }
-                        };
-                        rows.push(Row::new(vec![
-                            Value::Int64(oid(CONSTRAINT_OID_BASE, constraint.id.get())),
-                            Value::Text(constraint.name.as_str().to_owned()),
-                            Value::Text(constraint_type.into()),
-                            Value::Int64(namespace_oid),
-                            Value::Int64(oid(TABLE_OID_BASE, table.id.get())),
-                            Value::Int64(0),
-                            Value::Boolean(true),
-                            expression,
-                        ]));
-                    }
-                }
-                for definition in schema.types() {
-                    let UserDefinedTypeKind::Domain { checks, .. } = &definition.definition else {
-                        continue;
-                    };
-                    for (ordinal, constraint) in checks.iter().enumerate() {
-                        let generated_name = if ordinal == 0 {
-                            format!("{}_check", definition.name.as_str())
-                        } else {
-                            format!("{}_check{}", definition.name.as_str(), ordinal + 1)
-                        };
-                        let constraint_oid = constraint.id.map_or_else(
-                            || {
-                                LEGACY_DOMAIN_CONSTRAINT_OID_BASE
-                                    .saturating_add(
-                                        i64::try_from(definition.id.get())
-                                            .unwrap_or(i64::MAX)
-                                            .saturating_mul(1_000_000),
-                                    )
-                                    .saturating_add(i64::try_from(ordinal).unwrap_or(i64::MAX))
-                            },
-                            |id| oid(CONSTRAINT_OID_BASE, id.get()),
-                        );
-                        rows.push(Row::new(vec![
-                            Value::Int64(constraint_oid),
-                            Value::Text(
-                                constraint
-                                    .name
-                                    .as_ref()
-                                    .map_or(generated_name, |name| name.as_str().to_owned()),
-                            ),
-                            Value::Text("c".into()),
-                            Value::Int64(namespace_oid),
-                            Value::Int64(0),
-                            Value::Int64(i64::from(user_defined_type_oid(definition.id))),
-                            Value::Boolean(true),
-                            Value::Text(constraint.expression.sql.clone()),
-                        ]));
-                    }
-                }
-            }
-            (
-                Schema::new(vec![
-                    Field::new("oid", ScalarType::Int64, false),
-                    Field::new("conname", ScalarType::Text, false),
-                    Field::new("contype", ScalarType::Text, false),
-                    Field::new("connamespace", ScalarType::Int64, false),
-                    Field::new("conrelid", ScalarType::Int64, false),
-                    Field::new("contypid", ScalarType::Int64, false),
-                    Field::new("convalidated", ScalarType::Boolean, false),
-                    Field::new("conbin", ScalarType::Text, true),
-                ]),
-                rows,
-            )
-        }
-        CatalogQuerySource::Procedure => {
-            let rows = catalog_database
-                .schemas()
-                .flat_map(|schema| {
-                    let namespace_oid = oid(SCHEMA_OID_BASE, schema.id.get());
-                    schema.routines().map(move |routine| {
-                        let return_oid = routine.return_type.as_ref().map_or(2278, |return_type| {
-                            routine
-                                .return_declared_type
-                                .map_or_else(|| type_oid(return_type), user_defined_type_oid)
-                        });
-                        let argument_oids = routine
-                            .arguments
-                            .iter()
-                            .map(|argument| {
-                                argument
-                                    .declared_type
-                                    .map_or_else(
-                                        || type_oid(&argument.data_type),
-                                        user_defined_type_oid,
-                                    )
-                                    .to_string()
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        Row::new(vec![
-                            Value::Int64(oid(ROUTINE_OID_BASE, routine.id.get())),
-                            Value::Text(routine.name.as_str().to_owned()),
-                            Value::Int64(namespace_oid),
-                            Value::Text(
-                                match routine.kind {
-                                    RoutineKind::Function => "f",
-                                    RoutineKind::Procedure => "p",
-                                }
-                                .into(),
-                            ),
-                            Value::Int64(i64::from(return_oid)),
-                            Value::Boolean(routine.returns_set),
-                            Value::Text(argument_oids),
-                            Value::Text(routine.language.clone()),
-                        ])
-                    })
-                })
-                .collect();
-            (
-                Schema::new(vec![
-                    Field::new("oid", ScalarType::Int64, false),
-                    Field::new("proname", ScalarType::Text, false),
-                    Field::new("pronamespace", ScalarType::Int64, false),
-                    Field::new("prokind", ScalarType::Text, false),
-                    Field::new("prorettype", ScalarType::Int64, false),
-                    Field::new("proretset", ScalarType::Boolean, false),
-                    Field::new("proargtypes", ScalarType::Text, false),
-                    Field::new("prolang", ScalarType::Text, false),
-                ]),
-                rows,
-            )
-        }
-        CatalogQuerySource::Trigger => {
-            let rows = catalog_database
-                .schemas()
-                .flat_map(|schema| {
-                    let materialized_tables = schema
-                        .views()
-                        .filter_map(|view| view.materialized_table_id)
-                        .collect::<BTreeSet<_>>();
-                    schema
-                        .tables()
-                        .filter(move |table| !materialized_tables.contains(&table.id))
-                        .flat_map(|table| {
-                            table.triggers().map(|trigger| {
-                                Row::new(vec![
-                                    Value::Int64(oid(TRIGGER_OID_BASE, trigger.id.get())),
-                                    Value::Text(trigger.name.as_str().to_owned()),
-                                    Value::Int64(oid(TABLE_OID_BASE, table.id.get())),
-                                    Value::Text(if trigger.enabled { "O" } else { "D" }.into()),
-                                    Value::Boolean(false),
-                                    Value::Int64(oid(ROUTINE_OID_BASE, trigger.routine_id.get())),
-                                ])
-                            })
-                        })
-                })
-                .collect();
-            (
-                Schema::new(vec![
-                    Field::new("oid", ScalarType::Int64, false),
-                    Field::new("tgname", ScalarType::Text, false),
-                    Field::new("tgrelid", ScalarType::Int64, false),
-                    Field::new("tgenabled", ScalarType::Text, false),
-                    Field::new("tgisinternal", ScalarType::Boolean, false),
-                    Field::new("tgfoid", ScalarType::Int64, false),
-                ]),
-                rows,
-            )
-        }
-        CatalogQuerySource::InformationSchemaTables => {
-            let mut rows = Vec::new();
-            for schema in catalog_database.schemas() {
-                let materialized_tables = schema
-                    .views()
-                    .filter_map(|view| view.materialized_table_id)
-                    .collect::<BTreeSet<_>>();
-                rows.extend(
-                    schema
-                        .tables()
-                        .filter(|table| !materialized_tables.contains(&table.id))
-                        .map(|table| {
-                            Row::new(vec![
-                                Value::Text(connection_database.to_owned()),
-                                Value::Text(schema.name.as_str().to_owned()),
-                                Value::Text(table.name.as_str().to_owned()),
-                                Value::Text("BASE TABLE".into()),
-                                Value::Text("YES".into()),
-                            ])
-                        }),
-                );
-                rows.extend(schema.views().map(|view| {
-                    Row::new(vec![
-                        Value::Text(connection_database.to_owned()),
-                        Value::Text(schema.name.as_str().to_owned()),
-                        Value::Text(view.name.as_str().to_owned()),
-                        Value::Text(
-                            match view.kind {
-                                ViewKind::Regular => "VIEW",
-                                ViewKind::Materialized => "MATERIALIZED VIEW",
-                            }
-                            .into(),
-                        ),
-                        Value::Text("NO".into()),
-                    ])
-                }));
-            }
-            (
-                Schema::new(vec![
-                    Field::new("table_catalog", ScalarType::Text, false),
-                    Field::new("table_schema", ScalarType::Text, false),
-                    Field::new("table_name", ScalarType::Text, false),
-                    Field::new("table_type", ScalarType::Text, false),
-                    Field::new("is_insertable_into", ScalarType::Text, false),
-                ]),
-                rows,
-            )
-        }
-    };
-    result_events(schema, rows, "SELECT")
 }
 
 fn result_events(schema: Schema, rows: Vec<Row>, tag: &str) -> Vec<QueryEvent> {
@@ -1923,55 +1725,503 @@ fn dollar_quote_delimiter(characters: &[char], start: usize) -> Option<Vec<char>
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CopyDirection {
     ToStdout,
     FromStdin,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyFormat {
+    Text,
+    Csv,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopyOptions {
+    format: CopyFormat,
+    delimiter: u8,
+    null: String,
+    header: bool,
+    quote: u8,
+    escape: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CopyCommand {
     table: String,
+    columns: Vec<String>,
     direction: CopyDirection,
+    options: CopyOptions,
 }
 
 fn parse_copy(sql: &str) -> Result<Option<CopyCommand>> {
-    let parts: Vec<&str> = sql.split_ascii_whitespace().collect();
-    if !parts
-        .first()
-        .is_some_and(|part| part.eq_ignore_ascii_case("COPY"))
-    {
+    let trimmed = sql.trim_start();
+    let first_word_end = trimmed
+        .bytes()
+        .position(|byte| !byte.is_ascii_alphabetic())
+        .unwrap_or(trimmed.len());
+    if !trimmed[..first_word_end].eq_ignore_ascii_case("COPY") {
         return Ok(None);
     }
-    if parts.len() != 4 {
-        return Err(DbError::new(
-            "0A000",
-            "only COPY <table> TO STDOUT and COPY <table> FROM STDIN are supported",
-        ));
+    CopyParser::new(lex_copy(trimmed)?).parse().map(Some)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CopyToken {
+    Word(String),
+    String(String),
+    LeftParen,
+    RightParen,
+    Comma,
+    Equals,
+}
+
+fn lex_copy(sql: &str) -> Result<Vec<CopyToken>> {
+    const MAX_COPY_TOKENS: usize = 256;
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        let token = match bytes[index] {
+            b'(' => {
+                index += 1;
+                CopyToken::LeftParen
+            }
+            b')' => {
+                index += 1;
+                CopyToken::RightParen
+            }
+            b',' => {
+                index += 1;
+                CopyToken::Comma
+            }
+            b'=' => {
+                index += 1;
+                CopyToken::Equals
+            }
+            b'\'' => {
+                index += 1;
+                let mut value = String::new();
+                loop {
+                    let Some(&byte) = bytes.get(index) else {
+                        return Err(DbError::new("42601", "unterminated COPY string literal"));
+                    };
+                    if byte == b'\'' {
+                        if bytes.get(index + 1) == Some(&b'\'') {
+                            value.push('\'');
+                            index += 2;
+                            continue;
+                        }
+                        index += 1;
+                        break;
+                    }
+                    let rest = std::str::from_utf8(&bytes[index..])
+                        .map_err(|_| DbError::new("22021", "COPY command is not valid UTF-8"))?;
+                    let character = rest
+                        .chars()
+                        .next()
+                        .ok_or_else(|| DbError::new("22021", "COPY command is not valid UTF-8"))?;
+                    value.push(character);
+                    index += character.len_utf8();
+                }
+                CopyToken::String(value)
+            }
+            b'"' => {
+                return Err(copy_unsupported(
+                    "quoted COPY table and column names are not supported",
+                ));
+            }
+            byte if byte.is_ascii_alphanumeric() || byte == b'_' => {
+                let start = index;
+                index += 1;
+                while bytes.get(index).is_some_and(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b'+')
+                }) {
+                    index += 1;
+                }
+                CopyToken::Word(sql[start..index].to_owned())
+            }
+            _ => {
+                return Err(DbError::new(
+                    "42601",
+                    "COPY command contains an unsupported token",
+                ));
+            }
+        };
+        tokens.push(token);
+        if tokens.len() > MAX_COPY_TOKENS {
+            return Err(DbError::new("54000", "COPY command has too many tokens"));
+        }
     }
-    let table = parts[1];
-    if !table
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
-    {
-        return Err(DbError::new(
-            "0A000",
-            "COPY currently supports only unquoted schema/table names",
-        ));
+    Ok(tokens)
+}
+
+struct CopyParser {
+    tokens: Vec<CopyToken>,
+    index: usize,
+}
+
+impl CopyParser {
+    const fn new(tokens: Vec<CopyToken>) -> Self {
+        Self { tokens, index: 0 }
     }
-    let direction =
-        if parts[2].eq_ignore_ascii_case("TO") && parts[3].eq_ignore_ascii_case("STDOUT") {
-            CopyDirection::ToStdout
-        } else if parts[2].eq_ignore_ascii_case("FROM") && parts[3].eq_ignore_ascii_case("STDIN") {
-            CopyDirection::FromStdin
+
+    fn parse(mut self) -> Result<CopyCommand> {
+        self.expect_keyword("COPY")?;
+        if self.consume_keyword("BINARY") {
+            return Err(copy_unsupported("COPY BINARY is not supported"));
+        }
+        if self.peek_left_paren() {
+            return Err(copy_unsupported("COPY query sources are not supported"));
+        }
+        let table = self.take_word("COPY requires a table name")?;
+        validate_copy_identifier_path(&table, "table")?;
+        let columns = self.parse_columns()?;
+        let direction = if self.consume_keyword("TO") {
+            self.expect_target("STDOUT", CopyDirection::ToStdout)?
+        } else if self.consume_keyword("FROM") {
+            self.expect_target("STDIN", CopyDirection::FromStdin)?
         } else {
+            return Err(copy_unsupported("COPY requires TO STDOUT or FROM STDIN"));
+        };
+        let options = self.parse_options()?;
+        if self.index != self.tokens.len() {
+            return Err(DbError::new("42601", "COPY command has trailing tokens"));
+        }
+        Ok(CopyCommand {
+            table,
+            columns,
+            direction,
+            options,
+        })
+    }
+
+    fn parse_columns(&mut self) -> Result<Vec<String>> {
+        if !self.consume_left_paren() {
+            return Ok(Vec::new());
+        }
+        let mut columns = Vec::new();
+        loop {
+            let column = self.take_word("COPY column list requires a column name")?;
+            validate_copy_identifier_path(&column, "column")?;
+            if column.contains('.') {
+                return Err(copy_unsupported("COPY column names cannot be qualified"));
+            }
+            if columns
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(&column))
+            {
+                return Err(DbError::new(
+                    "42701",
+                    format!("COPY column {column} is specified more than once"),
+                ));
+            }
+            columns.push(column);
+            if self.consume_right_paren() {
+                return Ok(columns);
+            }
+            if !self.consume_comma() {
+                return Err(DbError::new("42601", "COPY column list requires a comma"));
+            }
+        }
+    }
+
+    fn expect_target(&mut self, expected: &str, direction: CopyDirection) -> Result<CopyDirection> {
+        if self.consume_keyword(expected) {
+            return Ok(direction);
+        }
+        if self.consume_keyword("PROGRAM") {
+            return Err(copy_unsupported("COPY PROGRAM is not supported"));
+        }
+        if matches!(self.tokens.get(self.index), Some(CopyToken::String(_))) {
+            return Err(copy_unsupported("server-side COPY files are not supported"));
+        }
+        Err(copy_unsupported(format!("COPY requires {expected}")))
+    }
+
+    fn parse_options(&mut self) -> Result<CopyOptions> {
+        let _ = self.consume_keyword("WITH");
+        if self.index == self.tokens.len() {
+            return Ok(default_copy_options(CopyFormat::Text));
+        }
+        let parenthesized = self.consume_left_paren();
+        let mut format = None;
+        let mut delimiter = None;
+        let mut null = None;
+        let mut header = None;
+        let mut quote = None;
+        let mut escape = None;
+        let mut seen = std::collections::BTreeSet::new();
+        loop {
+            if parenthesized && self.consume_right_paren() {
+                break;
+            }
+            if self.index == self.tokens.len() {
+                if parenthesized {
+                    return Err(DbError::new("42601", "unterminated COPY option list"));
+                }
+                break;
+            }
+            let name = self
+                .take_word("COPY option name is required")?
+                .to_ascii_lowercase();
+            if !seen.insert(name.clone()) {
+                return Err(DbError::new(
+                    "42601",
+                    format!("COPY option {name} is specified more than once"),
+                ));
+            }
+            self.consume_equals();
+            match name.as_str() {
+                "format" => format = Some(self.parse_format()?),
+                "text" => format = Some(CopyFormat::Text),
+                "csv" => format = Some(CopyFormat::Csv),
+                "delimiter" => delimiter = Some(self.take_single_byte("DELIMITER")?),
+                "null" => null = Some(self.take_string("NULL")?),
+                "header" => header = Some(self.take_optional_boolean()?.unwrap_or(true)),
+                "quote" => quote = Some(self.take_single_byte("QUOTE")?),
+                "escape" => escape = Some(self.take_single_byte("ESCAPE")?),
+                "encoding" => {
+                    let value = self.take_value("ENCODING")?;
+                    if !matches!(value.to_ascii_lowercase().as_str(), "utf8" | "utf-8") {
+                        return Err(copy_unsupported("COPY supports only UTF8 encoding"));
+                    }
+                }
+                "binary" => {
+                    return Err(copy_unsupported("COPY FORMAT BINARY is not supported"));
+                }
+                _ => {
+                    return Err(copy_unsupported(format!(
+                        "COPY option {name} is not supported"
+                    )));
+                }
+            }
+            if parenthesized {
+                if self.consume_comma() {
+                    continue;
+                }
+                if self.consume_right_paren() {
+                    break;
+                }
+                return Err(DbError::new(
+                    "42601",
+                    "COPY options require a comma or closing parenthesis",
+                ));
+            }
+            self.consume_comma();
+        }
+
+        let format = format.unwrap_or(CopyFormat::Text);
+        let mut options = default_copy_options(format);
+        if let Some(value) = delimiter {
+            options.delimiter = value;
+        }
+        if let Some(value) = null {
+            options.null = value;
+        }
+        if let Some(value) = header {
+            options.header = value;
+        }
+        if let Some(value) = quote {
+            options.quote = value;
+        }
+        if let Some(value) = escape {
+            options.escape = value;
+        }
+        if format == CopyFormat::Text && (options.header || quote.is_some() || escape.is_some()) {
             return Err(DbError::new(
-                "0A000",
-                "only COPY TO STDOUT or COPY FROM STDIN is supported",
+                "22023",
+                "COPY HEADER, QUOTE and ESCAPE require FORMAT CSV",
+            ));
+        }
+        if matches!(options.delimiter, 0 | b'\r' | b'\n' | b'\\') {
+            return Err(DbError::new("22023", "COPY delimiter is not valid"));
+        }
+        if format == CopyFormat::Csv && options.delimiter == options.quote {
+            return Err(DbError::new(
+                "22023",
+                "COPY delimiter and quote must be different",
+            ));
+        }
+        if format == CopyFormat::Csv
+            && (matches!(options.quote, 0 | b'\r' | b'\n')
+                || matches!(options.escape, 0 | b'\r' | b'\n'))
+        {
+            return Err(DbError::new("22023", "COPY quote or escape is not valid"));
+        }
+        if options.null.contains(['\r', '\n'])
+            || options.null.as_bytes().contains(&options.delimiter)
+            || format == CopyFormat::Csv && options.null.as_bytes().contains(&options.quote)
+        {
+            return Err(DbError::new(
+                "22023",
+                "COPY NULL marker conflicts with the selected format",
+            ));
+        }
+        Ok(options)
+    }
+
+    fn parse_format(&mut self) -> Result<CopyFormat> {
+        let value = self.take_word("COPY FORMAT requires TEXT or CSV")?;
+        match value.to_ascii_lowercase().as_str() {
+            "text" => Ok(CopyFormat::Text),
+            "csv" => Ok(CopyFormat::Csv),
+            "binary" => Err(copy_unsupported("COPY FORMAT BINARY is not supported")),
+            _ => Err(DbError::new("22023", "COPY FORMAT must be TEXT or CSV")),
+        }
+    }
+
+    fn take_single_byte(&mut self, option: &str) -> Result<u8> {
+        let value = self.take_string(option)?;
+        let [byte] = value.as_bytes() else {
+            return Err(DbError::new(
+                "22023",
+                format!("COPY {option} must be exactly one single-byte character"),
             ));
         };
-    Ok(Some(CopyCommand {
-        table: table.to_owned(),
-        direction,
-    }))
+        Ok(*byte)
+    }
+
+    fn take_string(&mut self, option: &str) -> Result<String> {
+        let Some(CopyToken::String(value)) = self.tokens.get(self.index) else {
+            return Err(DbError::new(
+                "42601",
+                format!("COPY {option} requires a string literal"),
+            ));
+        };
+        self.index += 1;
+        Ok(value.clone())
+    }
+
+    fn take_value(&mut self, option: &str) -> Result<String> {
+        match self.tokens.get(self.index) {
+            Some(CopyToken::Word(value)) | Some(CopyToken::String(value)) => {
+                self.index += 1;
+                Ok(value.clone())
+            }
+            _ => Err(DbError::new(
+                "42601",
+                format!("COPY {option} requires a value"),
+            )),
+        }
+    }
+
+    fn take_optional_boolean(&mut self) -> Result<Option<bool>> {
+        let Some(CopyToken::Word(value)) = self.tokens.get(self.index) else {
+            return Ok(None);
+        };
+        let value = value.to_ascii_lowercase();
+        let result = match value.as_str() {
+            "true" | "on" | "1" => true,
+            "false" | "off" | "0" => false,
+            _ => return Ok(None),
+        };
+        self.index += 1;
+        Ok(Some(result))
+    }
+
+    fn take_word(&mut self, message: &str) -> Result<String> {
+        let Some(CopyToken::Word(value)) = self.tokens.get(self.index) else {
+            return Err(DbError::new("42601", message));
+        };
+        self.index += 1;
+        Ok(value.clone())
+    }
+
+    fn expect_keyword(&mut self, expected: &str) -> Result<()> {
+        if self.consume_keyword(expected) {
+            Ok(())
+        } else {
+            Err(DbError::new(
+                "42601",
+                format!("COPY expected keyword {expected}"),
+            ))
+        }
+    }
+
+    fn consume_keyword(&mut self, expected: &str) -> bool {
+        let Some(CopyToken::Word(value)) = self.tokens.get(self.index) else {
+            return false;
+        };
+        if value.eq_ignore_ascii_case(expected) {
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek_left_paren(&self) -> bool {
+        matches!(self.tokens.get(self.index), Some(CopyToken::LeftParen))
+    }
+
+    fn consume_left_paren(&mut self) -> bool {
+        consume_copy_token(&self.tokens, &mut self.index, &CopyToken::LeftParen)
+    }
+
+    fn consume_right_paren(&mut self) -> bool {
+        consume_copy_token(&self.tokens, &mut self.index, &CopyToken::RightParen)
+    }
+
+    fn consume_comma(&mut self) -> bool {
+        consume_copy_token(&self.tokens, &mut self.index, &CopyToken::Comma)
+    }
+
+    fn consume_equals(&mut self) -> bool {
+        consume_copy_token(&self.tokens, &mut self.index, &CopyToken::Equals)
+    }
+}
+
+fn consume_copy_token(tokens: &[CopyToken], index: &mut usize, expected: &CopyToken) -> bool {
+    if tokens.get(*index) == Some(expected) {
+        *index += 1;
+        true
+    } else {
+        false
+    }
+}
+
+fn default_copy_options(format: CopyFormat) -> CopyOptions {
+    CopyOptions {
+        format,
+        delimiter: match format {
+            CopyFormat::Text => b'\t',
+            CopyFormat::Csv => b',',
+        },
+        null: match format {
+            CopyFormat::Text => "\\N".to_owned(),
+            CopyFormat::Csv => String::new(),
+        },
+        header: false,
+        quote: b'"',
+        escape: b'"',
+    }
+}
+
+fn validate_copy_identifier_path(value: &str, label: &str) -> Result<()> {
+    let valid = !value.is_empty()
+        && value.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(copy_unsupported(format!(
+            "COPY {label} must be an unquoted identifier"
+        )))
+    }
+}
+
+fn copy_unsupported(message: impl Into<String>) -> DbError {
+    DbError::new("0A000", message)
 }
 
 fn write_copy_response<W: Write>(writer: &mut W, tag: u8, columns: usize) -> Result<()> {
@@ -1984,34 +2234,122 @@ fn write_copy_response<W: Write>(writer: &mut W, tag: u8, columns: usize) -> Res
     write_message(writer, tag, &payload)
 }
 
-fn encode_csv_row(schema: &Schema, row: &Row) -> Result<Vec<u8>> {
+fn encode_copy_header(schema: &Schema, options: &CopyOptions) -> Result<Vec<u8>> {
+    if options.format != CopyFormat::Csv {
+        return Err(DbError::internal(
+            "COPY text header passed option validation",
+        ));
+    }
+    encode_csv_record(
+        schema
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>(),
+        options,
+    )
+}
+
+fn encode_copy_row(schema: &Schema, row: &Row, options: &CopyOptions) -> Result<Vec<u8>> {
     if schema.fields.len() != row.values.len() {
         return Err(DbError::new(
             "XX000",
             "COPY row width does not match schema",
         ));
     }
-    let fields: Result<Vec<String>> = row
-        .values
-        .iter()
-        .map(|value| match value {
-            Value::Null => Ok("\\N".to_owned()),
-            value => String::from_utf8(encode_text(value)?)
-                .map_err(|_| DbError::new("XX000", "COPY text encoding is not UTF-8")),
-        })
-        .collect();
-    let mut writer = WriterBuilder::new()
-        .has_headers(false)
-        .from_writer(Vec::new());
-    writer.write_record(fields?).map_err(|error| {
-        DbError::new("XX000", "failed to encode COPY CSV").with_detail(error.to_string())
-    })?;
-    writer.into_inner().map_err(|error| {
-        DbError::new("XX000", "failed to flush COPY CSV").with_detail(error.to_string())
-    })
+    match options.format {
+        CopyFormat::Text => encode_text_copy_row(row, options),
+        CopyFormat::Csv => encode_csv_copy_row(row, options),
+    }
 }
 
-fn copy_columns(engine: &Engine, table: &str) -> Result<Vec<ColumnDefinition>> {
+fn encode_csv_copy_row(row: &Row, options: &CopyOptions) -> Result<Vec<u8>> {
+    let mut encoded = Vec::new();
+    for (index, value) in row.values.iter().enumerate() {
+        if index > 0 {
+            encoded.push(options.delimiter);
+        }
+        if matches!(value, Value::Null) {
+            append_csv_field(&mut encoded, options.null.as_bytes(), true, options);
+        } else {
+            append_csv_field(&mut encoded, &encode_text(value)?, false, options);
+        }
+    }
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+fn encode_csv_record(fields: Vec<String>, options: &CopyOptions) -> Result<Vec<u8>> {
+    let mut encoded = Vec::new();
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            encoded.push(options.delimiter);
+        }
+        append_csv_field(&mut encoded, field.as_bytes(), false, options);
+    }
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+fn append_csv_field(encoded: &mut Vec<u8>, field: &[u8], null: bool, options: &CopyOptions) {
+    if null {
+        encoded.extend_from_slice(field);
+        return;
+    }
+    let quote = field == options.null.as_bytes()
+        || field.iter().any(|byte| {
+            matches!(*byte, b'\r' | b'\n') || *byte == options.delimiter || *byte == options.quote
+        });
+    if !quote {
+        encoded.extend_from_slice(field);
+        return;
+    }
+    encoded.push(options.quote);
+    for &byte in field {
+        if byte == options.quote {
+            encoded.push(options.escape);
+        }
+        encoded.push(byte);
+    }
+    encoded.push(options.quote);
+}
+
+fn encode_text_copy_row(row: &Row, options: &CopyOptions) -> Result<Vec<u8>> {
+    let mut encoded = Vec::new();
+    for (index, value) in row.values.iter().enumerate() {
+        if index > 0 {
+            encoded.push(options.delimiter);
+        }
+        if matches!(value, Value::Null) {
+            encoded.extend_from_slice(options.null.as_bytes());
+            continue;
+        }
+        for byte in encode_text(value)? {
+            match byte {
+                b'\\' => encoded.extend_from_slice(b"\\\\"),
+                b'\n' => encoded.extend_from_slice(b"\\n"),
+                b'\r' => encoded.extend_from_slice(b"\\r"),
+                b'\t' => encoded.extend_from_slice(b"\\t"),
+                b'\x08' => encoded.extend_from_slice(b"\\b"),
+                b'\x0c' => encoded.extend_from_slice(b"\\f"),
+                b'\x0b' => encoded.extend_from_slice(b"\\v"),
+                value if value == options.delimiter => {
+                    encoded.push(b'\\');
+                    encoded.push(value);
+                }
+                value => encoded.push(value),
+            }
+        }
+    }
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+fn copy_columns(
+    engine: &Engine,
+    table: &str,
+    requested: &[String],
+) -> Result<Vec<ColumnDefinition>> {
     let (schema, table) = table
         .split_once('.')
         .map_or(("public", table), |(schema, table)| (schema, table));
@@ -2019,64 +2357,320 @@ fn copy_columns(engine: &Engine, table: &str) -> Result<Vec<ColumnDefinition>> {
     let table = catalog
         .table(&Identifier::unquoted(schema), &Identifier::unquoted(table))
         .ok_or_else(|| DbError::new("42P01", "COPY table does not exist"))?;
-    Ok(table.columns().to_vec())
+    if requested.is_empty() {
+        return Ok(table.columns().to_vec());
+    }
+    requested
+        .iter()
+        .map(|name| {
+            table
+                .column(&Identifier::unquoted(name))
+                .cloned()
+                .ok_or_else(|| DbError::new("42703", format!("COPY column {name} does not exist")))
+        })
+        .collect()
 }
 
-fn insert_statement(table: &str, columns: usize) -> String {
-    let parameters = (1..=columns)
+fn insert_statement(table: &str, columns: &[ColumnDefinition]) -> String {
+    let names = columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let parameters = (1..=columns.len())
         .map(|index| format!("${index}"))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("INSERT INTO {table} VALUES ({parameters})")
+    format!("INSERT INTO {table} ({names}) VALUES ({parameters})")
+}
+
+fn import_copy(
+    session: &mut Session,
+    insert: &str,
+    columns: &[ColumnDefinition],
+    options: &CopyOptions,
+    bytes: &[u8],
+) -> Result<u64> {
+    match options.format {
+        CopyFormat::Text => import_text(session, insert, columns, options, bytes),
+        CopyFormat::Csv => import_csv(session, insert, columns, options, bytes),
+    }
 }
 
 fn import_csv(
     session: &mut Session,
     insert: &str,
     columns: &[ColumnDefinition],
+    options: &CopyOptions,
     bytes: &[u8],
 ) -> Result<u64> {
-    let mut reader = ReaderBuilder::new()
-        .has_headers(false)
-        .flexible(false)
-        .from_reader(bytes);
+    let records = decode_csv_records(bytes, options)?;
+    let mut records = records.into_iter();
+    if options.header {
+        let header = records
+            .next()
+            .ok_or_else(|| DbError::new("22P04", "COPY CSV header is missing"))?;
+        let expected = columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        let actual = header
+            .iter()
+            .map(|field| std::str::from_utf8(&field.value))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| {
+                DbError::new("22021", "COPY CSV header is not valid UTF-8")
+                    .with_detail(error.to_string())
+            })?;
+        if actual != expected {
+            return Err(DbError::new(
+                "22P04",
+                "COPY CSV header does not match the target columns",
+            ));
+        }
+    }
     let mut rows = 0_u64;
+    for record in records {
+        let raw = record
+            .into_iter()
+            .map(|field| {
+                if !field.quoted && field.value == options.null.as_bytes() {
+                    None
+                } else {
+                    Some(field.value)
+                }
+            })
+            .collect::<Vec<_>>();
+        insert_copy_row(session, insert, columns, raw)?;
+        rows = checked_copy_row_count(rows)?;
+    }
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodedCsvField {
+    value: Vec<u8>,
+    quoted: bool,
+}
+
+fn decode_csv_records(bytes: &[u8], options: &CopyOptions) -> Result<Vec<Vec<DecodedCsvField>>> {
+    let mut records = Vec::new();
+    let mut record = Vec::new();
+    let mut field = Vec::new();
+    let mut quoted = false;
+    let mut in_quotes = false;
+    let mut after_quote = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_quotes {
+            if byte == options.quote {
+                if options.escape == options.quote && bytes.get(index + 1) == Some(&options.quote) {
+                    field.push(options.quote);
+                    index += 2;
+                } else {
+                    in_quotes = false;
+                    after_quote = true;
+                    index += 1;
+                }
+            } else if options.escape != options.quote && byte == options.escape {
+                let Some(&escaped) = bytes.get(index + 1) else {
+                    return Err(DbError::new("22P04", "COPY CSV ends with an escape byte"));
+                };
+                if escaped == options.quote || escaped == options.escape {
+                    field.push(escaped);
+                    index += 2;
+                } else {
+                    field.push(byte);
+                    index += 1;
+                }
+            } else {
+                field.push(byte);
+                index += 1;
+            }
+            continue;
+        }
+
+        if after_quote {
+            if byte == options.delimiter {
+                push_csv_field(&mut record, &mut field, &mut quoted);
+                after_quote = false;
+                index += 1;
+                continue;
+            }
+            if matches!(byte, b'\r' | b'\n') {
+                push_csv_field(&mut record, &mut field, &mut quoted);
+                records.push(std::mem::take(&mut record));
+                after_quote = false;
+                index = skip_csv_record_end(bytes, index);
+                continue;
+            }
+            return Err(DbError::new(
+                "22P04",
+                "COPY CSV has data after a closing quote",
+            ));
+        }
+
+        if field.is_empty() && byte == options.quote {
+            quoted = true;
+            in_quotes = true;
+            index += 1;
+        } else if byte == options.delimiter {
+            push_csv_field(&mut record, &mut field, &mut quoted);
+            index += 1;
+        } else if matches!(byte, b'\r' | b'\n') {
+            push_csv_field(&mut record, &mut field, &mut quoted);
+            records.push(std::mem::take(&mut record));
+            index = skip_csv_record_end(bytes, index);
+        } else if byte == options.quote {
+            return Err(DbError::new(
+                "22P04",
+                "COPY CSV quote appears inside an unquoted field",
+            ));
+        } else {
+            field.push(byte);
+            index += 1;
+        }
+    }
+    if in_quotes {
+        return Err(DbError::new(
+            "22P04",
+            "COPY CSV has an unterminated quoted field",
+        ));
+    }
+    if after_quote || !field.is_empty() || quoted || !record.is_empty() {
+        push_csv_field(&mut record, &mut field, &mut quoted);
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn push_csv_field(record: &mut Vec<DecodedCsvField>, field: &mut Vec<u8>, quoted: &mut bool) {
+    record.push(DecodedCsvField {
+        value: std::mem::take(field),
+        quoted: *quoted,
+    });
+    *quoted = false;
+}
+
+fn skip_csv_record_end(bytes: &[u8], index: usize) -> usize {
+    if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+        index + 2
+    } else {
+        index + 1
+    }
+}
+
+fn import_text(
+    session: &mut Session,
+    insert: &str,
+    columns: &[ColumnDefinition],
+    options: &CopyOptions,
+    bytes: &[u8],
+) -> Result<u64> {
+    let mut rows = 0_u64;
+    let mut start = 0;
+    for end in (0..=bytes.len()).filter(|index| *index == bytes.len() || bytes[*index] == b'\n') {
+        if end == bytes.len() && start == end {
+            break;
+        }
+        let mut record = &bytes[start..end];
+        if record.ends_with(b"\r") {
+            record = &record[..record.len() - 1];
+        }
+        let raw = decode_text_record(record, options)?;
+        insert_copy_row(session, insert, columns, raw)?;
+        rows = checked_copy_row_count(rows)?;
+        start = end.saturating_add(1);
+    }
+    Ok(rows)
+}
+
+fn decode_text_record(record: &[u8], options: &CopyOptions) -> Result<Vec<Option<Vec<u8>>>> {
+    let mut fields = Vec::new();
+    let mut field = Vec::new();
+    let mut escaped = false;
+    for &byte in record {
+        if escaped {
+            field.push(byte);
+            escaped = false;
+        } else if byte == b'\\' {
+            field.push(byte);
+            escaped = true;
+        } else if byte == options.delimiter {
+            fields.push(decode_text_field(&field, options)?);
+            field.clear();
+        } else {
+            field.push(byte);
+        }
+    }
+    if escaped {
+        return Err(DbError::new("22P04", "COPY text row ends with a backslash"));
+    }
+    fields.push(decode_text_field(&field, options)?);
+    Ok(fields)
+}
+
+fn decode_text_field(field: &[u8], options: &CopyOptions) -> Result<Option<Vec<u8>>> {
+    if field == options.null.as_bytes() {
+        return Ok(None);
+    }
+    let mut decoded = Vec::with_capacity(field.len());
+    let mut index = 0;
+    while index < field.len() {
+        if field[index] != b'\\' {
+            decoded.push(field[index]);
+            index += 1;
+            continue;
+        }
+        let Some(&escaped) = field.get(index + 1) else {
+            return Err(DbError::new(
+                "22P04",
+                "COPY text field ends with a backslash",
+            ));
+        };
+        decoded.push(match escaped {
+            b'b' => b'\x08',
+            b'f' => b'\x0c',
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'v' => b'\x0b',
+            value => value,
+        });
+        index += 2;
+    }
+    Ok(Some(decoded))
+}
+
+fn insert_copy_row(
+    session: &mut Session,
+    insert: &str,
+    columns: &[ColumnDefinition],
+    raw: Vec<Option<Vec<u8>>>,
+) -> Result<()> {
+    if raw.len() != columns.len() {
+        return Err(DbError::new(
+            "22P04",
+            format!(
+                "COPY row has {} fields but target has {} columns",
+                raw.len(),
+                columns.len()
+            ),
+        ));
+    }
     let data_types = columns
         .iter()
         .map(|column| column.data_type.clone())
         .collect::<Vec<_>>();
     let oids = data_types.iter().map(type_oid).collect::<Vec<_>>();
-    for record in reader.records() {
-        let record = record.map_err(|error| {
-            DbError::new("22P04", "COPY CSV is invalid").with_detail(error.to_string())
-        })?;
-        if record.len() != columns.len() {
-            return Err(DbError::new(
-                "22P04",
-                format!(
-                    "COPY row has {} fields but table has {} columns",
-                    record.len(),
-                    columns.len()
-                ),
-            ));
-        }
-        let raw: Vec<Option<Vec<u8>>> = record
-            .iter()
-            .map(|value| {
-                if value == "\\N" {
-                    None
-                } else {
-                    Some(value.as_bytes().to_vec())
-                }
-            })
-            .collect();
-        let values = decode_parameters_as(&oids, &data_types, &[], &raw)?;
-        drain(session.execute_stream(insert, &values)?)?;
-        rows = rows
-            .checked_add(1)
-            .ok_or_else(|| DbError::new("54000", "COPY row count overflowed"))?;
-    }
-    Ok(rows)
+    let values = decode_parameters_as(&oids, &data_types, &[], &raw)?;
+    drain(session.execute_stream(insert, &values)?)
+}
+
+fn checked_copy_row_count(rows: u64) -> Result<u64> {
+    rows.checked_add(1)
+        .ok_or_else(|| DbError::new("54000", "COPY row count overflowed"))
 }
 
 fn invalid(message: impl Into<String>) -> DbError {
@@ -2085,6 +2679,8 @@ fn invalid(message: impl Into<String>) -> DbError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
@@ -2139,153 +2735,127 @@ mod tests {
     }
 
     #[test]
-    fn user_defined_type_catalog_projection_preserves_declared_identity() {
-        use ordadb_catalog::{
-            CatalogExpression, CatalogObjectRef, DomainConstraint, NewRoutine, RoutineArgument,
-        };
-        use ordadb_types::{Identifier, TypeId};
-
-        let mut catalog = Catalog::default();
-        let mood_id = catalog
-            .create_enum_type(
-                &Identifier::unquoted("public"),
-                Identifier::unquoted("mood"),
-                vec!["sad".into(), "ok".into(), "happy".into()],
-            )
-            .expect("enum");
-        let positive_id = catalog
-            .create_domain(
-                &Identifier::unquoted("public"),
-                Identifier::unquoted("positive_int"),
-                ScalarType::Int32,
-                true,
-                Some(CatalogExpression::new("1")),
-                vec![DomainConstraint {
-                    id: None,
-                    name: Some(Identifier::unquoted("positive")),
-                    expression: CatalogExpression::new("VALUE > 0"),
-                }],
-            )
-            .expect("positive domain");
-        let nonnegative_id = catalog
-            .create_domain(
-                &Identifier::unquoted("public"),
-                Identifier::unquoted("nonnegative_int"),
-                ScalarType::Int32,
-                false,
-                None,
-                Vec::new(),
-            )
-            .expect("nonnegative domain");
-        let routine = |type_id: TypeId| NewRoutine {
-            name: Identifier::unquoted("choose_value"),
-            kind: RoutineKind::Function,
-            arguments: vec![RoutineArgument {
-                name: Some(Identifier::unquoted("value")),
-                data_type: ScalarType::Int32,
-                declared_type: Some(type_id),
-            }],
-            return_type: Some(ScalarType::Int32),
-            return_declared_type: Some(type_id),
-            returns_set: false,
-            language: "plpgsql".into(),
-            body: "BEGIN RETURN value; END".into(),
-            replace: false,
-            references: vec![CatalogObjectRef::Type(type_id)],
-        };
-        catalog
-            .create_or_replace_routine(&Identifier::unquoted("public"), routine(positive_id))
-            .expect("positive overload");
-        catalog
-            .create_or_replace_routine(&Identifier::unquoted("public"), routine(nonnegative_id))
-            .expect("nonnegative overload");
-
+    fn extended_query_state_waits_for_sync_and_ignores_other_messages() {
         assert_eq!(
-            catalog_query_source("SELECT * FROM pg_catalog.pg_type"),
-            Some(CatalogQuerySource::Type)
+            failed_message_action(&FrontendMessage::Sync),
+            FailedMessageAction::Synchronize
         );
         assert_eq!(
-            catalog_query_source("SELECT * FROM pg_catalog.pg_enum"),
-            Some(CatalogQuerySource::Enum)
+            failed_message_action(&FrontendMessage::Flush),
+            FailedMessageAction::Flush
         );
         assert_eq!(
-            catalog_query_source("SELECT * FROM pg_catalog.pg_constraint"),
-            Some(CatalogQuerySource::Constraint)
+            failed_message_action(&FrontendMessage::Terminate),
+            FailedMessageAction::Terminate
+        );
+        assert_eq!(
+            failed_message_action(&FrontendMessage::Parse {
+                name: "ignored".into(),
+                sql: "SELECT 1".into(),
+                parameter_oids: Vec::new(),
+            }),
+            FailedMessageAction::Ignore
+        );
+        assert_eq!(
+            failed_message_action(&FrontendMessage::Query("SELECT 1".into())),
+            FailedMessageAction::Ignore
+        );
+    }
+
+    #[test]
+    fn named_extended_objects_require_close_while_unnamed_objects_replace() {
+        let statement = PreparedStatement {
+            sql: "SELECT 1".into(),
+            parameter_oids: Vec::new(),
+            parameter_types: Vec::new(),
+            schema: Schema::empty(),
+        };
+        let mut prepared = BTreeMap::new();
+        prepared.insert(String::new(), statement.clone());
+        ensure_prepared_statement_slot(&prepared, "", 1).expect("replace unnamed statement");
+        assert_eq!(
+            ensure_prepared_statement_slot(&prepared, "named", 1)
+                .expect_err("statement limit")
+                .sql_state,
+            "54000"
+        );
+        prepared.insert("named".into(), statement);
+        assert_eq!(
+            ensure_prepared_statement_slot(&prepared, "named", 3)
+                .expect_err("named statement requires close")
+                .sql_state,
+            "42P05"
         );
 
-        let rows = |source| {
-            catalog_query_events(source, &catalog, "ordadb")
-                .into_iter()
-                .find_map(|event| match event {
-                    QueryEvent::Batch(batch) => Some(batch.rows),
-                    _ => None,
-                })
-                .unwrap_or_default()
+        let portal = || Portal {
+            statement_name: String::new(),
+            sql: "SELECT 1".into(),
+            parameters: Vec::new(),
+            result_formats: Vec::new(),
+            stream: None,
+            schema: Some(Schema::empty()),
+            pending_rows: VecDeque::new(),
+            completed: false,
+            query_id: None,
+            rows_processed: 0,
         };
-        let type_rows = rows(CatalogQuerySource::Type);
-        for (name, type_id, kind) in [
-            ("mood", mood_id, "e"),
-            ("positive_int", positive_id, "d"),
-            ("nonnegative_int", nonnegative_id, "d"),
-        ] {
-            assert!(type_rows.iter().any(|row| {
-                row.values[0] == Value::Int64(i64::from(user_defined_type_oid(type_id)))
-                    && row.values[1] == Value::Text(name.into())
-                    && row.values[3] == Value::Text(kind.into())
-                    && row.values[7] == Value::Int64(i64::from(user_defined_array_oid(type_id)))
-            }));
-        }
-        let enum_rows = rows(CatalogQuerySource::Enum);
+        let mut portals = BTreeMap::new();
+        portals.insert(String::new(), portal());
+        ensure_portal_slot(&portals, "", 1).expect("replace unnamed portal");
         assert_eq!(
-            enum_rows
+            ensure_portal_slot(&portals, "named", 1)
+                .expect_err("portal limit")
+                .sql_state,
+            "54000"
+        );
+        portals.insert("named".into(), portal());
+        assert_eq!(
+            ensure_portal_slot(&portals, "named", 3)
+                .expect_err("named portal requires close")
+                .sql_state,
+            "42P03"
+        );
+    }
+
+    #[test]
+    fn retiring_an_active_portal_finishes_its_registered_query() {
+        let registry = SessionRegistry::default();
+        let handle = registry
+            .register_session("user".into(), "db".into(), None, "local".into(), 17)
+            .expect("register session");
+        registry
+            .begin_query(
+                handle.process_id(),
+                "portal-query".into(),
+                "SELECT 1".into(),
+            )
+            .expect("begin query");
+        retire_portal(
+            &registry,
+            Portal {
+                statement_name: String::new(),
+                sql: "SELECT 1".into(),
+                parameters: Vec::new(),
+                result_formats: Vec::new(),
+                stream: None,
+                schema: Some(Schema::empty()),
+                pending_rows: VecDeque::new(),
+                completed: false,
+                query_id: Some("portal-query".into()),
+                rows_processed: 0,
+            },
+            QueryOutcome::Cancelled,
+        )
+        .expect("retire portal");
+        assert_eq!(registry.active_query_count().expect("active count"), 0);
+        assert!(
+            registry
+                .queries()
+                .expect("query history")
                 .iter()
-                .map(|row| row.values[3].clone())
-                .collect::<Vec<_>>(),
-            vec![
-                Value::Text("sad".into()),
-                Value::Text("ok".into()),
-                Value::Text("happy".into()),
-            ]
+                .any(|query| query.query_id == "portal-query"
+                    && matches!(query.outcome, QueryOutcome::Cancelled))
         );
-        let procedure_rows = rows(CatalogQuerySource::Procedure);
-        let argument_oids = procedure_rows
-            .iter()
-            .filter(|row| row.values[1] == Value::Text("choose_value".into()))
-            .filter_map(|row| match &row.values[6] {
-                Value::Text(value) => Some(value.clone()),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            argument_oids,
-            BTreeSet::from([
-                user_defined_type_oid(positive_id).to_string(),
-                user_defined_type_oid(nonnegative_id).to_string(),
-            ])
-        );
-        let constraint_rows = rows(CatalogQuerySource::Constraint);
-        let constraint_oid = constraint_rows
-            .iter()
-            .find(|row| row.values[1] == Value::Text("positive".into()))
-            .map(|row| row.values[0].clone())
-            .expect("domain constraint projection");
-
-        let reopened: Catalog =
-            serde_json::from_slice(&serde_json::to_vec(&catalog).expect("serialize catalog"))
-                .expect("reopen catalog");
-        let reopened_constraint_oid =
-            catalog_query_events(CatalogQuerySource::Constraint, &reopened, "ordadb")
-                .into_iter()
-                .find_map(|event| match event {
-                    QueryEvent::Batch(batch) => batch
-                        .rows
-                        .into_iter()
-                        .find(|row| row.values[1] == Value::Text("positive".into()))
-                        .map(|row| row.values[0].clone()),
-                    _ => None,
-                })
-                .expect("reopened domain constraint projection");
-        assert_eq!(reopened_constraint_oid, constraint_oid);
     }
 
     #[test]
@@ -2336,7 +2906,300 @@ mod tests {
             .expect("copy")
             .expect("command");
         assert!(matches!(copy.direction, CopyDirection::ToStdout));
-        assert!(parse_copy("COPY items TO 'file.csv'").is_err());
+        assert_eq!(copy.options, default_copy_options(CopyFormat::Text));
+    }
+
+    #[test]
+    fn copy_grammar_supports_columns_and_typed_csv_options() {
+        let copy = parse_copy(
+            "COPY public.items (id, title) FROM STDIN \
+             WITH (FORMAT csv, HEADER true, DELIMITER ';', NULL 'NULL', QUOTE '\"')",
+        )
+        .expect("parse COPY")
+        .expect("COPY command");
+        assert_eq!(copy.table, "public.items");
+        assert_eq!(copy.columns, ["id", "title"]);
+        assert_eq!(copy.direction, CopyDirection::FromStdin);
+        assert_eq!(copy.options.format, CopyFormat::Csv);
+        assert_eq!(copy.options.delimiter, b';');
+        assert_eq!(copy.options.null, "NULL");
+        assert!(copy.options.header);
+        assert_eq!(copy.options.quote, b'"');
+
+        for sql in [
+            "COPY items TO 'file.csv'",
+            "COPY items FROM PROGRAM 'generate'",
+            "COPY items TO STDOUT WITH (FORMAT binary)",
+            "COPY BINARY items TO STDOUT",
+        ] {
+            assert_eq!(
+                parse_copy(sql)
+                    .expect_err("unsupported COPY form")
+                    .sql_state,
+                "0A000",
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            parse_copy("COPY items (id, ID) FROM STDIN")
+                .expect_err("duplicate COPY column")
+                .sql_state,
+            "42701"
+        );
+        assert_eq!(
+            parse_copy("COPY items TO STDOUT WITH (HEADER)")
+                .expect_err("header requires CSV")
+                .sql_state,
+            "22023"
+        );
+    }
+
+    #[test]
+    fn copy_text_codec_escapes_delimiters_nulls_and_newlines() {
+        let options = default_copy_options(CopyFormat::Text);
+        let schema = Schema::new(vec![
+            Field::new("first", ScalarType::Text, false),
+            Field::new("second", ScalarType::Text, true),
+        ]);
+        let original = b"tab\tbackslash\\newline\n".to_vec();
+        let encoded = encode_copy_row(
+            &schema,
+            &Row::new(vec![
+                Value::Text(String::from_utf8(original.clone()).unwrap()),
+                Value::Null,
+            ]),
+            &options,
+        )
+        .expect("encode COPY text");
+        assert!(encoded.ends_with(b"\n"));
+        let decoded =
+            decode_text_record(&encoded[..encoded.len() - 1], &options).expect("decode COPY text");
+        assert_eq!(decoded, vec![Some(original), None]);
+    }
+
+    #[test]
+    fn copy_out_requires_exactly_one_terminal_completion_event() {
+        let schema = Schema::new(vec![Field::new("value", ScalarType::Text, false)]);
+        let options = default_copy_options(CopyFormat::Text);
+        let batch = QueryEvent::Batch(Batch {
+            schema: schema.clone(),
+            rows: vec![Row::new(vec![Value::Text("row".into())])],
+        });
+        let complete = QueryEvent::Complete(CommandComplete {
+            tag: "SELECT".into(),
+            rows_affected: 1,
+        });
+
+        let mut encoded = Vec::new();
+        assert_eq!(
+            write_copy_stream(
+                &mut encoded,
+                &schema,
+                &options,
+                [Ok(batch.clone()), Ok(complete.clone())],
+                || Ok(()),
+            )
+            .expect("complete COPY stream"),
+            1
+        );
+        assert!(!encoded.is_empty());
+
+        let missing = write_copy_stream(
+            &mut Vec::new(),
+            &schema,
+            &options,
+            [Ok(batch.clone())],
+            || Ok(()),
+        )
+        .expect_err("missing completion");
+        assert_eq!(missing.sql_state, "XX000");
+
+        let duplicate = write_copy_stream(
+            &mut Vec::new(),
+            &schema,
+            &options,
+            [Ok(batch), Ok(complete.clone()), Ok(complete)],
+            || Ok(()),
+        )
+        .expect_err("duplicate completion");
+        assert_eq!(duplicate.sql_state, "XX000");
+    }
+
+    #[test]
+    fn copy_in_uses_and_preserves_an_existing_transaction_boundary() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine =
+            Engine::open(ordadb_engine::EngineConfig::new(directory.path())).expect("open engine");
+        let mut session = engine.connect().expect("connect");
+        drain(
+            session
+                .execute_stream("CREATE TABLE copy_tx (id BIGINT, label TEXT)", &[])
+                .expect("create table"),
+        )
+        .expect("drain create table");
+        let columns = copy_columns(&engine, "copy_tx", &[]).expect("COPY columns");
+        let insert = insert_statement("copy_tx", &columns);
+        let options = default_copy_options(CopyFormat::Text);
+
+        drain(session.execute_stream("BEGIN", &[]).expect("begin")).expect("drain begin");
+        let owns_transaction = begin_copy_transaction(&mut session).expect("reuse transaction");
+        assert!(!owns_transaction);
+        assert_eq!(
+            import_copy(&mut session, &insert, &columns, &options, b"1\touter\n",)
+                .expect("import COPY row"),
+            1
+        );
+        complete_copy_transaction(&mut session, owns_transaction).expect("finish COPY");
+        assert_eq!(session.transaction_status(), TransactionStatus::Active);
+        drain(session.execute_stream("ROLLBACK", &[]).expect("rollback")).expect("drain rollback");
+        let rows = session
+            .execute_stream("SELECT id FROM copy_tx", &[])
+            .expect("select after rollback")
+            .collect::<Result<Vec<_>>>()
+            .expect("drain select");
+        assert_eq!(
+            rows.iter()
+                .filter_map(|event| match event {
+                    QueryEvent::Batch(batch) => Some(batch.rows.len()),
+                    _ => None,
+                })
+                .sum::<usize>(),
+            0
+        );
+
+        drain(session.execute_stream("BEGIN", &[]).expect("second begin"))
+            .expect("drain second begin");
+        let owns_transaction = begin_copy_transaction(&mut session).expect("reuse transaction");
+        let error = import_copy(
+            &mut session,
+            &insert,
+            &columns,
+            &options,
+            b"2\tvalid\n3\ttoo\tmany\n",
+        )
+        .expect_err("malformed COPY input");
+        assert_eq!(error.sql_state, "22P04");
+        abort_copy_transaction(&mut session, owns_transaction);
+        assert_eq!(session.transaction_status(), TransactionStatus::Failed);
+        drain(
+            session
+                .execute_stream("ROLLBACK", &[])
+                .expect("failed rollback"),
+        )
+        .expect("drain failed rollback");
+    }
+
+    #[test]
+    fn copy_csv_codec_distinguishes_null_from_quoted_empty_text() {
+        let options = default_copy_options(CopyFormat::Csv);
+        let schema = Schema::new(vec![
+            Field::new("nullable", ScalarType::Text, true),
+            Field::new("empty", ScalarType::Text, false),
+        ]);
+        let encoded = encode_copy_row(
+            &schema,
+            &Row::new(vec![Value::Null, Value::Text(String::new())]),
+            &options,
+        )
+        .expect("encode COPY CSV");
+        assert_eq!(encoded, b",\"\"\n");
+        let records = decode_csv_records(&encoded, &options).expect("decode COPY CSV");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0][0].value, b"");
+        assert!(!records[0][0].quoted);
+        assert_eq!(records[0][1].value, b"");
+        assert!(records[0][1].quoted);
+
+        let multiline = decode_csv_records(b"\"line 1\nline 2\",value\r\n", &options)
+            .expect("decode multiline COPY CSV");
+        assert_eq!(multiline[0][0].value, b"line 1\nline 2");
+        assert!(multiline[0][0].quoted);
+    }
+
+    #[test]
+    fn copy_import_honors_columns_csv_header_and_transaction_rollback() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine =
+            Engine::open(ordadb_engine::EngineConfig::new(directory.path())).expect("open engine");
+        let mut session = engine.connect().expect("connect session");
+        drain(
+            session
+                .execute_stream(
+                    "CREATE TABLE items (\
+                     id BIGINT PRIMARY KEY, title TEXT NOT NULL, score INTEGER DEFAULT 7)",
+                    &[],
+                )
+                .expect("create table"),
+        )
+        .expect("drain create table");
+        let requested = vec!["id".to_owned(), "title".to_owned()];
+        let columns = copy_columns(&engine, "items", &requested).expect("COPY columns");
+        let insert = insert_statement("items", &columns);
+        let mut csv = default_copy_options(CopyFormat::Csv);
+        csv.header = true;
+        csv.delimiter = b';';
+
+        drain(session.execute_stream("BEGIN", &[]).expect("begin import")).expect("drain begin");
+        assert_eq!(
+            import_copy(
+                &mut session,
+                &insert,
+                &columns,
+                &csv,
+                b"id;title\n1;first\n2;second\n",
+            )
+            .expect("import CSV"),
+            2
+        );
+        drain(
+            session
+                .execute_stream("COMMIT", &[])
+                .expect("commit import"),
+        )
+        .expect("drain commit");
+
+        drain(session.execute_stream("BEGIN", &[]).expect("begin failure"))
+            .expect("drain begin failure");
+        let error = import_copy(
+            &mut session,
+            &insert,
+            &columns,
+            &default_copy_options(CopyFormat::Text),
+            b"3\tthird\nnot-an-id\tbroken\n",
+        )
+        .expect_err("invalid COPY row");
+        assert_eq!(error.sql_state, "22P02");
+        drain(
+            session
+                .execute_stream("ROLLBACK", &[])
+                .expect("rollback failed COPY"),
+        )
+        .expect("drain rollback");
+
+        let rows = session
+            .execute("SELECT id, title, score FROM items ORDER BY id", &[])
+            .expect("query imported rows")
+            .filter_map(|event| match event {
+                QueryEvent::Batch(batch) => Some(batch.rows),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![
+                Row::new(vec![
+                    Value::Int64(1),
+                    Value::Text("first".into()),
+                    Value::Int32(7),
+                ]),
+                Row::new(vec![
+                    Value::Int64(2),
+                    Value::Text("second".into()),
+                    Value::Int32(7),
+                ]),
+            ]
+        );
     }
 
     #[test]
@@ -2352,11 +3215,191 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_compatibility_queries_have_real_rows() {
-        let events = virtual_query("SELECT version()", "dba", "ordadb", &Catalog::default())
-            .expect("virtual");
-        assert!(matches!(events.first(), Some(QueryEvent::Schema(_))));
+    fn startup_encryption_negotiation_is_ordered_and_non_repeating() {
+        let mut negotiation = StartupNegotiation::default();
+        negotiation
+            .record(EncryptionRequest::Gss)
+            .expect("GSS preference probe");
+        negotiation
+            .record(EncryptionRequest::Ssl)
+            .expect("TLS probe after GSS rejection");
+        assert_eq!(
+            negotiation
+                .record(EncryptionRequest::Ssl)
+                .expect_err("repeated SSLRequest")
+                .sql_state,
+            "08P01"
+        );
+
+        let mut out_of_order = StartupNegotiation::default();
+        out_of_order
+            .record(EncryptionRequest::Ssl)
+            .expect("initial SSLRequest");
+        assert_eq!(
+            out_of_order
+                .record(EncryptionRequest::Gss)
+                .expect_err("GSS request after SSL")
+                .sql_state,
+            "08P01"
+        );
+    }
+
+    #[test]
+    fn session_compatibility_functions_remain_bounded_without_catalog_interception() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine =
+            Engine::open(ordadb_engine::EngineConfig::new(directory.path())).expect("open engine");
+        let mut session = engine.connect().expect("connect session");
+        session.set_runtime_metadata(
+            SessionRuntimeMetadata::postgres_compatible("18.0", "ordadb", "dba", "dba")
+                .expect("runtime metadata"),
+        );
+
+        for (sql, field_name, expected) in [
+            (
+                "SELECT version()",
+                "version",
+                Value::Text("PostgreSQL 18.0 compatible OrdaDB on x86_64-pc-windows-msvc".into()),
+            ),
+            (
+                "SELECT current_database()",
+                "current_database",
+                Value::Text("ordadb".into()),
+            ),
+            (
+                "SELECT CURRENT_USER",
+                "current_user",
+                Value::Text("dba".into()),
+            ),
+            (
+                "SELECT SESSION_USER",
+                "session_user",
+                Value::Text("dba".into()),
+            ),
+            (
+                "SELECT current_setting('client_encoding')",
+                "current_setting",
+                Value::Text("UTF8".into()),
+            ),
+            ("SELECT 1", "?column?", Value::Int32(1)),
+        ] {
+            let events = session
+                .execute(sql, &[])
+                .unwrap_or_else(|error| panic!("{sql}: {error}"))
+                .collect::<Vec<_>>();
+            let QueryEvent::Schema(schema) = &events[0] else {
+                panic!("{sql}: schema event");
+            };
+            assert_eq!(schema.fields[0].name, field_name);
+            let value = events.iter().find_map(|event| match event {
+                QueryEvent::Batch(batch) => batch.rows.first()?.values.first(),
+                _ => None,
+            });
+            assert_eq!(value, Some(&expected), "{sql}");
+            assert!(matches!(events.last(), Some(QueryEvent::Complete(_))));
+        }
+
+        let settings_events = session
+            .execute(
+                "SELECT current_setting('client_encoding'), \
+                 current_setting('standard_conforming_strings')",
+                &[],
+            )
+            .expect("multi-setting query")
+            .collect::<Vec<_>>();
+        let values = settings_events.iter().find_map(|event| match event {
+            QueryEvent::Batch(batch) => batch.rows.first().map(|row| row.values.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            values,
+            Some(vec![Value::Text("UTF8".into()), Value::Text("on".into())])
+        );
+
+        let catalog_events = session
+            .execute("SELECT relname FROM pg_catalog.pg_class LIMIT 1", &[])
+            .expect("system catalog query")
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            catalog_events.first(),
+            Some(QueryEvent::Schema(_))
+        ));
+    }
+
+    #[test]
+    fn session_settings_describe_without_mutation_and_apply_on_execution() {
+        let mut settings = PgSessionSettings::from_startup(
+            "18.0 (OrdaDB test)".to_owned(),
+            "dba",
+            &BTreeMap::new(),
+        )
+        .expect("settings");
+        let description =
+            session_setting_description("SET application_name TO 'DataGrip'", &settings)
+                .expect("describe")
+                .expect("session statement");
+        assert!(description.schema.fields.is_empty());
+        assert_eq!(settings.get("application_name"), Some(""));
+
+        let events = session_setting_events("SET application_name TO 'DataGrip'", &mut settings)
+            .expect("execute")
+            .expect("session statement");
         assert!(matches!(events.last(), Some(QueryEvent::Complete(_))));
+        assert_eq!(settings.get("application_name"), Some("DataGrip"));
+
+        let events = session_setting_events("SHOW application_name", &mut settings)
+            .expect("show")
+            .expect("session statement");
+        assert!(matches!(events.first(), Some(QueryEvent::Schema(_))));
+
+        let description = session_setting_description(
+            "SELECT set_config('application_name', 'DescribeOnly', false)",
+            &settings,
+        )
+        .expect("describe set_config")
+        .expect("set_config statement");
+        assert_eq!(description.schema.fields[0].name, "set_config");
+        assert_eq!(settings.get("application_name"), Some("DataGrip"));
+
+        let events = session_setting_events(
+            "SELECT set_config('application_name', 'pgjdbc', false)",
+            &mut settings,
+        )
+        .expect("execute set_config")
+        .expect("set_config statement");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            QueryEvent::Batch(batch)
+                if batch.rows == [Row::new(vec![Value::Text("pgjdbc".into())])]
+        )));
+        let error = session_setting_events(
+            "SELECT set_config('application_name', 'local', true)",
+            &mut settings,
+        )
+        .expect_err("local set_config rejected");
+        assert_eq!(error.sql_state, "0A000");
+        assert_eq!(settings.get("application_name"), Some("pgjdbc"));
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine =
+            Engine::open(ordadb_engine::EngineConfig::new(directory.path())).expect("open engine");
+        let mut session = engine.connect().expect("connect session");
+        let principal = Principal {
+            user: "dba".into(),
+            roles: BTreeSet::new(),
+        };
+        session.set_runtime_metadata(
+            session_runtime_metadata(&settings, "ordadb", &principal)
+                .expect("refreshed runtime metadata"),
+        );
+        let values = session
+            .execute("SELECT current_setting('application_name')", &[])
+            .expect("read changed setting")
+            .find_map(|event| match event {
+                QueryEvent::Batch(batch) => batch.rows.into_iter().next().map(|row| row.values),
+                _ => None,
+            });
+        assert_eq!(values, Some(vec![Value::Text("pgjdbc".into())]));
     }
 
     #[test]

@@ -6,18 +6,21 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use ordadb_types::{
-    ArrayDimension, DbError, MAX_ARRAY_DIMENSIONS, MAX_ARRAY_ELEMENTS, PgArray, PgInterval, Result,
-    Row, ScalarType, Schema, TypeId, Value,
+    ArrayDimension, DbError, MAX_ARRAY_DIMENSIONS, MAX_ARRAY_ELEMENTS, MAX_POSTGRES_NAME_BYTES,
+    PgArray, PgInterval, Result, Row, ScalarType, Schema, TypeId, Value,
 };
 
 use crate::codec::{protocol, push_cstring, write_message};
 
 pub const OID_BOOL: u32 = 16;
 pub const OID_BYTEA: u32 = 17;
+pub const OID_INTERNAL_CHAR: u32 = 18;
+pub const OID_NAME: u32 = 19;
 pub const OID_INT8: u32 = 20;
 pub const OID_INT2: u32 = 21;
 pub const OID_INT4: u32 = 23;
 pub const OID_TEXT: u32 = 25;
+pub const OID_OID: u32 = 26;
 pub const OID_FLOAT4: u32 = 700;
 pub const OID_FLOAT8: u32 = 701;
 pub const OID_BPCHAR: u32 = 1042;
@@ -33,6 +36,8 @@ pub const OID_UUID: u32 = 2950;
 pub const OID_JSONB: u32 = 3802;
 pub const OID_BOOL_ARRAY: u32 = 1000;
 pub const OID_BYTEA_ARRAY: u32 = 1001;
+pub const OID_INTERNAL_CHAR_ARRAY: u32 = 1002;
+pub const OID_NAME_ARRAY: u32 = 1003;
 pub const OID_INT2_ARRAY: u32 = 1005;
 pub const OID_INT4_ARRAY: u32 = 1007;
 pub const OID_TEXT_ARRAY: u32 = 1009;
@@ -41,6 +46,7 @@ pub const OID_VARCHAR_ARRAY: u32 = 1015;
 pub const OID_INT8_ARRAY: u32 = 1016;
 pub const OID_FLOAT4_ARRAY: u32 = 1021;
 pub const OID_FLOAT8_ARRAY: u32 = 1022;
+pub const OID_OID_ARRAY: u32 = 1028;
 pub const OID_JSON_ARRAY: u32 = 199;
 pub const OID_TIMESTAMP_ARRAY: u32 = 1115;
 pub const OID_DATE_ARRAY: u32 = 1182;
@@ -154,7 +160,7 @@ pub fn write_data_row<W: Write>(
             payload.extend_from_slice(&(-1_i32).to_be_bytes());
             continue;
         }
-        validate_enum_value(value, &field.data_type)?;
+        validate_wire_value(value, &field.data_type)?;
         let bytes = if format == 0 {
             encode_text(value)?
         } else {
@@ -174,6 +180,9 @@ pub fn type_oid(data_type: &ScalarType) -> u32 {
         ScalarType::Int16 => OID_INT2,
         ScalarType::Int32 => OID_INT4,
         ScalarType::Int64 => OID_INT8,
+        ScalarType::Oid => OID_OID,
+        ScalarType::Name => OID_NAME,
+        ScalarType::InternalChar => OID_INTERNAL_CHAR,
         ScalarType::Float32 => OID_FLOAT4,
         ScalarType::Float64 => OID_FLOAT8,
         ScalarType::Decimal { .. } => OID_NUMERIC,
@@ -241,8 +250,10 @@ fn enum_type_id_from_oid(oid: u32, array: bool) -> Option<TypeId> {
 fn type_size(data_type: &ScalarType) -> i16 {
     match data_type {
         ScalarType::Boolean => 1,
+        ScalarType::InternalChar => 1,
+        ScalarType::Name => 64,
         ScalarType::Int16 => 2,
-        ScalarType::Int32 | ScalarType::Float32 | ScalarType::Date => 4,
+        ScalarType::Int32 | ScalarType::Oid | ScalarType::Float32 | ScalarType::Date => 4,
         ScalarType::Int64
         | ScalarType::Float64
         | ScalarType::Time
@@ -361,6 +372,13 @@ fn decode_text(oid: u32, bytes: &[u8]) -> Result<Value> {
     };
     match oid {
         0 | OID_TEXT | OID_BPCHAR | OID_VARCHAR => Ok(Value::Text(text.to_owned())),
+        OID_NAME if text.len() <= MAX_POSTGRES_NAME_BYTES => Ok(Value::Text(text.to_owned())),
+        OID_NAME => Err(DbError::new(
+            "22001",
+            "PostgreSQL name parameter exceeds 63 bytes",
+        )),
+        OID_INTERNAL_CHAR if text.len() == 1 => Ok(Value::Text(text.to_owned())),
+        OID_INTERNAL_CHAR => Err(invalid()),
         oid if enum_type_id_from_oid(oid, false).is_some() => Ok(Value::Text(text.to_owned())),
         OID_BOOL => match text.to_ascii_lowercase().as_str() {
             "t" | "true" | "1" => Ok(Value::Boolean(true)),
@@ -370,6 +388,12 @@ fn decode_text(oid: u32, bytes: &[u8]) -> Result<Value> {
         OID_INT2 => text.parse().map(Value::Int16).map_err(|_| invalid()),
         OID_INT4 => text.parse().map(Value::Int32).map_err(|_| invalid()),
         OID_INT8 => text.parse().map(Value::Int64).map_err(|_| invalid()),
+        OID_OID => {
+            let value = text.parse::<u64>().map_err(|_| invalid())?;
+            u32::try_from(value)
+                .map(|value| Value::Int64(i64::from(value)))
+                .map_err(|_| DbError::new("22003", "OID parameter is out of range"))
+        }
         OID_FLOAT4 => text.parse().map(Value::Float32).map_err(|_| invalid()),
         OID_FLOAT8 => text.parse().map(Value::Float64).map_err(|_| invalid()),
         OID_NUMERIC => Decimal::from_str(text)
@@ -442,6 +466,12 @@ fn decode_binary(oid: u32, bytes: &[u8]) -> Result<Value> {
                 bytes.try_into().expect("checked length"),
             )))
         }
+        OID_OID => {
+            length(4)?;
+            Ok(Value::Int64(i64::from(u32::from_be_bytes(
+                bytes.try_into().expect("checked length"),
+            ))))
+        }
         OID_FLOAT4 => {
             length(4)?;
             Ok(Value::Float32(f32::from_bits(u32::from_be_bytes(
@@ -458,6 +488,23 @@ fn decode_binary(oid: u32, bytes: &[u8]) -> Result<Value> {
         OID_TEXT | OID_BPCHAR | OID_VARCHAR => std::str::from_utf8(bytes)
             .map(|text| Value::Text(text.to_owned()))
             .map_err(|_| DbError::new("22021", "binary text is not valid UTF-8")),
+        OID_NAME => {
+            if bytes.len() > MAX_POSTGRES_NAME_BYTES {
+                return Err(DbError::new(
+                    "22001",
+                    "binary PostgreSQL name exceeds 63 bytes",
+                ));
+            }
+            std::str::from_utf8(bytes)
+                .map(|text| Value::Text(text.to_owned()))
+                .map_err(|_| DbError::new("22021", "binary name is not valid UTF-8"))
+        }
+        OID_INTERNAL_CHAR => {
+            length(1)?;
+            std::str::from_utf8(bytes)
+                .map(|text| Value::Text(text.to_owned()))
+                .map_err(|_| DbError::new("22021", "binary internal char is not valid UTF-8"))
+        }
         oid if enum_type_id_from_oid(oid, false).is_some() => std::str::from_utf8(bytes)
             .map(|text| Value::Text(text.to_owned()))
             .map_err(|_| DbError::new("22021", "binary enum is not valid UTF-8")),
@@ -571,7 +618,18 @@ pub fn encode_text(value: &Value) -> Result<Vec<u8>> {
 }
 
 fn encode_binary(value: &Value, data_type: &ScalarType) -> Result<Vec<u8>> {
-    validate_enum_value(value, data_type)?;
+    validate_wire_value(value, data_type)?;
+    if matches!(data_type, ScalarType::Oid) {
+        let Value::Int64(value) = value else {
+            return Err(DbError::new(
+                "42804",
+                "OID result must use an integer value",
+            ));
+        };
+        return u32::try_from(*value)
+            .map(|value| value.to_be_bytes().to_vec())
+            .map_err(|_| DbError::new("22003", "OID result is out of range"));
+    }
     match value {
         Value::Boolean(value) => Ok(vec![u8::from(*value)]),
         Value::Int16(value) => Ok(value.to_be_bytes().to_vec()),
@@ -626,6 +684,38 @@ fn encode_binary(value: &Value, data_type: &ScalarType) -> Result<Vec<u8>> {
             format!("binary results are unsupported for {data_type:?}"),
         )),
         Value::Null => Err(DbError::new("XX000", "NULL has no binary payload")),
+    }
+}
+
+fn validate_wire_value(value: &Value, data_type: &ScalarType) -> Result<()> {
+    validate_enum_value(value, data_type)?;
+    match (data_type, value) {
+        (ScalarType::Oid, Value::Int64(value)) if u32::try_from(*value).is_ok() => Ok(()),
+        (ScalarType::Oid, Value::Int64(_)) => {
+            Err(DbError::new("22003", "OID result is out of range"))
+        }
+        (ScalarType::Oid, _) => Err(DbError::new(
+            "42804",
+            "OID result must use an integer value",
+        )),
+        (ScalarType::Name, Value::Text(value)) if value.len() <= MAX_POSTGRES_NAME_BYTES => Ok(()),
+        (ScalarType::Name, Value::Text(_)) => {
+            Err(DbError::new("22001", "PostgreSQL name exceeds 63 bytes"))
+        }
+        (ScalarType::Name, _) => Err(DbError::new(
+            "42804",
+            "PostgreSQL name result must use a text value",
+        )),
+        (ScalarType::InternalChar, Value::Text(value)) if value.len() == 1 => Ok(()),
+        (ScalarType::InternalChar, Value::Text(_)) => Err(DbError::new(
+            "22001",
+            "PostgreSQL internal char must contain exactly one byte",
+        )),
+        (ScalarType::InternalChar, _) => Err(DbError::new(
+            "42804",
+            "PostgreSQL internal char result must use a text value",
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -802,6 +892,9 @@ fn array_oid(element: &ScalarType) -> Option<u32> {
         ScalarType::Int16 => Some(OID_INT2_ARRAY),
         ScalarType::Int32 => Some(OID_INT4_ARRAY),
         ScalarType::Int64 => Some(OID_INT8_ARRAY),
+        ScalarType::Oid => Some(OID_OID_ARRAY),
+        ScalarType::Name => Some(OID_NAME_ARRAY),
+        ScalarType::InternalChar => Some(OID_INTERNAL_CHAR_ARRAY),
         ScalarType::Float32 => Some(OID_FLOAT4_ARRAY),
         ScalarType::Float64 => Some(OID_FLOAT8_ARRAY),
         ScalarType::Decimal { .. } => Some(OID_NUMERIC_ARRAY),
@@ -830,12 +923,15 @@ fn array_element_type(oid: u32) -> Option<(ScalarType, u32)> {
     let value = match oid {
         OID_BOOL_ARRAY => (ScalarType::Boolean, OID_BOOL),
         OID_BYTEA_ARRAY => (ScalarType::Binary, OID_BYTEA),
+        OID_INTERNAL_CHAR_ARRAY => (ScalarType::InternalChar, OID_INTERNAL_CHAR),
+        OID_NAME_ARRAY => (ScalarType::Name, OID_NAME),
         OID_INT2_ARRAY => (ScalarType::Int16, OID_INT2),
         OID_INT4_ARRAY => (ScalarType::Int32, OID_INT4),
         OID_TEXT_ARRAY => (ScalarType::Text, OID_TEXT),
         OID_BPCHAR_ARRAY => (ScalarType::Char { length: None }, OID_BPCHAR),
         OID_VARCHAR_ARRAY => (ScalarType::Varchar { length: None }, OID_VARCHAR),
         OID_INT8_ARRAY => (ScalarType::Int64, OID_INT8),
+        OID_OID_ARRAY => (ScalarType::Oid, OID_OID),
         OID_FLOAT4_ARRAY => (ScalarType::Float32, OID_FLOAT4),
         OID_FLOAT8_ARRAY => (ScalarType::Float64, OID_FLOAT8),
         OID_JSON_ARRAY => (ScalarType::Json, OID_JSON),
@@ -1507,6 +1603,125 @@ mod tests {
             decode_binary(OID_DATE, &binary).expect("decode"),
             Value::Date(date)
         );
+    }
+
+    #[test]
+    fn postgres_catalog_wire_types_preserve_oids_widths_and_bounds() {
+        let schema = Schema::new(vec![
+            Field::new("schema_oid", ScalarType::Oid, false),
+            Field::new("schema_name", ScalarType::Name, false),
+            Field::new("owner_name", ScalarType::Name, true),
+            Field::new("relation_oid", ScalarType::Oid, false),
+            Field::new("relkind", ScalarType::InternalChar, false),
+        ]);
+        let mut description = Vec::new();
+        write_row_description(&mut description, &schema, &[]).expect("row description");
+        assert_eq!(
+            row_description_type_metadata(&description),
+            vec![
+                ("schema_oid".to_owned(), OID_OID, 4),
+                ("schema_name".to_owned(), OID_NAME, 64),
+                ("owner_name".to_owned(), OID_NAME, 64),
+                ("relation_oid".to_owned(), OID_OID, 4),
+                ("relkind".to_owned(), OID_INTERNAL_CHAR, 1),
+            ]
+        );
+
+        let maximum_oid = Value::Int64(i64::from(u32::MAX));
+        assert_eq!(
+            decode_text(OID_OID, u32::MAX.to_string().as_bytes()).expect("maximum text OID"),
+            maximum_oid
+        );
+        let encoded_oid = encode_binary(&maximum_oid, &ScalarType::Oid).expect("binary OID");
+        assert_eq!(encoded_oid, u32::MAX.to_be_bytes());
+        assert_eq!(
+            decode_binary(OID_OID, &encoded_oid).expect("decode binary OID"),
+            maximum_oid
+        );
+        assert_eq!(
+            decode_text(OID_OID, b"4294967296")
+                .expect_err("out-of-range text OID")
+                .sql_state,
+            "22003"
+        );
+        assert_eq!(
+            encode_binary(&Value::Int64(-1), &ScalarType::Oid)
+                .expect_err("negative result OID")
+                .sql_state,
+            "22003"
+        );
+
+        let maximum_name = "n".repeat(MAX_POSTGRES_NAME_BYTES);
+        assert_eq!(
+            decode_text(OID_NAME, maximum_name.as_bytes()).expect("maximum name"),
+            Value::Text(maximum_name)
+        );
+        let oversized_name = "n".repeat(MAX_POSTGRES_NAME_BYTES + 1);
+        assert_eq!(
+            decode_binary(OID_NAME, oversized_name.as_bytes())
+                .expect_err("oversized binary name")
+                .sql_state,
+            "22001"
+        );
+        assert_eq!(
+            write_data_row(
+                &mut Vec::new(),
+                &Schema::new(vec![Field::new("name", ScalarType::Name, false)]),
+                &Row::new(vec![Value::Text(oversized_name)]),
+                &[0],
+            )
+            .expect_err("oversized text name result")
+            .sql_state,
+            "22001"
+        );
+
+        assert_eq!(
+            decode_text(OID_INTERNAL_CHAR, b"r").expect("internal char"),
+            Value::Text("r".into())
+        );
+        assert_eq!(
+            decode_text(OID_INTERNAL_CHAR, "é".as_bytes())
+                .expect_err("multibyte internal char")
+                .sql_state,
+            "22P02"
+        );
+        assert_eq!(
+            decode_binary(OID_INTERNAL_CHAR, b"rr")
+                .expect_err("wide binary internal char")
+                .sql_state,
+            "08P01"
+        );
+    }
+
+    fn row_description_type_metadata(bytes: &[u8]) -> Vec<(String, u32, i16)> {
+        assert_eq!(bytes.first(), Some(&b'T'));
+        let message_len = u32::from_be_bytes(bytes[1..5].try_into().expect("message length"));
+        assert_eq!(
+            usize::try_from(message_len).expect("bounded length") + 1,
+            bytes.len()
+        );
+        let mut offset = 5;
+        let field_count = u16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("count"));
+        offset += 2;
+        let mut fields = Vec::with_capacity(usize::from(field_count));
+        for _ in 0..field_count {
+            let name_end = bytes[offset..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|position| offset + position)
+                .expect("field terminator");
+            let name = std::str::from_utf8(&bytes[offset..name_end])
+                .expect("field UTF-8")
+                .to_owned();
+            offset = name_end + 1 + 4 + 2;
+            let oid = u32::from_be_bytes(bytes[offset..offset + 4].try_into().expect("type OID"));
+            offset += 4;
+            let size = i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("type size"));
+            offset += 2 + 4 + 2;
+            fields.push((name, oid, size));
+        }
+        assert_eq!(offset, bytes.len());
+        fields
     }
 
     #[test]

@@ -763,7 +763,12 @@ mod tests {
             "0A000"
         );
         let mut corrupt = receipt;
-        corrupt.receipt_digest.replace_range(..1, "f");
+        let replacement = if corrupt.receipt_digest.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        corrupt.receipt_digest.replace_range(..1, replacement);
         assert_eq!(
             validate_installer_migration_receipt(&corrupt)
                 .expect_err("digest")

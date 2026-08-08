@@ -8,8 +8,24 @@ use serde::de::{self, SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+mod system;
+
+pub use system::*;
+
 const MAX_DEPENDENCY_OBJECTS: usize = 16_384;
 const MAX_CATALOG_OWNER_BYTES: usize = 63;
+
+fn system_catalog_read_only() -> DbError {
+    DbError::new("42501", "system catalogs are read-only")
+        .with_detail("pg_catalog and information_schema cannot be modified")
+}
+
+fn ensure_writable_schema_name(name: &Identifier) -> Result<()> {
+    if system::is_system_schema_name(name) {
+        return Err(system_catalog_read_only());
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogExpression {
@@ -500,6 +516,326 @@ pub enum CatalogObjectRef {
     Type(TypeId),
 }
 
+/// PostgreSQL reserves OID zero as invalid and OIDs below this boundary for
+/// built-in objects. OrdaDB user catalog objects are allocated monotonically
+/// from PostgreSQL's `FirstNormalObjectId`.
+pub const POSTGRES_OID_FIRST_USER: u32 = 16_384;
+pub const POSTGRES_OID_LAST_BUILTIN: u32 = POSTGRES_OID_FIRST_USER - 1;
+
+const MAX_POSTGRES_OID_MAPPINGS: usize = 1_048_576;
+const POSTGRES_OID_EXHAUSTED: u64 = u32::MAX as u64 + 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PostgresOid(u32);
+
+impl PostgresOid {
+    pub fn new(value: u32) -> Result<Self> {
+        if value == 0 {
+            return Err(DbError::new("22023", "PostgreSQL OID zero is invalid"));
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn is_builtin(self) -> bool {
+        self.0 <= POSTGRES_OID_LAST_BUILTIN
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum PostgresOidObject {
+    Database(DatabaseId),
+    Schema(SchemaId),
+    Table(TableId),
+    View(ViewId),
+    Column(TableId, ColumnId),
+    Index(IndexId),
+    Constraint(ConstraintId),
+    Sequence(SequenceId),
+    Routine(RoutineId),
+    Trigger(TriggerId),
+    Type(TypeId),
+}
+
+impl From<CatalogObjectRef> for PostgresOidObject {
+    fn from(object: CatalogObjectRef) -> Self {
+        match object {
+            CatalogObjectRef::Schema(id) => Self::Schema(id),
+            CatalogObjectRef::Table(id) => Self::Table(id),
+            CatalogObjectRef::Column(table_id, column_id) => Self::Column(table_id, column_id),
+            CatalogObjectRef::Index(id) => Self::Index(id),
+            CatalogObjectRef::Constraint(id) => Self::Constraint(id),
+            CatalogObjectRef::Sequence(id) => Self::Sequence(id),
+            CatalogObjectRef::View(id) => Self::View(id),
+            CatalogObjectRef::Routine(id) => Self::Routine(id),
+            CatalogObjectRef::Trigger(id) => Self::Trigger(id),
+            CatalogObjectRef::Type(id) => Self::Type(id),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct PostgresOidMapping {
+    object: PostgresOidObject,
+    oid: PostgresOid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresOidRegistry {
+    first_user_oid: u32,
+    next_oid: u64,
+    mappings: BTreeMap<PostgresOidObject, PostgresOid>,
+}
+
+#[derive(Serialize)]
+struct PostgresOidRegistryRef {
+    first_user_oid: u32,
+    next_oid: u64,
+    mappings: Vec<PostgresOidMapping>,
+}
+
+#[derive(Deserialize)]
+struct PostgresOidRegistryOwned {
+    first_user_oid: u32,
+    next_oid: u64,
+    #[serde(default, deserialize_with = "deserialize_postgres_oid_mappings")]
+    mappings: Vec<PostgresOidMapping>,
+}
+
+fn deserialize_postgres_oid_mappings<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<PostgresOidMapping>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct MappingVisitor;
+
+    impl<'de> Visitor<'de> for MappingVisitor {
+        type Value = Vec<PostgresOidMapping>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded PostgreSQL OID mapping array")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let capacity = sequence
+                .size_hint()
+                .unwrap_or_default()
+                .min(MAX_POSTGRES_OID_MAPPINGS);
+            let mut mappings = Vec::with_capacity(capacity);
+            while let Some(mapping) = sequence.next_element::<PostgresOidMapping>()? {
+                if mappings.len() >= MAX_POSTGRES_OID_MAPPINGS {
+                    return Err(de::Error::custom(
+                        "XX001: PostgreSQL OID registry exceeds its mapping limit",
+                    ));
+                }
+                mappings.push(mapping);
+            }
+            Ok(mappings)
+        }
+    }
+
+    deserializer.deserialize_seq(MappingVisitor)
+}
+
+impl Serialize for PostgresOidRegistry {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        PostgresOidRegistryRef {
+            first_user_oid: self.first_user_oid,
+            next_oid: self.next_oid,
+            mappings: self
+                .mappings
+                .iter()
+                .map(|(object, oid)| PostgresOidMapping {
+                    object: *object,
+                    oid: *oid,
+                })
+                .collect(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PostgresOidRegistry {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = PostgresOidRegistryOwned::deserialize(deserializer)?;
+        if encoded.mappings.len() > MAX_POSTGRES_OID_MAPPINGS {
+            return Err(de::Error::custom(
+                "XX001: PostgreSQL OID registry exceeds its mapping limit",
+            ));
+        }
+        let mut mappings = BTreeMap::new();
+        let mut oids = BTreeSet::new();
+        for mapping in encoded.mappings {
+            if mappings.insert(mapping.object, mapping.oid).is_some() {
+                return Err(de::Error::custom(
+                    "XX001: PostgreSQL OID registry contains a duplicate object",
+                ));
+            }
+            if !oids.insert(mapping.oid) {
+                return Err(de::Error::custom(
+                    "XX001: PostgreSQL OID registry contains a duplicate OID",
+                ));
+            }
+        }
+        let registry = Self {
+            first_user_oid: encoded.first_user_oid,
+            next_oid: encoded.next_oid,
+            mappings,
+        };
+        registry.validate_metadata().map_err(de::Error::custom)?;
+        Ok(registry)
+    }
+}
+
+impl PostgresOidRegistry {
+    fn bootstrap(database_id: DatabaseId, public_schema_id: SchemaId) -> Self {
+        Self {
+            first_user_oid: POSTGRES_OID_FIRST_USER,
+            next_oid: u64::from(POSTGRES_OID_FIRST_USER) + 2,
+            mappings: BTreeMap::from([
+                (
+                    PostgresOidObject::Database(database_id),
+                    PostgresOid(POSTGRES_OID_FIRST_USER),
+                ),
+                (
+                    PostgresOidObject::Schema(public_schema_id),
+                    PostgresOid(POSTGRES_OID_FIRST_USER + 1),
+                ),
+            ]),
+        }
+    }
+
+    fn reconstruct(objects: &BTreeSet<PostgresOidObject>) -> Result<Self> {
+        let mut registry = Self {
+            first_user_oid: POSTGRES_OID_FIRST_USER,
+            next_oid: u64::from(POSTGRES_OID_FIRST_USER),
+            mappings: BTreeMap::new(),
+        };
+        for object in objects {
+            registry.allocate(*object)?;
+        }
+        Ok(registry)
+    }
+
+    fn allocate(&mut self, object: PostgresOidObject) -> Result<PostgresOid> {
+        if self.mappings.contains_key(&object) {
+            return Err(DbError::new(
+                "XX001",
+                "PostgreSQL OID registry already contains the catalog object",
+            ));
+        }
+        if self.mappings.len() >= MAX_POSTGRES_OID_MAPPINGS {
+            return Err(DbError::new(
+                "54000",
+                "PostgreSQL OID registry exceeds its mapping limit",
+            ));
+        }
+        let value = u32::try_from(self.next_oid)
+            .map_err(|_| DbError::new("54000", "PostgreSQL OID allocation space is exhausted"))?;
+        let oid = PostgresOid(value);
+        self.next_oid = self
+            .next_oid
+            .checked_add(1)
+            .ok_or_else(|| DbError::new("54000", "PostgreSQL OID allocation space is exhausted"))?;
+        self.mappings.insert(object, oid);
+        Ok(oid)
+    }
+
+    fn remove(&mut self, object: PostgresOidObject) {
+        self.mappings.remove(&object);
+    }
+
+    fn validate_metadata(&self) -> Result<()> {
+        if self.first_user_oid != POSTGRES_OID_FIRST_USER {
+            return Err(DbError::new(
+                "XX001",
+                "PostgreSQL OID registry has an incompatible built-in boundary",
+            ));
+        }
+        if !(u64::from(POSTGRES_OID_FIRST_USER)..=POSTGRES_OID_EXHAUSTED).contains(&self.next_oid) {
+            return Err(DbError::new(
+                "XX001",
+                "PostgreSQL OID registry has an invalid allocation cursor",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for oid in self.mappings.values().copied() {
+            if oid.get() < POSTGRES_OID_FIRST_USER {
+                return Err(DbError::new(
+                    "XX001",
+                    "PostgreSQL OID registry maps a user object into the built-in range",
+                ));
+            }
+            if u64::from(oid.get()) >= self.next_oid {
+                return Err(DbError::new(
+                    "XX001",
+                    "PostgreSQL OID registry allocation cursor precedes a live mapping",
+                ));
+            }
+            if !seen.insert(oid) {
+                return Err(DbError::new(
+                    "XX001",
+                    "PostgreSQL OID registry contains a duplicate OID",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate(&self, expected: &BTreeSet<PostgresOidObject>) -> Result<()> {
+        self.validate_metadata()?;
+        let actual = self.mappings.keys().copied().collect::<BTreeSet<_>>();
+        if actual != *expected {
+            let missing = expected.difference(&actual).next();
+            let stale = actual.difference(expected).next();
+            return Err(DbError::new(
+                "XX001",
+                "PostgreSQL OID registry references do not match the live catalog",
+            )
+            .with_detail(format!("missing: {missing:?}; stale: {stale:?}")));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn first_user_oid(&self) -> u32 {
+        self.first_user_oid
+    }
+
+    pub fn mappings(&self) -> impl Iterator<Item = (PostgresOidObject, PostgresOid)> + '_ {
+        self.mappings.iter().map(|(object, oid)| (*object, *oid))
+    }
+
+    #[must_use]
+    pub fn oid(&self, object: PostgresOidObject) -> Option<PostgresOid> {
+        self.mappings.get(&object).copied()
+    }
+
+    #[must_use]
+    pub fn object(&self, oid: PostgresOid) -> Option<PostgresOidObject> {
+        self.mappings
+            .iter()
+            .find_map(|(object, candidate)| (*candidate == oid).then_some(*object))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CatalogOwner(String);
 
@@ -950,7 +1286,15 @@ impl SchemaDefinition {
 
     #[must_use]
     pub fn table(&self, name: &Identifier) -> Option<&TableDefinition> {
-        self.tables.get(name)
+        self.tables.get(name).or_else(|| {
+            system::is_system_schema_id(self.id)
+                .then(|| {
+                    self.tables
+                        .values()
+                        .find(|table| table.name.as_str() == name.as_str())
+                })
+                .flatten()
+        })
     }
 
     pub fn sequences(&self) -> impl Iterator<Item = &SequenceDefinition> {
@@ -1011,7 +1355,7 @@ impl DatabaseDefinition {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Catalog {
     database: DatabaseDefinition,
     next_schema_id: u64,
@@ -1035,6 +1379,73 @@ pub struct Catalog {
     dependencies: DependencyGraph,
     #[serde(default)]
     ownership: CatalogOwnership,
+    postgres_oid_registry: PostgresOidRegistry,
+}
+
+#[derive(Deserialize)]
+struct CatalogOwned {
+    database: DatabaseDefinition,
+    next_schema_id: u64,
+    next_table_id: u64,
+    next_column_id: u64,
+    #[serde(default = "initial_index_id")]
+    next_index_id: u64,
+    #[serde(default = "initial_object_id")]
+    next_constraint_id: u64,
+    #[serde(default = "initial_object_id")]
+    next_sequence_id: u64,
+    #[serde(default = "initial_object_id")]
+    next_view_id: u64,
+    #[serde(default = "initial_object_id")]
+    next_routine_id: u64,
+    #[serde(default = "initial_object_id")]
+    next_trigger_id: u64,
+    #[serde(default = "initial_object_id")]
+    next_type_id: u64,
+    #[serde(default)]
+    dependencies: DependencyGraph,
+    #[serde(default)]
+    ownership: CatalogOwnership,
+    #[serde(default)]
+    postgres_oid_registry: Option<PostgresOidRegistry>,
+}
+
+impl<'de> Deserialize<'de> for Catalog {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = CatalogOwned::deserialize(deserializer)?;
+        let mut catalog = Self {
+            database: encoded.database,
+            next_schema_id: encoded.next_schema_id,
+            next_table_id: encoded.next_table_id,
+            next_column_id: encoded.next_column_id,
+            next_index_id: encoded.next_index_id,
+            next_constraint_id: encoded.next_constraint_id,
+            next_sequence_id: encoded.next_sequence_id,
+            next_view_id: encoded.next_view_id,
+            next_routine_id: encoded.next_routine_id,
+            next_trigger_id: encoded.next_trigger_id,
+            next_type_id: encoded.next_type_id,
+            dependencies: encoded.dependencies,
+            ownership: encoded.ownership,
+            postgres_oid_registry: PostgresOidRegistry {
+                first_user_oid: POSTGRES_OID_FIRST_USER,
+                next_oid: u64::from(POSTGRES_OID_FIRST_USER),
+                mappings: BTreeMap::new(),
+            },
+        };
+        catalog.postgres_oid_registry = match encoded.postgres_oid_registry {
+            Some(registry) => registry,
+            None => PostgresOidRegistry::reconstruct(&catalog.postgres_oid_objects())
+                .map_err(de::Error::custom)?,
+        };
+        catalog
+            .validate_postgres_oid_registry()
+            .map_err(de::Error::custom)?;
+        Ok(catalog)
+    }
 }
 
 const fn initial_index_id() -> u64 {
@@ -1086,6 +1497,7 @@ impl Catalog {
             next_type_id: initial_object_id(),
             dependencies: DependencyGraph::default(),
             ownership: CatalogOwnership::default(),
+            postgres_oid_registry: PostgresOidRegistry::bootstrap(database_id, SchemaId::new(1)),
         }
     }
 
@@ -1095,15 +1507,155 @@ impl Catalog {
     }
 
     #[must_use]
+    pub const fn postgres_oid_registry(&self) -> &PostgresOidRegistry {
+        &self.postgres_oid_registry
+    }
+
+    pub fn postgres_oid(&self, object: PostgresOidObject) -> Result<PostgresOid> {
+        if let Some(oid) = self.postgres_oid_registry.oid(object) {
+            return Ok(oid);
+        }
+        if self.postgres_oid_objects().contains(&object) {
+            return Err(DbError::new(
+                "XX001",
+                "PostgreSQL OID registry is missing a live catalog object",
+            ));
+        }
+        Err(DbError::new(
+            "22023",
+            "PostgreSQL OID was requested for an object outside the live catalog",
+        ))
+    }
+
+    #[must_use]
+    pub fn postgres_oid_object(&self, oid: PostgresOid) -> Option<PostgresOidObject> {
+        self.postgres_oid_registry.object(oid)
+    }
+
+    pub fn validate_postgres_oid_registry(&self) -> Result<()> {
+        self.postgres_oid_registry
+            .validate(&self.postgres_oid_objects())
+    }
+
+    fn postgres_oid_objects(&self) -> BTreeSet<PostgresOidObject> {
+        let mut objects = BTreeSet::from([PostgresOidObject::Database(self.database.id)]);
+        for schema in self.database.schemas() {
+            objects.insert(PostgresOidObject::Schema(schema.id));
+            for table in schema.tables() {
+                objects.insert(PostgresOidObject::Table(table.id));
+                objects.extend(
+                    table
+                        .columns()
+                        .iter()
+                        .map(|column| PostgresOidObject::Column(table.id, column.id)),
+                );
+                objects.extend(
+                    table
+                        .indexes()
+                        .map(|index| PostgresOidObject::Index(index.id)),
+                );
+                objects.extend(
+                    table
+                        .constraints()
+                        .map(|constraint| PostgresOidObject::Constraint(constraint.id)),
+                );
+                objects.extend(
+                    table
+                        .triggers()
+                        .map(|trigger| PostgresOidObject::Trigger(trigger.id)),
+                );
+            }
+            objects.extend(
+                schema
+                    .sequences()
+                    .map(|sequence| PostgresOidObject::Sequence(sequence.id)),
+            );
+            objects.extend(schema.views().map(|view| PostgresOidObject::View(view.id)));
+            objects.extend(
+                schema
+                    .routines()
+                    .map(|routine| PostgresOidObject::Routine(routine.id)),
+            );
+            for definition in schema.types() {
+                objects.insert(PostgresOidObject::Type(definition.id));
+                if let UserDefinedTypeKind::Domain { checks, .. } = &definition.definition {
+                    objects.extend(
+                        checks
+                            .iter()
+                            .filter_map(|constraint| constraint.id)
+                            .map(PostgresOidObject::Constraint),
+                    );
+                }
+            }
+        }
+        objects
+    }
+
+    fn postgres_oid_candidate(
+        &self,
+        objects: impl IntoIterator<Item = PostgresOidObject>,
+    ) -> Result<PostgresOidRegistry> {
+        let mut registry = self.postgres_oid_registry.clone();
+        for object in objects {
+            registry.allocate(object)?;
+        }
+        Ok(registry)
+    }
+
+    fn publish_postgres_oid_candidate(&mut self, registry: PostgresOidRegistry) -> Result<()> {
+        registry.validate(&self.postgres_oid_objects())?;
+        self.postgres_oid_registry = registry;
+        Ok(())
+    }
+
+    #[must_use]
     pub fn schema(&self, name: &Identifier) -> Option<&SchemaDefinition> {
-        self.database.schema(name)
+        system::system_schema(name).or_else(|| self.database.schema(name))
     }
 
     #[must_use]
     pub fn schema_by_id(&self, schema_id: SchemaId) -> Option<&SchemaDefinition> {
-        self.database
-            .schemas()
-            .find(|schema| schema.id == schema_id)
+        system::system_schema_by_id(schema_id).or_else(|| {
+            self.database
+                .schemas()
+                .find(|schema| schema.id == schema_id)
+        })
+    }
+
+    #[must_use]
+    pub fn is_system_schema(name: &Identifier) -> bool {
+        system::is_system_schema_name(name)
+    }
+
+    #[must_use]
+    pub fn is_system_table(table_id: TableId) -> bool {
+        system_relation(table_id).is_some()
+    }
+
+    fn ensure_writable_schema_id(&self, schema_id: SchemaId) -> Result<()> {
+        let is_system = system::is_system_schema_id(schema_id)
+            || self
+                .database
+                .schemas()
+                .any(|schema| schema.id == schema_id && Self::is_system_schema(&schema.name));
+        if is_system {
+            return Err(system_catalog_read_only());
+        }
+        Ok(())
+    }
+
+    fn ensure_writable_table_id(&self, table_id: TableId) -> Result<()> {
+        let is_system = Self::is_system_table(table_id)
+            || self
+                .database
+                .schemas()
+                .filter(|schema| Self::is_system_schema(&schema.name))
+                .flat_map(SchemaDefinition::tables)
+                .any(|table| table.id == table_id);
+        if is_system {
+            return Err(system_catalog_read_only());
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -1257,6 +1809,7 @@ impl Catalog {
         name: Identifier,
         labels: Vec<String>,
     ) -> Result<TypeId> {
+        ensure_writable_schema_name(schema_name)?;
         if labels.is_empty() {
             return Err(DbError::new(
                 "42601",
@@ -1380,6 +1933,7 @@ impl Catalog {
         default: Option<CatalogExpression>,
         mut checks: Vec<DomainConstraint>,
     ) -> Result<TypeId> {
+        ensure_writable_schema_name(schema_name)?;
         let DomainBaseType {
             data_type: base_type,
             declared_type: base_declared_type,
@@ -1502,6 +2056,8 @@ impl Catalog {
             ));
         }
         let constraint_id = ConstraintId::new(self.next_constraint_id);
+        let oid_registry =
+            self.postgres_oid_candidate([PostgresOidObject::Constraint(constraint_id)])?;
         let next_constraint_id = self
             .next_constraint_id
             .checked_add(1)
@@ -1515,6 +2071,7 @@ impl Catalog {
         };
         checks.push(constraint);
         self.next_constraint_id = next_constraint_id;
+        self.publish_postgres_oid_candidate(oid_registry)?;
         Ok(())
     }
 
@@ -1540,7 +2097,13 @@ impl Catalog {
                 format!("constraint {name} does not exist"),
             ));
         };
+        let constraint_id = checks[index].id;
         checks.remove(index);
+        if let Some(constraint_id) = constraint_id {
+            self.postgres_oid_registry
+                .remove(PostgresOidObject::Constraint(constraint_id));
+        }
+        self.validate_postgres_oid_registry()?;
         Ok(true)
     }
 
@@ -1561,27 +2124,42 @@ impl Catalog {
         name: Identifier,
         definition: UserDefinedTypeKind,
     ) -> Result<TypeId> {
-        let schema =
-            self.database.schemas.get_mut(schema_name).ok_or_else(|| {
+        ensure_writable_schema_name(schema_name)?;
+        let schema_id = {
+            let schema = self.database.schemas.get(schema_name).ok_or_else(|| {
                 DbError::new("3F000", format!("schema {schema_name} does not exist"))
             })?;
-        if schema.types.contains_key(&name) {
-            return Err(DbError::new("42710", format!("type {name} already exists")));
-        }
+            if schema.types.contains_key(&name) {
+                return Err(DbError::new("42710", format!("type {name} already exists")));
+            }
+            schema.id
+        };
         let id = TypeId::new(self.next_type_id);
-        self.next_type_id = self
+        let mut oid_objects = vec![PostgresOidObject::Type(id)];
+        if let UserDefinedTypeKind::Domain { checks, .. } = &definition {
+            oid_objects.extend(
+                checks
+                    .iter()
+                    .filter_map(|constraint| constraint.id)
+                    .map(PostgresOidObject::Constraint),
+            );
+        }
+        let oid_registry = self.postgres_oid_candidate(oid_objects)?;
+        let next_type_id = self
             .next_type_id
             .checked_add(1)
             .ok_or_else(|| DbError::new("54000", "catalog type ID space is exhausted"))?;
-        schema.types.insert(
+        self.schema_by_id_mut(schema_id)?.types.insert(
             name.clone(),
             TypeDefinition {
                 id,
-                schema_id: schema.id,
+                schema_id,
                 name,
                 definition,
             },
         );
+        self.next_type_id = next_type_id;
+        self.publish_postgres_oid_candidate(oid_registry)?;
         Ok(id)
     }
 
@@ -1658,6 +2236,7 @@ impl Catalog {
     }
 
     pub fn create_schema(&mut self, name: Identifier) -> Result<SchemaId> {
+        ensure_writable_schema_name(&name)?;
         if self.database.schemas.contains_key(&name) {
             return Err(DbError::new(
                 "42P06",
@@ -1666,7 +2245,11 @@ impl Catalog {
         }
 
         let id = SchemaId::new(self.next_schema_id);
-        self.next_schema_id += 1;
+        let oid_registry = self.postgres_oid_candidate([PostgresOidObject::Schema(id)])?;
+        let next_schema_id = self
+            .next_schema_id
+            .checked_add(1)
+            .ok_or_else(|| DbError::new("54000", "catalog schema ID space is exhausted"))?;
         self.database.schemas.insert(
             name.clone(),
             SchemaDefinition {
@@ -1680,10 +2263,14 @@ impl Catalog {
                 types: BTreeMap::new(),
             },
         );
+        self.next_schema_id = next_schema_id;
+        self.publish_postgres_oid_candidate(oid_registry)?;
         Ok(id)
     }
 
     pub fn rename_schema(&mut self, schema_id: SchemaId, new_name: Identifier) -> Result<()> {
+        self.ensure_writable_schema_id(schema_id)?;
+        ensure_writable_schema_name(&new_name)?;
         if self.database.schemas.contains_key(&new_name) {
             return Err(DbError::new(
                 "42P06",
@@ -1709,6 +2296,7 @@ impl Catalog {
         schema_id: SchemaId,
         behavior: DropBehavior,
     ) -> Result<Vec<CatalogObjectRef>> {
+        self.ensure_writable_schema_id(schema_id)?;
         let schema = self
             .schema_by_id(schema_id)
             .ok_or_else(|| DbError::new("3F000", "schema does not exist"))?;
@@ -1754,6 +2342,7 @@ impl Catalog {
             }
         }
         self.remove_catalog_object(CatalogObjectRef::Schema(schema_id))?;
+        self.validate_postgres_oid_registry()?;
         removed.push(CatalogObjectRef::Schema(schema_id));
         Ok(removed)
     }
@@ -1764,6 +2353,7 @@ impl Catalog {
         table_name: Identifier,
         columns: Vec<NewColumn>,
     ) -> Result<TableId> {
+        ensure_writable_schema_name(schema_name)?;
         if columns.is_empty() {
             return Err(DbError::new(
                 "42601",
@@ -1847,6 +2437,14 @@ impl Catalog {
                 );
             }
         }
+        let mut oid_registry = self.postgres_oid_registry.clone();
+        oid_registry.allocate(PostgresOidObject::Table(table_id))?;
+        for column in &definitions {
+            oid_registry.allocate(PostgresOidObject::Column(table_id, column.id))?;
+        }
+        for index in indexes.values() {
+            oid_registry.allocate(PostgresOidObject::Index(index.id))?;
+        }
         let declared_types = definitions
             .iter()
             .filter_map(|column| column.declared_type.map(|type_id| (column.id, type_id)))
@@ -1870,6 +2468,7 @@ impl Catalog {
                 CatalogObjectRef::Type(type_id),
             )?;
         }
+        self.publish_postgres_oid_candidate(oid_registry)?;
         Ok(table_id)
     }
 
@@ -1879,18 +2478,23 @@ impl Catalog {
         schema_name: &Identifier,
         table_name: &Identifier,
     ) -> Option<&TableDefinition> {
-        self.schema(schema_name)?.table(table_name)
+        system_relation_by_name(schema_name, table_name)
+            .and_then(|relation| system::system_table(relation.table_id))
+            .or_else(|| self.database.schema(schema_name)?.table(table_name))
     }
 
     #[must_use]
     pub fn table_by_id(&self, table_id: TableId) -> Option<&TableDefinition> {
-        self.database
-            .schemas()
-            .flat_map(SchemaDefinition::tables)
-            .find(|table| table.id == table_id)
+        system::system_table(table_id).or_else(|| {
+            self.database
+                .schemas()
+                .flat_map(SchemaDefinition::tables)
+                .find(|table| table.id == table_id)
+        })
     }
 
     pub fn rename_table(&mut self, table_id: TableId, new_name: Identifier) -> Result<()> {
+        self.ensure_writable_table_id(table_id)?;
         let (schema_id, old_name) = self
             .table_by_id(table_id)
             .map(|table| (table.schema_id, table.name.clone()))
@@ -1919,6 +2523,7 @@ impl Catalog {
         table_id: TableId,
         behavior: DropBehavior,
     ) -> Result<Vec<CatalogObjectRef>> {
+        self.ensure_writable_table_id(table_id)?;
         if self.table_by_id(table_id).is_none() {
             return Err(DbError::new("42P01", "table does not exist"));
         }
@@ -1947,6 +2552,7 @@ impl Catalog {
         column_id: ColumnId,
         new_name: Identifier,
     ) -> Result<()> {
+        self.ensure_writable_table_id(table_id)?;
         let table = self.table_by_id_mut(table_id)?;
         if table.column(&new_name).is_some() {
             return Err(DbError::new(
@@ -1962,6 +2568,7 @@ impl Catalog {
     }
 
     pub fn add_column(&mut self, table_id: TableId, column: NewColumn) -> Result<ColumnId> {
+        self.ensure_writable_table_id(table_id)?;
         if let Some(type_id) = column.declared_type
             && self.type_by_id(type_id).is_none()
         {
@@ -1982,8 +2589,20 @@ impl Catalog {
             ));
         }
         let column_id = ColumnId::new(self.next_column_id);
-        self.next_column_id = self.next_column_id.saturating_add(1);
+        let oid_registry =
+            self.postgres_oid_candidate([PostgresOidObject::Column(table_id, column_id)])?;
+        let next_column_id = self
+            .next_column_id
+            .checked_add(1)
+            .ok_or_else(|| DbError::new("54000", "catalog column ID space is exhausted"))?;
         let declared_type = column.declared_type;
+        let mut dependencies = self.dependencies.clone();
+        if let Some(type_id) = declared_type {
+            dependencies.add(
+                CatalogObjectRef::Column(table_id, column_id),
+                CatalogObjectRef::Type(type_id),
+            )?;
+        }
         self.table_by_id_mut(table_id)?
             .columns
             .push(ColumnDefinition {
@@ -1996,12 +2615,9 @@ impl Catalog {
                 unique: column.unique || column.primary_key,
                 default: column.default,
             });
-        if let Some(type_id) = declared_type {
-            self.dependencies.add(
-                CatalogObjectRef::Column(table_id, column_id),
-                CatalogObjectRef::Type(type_id),
-            )?;
-        }
+        self.next_column_id = next_column_id;
+        self.dependencies = dependencies;
+        self.publish_postgres_oid_candidate(oid_registry)?;
         Ok(column_id)
     }
 
@@ -2014,6 +2630,7 @@ impl Catalog {
         default: Option<Option<CatalogExpression>>,
         declared_type: Option<Option<TypeId>>,
     ) -> Result<()> {
+        self.ensure_writable_table_id(table_id)?;
         let mut dependencies = self.dependencies.clone();
         if let Some(declared_type) = declared_type {
             let object = CatalogObjectRef::Column(table_id, column_id);
@@ -2058,6 +2675,7 @@ impl Catalog {
         column_id: ColumnId,
         behavior: DropBehavior,
     ) -> Result<Vec<CatalogObjectRef>> {
+        self.ensure_writable_table_id(table_id)?;
         let table = self
             .table_by_id(table_id)
             .ok_or_else(|| DbError::new("42P01", "table does not exist"))?;
@@ -2084,6 +2702,7 @@ impl Catalog {
     }
 
     pub fn create_index(&mut self, table_id: TableId, new_index: NewIndex) -> Result<IndexId> {
+        self.ensure_writable_table_id(table_id)?;
         if new_index.key_columns.is_empty() {
             return Err(DbError::new(
                 "42601",
@@ -2251,7 +2870,11 @@ impl Catalog {
         }
 
         let id = IndexId::new(self.next_index_id);
-        self.next_index_id += 1;
+        let oid_registry = self.postgres_oid_candidate([PostgresOidObject::Index(id)])?;
+        let next_index_id = self
+            .next_index_id
+            .checked_add(1)
+            .ok_or_else(|| DbError::new("54000", "catalog index ID space is exhausted"))?;
         let definition = IndexDefinition {
             id,
             table_id,
@@ -2266,6 +2889,8 @@ impl Catalog {
         self.table_by_id_mut(table_id)?
             .indexes
             .insert(new_index.name, definition);
+        self.next_index_id = next_index_id;
+        self.publish_postgres_oid_candidate(oid_registry)?;
         Ok(id)
     }
 
@@ -2312,6 +2937,7 @@ impl Catalog {
         table_id: TableId,
         new_constraint: NewConstraint,
     ) -> Result<ConstraintId> {
+        self.ensure_writable_table_id(table_id)?;
         let table = self
             .table_by_id(table_id)
             .ok_or_else(|| DbError::new("42P01", "constraint owner table does not exist"))?;
@@ -2427,10 +3053,27 @@ impl Catalog {
             ));
         }
 
-        self.next_constraint_id = self.next_constraint_id.saturating_add(1);
+        let index_id = creates_index.then(|| IndexId::new(self.next_index_id));
+        let mut oid_objects = vec![PostgresOidObject::Constraint(id)];
+        oid_objects.extend(index_id.map(PostgresOidObject::Index));
+        let oid_registry = self.postgres_oid_candidate(oid_objects)?;
+        let next_constraint_id = self
+            .next_constraint_id
+            .checked_add(1)
+            .ok_or_else(|| DbError::new("54000", "catalog constraint ID space is exhausted"))?;
+        let next_index_id = if creates_index {
+            Some(
+                self.next_index_id
+                    .checked_add(1)
+                    .ok_or_else(|| DbError::new("54000", "catalog index ID space is exhausted"))?,
+            )
+        } else {
+            None
+        };
         if creates_index {
-            let index_id = IndexId::new(self.next_index_id);
-            self.next_index_id = self.next_index_id.saturating_add(1);
+            let index_id = index_id.ok_or_else(|| {
+                DbError::internal("constraint index allocation lost its planned identity")
+            })?;
             let key_columns = constraint_columns(&kind).collect::<Vec<_>>();
             self.table_by_id_mut(table_id)?.indexes.insert(
                 new_constraint.name.clone(),
@@ -2470,7 +3113,12 @@ impl Catalog {
                 kind,
             },
         );
+        self.next_constraint_id = next_constraint_id;
+        if let Some(next_index_id) = next_index_id {
+            self.next_index_id = next_index_id;
+        }
         self.dependencies = dependencies;
+        self.publish_postgres_oid_candidate(oid_registry)?;
         Ok(id)
     }
 
@@ -2479,6 +3127,10 @@ impl Catalog {
         schema_name: &Identifier,
         sequence: NewSequence,
     ) -> Result<SequenceId> {
+        ensure_writable_schema_name(schema_name)?;
+        if let Some((table_id, _)) = sequence.owner {
+            self.ensure_writable_table_id(table_id)?;
+        }
         let schema_id = {
             let schema = self.schema(schema_name).ok_or_else(|| {
                 DbError::new("3F000", format!("schema {schema_name} does not exist"))
@@ -2533,13 +3185,17 @@ impl Catalog {
         }
 
         let id = SequenceId::new(self.next_sequence_id);
+        let oid_registry = self.postgres_oid_candidate([PostgresOidObject::Sequence(id)])?;
+        let next_sequence_id = self
+            .next_sequence_id
+            .checked_add(1)
+            .ok_or_else(|| DbError::new("54000", "catalog sequence ID space is exhausted"))?;
         let object = CatalogObjectRef::Sequence(id);
         let mut dependencies = self.dependencies.clone();
         if let Some((table_id, column_id)) = sequence.owner {
             dependencies.add(object, CatalogObjectRef::Table(table_id))?;
             dependencies.add(object, CatalogObjectRef::Column(table_id, column_id))?;
         }
-        self.next_sequence_id = self.next_sequence_id.saturating_add(1);
         self.schema_by_id_mut(schema_id)?.sequences.insert(
             sequence.name.clone(),
             SequenceDefinition {
@@ -2557,11 +3213,17 @@ impl Catalog {
                 owner: sequence.owner,
             },
         );
+        self.next_sequence_id = next_sequence_id;
         self.dependencies = dependencies;
+        self.publish_postgres_oid_candidate(oid_registry)?;
         Ok(id)
     }
 
     pub fn create_view(&mut self, schema_name: &Identifier, view: NewView) -> Result<ViewId> {
+        ensure_writable_schema_name(schema_name)?;
+        if let Some(table_id) = view.materialized_table_id {
+            self.ensure_writable_table_id(table_id)?;
+        }
         let NewView {
             name,
             kind,
@@ -2590,6 +3252,11 @@ impl Catalog {
             ));
         }
         let id = ViewId::new(self.next_view_id);
+        let oid_registry = self.postgres_oid_candidate([PostgresOidObject::View(id)])?;
+        let next_view_id = self
+            .next_view_id
+            .checked_add(1)
+            .ok_or_else(|| DbError::new("54000", "catalog view ID space is exhausted"))?;
         let object = CatalogObjectRef::View(id);
         let mut dependencies = self.dependencies.clone();
         for referenced in references {
@@ -2598,7 +3265,6 @@ impl Catalog {
         if let Some(table_id) = materialized_table_id {
             dependencies.add(object, CatalogObjectRef::Table(table_id))?;
         }
-        self.next_view_id = self.next_view_id.saturating_add(1);
         self.schema_by_id_mut(schema_id)?.views.insert(
             name.clone(),
             ViewDefinition {
@@ -2612,7 +3278,9 @@ impl Catalog {
                 populated,
             },
         );
+        self.next_view_id = next_view_id;
         self.dependencies = dependencies;
+        self.publish_postgres_oid_candidate(oid_registry)?;
         Ok(id)
     }
 
@@ -2621,6 +3289,7 @@ impl Catalog {
         schema_name: &Identifier,
         routine: NewRoutine,
     ) -> Result<RoutineId> {
+        ensure_writable_schema_name(schema_name)?;
         let NewRoutine {
             name,
             kind,
@@ -2650,6 +3319,19 @@ impl Catalog {
         let (id, old_object) = existing_id
             .map(|routine_id| (routine_id, Some(CatalogObjectRef::Routine(routine_id))))
             .unwrap_or_else(|| (RoutineId::new(self.next_routine_id), None));
+        let oid_registry = if existing_id.is_none() {
+            Some(self.postgres_oid_candidate([PostgresOidObject::Routine(id)])?)
+        } else {
+            None
+        };
+        let next_routine_id =
+            if existing_id.is_none() {
+                Some(self.next_routine_id.checked_add(1).ok_or_else(|| {
+                    DbError::new("54000", "catalog routine ID space is exhausted")
+                })?)
+            } else {
+                None
+            };
         let object = CatalogObjectRef::Routine(id);
         let mut dependencies = self.dependencies.clone();
         if let Some(old_object) = old_object {
@@ -2657,9 +3339,6 @@ impl Catalog {
         }
         for referenced in references {
             dependencies.add(object, referenced)?;
-        }
-        if existing_id.is_none() {
-            self.next_routine_id = self.next_routine_id.saturating_add(1);
         }
         let routines = self
             .schema_by_id_mut(schema_id)?
@@ -2688,7 +3367,15 @@ impl Catalog {
             body,
         });
         routines.sort_by_key(|routine| routine.id);
+        if let Some(next_routine_id) = next_routine_id {
+            self.next_routine_id = next_routine_id;
+        }
         self.dependencies = dependencies;
+        if let Some(oid_registry) = oid_registry {
+            self.publish_postgres_oid_candidate(oid_registry)?;
+        } else {
+            self.validate_postgres_oid_registry()?;
+        }
         Ok(id)
     }
 
@@ -2700,6 +3387,7 @@ impl Catalog {
         events: BTreeSet<TriggerEvent>,
         routine_id: RoutineId,
     ) -> Result<TriggerId> {
+        self.ensure_writable_table_id(table_id)?;
         if events.is_empty() {
             return Err(DbError::new(
                 "42601",
@@ -2719,11 +3407,15 @@ impl Catalog {
             return Err(DbError::new("42883", "trigger routine does not exist"));
         }
         let id = TriggerId::new(self.next_trigger_id);
+        let oid_registry = self.postgres_oid_candidate([PostgresOidObject::Trigger(id)])?;
+        let next_trigger_id = self
+            .next_trigger_id
+            .checked_add(1)
+            .ok_or_else(|| DbError::new("54000", "catalog trigger ID space is exhausted"))?;
         let object = CatalogObjectRef::Trigger(id);
         let mut dependencies = self.dependencies.clone();
         dependencies.add(object, CatalogObjectRef::Table(table_id))?;
         dependencies.add(object, CatalogObjectRef::Routine(routine_id))?;
-        self.next_trigger_id = self.next_trigger_id.saturating_add(1);
         self.table_by_id_mut(table_id)?.triggers.insert(
             name.clone(),
             TriggerDefinition {
@@ -2736,7 +3428,9 @@ impl Catalog {
                 enabled: true,
             },
         );
+        self.next_trigger_id = next_trigger_id;
         self.dependencies = dependencies;
+        self.publish_postgres_oid_candidate(oid_registry)?;
         Ok(id)
     }
 
@@ -2769,6 +3463,9 @@ impl Catalog {
         sequence_id: SequenceId,
         alteration: SequenceAlteration,
     ) -> Result<()> {
+        if let Some(Some((table_id, _))) = alteration.owner {
+            self.ensure_writable_table_id(table_id)?;
+        }
         let SequenceAlteration {
             increment,
             min_value,
@@ -3078,6 +3775,7 @@ impl Catalog {
         table_id: TableId,
         statistics: TableStatistics,
     ) -> Result<()> {
+        self.ensure_writable_table_id(table_id)?;
         let table = self.table_by_id_mut(table_id)?;
         if statistics
             .columns
@@ -3093,6 +3791,7 @@ impl Catalog {
     }
 
     pub fn table_by_id_mut(&mut self, table_id: TableId) -> Result<&mut TableDefinition> {
+        self.ensure_writable_table_id(table_id)?;
         self.database
             .schemas
             .values_mut()
@@ -3102,6 +3801,7 @@ impl Catalog {
     }
 
     fn schema_by_id_mut(&mut self, schema_id: SchemaId) -> Result<&mut SchemaDefinition> {
+        self.ensure_writable_schema_id(schema_id)?;
         self.database
             .schemas
             .values_mut()
@@ -3149,10 +3849,18 @@ impl Catalog {
         root: CatalogObjectRef,
         behavior: DropBehavior,
     ) -> Result<Vec<CatalogObjectRef>> {
+        match root {
+            CatalogObjectRef::Schema(schema_id) => self.ensure_writable_schema_id(schema_id)?,
+            CatalogObjectRef::Table(table_id) | CatalogObjectRef::Column(table_id, _) => {
+                self.ensure_writable_table_id(table_id)?;
+            }
+            _ => {}
+        }
         let order = self.dependencies.drop_order(root, behavior)?;
         for object in &order {
             self.remove_catalog_object(*object)?;
         }
+        self.validate_postgres_oid_registry()?;
         Ok(order)
     }
 
@@ -3195,9 +3903,33 @@ impl Catalog {
                 for owned in owned {
                     self.dependencies.remove(owned);
                     self.ownership.remove(owned);
+                    self.postgres_oid_registry.remove(owned.into());
                 }
             }
             CatalogObjectRef::Column(table_id, column_id) => {
+                let (removed_indexes, removed_constraints) = {
+                    let table = self.table_by_id(table_id).ok_or_else(|| {
+                        DbError::new("42P01", "column owner table does not exist")
+                    })?;
+                    (
+                        table
+                            .indexes()
+                            .filter(|index| {
+                                index.key_columns.contains(&column_id)
+                                    || index.include_columns.contains(&column_id)
+                            })
+                            .map(|index| index.id)
+                            .collect::<Vec<_>>(),
+                        table
+                            .constraints()
+                            .filter(|constraint| {
+                                constraint_columns(&constraint.kind)
+                                    .any(|candidate| candidate == column_id)
+                            })
+                            .map(|constraint| constraint.id)
+                            .collect::<Vec<_>>(),
+                    )
+                };
                 let table = self.table_by_id_mut(table_id)?;
                 table.columns.retain(|column| column.id != column_id);
                 table.indexes.retain(|_, index| {
@@ -3207,6 +3939,14 @@ impl Catalog {
                 table.constraints.retain(|_, constraint| {
                     !constraint_columns(&constraint.kind).any(|candidate| candidate == column_id)
                 });
+                for index_id in removed_indexes {
+                    self.postgres_oid_registry
+                        .remove(PostgresOidObject::Index(index_id));
+                }
+                for constraint_id in removed_constraints {
+                    self.postgres_oid_registry
+                        .remove(PostgresOidObject::Constraint(constraint_id));
+                }
             }
             CatalogObjectRef::Index(index_id) => {
                 for schema in self.database.schemas.values_mut() {
@@ -3235,6 +3975,8 @@ impl Catalog {
                         for (name, index_id) in owned_indexes {
                             table.indexes.remove(&name);
                             self.ownership.remove(CatalogObjectRef::Index(index_id));
+                            self.postgres_oid_registry
+                                .remove(PostgresOidObject::Index(index_id));
                         }
                     }
                 }
@@ -3267,15 +4009,32 @@ impl Catalog {
                 }
             }
             CatalogObjectRef::Type(type_id) => {
+                let constraints = self
+                    .type_by_id(type_id)
+                    .and_then(|definition| match &definition.definition {
+                        UserDefinedTypeKind::Domain { checks, .. } => Some(
+                            checks
+                                .iter()
+                                .filter_map(|constraint| constraint.id)
+                                .collect::<Vec<_>>(),
+                        ),
+                        UserDefinedTypeKind::Enum { .. } => None,
+                    })
+                    .unwrap_or_default();
                 for schema in self.database.schemas.values_mut() {
                     schema
                         .types
                         .retain(|_, definition| definition.id != type_id);
                 }
+                for constraint_id in constraints {
+                    self.postgres_oid_registry
+                        .remove(PostgresOidObject::Constraint(constraint_id));
+                }
             }
         }
         self.dependencies.remove(object);
         self.ownership.remove(object);
+        self.postgres_oid_registry.remove(object.into());
         Ok(())
     }
 }
@@ -3360,18 +4119,173 @@ pub const fn text_search_type(data_type: &ScalarType) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
-    use ordadb_types::{Identifier, ScalarType, Schema, SchemaId, TableId};
+    use ordadb_types::{
+        ColumnId, ConstraintId, Identifier, IndexId, RoutineId, ScalarType, Schema, SchemaId,
+        SequenceId, TableId, TriggerId, TypeId, ViewId,
+    };
 
     use super::{
         Catalog, CatalogExpression, CatalogObjectRef, CatalogOwner, ConstraintKind,
         DependencyGraph, DomainBaseType, DomainConstraint, DropBehavior, EnumValuePosition,
         FullTextAnalyzer, IndexDefinition, IndexMethod, IndexOptions, NewColumn, NewConstraint,
-        NewConstraintKind, NewIndex, NewRoutine, NewSequence, NewView, ReferentialAction,
-        RoutineArgument, RoutineKind, TriggerEvent, TriggerTiming, UserDefinedTypeKind,
-        VectorDistanceMetric, ViewKind,
+        NewConstraintKind, NewIndex, NewRoutine, NewSequence, NewView, PG_AM_TABLE_ID,
+        PG_CATALOG_SCHEMA_ID, PG_COLLATION_TABLE_ID, PG_DESCRIPTION_TABLE_ID,
+        PG_NAMESPACE_TABLE_ID, POSTGRES_OID_EXHAUSTED, POSTGRES_OID_FIRST_USER,
+        POSTGRES_OID_LAST_BUILTIN, PostgresOid, PostgresOidObject, ReferentialAction,
+        RoutineArgument, RoutineKind, SchemaDefinition, TableDefinition, TableStatistics,
+        TriggerEvent, TriggerTiming, UserDefinedTypeKind, VectorDistanceMetric, ViewKind,
+        system_relation, system_relations,
     };
+
+    struct OidFixture {
+        catalog: Catalog,
+        schema_id: SchemaId,
+        table_id: TableId,
+        column_id: ColumnId,
+        index_id: IndexId,
+        constraint_id: ConstraintId,
+        sequence_id: SequenceId,
+        view_id: ViewId,
+        materialized_view_id: ViewId,
+        routine_id: RoutineId,
+        trigger_id: TriggerId,
+        type_id: TypeId,
+    }
+
+    fn oid_fixture() -> OidFixture {
+        let mut catalog = Catalog::default();
+        let schema_id = catalog
+            .create_schema(Identifier::unquoted("app"))
+            .expect("schema");
+        let type_id = catalog
+            .create_enum_type(
+                &Identifier::unquoted("app"),
+                Identifier::unquoted("status"),
+                vec!["ready".into(), "done".into()],
+            )
+            .expect("type");
+        let table_id = catalog
+            .create_table(
+                &Identifier::unquoted("app"),
+                Identifier::unquoted("items"),
+                vec![
+                    NewColumn::new(Identifier::unquoted("id"), ScalarType::Int64),
+                    NewColumn::new(Identifier::unquoted("label"), ScalarType::Text),
+                ],
+            )
+            .expect("table");
+        let column_id = catalog.table_by_id(table_id).expect("table").columns()[1].id;
+        let index_id = catalog
+            .create_index(
+                table_id,
+                NewIndex {
+                    name: Identifier::unquoted("items_label_idx"),
+                    key_columns: vec![Identifier::unquoted("label")],
+                    include_columns: Vec::new(),
+                    unique: false,
+                    method: IndexMethod::BTree,
+                    options: IndexOptions::BTree,
+                },
+            )
+            .expect("index");
+        let constraint_id = catalog
+            .create_constraint(
+                table_id,
+                NewConstraint {
+                    name: Identifier::unquoted("items_id_positive"),
+                    kind: NewConstraintKind::Check {
+                        expression: CatalogExpression::new("id > 0"),
+                    },
+                },
+            )
+            .expect("constraint");
+        let sequence_id = catalog
+            .create_sequence(
+                &Identifier::unquoted("app"),
+                NewSequence::new(Identifier::unquoted("items_id_seq")),
+            )
+            .expect("sequence");
+        let view_id = catalog
+            .create_view(
+                &Identifier::unquoted("app"),
+                NewView {
+                    name: Identifier::unquoted("item_view"),
+                    kind: ViewKind::Regular,
+                    query: "SELECT id, label FROM items".into(),
+                    output: Schema::empty(),
+                    materialized_table_id: None,
+                    populated: true,
+                    references: vec![CatalogObjectRef::Table(table_id)],
+                },
+            )
+            .expect("view");
+        let backing_table_id = catalog
+            .create_table(
+                &Identifier::unquoted("app"),
+                Identifier::unquoted("item_rollup_storage"),
+                vec![NewColumn::new(
+                    Identifier::unquoted("count"),
+                    ScalarType::Int64,
+                )],
+            )
+            .expect("materialized backing table");
+        let materialized_view_id = catalog
+            .create_view(
+                &Identifier::unquoted("app"),
+                NewView {
+                    name: Identifier::unquoted("item_rollup"),
+                    kind: ViewKind::Materialized,
+                    query: "SELECT count(*) FROM items".into(),
+                    output: Schema::empty(),
+                    materialized_table_id: Some(backing_table_id),
+                    populated: true,
+                    references: vec![CatalogObjectRef::Table(table_id)],
+                },
+            )
+            .expect("materialized view");
+        let routine_id = catalog
+            .create_or_replace_routine(
+                &Identifier::unquoted("app"),
+                NewRoutine {
+                    name: Identifier::unquoted("touch_item"),
+                    kind: RoutineKind::Function,
+                    arguments: Vec::new(),
+                    return_type: None,
+                    return_declared_type: None,
+                    returns_set: false,
+                    language: "plpgsql".into(),
+                    body: "BEGIN RETURN; END".into(),
+                    replace: false,
+                    references: vec![CatalogObjectRef::View(view_id)],
+                },
+            )
+            .expect("routine");
+        let trigger_id = catalog
+            .create_trigger(
+                table_id,
+                Identifier::unquoted("items_touch"),
+                TriggerTiming::Before,
+                BTreeSet::from([TriggerEvent::Insert]),
+                routine_id,
+            )
+            .expect("trigger");
+        OidFixture {
+            catalog,
+            schema_id,
+            table_id,
+            column_id,
+            index_id,
+            constraint_id,
+            sequence_id,
+            view_id,
+            materialized_view_id,
+            routine_id,
+            trigger_id,
+            type_id,
+        }
+    }
 
     #[test]
     fn bootstraps_public_schema_with_deterministic_ids() {
@@ -3383,6 +4297,30 @@ mod tests {
                 .expect("public schema")
                 .id,
             SchemaId::new(1)
+        );
+        assert_eq!(POSTGRES_OID_LAST_BUILTIN, 16_383);
+        assert_eq!(
+            catalog
+                .postgres_oid(PostgresOidObject::Database(catalog.database().id))
+                .expect("database OID")
+                .get(),
+            POSTGRES_OID_FIRST_USER
+        );
+        assert_eq!(
+            catalog
+                .postgres_oid(PostgresOidObject::Schema(SchemaId::new(1)))
+                .expect("public schema OID")
+                .get(),
+            POSTGRES_OID_FIRST_USER + 1
+        );
+        assert!(
+            PostgresOid::new(POSTGRES_OID_LAST_BUILTIN)
+                .expect("built-in OID")
+                .is_builtin()
+        );
+        assert_eq!(
+            PostgresOid::new(0).expect_err("zero is invalid").sql_state,
+            "22023"
         );
     }
 
@@ -4127,5 +5065,535 @@ mod tests {
         let routine = decoded.routine_by_id(routine_id).expect("routine");
         assert_eq!(routine.arguments[0].declared_type, Some(enum_id));
         assert_eq!(routine.return_declared_type, Some(domain_id));
+    }
+
+    #[test]
+    fn assigns_unique_postgres_oids_to_every_catalog_object_kind() {
+        let fixture = oid_fixture();
+        let catalog = &fixture.catalog;
+        let objects = [
+            PostgresOidObject::Database(catalog.database().id),
+            PostgresOidObject::Schema(fixture.schema_id),
+            PostgresOidObject::Table(fixture.table_id),
+            PostgresOidObject::Column(fixture.table_id, fixture.column_id),
+            PostgresOidObject::Index(fixture.index_id),
+            PostgresOidObject::Constraint(fixture.constraint_id),
+            PostgresOidObject::Sequence(fixture.sequence_id),
+            PostgresOidObject::View(fixture.view_id),
+            PostgresOidObject::View(fixture.materialized_view_id),
+            PostgresOidObject::Routine(fixture.routine_id),
+            PostgresOidObject::Trigger(fixture.trigger_id),
+            PostgresOidObject::Type(fixture.type_id),
+        ];
+        let mut oids = BTreeSet::new();
+        for object in objects {
+            let oid = catalog.postgres_oid(object).expect("object OID");
+            assert!(oid.get() >= POSTGRES_OID_FIRST_USER);
+            assert!(oids.insert(oid));
+            assert_eq!(catalog.postgres_oid_object(oid), Some(object));
+        }
+        catalog
+            .validate_postgres_oid_registry()
+            .expect("valid registry");
+    }
+
+    #[test]
+    fn postgres_oids_survive_renames_replacements_and_alterations() {
+        let mut fixture = oid_fixture();
+        let before = fixture
+            .catalog
+            .postgres_oid_registry()
+            .mappings()
+            .collect::<BTreeMap<_, _>>();
+        fixture
+            .catalog
+            .rename_schema(fixture.schema_id, Identifier::unquoted("renamed"))
+            .expect("rename schema");
+        fixture
+            .catalog
+            .rename_table(fixture.table_id, Identifier::unquoted("renamed_items"))
+            .expect("rename table");
+        fixture
+            .catalog
+            .rename_column(
+                fixture.table_id,
+                fixture.column_id,
+                Identifier::unquoted("renamed_label"),
+            )
+            .expect("rename column");
+        fixture
+            .catalog
+            .rename_index(fixture.index_id, Identifier::unquoted("renamed_items_idx"))
+            .expect("rename index");
+        fixture
+            .catalog
+            .rename_sequence(
+                fixture.sequence_id,
+                Identifier::unquoted("renamed_items_seq"),
+            )
+            .expect("rename sequence");
+        fixture
+            .catalog
+            .rename_view(fixture.view_id, Identifier::unquoted("renamed_item_view"))
+            .expect("rename view");
+        fixture
+            .catalog
+            .replace_view(
+                fixture.view_id,
+                "SELECT id FROM renamed_items".into(),
+                Schema::empty(),
+                true,
+                [CatalogObjectRef::Table(fixture.table_id)],
+            )
+            .expect("replace view");
+        let replaced_routine = fixture
+            .catalog
+            .create_or_replace_routine(
+                &Identifier::unquoted("renamed"),
+                NewRoutine {
+                    name: Identifier::unquoted("touch_item"),
+                    kind: RoutineKind::Function,
+                    arguments: Vec::new(),
+                    return_type: None,
+                    return_declared_type: None,
+                    returns_set: false,
+                    language: "plpgsql".into(),
+                    body: "BEGIN NULL; RETURN; END".into(),
+                    replace: true,
+                    references: vec![CatalogObjectRef::View(fixture.view_id)],
+                },
+            )
+            .expect("replace routine");
+        assert_eq!(replaced_routine, fixture.routine_id);
+        fixture
+            .catalog
+            .set_trigger_enabled(fixture.trigger_id, false)
+            .expect("alter trigger");
+        assert!(
+            fixture
+                .catalog
+                .alter_enum_add_value(fixture.type_id, "archived".into(), None, false)
+                .expect("alter type")
+        );
+        assert_eq!(
+            fixture
+                .catalog
+                .postgres_oid_registry()
+                .mappings()
+                .collect::<BTreeMap<_, _>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn dropped_postgres_oids_are_removed_and_never_reused_after_reopen() {
+        let mut catalog = Catalog::default();
+        let table_id = catalog
+            .create_table(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("old_items"),
+                vec![NewColumn::new(
+                    Identifier::unquoted("id"),
+                    ScalarType::Int64,
+                )],
+            )
+            .expect("old table");
+        let old_object = PostgresOidObject::Table(table_id);
+        let old_oid = catalog.postgres_oid(old_object).expect("old OID");
+        catalog
+            .drop_table(table_id, DropBehavior::Restrict)
+            .expect("drop old table");
+        assert!(catalog.postgres_oid_registry().oid(old_object).is_none());
+        assert_eq!(
+            catalog
+                .postgres_oid(old_object)
+                .expect_err("dropped object has no live OID")
+                .sql_state,
+            "22023"
+        );
+
+        let encoded = serde_json::to_vec(&catalog).expect("serialize dropped registry");
+        let mut reopened: Catalog = serde_json::from_slice(&encoded).expect("reopen catalog");
+        let new_table_id = reopened
+            .create_table(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("new_items"),
+                vec![NewColumn::new(
+                    Identifier::unquoted("id"),
+                    ScalarType::Int64,
+                )],
+            )
+            .expect("new table");
+        let new_oid = reopened
+            .postgres_oid(PostgresOidObject::Table(new_table_id))
+            .expect("new OID");
+        assert!(new_oid.get() > old_oid.get());
+    }
+
+    #[test]
+    fn legacy_catalog_reconstructs_deterministic_stable_postgres_oids() {
+        let fixture = oid_fixture();
+        let mut legacy = serde_json::to_value(&fixture.catalog).expect("serialize legacy source");
+        legacy
+            .as_object_mut()
+            .expect("catalog object")
+            .remove("postgres_oid_registry");
+        let first: Catalog = serde_json::from_value(legacy.clone()).expect("first legacy reopen");
+        let second: Catalog = serde_json::from_value(legacy).expect("second legacy reopen");
+        assert_eq!(
+            first
+                .postgres_oid_registry()
+                .mappings()
+                .collect::<BTreeMap<_, _>>(),
+            second
+                .postgres_oid_registry()
+                .mappings()
+                .collect::<BTreeMap<_, _>>()
+        );
+
+        let first_encoding = serde_json::to_vec(&first).expect("serialize reconstructed registry");
+        let reopened: Catalog =
+            serde_json::from_slice(&first_encoding).expect("reopen reconstructed registry");
+        let second_encoding = serde_json::to_vec(&reopened).expect("reserialize registry");
+        assert_eq!(first_encoding, second_encoding);
+        assert_eq!(first, reopened);
+    }
+
+    #[test]
+    fn rejects_duplicate_and_corrupt_postgres_oid_mappings() {
+        let fixture = oid_fixture();
+        let mut duplicate = serde_json::to_value(&fixture.catalog).expect("serialize registry");
+        let mappings = duplicate
+            .get_mut("postgres_oid_registry")
+            .and_then(|registry| registry.get_mut("mappings"))
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("registry mappings");
+        let duplicate_oid = mappings[0].get("oid").cloned().expect("first OID");
+        mappings[1]
+            .as_object_mut()
+            .expect("mapping")
+            .insert("oid".into(), duplicate_oid);
+        let error = serde_json::from_value::<Catalog>(duplicate).expect_err("duplicate OID");
+        assert!(error.to_string().contains("XX001"));
+
+        let mut corrupt = serde_json::to_value(&fixture.catalog).expect("serialize registry");
+        corrupt
+            .get_mut("postgres_oid_registry")
+            .and_then(|registry| registry.get_mut("mappings"))
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("registry mappings")
+            .pop();
+        let error = serde_json::from_value::<Catalog>(corrupt).expect_err("missing mapping");
+        assert!(error.to_string().contains("XX001"));
+    }
+
+    #[test]
+    fn postgres_oid_exhaustion_is_atomic_and_explicit() {
+        let mut catalog = Catalog::default();
+        catalog.postgres_oid_registry.next_oid = POSTGRES_OID_EXHAUSTED;
+        catalog
+            .validate_postgres_oid_registry()
+            .expect("exhausted cursor is durable");
+        let before = catalog.clone();
+        let error = catalog
+            .create_schema(Identifier::unquoted("exhausted"))
+            .expect_err("OID exhaustion");
+        assert_eq!(error.sql_state, "54000");
+        assert_eq!(catalog, before);
+    }
+
+    #[test]
+    fn cloned_catalog_candidates_do_not_publish_rolled_back_oids() {
+        let committed = Catalog::default();
+        let mut rolled_back = committed.clone();
+        let rolled_back_schema = rolled_back
+            .create_schema(Identifier::unquoted("candidate"))
+            .expect("candidate schema");
+        let rolled_back_oid = rolled_back
+            .postgres_oid(PostgresOidObject::Schema(rolled_back_schema))
+            .expect("candidate OID");
+        assert_eq!(
+            committed
+                .postgres_oid(PostgresOidObject::Schema(rolled_back_schema))
+                .expect_err("unpublished candidate")
+                .sql_state,
+            "22023"
+        );
+        drop(rolled_back);
+
+        let mut retried = committed.clone();
+        let retried_schema = retried
+            .create_schema(Identifier::unquoted("candidate"))
+            .expect("retried schema");
+        assert_eq!(retried_schema, rolled_back_schema);
+        assert_eq!(
+            retried
+                .postgres_oid(PostgresOidObject::Schema(retried_schema))
+                .expect("retried OID"),
+            rolled_back_oid
+        );
+    }
+
+    #[test]
+    fn system_relation_descriptors_are_unique_stable_and_lookupable() {
+        let catalog = Catalog::default();
+        let relations = system_relations();
+        assert_eq!(relations.len(), 27);
+
+        let mut table_ids = BTreeSet::new();
+        let mut relation_oids = BTreeSet::new();
+        let mut qualified_names = BTreeSet::new();
+        let mut column_ids = BTreeSet::new();
+        for relation in relations {
+            assert!(table_ids.insert(relation.table_id));
+            assert!(relation_oids.insert(relation.oid));
+            assert!(relation.oid.is_builtin());
+            assert!(qualified_names.insert((relation.schema, relation.name)));
+            assert!(Catalog::is_system_schema(&Identifier::unquoted(
+                relation.schema
+            )));
+            assert!(Catalog::is_system_table(relation.table_id));
+            assert_eq!(system_relation(relation.table_id), Some(relation));
+
+            let table = catalog
+                .table(
+                    &Identifier::unquoted(relation.schema),
+                    &Identifier::unquoted(relation.name),
+                )
+                .expect("system relation by name");
+            assert_eq!(catalog.table_by_id(relation.table_id), Some(table));
+            assert_eq!(table.schema_id, relation.schema_id);
+            assert_eq!(table.columns().len(), relation.columns.len());
+            for (column, descriptor) in table.columns().iter().zip(relation.columns) {
+                assert!(column_ids.insert(column.id));
+                assert_eq!(column.id, descriptor.id);
+                assert_eq!(column.name.as_str(), descriptor.name);
+                assert_eq!(column.data_type, descriptor.data_type);
+                assert_eq!(column.nullable, descriptor.nullable);
+            }
+        }
+
+        let namespace = system_relation(PG_NAMESPACE_TABLE_ID).expect("pg_namespace");
+        assert_eq!(namespace.schema, "pg_catalog");
+        assert_eq!(namespace.name, "pg_namespace");
+        assert_eq!(namespace.oid.get(), 2_615);
+        assert_eq!(
+            system_relation(PG_AM_TABLE_ID).expect("pg_am").oid.get(),
+            2_601
+        );
+        assert_eq!(
+            system_relation(PG_COLLATION_TABLE_ID)
+                .expect("pg_collation")
+                .oid
+                .get(),
+            3_456
+        );
+        assert_eq!(
+            system_relation(PG_DESCRIPTION_TABLE_ID)
+                .expect("pg_description")
+                .oid
+                .get(),
+            2_609
+        );
+        assert_eq!(
+            namespace
+                .columns
+                .iter()
+                .map(|column| (column.name, &column.data_type, column.nullable))
+                .collect::<Vec<_>>(),
+            vec![
+                ("oid", &ScalarType::Oid, false),
+                ("nspname", &ScalarType::Name, false),
+                ("nspowner", &ScalarType::Oid, false),
+            ]
+        );
+        assert_eq!(
+            catalog
+                .schema(&Identifier::quoted("pg_catalog"))
+                .expect("quoted system schema")
+                .id,
+            PG_CATALOG_SCHEMA_ID
+        );
+        assert!(
+            catalog
+                .schema(&Identifier::quoted("pg_catalog"))
+                .expect("quoted system schema")
+                .table(&Identifier::quoted("pg_namespace"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn system_relations_are_not_serialized_or_registered_as_user_objects() {
+        let catalog = Catalog::default();
+        let encoded = serde_json::to_string(&catalog).expect("serialize catalog");
+        assert!(!encoded.contains("pg_catalog"));
+        assert!(!encoded.contains("information_schema"));
+        for relation in system_relations() {
+            assert!(
+                !catalog
+                    .object_refs()
+                    .contains(&CatalogObjectRef::Table(relation.table_id))
+            );
+            assert!(
+                catalog
+                    .postgres_oid_registry()
+                    .oid(PostgresOidObject::Table(relation.table_id))
+                    .is_none()
+            );
+        }
+
+        let reopened: Catalog = serde_json::from_str(&encoded).expect("reopen catalog");
+        assert_eq!(reopened, catalog);
+        assert!(reopened.table_by_id(PG_NAMESPACE_TABLE_ID).is_some());
+    }
+
+    #[test]
+    fn system_catalog_mutations_fail_atomically_with_insufficient_privilege() {
+        fn assert_read_only<T: std::fmt::Debug>(result: ordadb_types::Result<T>) {
+            let error = result.expect_err("system catalog mutation must fail");
+            assert_eq!(error.sql_state, "42501");
+        }
+
+        let mut catalog = Catalog::default();
+        let before = catalog.clone();
+        let schema = Identifier::unquoted("pg_catalog");
+        let table_id = PG_NAMESPACE_TABLE_ID;
+        let column_id = system_relation(table_id).expect("pg_namespace").columns[0].id;
+
+        assert_read_only(catalog.create_schema(schema.clone()));
+        assert_read_only(catalog.create_schema(Identifier::quoted("pg_catalog")));
+        assert_read_only(catalog.rename_schema(
+            PG_CATALOG_SCHEMA_ID,
+            Identifier::unquoted("renamed_catalog"),
+        ));
+        assert_read_only(catalog.drop_schema(PG_CATALOG_SCHEMA_ID, DropBehavior::Cascade));
+        assert_read_only(catalog.create_table(
+            &schema,
+            Identifier::unquoted("blocked"),
+            vec![NewColumn::new(
+                Identifier::unquoted("id"),
+                ScalarType::Int64,
+            )],
+        ));
+        assert_read_only(catalog.rename_table(table_id, Identifier::unquoted("blocked")));
+        assert_read_only(catalog.drop_table(table_id, DropBehavior::Cascade));
+        assert_read_only(catalog.rename_column(
+            table_id,
+            column_id,
+            Identifier::unquoted("blocked"),
+        ));
+        assert_read_only(catalog.add_column(
+            table_id,
+            NewColumn::new(Identifier::unquoted("blocked"), ScalarType::Text),
+        ));
+        assert_read_only(catalog.alter_column(
+            table_id,
+            column_id,
+            Some(ScalarType::Text),
+            None,
+            None,
+            None,
+        ));
+        assert_read_only(catalog.drop_column(table_id, column_id, DropBehavior::Cascade));
+        assert_read_only(catalog.create_index(
+            table_id,
+            NewIndex {
+                name: Identifier::unquoted("blocked_idx"),
+                key_columns: vec![Identifier::unquoted("oid")],
+                include_columns: Vec::new(),
+                unique: false,
+                method: IndexMethod::BTree,
+                options: IndexOptions::BTree,
+            },
+        ));
+        assert_read_only(catalog.create_constraint(
+            table_id,
+            NewConstraint {
+                name: Identifier::unquoted("blocked_check"),
+                kind: NewConstraintKind::Check {
+                    expression: CatalogExpression::new("true"),
+                },
+            },
+        ));
+        assert_read_only(catalog.create_sequence(
+            &schema,
+            NewSequence::new(Identifier::unquoted("blocked_seq")),
+        ));
+        assert_read_only(catalog.create_view(
+            &schema,
+            NewView {
+                name: Identifier::unquoted("blocked_view"),
+                kind: ViewKind::Regular,
+                query: "SELECT 1".into(),
+                output: Schema::empty(),
+                materialized_table_id: None,
+                populated: true,
+                references: Vec::new(),
+            },
+        ));
+        assert_read_only(catalog.create_or_replace_routine(
+            &schema,
+            NewRoutine {
+                name: Identifier::unquoted("blocked_routine"),
+                kind: RoutineKind::Function,
+                arguments: Vec::new(),
+                return_type: None,
+                return_declared_type: None,
+                returns_set: false,
+                language: "plpgsql".into(),
+                body: "BEGIN RETURN; END".into(),
+                replace: false,
+                references: Vec::new(),
+            },
+        ));
+        assert_read_only(catalog.create_trigger(
+            table_id,
+            Identifier::unquoted("blocked_trigger"),
+            TriggerTiming::Before,
+            BTreeSet::new(),
+            RoutineId::new(999),
+        ));
+        assert_read_only(catalog.set_table_statistics(table_id, TableStatistics::default()));
+        assert_read_only(catalog.table_by_id_mut(table_id));
+
+        assert_eq!(catalog, before);
+    }
+
+    #[test]
+    fn legacy_serialized_system_names_remain_read_only_by_id() {
+        let mut catalog = Catalog::default();
+        let schema_id = SchemaId::new(99);
+        let table_id = TableId::new(99);
+        let mut table =
+            TableDefinition::expression_scope(Identifier::unquoted("oid"), ScalarType::Int64);
+        table.id = table_id;
+        table.schema_id = schema_id;
+        table.name = Identifier::unquoted("legacy_relation");
+        let schema_name = Identifier::unquoted("pg_catalog");
+        catalog.database.schemas.insert(
+            schema_name.clone(),
+            SchemaDefinition {
+                id: schema_id,
+                database_id: catalog.database.id,
+                name: schema_name,
+                tables: BTreeMap::from([(table.name.clone(), table)]),
+                sequences: BTreeMap::new(),
+                views: BTreeMap::new(),
+                routines: BTreeMap::new(),
+                types: BTreeMap::new(),
+            },
+        );
+        let before = catalog.clone();
+
+        let schema_error = catalog
+            .rename_schema(schema_id, Identifier::unquoted("renamed"))
+            .expect_err("legacy system schema rename");
+        assert_eq!(schema_error.sql_state, "42501");
+        let table_error = catalog
+            .rename_table(table_id, Identifier::unquoted("renamed"))
+            .expect_err("legacy system table rename");
+        assert_eq!(table_error.sql_state, "42501");
+        assert_eq!(catalog, before);
     }
 }

@@ -1,10 +1,14 @@
-use std::io::{Read, Write};
+use std::{
+    collections::BTreeSet,
+    io::{Read, Write},
+};
 
-use ordadb_types::{DbError, Result};
+use ordadb_types::{DbError, DbNotice, Result};
 
 pub const PROTOCOL_VERSION_3: u32 = 196_608;
 pub const SSL_REQUEST_CODE: u32 = 80_877_103;
 pub const CANCEL_REQUEST_CODE: u32 = 80_877_102;
+pub const GSSENC_REQUEST_CODE: u32 = 80_877_104;
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_NAME_BYTES: usize = 1024;
 pub const DEFAULT_MAX_PARAMETERS: usize = 32_767;
@@ -13,6 +17,7 @@ pub const DEFAULT_MAX_PARAMETERS: usize = 32_767;
 pub enum StartupPacket {
     Startup(Vec<(String, String)>),
     SslRequest,
+    GssEncRequest,
     CancelRequest { process_id: u32, secret_key: u32 },
 }
 
@@ -67,6 +72,10 @@ pub fn read_startup<R: Read>(reader: &mut R, max_frame_bytes: usize) -> Result<S
             cursor.finish("SSL request")?;
             Ok(StartupPacket::SslRequest)
         }
+        GSSENC_REQUEST_CODE => {
+            cursor.finish("GSS encryption request")?;
+            Ok(StartupPacket::GssEncRequest)
+        }
         CANCEL_REQUEST_CODE => {
             let process_id = cursor.u32("cancel process ID")?;
             let secret_key = cursor.u32("cancel secret key")?;
@@ -78,10 +87,13 @@ pub fn read_startup<R: Read>(reader: &mut R, max_frame_bytes: usize) -> Result<S
         }
         PROTOCOL_VERSION_3 => {
             let mut parameters = Vec::new();
+            let mut names = BTreeSet::new();
+            let mut terminated = false;
             while !cursor.remaining().is_empty() {
                 if cursor.remaining()[0] == 0 {
                     cursor.byte("startup terminator")?;
                     cursor.finish("startup packet")?;
+                    terminated = true;
                     break;
                 }
                 if parameters.len() >= 64 {
@@ -89,7 +101,15 @@ pub fn read_startup<R: Read>(reader: &mut R, max_frame_bytes: usize) -> Result<S
                 }
                 let key = cursor.cstring("startup parameter name", DEFAULT_MAX_NAME_BYTES)?;
                 let value = cursor.cstring("startup parameter value", DEFAULT_MAX_NAME_BYTES)?;
+                if !names.insert(key.clone()) {
+                    return Err(protocol(format!(
+                        "startup parameter {key} is specified more than once"
+                    )));
+                }
                 parameters.push((key, value));
+            }
+            if !terminated {
+                return Err(protocol("startup packet has no terminating NUL byte"));
             }
             Ok(StartupPacket::Startup(parameters))
         }
@@ -268,6 +288,32 @@ pub fn write_error<W: Write>(writer: &mut W, error: &DbError) -> Result<()> {
     if let Some(position) = error.position {
         push_error_field(&mut payload, b'P', &position.to_string())?;
     }
+    let identity = error.object_identity.as_deref();
+    push_optional_error_field(
+        &mut payload,
+        b's',
+        identity.and_then(|identity| identity.schema_name.as_deref()),
+    )?;
+    push_optional_error_field(
+        &mut payload,
+        b't',
+        identity.and_then(|identity| identity.table_name.as_deref()),
+    )?;
+    push_optional_error_field(
+        &mut payload,
+        b'c',
+        identity.and_then(|identity| identity.column_name.as_deref()),
+    )?;
+    push_optional_error_field(
+        &mut payload,
+        b'd',
+        identity.and_then(|identity| identity.data_type_name.as_deref()),
+    )?;
+    push_optional_error_field(
+        &mut payload,
+        b'n',
+        identity.and_then(|identity| identity.constraint_name.as_deref()),
+    )?;
     push_error_field(
         &mut payload,
         b'W',
@@ -277,11 +323,43 @@ pub fn write_error<W: Write>(writer: &mut W, error: &DbError) -> Result<()> {
     write_message(writer, b'E', &payload)
 }
 
-pub fn write_notice<W: Write>(writer: &mut W, sql_state: &str, message: &str) -> Result<()> {
+pub fn write_notice<W: Write>(writer: &mut W, notice: &DbNotice) -> Result<()> {
     let mut payload = Vec::new();
     push_error_field(&mut payload, b'S', "NOTICE")?;
-    push_error_field(&mut payload, b'C', sql_state)?;
-    push_error_field(&mut payload, b'M', message)?;
+    push_error_field(&mut payload, b'V', "NOTICE")?;
+    push_error_field(&mut payload, b'C', &notice.sql_state)?;
+    push_error_field(&mut payload, b'M', &notice.message)?;
+    push_optional_error_field(&mut payload, b'D', notice.detail.as_deref())?;
+    push_optional_error_field(&mut payload, b'H', notice.hint.as_deref())?;
+    if let Some(position) = notice.position {
+        push_error_field(&mut payload, b'P', &position.to_string())?;
+    }
+    let identity = notice.object_identity.as_deref();
+    push_optional_error_field(
+        &mut payload,
+        b's',
+        identity.and_then(|identity| identity.schema_name.as_deref()),
+    )?;
+    push_optional_error_field(
+        &mut payload,
+        b't',
+        identity.and_then(|identity| identity.table_name.as_deref()),
+    )?;
+    push_optional_error_field(
+        &mut payload,
+        b'c',
+        identity.and_then(|identity| identity.column_name.as_deref()),
+    )?;
+    push_optional_error_field(
+        &mut payload,
+        b'd',
+        identity.and_then(|identity| identity.data_type_name.as_deref()),
+    )?;
+    push_optional_error_field(
+        &mut payload,
+        b'n',
+        identity.and_then(|identity| identity.constraint_name.as_deref()),
+    )?;
     payload.push(0);
     write_message(writer, b'N', &payload)
 }
@@ -338,6 +416,13 @@ pub fn push_cstring(target: &mut Vec<u8>, value: &str) -> Result<()> {
 fn push_error_field(target: &mut Vec<u8>, tag: u8, value: &str) -> Result<()> {
     target.push(tag);
     push_cstring(target, value)
+}
+
+fn push_optional_error_field(target: &mut Vec<u8>, tag: u8, value: Option<&str>) -> Result<()> {
+    if let Some(value) = value {
+        push_error_field(target, tag, value)?;
+    }
+    Ok(())
 }
 
 fn checked_frame_length(length: u32, max_frame_bytes: usize) -> Result<usize> {
@@ -489,6 +574,17 @@ mod tests {
         bytes
     }
 
+    fn startup(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(
+            &u32::try_from(payload.len() + 4)
+                .expect("length")
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
     #[test]
     fn startup_and_query_frames_are_bounded_and_exact() {
         let mut startup_payload = Vec::new();
@@ -529,5 +625,117 @@ mod tests {
                 .sql_state,
             "08P01"
         );
+    }
+
+    #[test]
+    fn startup_requires_termination_unique_names_and_bounded_frames() {
+        let mut missing_terminator = PROTOCOL_VERSION_3.to_be_bytes().to_vec();
+        missing_terminator.extend_from_slice(b"user\0dba\0");
+        assert_eq!(
+            read_startup(
+                &mut startup(&missing_terminator).as_slice(),
+                DEFAULT_MAX_FRAME_BYTES,
+            )
+            .expect_err("missing startup terminator")
+            .sql_state,
+            "08P01"
+        );
+
+        let mut duplicate = PROTOCOL_VERSION_3.to_be_bytes().to_vec();
+        duplicate.extend_from_slice(b"user\0dba\0user\0other\0\0");
+        assert_eq!(
+            read_startup(&mut startup(&duplicate).as_slice(), DEFAULT_MAX_FRAME_BYTES)
+                .expect_err("duplicate startup parameter")
+                .sql_state,
+            "08P01"
+        );
+
+        let oversized_length = u32::try_from(DEFAULT_MAX_FRAME_BYTES + 1)
+            .expect("bounded test length")
+            .to_be_bytes();
+        assert_eq!(
+            read_startup(&mut oversized_length.as_slice(), DEFAULT_MAX_FRAME_BYTES,)
+                .expect_err("oversized startup frame")
+                .sql_state,
+            "08P01"
+        );
+    }
+
+    #[test]
+    fn encryption_requests_are_exact_frames() {
+        assert_eq!(
+            read_startup(
+                &mut startup(&GSSENC_REQUEST_CODE.to_be_bytes()).as_slice(),
+                DEFAULT_MAX_FRAME_BYTES,
+            )
+            .expect("GSS encryption request"),
+            StartupPacket::GssEncRequest
+        );
+        let mut ssl_with_trailing = SSL_REQUEST_CODE.to_be_bytes().to_vec();
+        ssl_with_trailing.push(0);
+        assert_eq!(
+            read_startup(
+                &mut startup(&ssl_with_trailing).as_slice(),
+                DEFAULT_MAX_FRAME_BYTES,
+            )
+            .expect_err("SSLRequest trailing byte")
+            .sql_state,
+            "08P01"
+        );
+    }
+
+    #[test]
+    fn error_and_notice_responses_preserve_structured_fields() {
+        let error = DbError::new("23505", "duplicate key")
+            .with_detail("Key (id)=(1) already exists")
+            .with_hint("Choose another id")
+            .with_position(17)
+            .with_schema_name("public")
+            .with_table_name("items")
+            .with_column_name("id")
+            .with_data_type_name("int8")
+            .with_constraint_name("items_pkey");
+        let mut encoded = Vec::new();
+        write_error(&mut encoded, &error).expect("encode error");
+        assert_eq!(encoded[0], b'E');
+        let payload = &encoded[5..];
+        for field in [
+            b"C23505\0".as_slice(),
+            b"DKey (id)=(1) already exists\0".as_slice(),
+            b"HChoose another id\0".as_slice(),
+            b"P17\0".as_slice(),
+            b"spublic\0".as_slice(),
+            b"titems\0".as_slice(),
+            b"cid\0".as_slice(),
+            b"dint8\0".as_slice(),
+            b"nitems_pkey\0".as_slice(),
+        ] {
+            assert!(payload.windows(field.len()).any(|window| window == field));
+        }
+        assert_eq!(payload.last(), Some(&0));
+
+        let notice = DbNotice {
+            sql_state: "00000".into(),
+            message: "maintenance complete".into(),
+            detail: Some("one table".into()),
+            hint: None,
+            position: Some(3),
+            object_identity: Some(Box::new(ordadb_types::DbObjectIdentity {
+                schema_name: Some("public".into()),
+                table_name: Some("items".into()),
+                column_name: None,
+                data_type_name: None,
+                constraint_name: None,
+            })),
+        };
+        encoded.clear();
+        write_notice(&mut encoded, &notice).expect("encode notice");
+        assert_eq!(encoded[0], b'N');
+        assert!(
+            encoded[5..]
+                .windows(b"VNOTICE\0".len())
+                .any(|window| window == b"VNOTICE\0")
+        );
+        assert_eq!(encoded.last(), Some(&0));
     }
 }

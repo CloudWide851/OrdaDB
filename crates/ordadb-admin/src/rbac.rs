@@ -94,6 +94,19 @@ impl Authorizer {
         self.authorize(principal, action, &object)
     }
 
+    /// Return the bounded RBAC object scopes that make catalog objects
+    /// discoverable to this principal. Callers must still apply ownership and
+    /// public-visibility rules against their transactional catalog snapshot.
+    pub fn discovery_objects(&self, principal: &Principal) -> Result<BTreeSet<DbObject>> {
+        let effective = self.effective_roles(&principal.roles)?;
+        Ok(self
+            .grants
+            .iter()
+            .filter(|grant| effective.contains(&grant.role))
+            .map(|grant| grant.object.clone())
+            .collect())
+    }
+
     fn effective_roles(&self, roots: &BTreeSet<String>) -> Result<BTreeSet<String>> {
         let mut effective = BTreeSet::new();
         let mut stack: Vec<(String, usize)> = roots.iter().cloned().map(|role| (role, 0)).collect();

@@ -25,6 +25,7 @@ use ordadb_types::{DbError, Result};
 use crate::rbac::{Action, DbObject, Grant, Role};
 
 pub const AUTH_FORMAT_VERSION: u32 = 1;
+pub const POSTGRES_ROLE_OID_FIRST_USER: u32 = 16_384;
 const AUTH_FILE_NAME: &str = "ordadb.auth.json";
 const MAX_AUTH_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MIN_PASSWORD_BYTES: usize = 12;
@@ -143,6 +144,8 @@ struct AuthDocument {
     users: BTreeMap<String, UserRecord>,
     roles: BTreeMap<String, Role>,
     grants: Vec<Grant>,
+    #[serde(default = "missing_postgres_role_oid_registry")]
+    postgres_role_oids: PostgresRoleOidRegistry,
 }
 
 impl Default for AuthDocument {
@@ -152,8 +155,127 @@ impl Default for AuthDocument {
             users: BTreeMap::new(),
             roles: BTreeMap::new(),
             grants: Vec::new(),
+            postgres_role_oids: PostgresRoleOidRegistry::empty(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PostgresRoleOidRegistry {
+    first_user_oid: u32,
+    next_oid: u64,
+    mappings: BTreeMap<String, u32>,
+    #[serde(default)]
+    retired_oids: BTreeSet<u32>,
+}
+
+impl PostgresRoleOidRegistry {
+    fn empty() -> Self {
+        Self {
+            first_user_oid: POSTGRES_ROLE_OID_FIRST_USER,
+            next_oid: u64::from(POSTGRES_ROLE_OID_FIRST_USER),
+            mappings: BTreeMap::new(),
+            retired_oids: BTreeSet::new(),
+        }
+    }
+
+    fn reconstruct(names: &BTreeSet<String>) -> Result<Self> {
+        let mut registry = Self::empty();
+        for name in names {
+            registry.allocate(name)?;
+        }
+        Ok(registry)
+    }
+
+    fn allocate(&mut self, name: &str) -> Result<u32> {
+        if self.mappings.contains_key(name) {
+            return Err(corrupt("PostgreSQL role OID mapping already exists"));
+        }
+        let oid = u32::try_from(self.next_oid).map_err(|_| {
+            DbError::new("54000", "PostgreSQL role OID space is exhausted")
+                .with_hint("restore into a new isolated role authority before creating more roles")
+        })?;
+        if oid < self.first_user_oid || self.retired_oids.contains(&oid) {
+            return Err(corrupt("PostgreSQL role OID allocator state is invalid"));
+        }
+        self.next_oid = self
+            .next_oid
+            .checked_add(1)
+            .ok_or_else(|| corrupt("PostgreSQL role OID high-water mark overflowed"))?;
+        self.mappings.insert(name.to_owned(), oid);
+        Ok(oid)
+    }
+
+    fn retire(&mut self, name: &str) -> Result<u32> {
+        let oid = self
+            .mappings
+            .remove(name)
+            .ok_or_else(|| corrupt("PostgreSQL role OID mapping is missing"))?;
+        if !self.retired_oids.insert(oid) {
+            return Err(corrupt("PostgreSQL role OID was retired more than once"));
+        }
+        Ok(oid)
+    }
+
+    fn validate(&self, names: &BTreeSet<String>) -> Result<()> {
+        let terminal = u64::from(u32::MAX) + 1;
+        if self.first_user_oid != POSTGRES_ROLE_OID_FIRST_USER {
+            return Err(corrupt(
+                "PostgreSQL role OID first-user boundary is invalid",
+            ));
+        }
+        if self.next_oid < u64::from(self.first_user_oid) || self.next_oid > terminal {
+            return Err(corrupt("PostgreSQL role OID high-water mark is invalid"));
+        }
+        if self.mappings.keys().collect::<BTreeSet<_>>() != names.iter().collect() {
+            return Err(corrupt(
+                "PostgreSQL role OID mappings do not match the role authority",
+            ));
+        }
+        let mut allocated = BTreeSet::new();
+        for oid in self
+            .mappings
+            .values()
+            .copied()
+            .chain(self.retired_oids.iter().copied())
+        {
+            if oid < self.first_user_oid || u64::from(oid) >= self.next_oid {
+                return Err(corrupt(
+                    "PostgreSQL role OID is outside its declared high-water mark",
+                ));
+            }
+            if !allocated.insert(oid) {
+                return Err(corrupt("PostgreSQL role OID is duplicated"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn missing_postgres_role_oid_registry() -> PostgresRoleOidRegistry {
+    PostgresRoleOidRegistry {
+        first_user_oid: 0,
+        next_oid: 0,
+        mappings: BTreeMap::new(),
+        retired_oids: BTreeSet::new(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SafeRoleMetadata {
+    pub postgres_oid: u32,
+    pub name: String,
+    pub can_login: bool,
+    pub login_enabled: bool,
+    pub member_of: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SafeRoleMetadataSnapshot {
+    pub roles: Vec<SafeRoleMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +337,7 @@ impl AuthStore {
                 }
                 return Err(DbError::new("42710", format!("role {name} already exists")));
             }
+            document.postgres_role_oids.allocate(&name)?;
             document.roles.insert(
                 name.clone(),
                 Role {
@@ -238,6 +361,7 @@ impl AuthStore {
                 }
                 return Err(DbError::new("42710", format!("user {name} already exists")));
             }
+            document.postgres_role_oids.allocate(&name)?;
             document.users.insert(
                 name.clone(),
                 UserRecord {
@@ -284,6 +408,7 @@ impl AuthStore {
         let name = normalize_name(name, "user")?;
         self.mutate_document(|document| {
             if document.users.remove(&name).is_some() {
+                document.postgres_role_oids.retire(&name)?;
                 return Ok(true);
             }
             if if_exists {
@@ -321,6 +446,7 @@ impl AuthStore {
                 .with_hint("revoke memberships and privileges before dropping the role"));
             }
             document.roles.remove(&name);
+            document.postgres_role_oids.retire(&name)?;
             Ok(true)
         })
     }
@@ -433,6 +559,15 @@ impl AuthStore {
         }
         let mut candidate = current;
         let role_name = "ordadb_admin".to_owned();
+        if username == role_name {
+            return Err(DbError::new(
+                "42710",
+                "administrator user name conflicts with the bootstrap role",
+            ));
+        }
+        if !candidate.roles.contains_key(&role_name) {
+            candidate.postgres_role_oids.allocate(&role_name)?;
+        }
         candidate.roles.insert(
             role_name.clone(),
             Role {
@@ -445,6 +580,13 @@ impl AuthStore {
             action: Action::Manage,
             object: DbObject::Server,
         });
+        if candidate.roles.contains_key(&username) {
+            return Err(DbError::new(
+                "42710",
+                format!("user {username} already exists as a role"),
+            ));
+        }
+        candidate.postgres_role_oids.allocate(&username)?;
         candidate.users.insert(
             username.clone(),
             UserRecord {
@@ -511,6 +653,31 @@ impl AuthStore {
     pub fn authorization_snapshot(&self) -> Result<(BTreeMap<String, Role>, Vec<Grant>)> {
         let document = self.read_document()?;
         Ok((document.roles.clone(), document.grants.clone()))
+    }
+
+    pub fn safe_role_metadata_snapshot(&self) -> Result<SafeRoleMetadataSnapshot> {
+        let document = self.read_document()?;
+        let mut roles = Vec::with_capacity(document.users.len() + document.roles.len());
+        for user in document.users.values() {
+            roles.push(SafeRoleMetadata {
+                postgres_oid: postgres_role_oid(&document, &user.name)?,
+                name: user.name.clone(),
+                can_login: true,
+                login_enabled: user.enabled,
+                member_of: user.roles.clone(),
+            });
+        }
+        for role in document.roles.values() {
+            roles.push(SafeRoleMetadata {
+                postgres_oid: postgres_role_oid(&document, &role.name)?,
+                name: role.name.clone(),
+                can_login: false,
+                login_enabled: false,
+                member_of: role.inherits.clone(),
+            });
+        }
+        roles.sort_by_key(|role| role.postgres_oid);
+        Ok(SafeRoleMetadataSnapshot { roles })
     }
 
     fn mutate_document<T>(
@@ -689,6 +856,33 @@ fn normalize_name(value: &str, kind: &str) -> Result<String> {
     Ok(value)
 }
 
+fn postgres_role_names(document: &AuthDocument) -> Result<BTreeSet<String>> {
+    if document
+        .users
+        .keys()
+        .any(|name| document.roles.contains_key(name))
+    {
+        return Err(corrupt(
+            "authentication user and role names share the same authority key",
+        ));
+    }
+    Ok(document
+        .users
+        .keys()
+        .chain(document.roles.keys())
+        .cloned()
+        .collect())
+}
+
+fn postgres_role_oid(document: &AuthDocument, name: &str) -> Result<u32> {
+    document
+        .postgres_role_oids
+        .mappings
+        .get(name)
+        .copied()
+        .ok_or_else(|| corrupt("PostgreSQL role OID mapping is missing"))
+}
+
 fn role_reaches(roles: &BTreeMap<String, Role>, start: &str, target: &str) -> Result<bool> {
     let mut visited = BTreeSet::new();
     let mut stack = vec![(start.to_owned(), 0usize)];
@@ -763,6 +957,9 @@ fn validate_document(document: &AuthDocument) -> Result<()> {
     {
         return Err(corrupt("grant references an unknown role"));
     }
+    document
+        .postgres_role_oids
+        .validate(&postgres_role_names(document)?)?;
     Ok(())
 }
 
@@ -779,8 +976,18 @@ fn read_document(path: &Path) -> Result<AuthDocument> {
     let mut bytes = Vec::with_capacity(capacity);
     file.read_to_end(&mut bytes)
         .map_err(|error| io_error("failed to read authentication catalog", error))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| corrupt(format!("authentication catalog is invalid JSON: {error}")))
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| corrupt(format!("authentication catalog is invalid JSON: {error}")))?;
+    let is_legacy = value
+        .as_object()
+        .is_some_and(|object| !object.contains_key("postgresRoleOids"));
+    let mut document: AuthDocument = serde_json::from_value(value)
+        .map_err(|error| corrupt(format!("authentication catalog is invalid JSON: {error}")))?;
+    if is_legacy {
+        document.postgres_role_oids =
+            PostgresRoleOidRegistry::reconstruct(&postgres_role_names(&document)?)?;
+    }
+    Ok(document)
 }
 
 fn persist_document(path: &Path, document: &AuthDocument) -> Result<()> {
@@ -1024,6 +1231,253 @@ mod tests {
             reopened
                 .authenticate_password("alice", b"replacement password value")
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn safe_role_snapshot_covers_users_and_roles_without_secret_fields() {
+        let directory = tempdir().expect("tempdir");
+        let auth = AuthStore::open(directory.path()).expect("open");
+        auth.bootstrap_admin("dba", b"correct horse battery staple")
+            .expect("bootstrap");
+        auth.create_role("analyst", false).expect("create role");
+        auth.create_user("alice", b"initial password value", false)
+            .expect("create user");
+        auth.grant_role("analyst", "alice").expect("grant role");
+        auth.set_user_enabled("alice", false).expect("disable user");
+
+        let snapshot = auth.safe_role_metadata_snapshot().expect("snapshot");
+        assert_eq!(snapshot.roles.len(), 4);
+        let alice = snapshot
+            .roles
+            .iter()
+            .find(|role| role.name == "alice")
+            .expect("alice metadata");
+        assert!(alice.can_login);
+        assert!(!alice.login_enabled);
+        assert_eq!(alice.member_of, BTreeSet::from(["analyst".into()]));
+        let analyst = snapshot
+            .roles
+            .iter()
+            .find(|role| role.name == "analyst")
+            .expect("analyst metadata");
+        assert!(!analyst.can_login);
+        assert!(!analyst.login_enabled);
+
+        let serialized = serde_json::to_string(&snapshot).expect("serialize safe snapshot");
+        let debug = format!("{snapshot:?}");
+        for forbidden in [
+            "argon2id",
+            "password",
+            "scram",
+            "storedKey",
+            "serverKey",
+            "accessToken",
+            "correct horse battery staple",
+            "initial password value",
+        ] {
+            assert!(!serialized.contains(forbidden));
+            assert!(!debug.contains(forbidden));
+        }
+
+        let reopened = AuthStore::open(directory.path()).expect("reopen");
+        assert_eq!(
+            reopened
+                .safe_role_metadata_snapshot()
+                .expect("reopened snapshot"),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn postgres_role_oids_are_persistent_monotonic_and_never_reused() {
+        let directory = tempdir().expect("tempdir");
+        let auth = AuthStore::open(directory.path()).expect("open");
+        auth.create_role("first", false).expect("create first");
+        let first_oid = auth
+            .safe_role_metadata_snapshot()
+            .expect("first snapshot")
+            .roles[0]
+            .postgres_oid;
+        assert_eq!(first_oid, POSTGRES_ROLE_OID_FIRST_USER);
+        auth.drop_role("first", false).expect("drop first");
+        auth.create_user("second", b"initial password value", false)
+            .expect("create second");
+        let second_oid = auth
+            .safe_role_metadata_snapshot()
+            .expect("second snapshot")
+            .roles[0]
+            .postgres_oid;
+        assert!(second_oid > first_oid);
+        auth.drop_user("second", false).expect("drop second");
+        auth.create_role("third", false).expect("create third");
+        let third_oid = auth
+            .safe_role_metadata_snapshot()
+            .expect("third snapshot")
+            .roles[0]
+            .postgres_oid;
+        assert!(third_oid > second_oid);
+
+        let reopened = AuthStore::open(directory.path()).expect("reopen");
+        assert_eq!(
+            reopened
+                .safe_role_metadata_snapshot()
+                .expect("reopened snapshot")
+                .roles[0]
+                .postgres_oid,
+            third_oid
+        );
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(reopened.path()).expect("read auth"))
+                .expect("auth JSON");
+        assert_eq!(
+            persisted["postgresRoleOids"]["retiredOids"]
+                .as_array()
+                .expect("retired OIDs")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn legacy_role_oids_reconstruct_deterministically_and_persist_on_mutation() {
+        let directory = tempdir().expect("tempdir");
+        let auth = AuthStore::open(directory.path()).expect("open");
+        auth.create_role("zeta", false).expect("create zeta");
+        auth.create_user("alpha", b"initial password value", false)
+            .expect("create alpha");
+        let path = auth.path().to_path_buf();
+        drop(auth);
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read auth")).expect("auth JSON");
+        legacy
+            .as_object_mut()
+            .expect("auth object")
+            .remove("postgresRoleOids");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy).expect("encode legacy auth"),
+        )
+        .expect("write legacy auth");
+
+        let reopened = AuthStore::open(directory.path()).expect("open legacy");
+        let snapshot = reopened
+            .safe_role_metadata_snapshot()
+            .expect("legacy snapshot");
+        assert_eq!(
+            snapshot
+                .roles
+                .iter()
+                .map(|role| (role.name.as_str(), role.postgres_oid))
+                .collect::<Vec<_>>(),
+            vec![
+                ("alpha", POSTGRES_ROLE_OID_FIRST_USER),
+                ("zeta", POSTGRES_ROLE_OID_FIRST_USER + 1),
+            ]
+        );
+        reopened
+            .create_role("middle", false)
+            .expect("persist reconstructed registry");
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read migrated auth"))
+                .expect("migrated auth JSON");
+        assert!(persisted.get("postgresRoleOids").is_some());
+        assert_eq!(
+            AuthStore::open(directory.path())
+                .expect("reopen migrated")
+                .safe_role_metadata_snapshot()
+                .expect("migrated snapshot")
+                .roles,
+            reopened
+                .safe_role_metadata_snapshot()
+                .expect("current snapshot")
+                .roles
+        );
+    }
+
+    #[test]
+    fn duplicate_or_null_postgres_role_oid_registry_fails_closed() {
+        let directory = tempdir().expect("tempdir");
+        let auth = AuthStore::open(directory.path()).expect("open");
+        auth.create_role("one", false).expect("create one");
+        auth.create_role("two", false).expect("create two");
+        let path = auth.path().to_path_buf();
+        drop(auth);
+
+        let original = fs::read(&path).expect("read auth");
+        let mut duplicate: serde_json::Value =
+            serde_json::from_slice(&original).expect("auth JSON");
+        let first_oid = duplicate["postgresRoleOids"]["mappings"]["one"]
+            .as_u64()
+            .expect("first OID");
+        duplicate["postgresRoleOids"]["mappings"]["two"] = first_oid.into();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&duplicate).expect("encode duplicate auth"),
+        )
+        .expect("write duplicate auth");
+        assert_eq!(
+            AuthStore::open(directory.path())
+                .expect_err("duplicate OID must fail")
+                .sql_state,
+            "XX001"
+        );
+
+        let mut null_registry: serde_json::Value =
+            serde_json::from_slice(&original).expect("auth JSON");
+        null_registry["postgresRoleOids"] = serde_json::Value::Null;
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&null_registry).expect("encode null auth"),
+        )
+        .expect("write null auth");
+        assert_eq!(
+            AuthStore::open(directory.path())
+                .expect_err("null registry must fail")
+                .sql_state,
+            "XX001"
+        );
+    }
+
+    #[test]
+    fn exhausted_postgres_role_oid_registry_rejects_creation_atomically() {
+        let directory = tempdir().expect("tempdir");
+        let auth = AuthStore::open(directory.path()).expect("open");
+        auth.create_role("retained", false)
+            .expect("create retained");
+        let retained_oid =
+            auth.safe_role_metadata_snapshot().expect("snapshot").roles[0].postgres_oid;
+        let path = auth.path().to_path_buf();
+        drop(auth);
+
+        let mut exhausted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read auth")).expect("auth JSON");
+        exhausted["postgresRoleOids"]["nextOid"] = (u64::from(u32::MAX) + 1).into();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&exhausted).expect("encode exhausted auth"),
+        )
+        .expect("write exhausted auth");
+
+        let reopened = AuthStore::open(directory.path()).expect("open exhausted");
+        assert_eq!(
+            reopened
+                .create_role("rejected", false)
+                .expect_err("OID exhaustion must fail")
+                .sql_state,
+            "54000"
+        );
+        let snapshot = reopened
+            .safe_role_metadata_snapshot()
+            .expect("snapshot after failure");
+        assert_eq!(snapshot.roles.len(), 1);
+        assert_eq!(snapshot.roles[0].name, "retained");
+        assert_eq!(snapshot.roles[0].postgres_oid, retained_oid);
+        assert!(
+            !fs::read_to_string(&path)
+                .expect("read auth after failure")
+                .contains("rejected")
         );
     }
 }

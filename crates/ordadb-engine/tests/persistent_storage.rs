@@ -75,7 +75,7 @@ fn public_api_reopens_persisted_catalog_rows_and_generation() {
 }
 
 #[test]
-fn rollback_failed_statement_and_competing_writer_do_not_reappear() {
+fn rolled_back_and_failed_writes_do_not_reappear_but_disjoint_writer_does() {
     let directory = tempdir().expect("tempdir");
     {
         let engine = Engine::open(EngineConfig::new(directory.path())).expect("open");
@@ -115,18 +115,11 @@ fn rollback_failed_statement_and_competing_writer_do_not_reappear() {
             .execute("INSERT INTO events VALUES (4, 'rolled back writer')", &[])
             .expect("transaction insert")
             .for_each(drop);
-        assert_eq!(
-            second
-                .execute("INSERT INTO events VALUES (5, 'concurrent')", &[])
-                .expect_err("competing writer")
-                .sql_state,
-            "55P03"
-        );
-        transaction.rollback().expect("rollback writer");
         second
-            .execute("INSERT INTO events VALUES (5, 'after release')", &[])
-            .expect("released writer")
+            .execute("INSERT INTO events VALUES (5, 'concurrent')", &[])
+            .expect("disjoint concurrent writer")
             .for_each(drop);
+        transaction.rollback().expect("rollback writer");
     }
 
     let engine = Engine::open(EngineConfig::new(directory.path())).expect("reopen");

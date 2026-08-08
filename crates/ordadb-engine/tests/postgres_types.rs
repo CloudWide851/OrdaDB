@@ -23,7 +23,7 @@ fn rows(events: &[QueryEvent]) -> Vec<Row> {
 fn sql_state(session: &mut Session, sql: &str) -> String {
     match session.execute(sql, &[]) {
         Ok(_) => panic!("statement unexpectedly succeeded: {sql}"),
-        Err(error) => error.sql_state,
+        Err(error) => error.sql_state.to_string(),
     }
 }
 

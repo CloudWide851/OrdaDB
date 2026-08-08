@@ -1,0 +1,370 @@
+{
+  "schemaVersion": 1,
+  "corpusId": "ordadb-postgresql-18-client-replay",
+  "semanticTarget": {
+    "product": "PostgreSQL",
+    "version": "18.0",
+    "wireProtocol": 3
+  },
+  "limits": {
+    "maxCases": 32,
+    "maxStepsPerCase": 16,
+    "maxSqlBytesPerStep": 8192,
+    "maxCopyPayloadBytes": 65536,
+    "maxExpectedRows": 256,
+    "maxDiagnosticBytes": 4096
+  },
+  "capturePolicy": {
+    "liveReferenceCaptureAvailable": false,
+    "statementProvenance": "authored_replay_fixture",
+    "referenceGapPolicy": "Every case labels the absent PostgreSQL 18 reference result explicitly. Expected shapes are normative assertions, not captured pass evidence.",
+    "dataPolicy": "Only synthetic ordadb_compat_* objects and values are allowed. No production identifiers, values, or credentials are captured."
+  },
+  "cases": [
+    {
+      "id": "session-startup-001",
+      "category": "session_startup",
+      "purpose": "Read session identity and settings from the SQL-visible session state.",
+      "replayability": "engine_and_wire",
+      "source": {
+        "client": "psql, pgJDBC, DataGrip",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "PostgreSQL 18 startup and session compatibility contract"
+      },
+      "steps": [
+        { "kind": "sql", "sql": "SELECT version() AS version, current_database() AS database_name, current_user AS current_user_name, session_user AS session_user_name" },
+        { "kind": "sql", "sql": "SHOW server_version" },
+        { "kind": "sql", "sql": "SELECT current_setting('client_encoding') AS client_encoding, current_setting('standard_conforming_strings') AS standard_conforming_strings" }
+      ],
+      "expected": {
+        "maxRows": 1,
+        "columnSets": [
+          ["version", "database_name", "current_user_name", "session_user_name"],
+          ["server_version"],
+          ["client_encoding", "standard_conforming_strings"]
+        ],
+        "requiredValues": ["PostgreSQL 18", "UTF8", "on"]
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "Neither a PostgreSQL 18 reference server nor a live OrdaDB endpoint was queried for this baseline."
+      }
+    },
+    {
+      "id": "catalog-schemas-001",
+      "category": "catalog_introspection",
+      "purpose": "Discover visible schemas and owners using ordinary projection, join, filtering, ordering, and limit semantics.",
+      "replayability": "engine_and_wire",
+      "source": {
+        "client": "DataGrip",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "bounded DataGrip-style schema introspection pattern"
+      },
+      "steps": [
+        { "kind": "sql", "sql": "SELECT n.oid AS schema_oid, n.nspname AS schema_name, r.rolname AS owner_name FROM pg_catalog.pg_namespace AS n LEFT JOIN pg_catalog.pg_roles AS r ON r.oid = n.nspowner WHERE n.nspname IN ('pg_catalog', 'information_schema', 'public') ORDER BY n.nspname LIMIT 256" }
+      ],
+      "expected": {
+        "maxRows": 256,
+        "columnSets": [["schema_oid", "schema_name", "owner_name"]],
+        "postgresTypeOids": [[26, 19, 19]]
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "The result rows and nullability have not yet been captured from pinned DataGrip against PostgreSQL 18."
+      }
+    },
+    {
+      "id": "catalog-relations-001",
+      "category": "catalog_introspection",
+      "purpose": "Discover visible tables and views with stable relation and namespace OIDs.",
+      "replayability": "engine_and_wire",
+      "source": {
+        "client": "DataGrip, pgJDBC DatabaseMetaData",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "bounded relation metadata pattern"
+      },
+      "steps": [
+        { "kind": "sql", "sql": "SELECT c.oid AS relation_oid, n.oid AS schema_oid, n.nspname AS schema_name, c.relname AS relation_name, c.relkind FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace WHERE c.relkind IN ('r', 'v', 'm', 'S') ORDER BY n.nspname, c.relname, c.oid LIMIT 256" }
+      ],
+      "expected": {
+        "maxRows": 256,
+        "columnSets": [["relation_oid", "schema_oid", "schema_name", "relation_name", "relkind"]],
+        "postgresTypeOids": [[26, 26, 19, 19, 18]]
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "Pinned-client result ordering and JDBC metadata mapping remain to be captured."
+      }
+    },
+    {
+      "id": "catalog-columns-001",
+      "category": "catalog_introspection",
+      "purpose": "Discover visible columns through information_schema with deterministic pagination.",
+      "replayability": "engine_and_wire",
+      "source": {
+        "client": "DataGrip, Hibernate",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "bounded information_schema column introspection pattern"
+      },
+      "steps": [
+        { "kind": "sql", "sql": "SELECT table_schema, table_name, column_name, ordinal_position, data_type, is_nullable FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, ordinal_position LIMIT 256 OFFSET 0" }
+      ],
+      "expected": {
+        "maxRows": 256,
+        "columnSets": [["table_schema", "table_name", "column_name", "ordinal_position", "data_type", "is_nullable"]]
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "PostgreSQL 18 information_schema type names and nullability have not been reference-captured."
+      }
+    },
+    {
+      "id": "catalog-visibility-001",
+      "category": "catalog_introspection",
+      "purpose": "Prove the safe role projection exposes identity flags and PostgreSQL-compatible masked password metadata without exposing a verifier.",
+      "replayability": "engine_and_wire",
+      "source": {
+        "client": "psql, DataGrip",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "least-privilege discovery and secret non-disclosure contract"
+      },
+      "steps": [
+        { "kind": "sql", "sql": "SELECT rolname, rolsuper, rolcanlogin FROM pg_catalog.pg_roles ORDER BY rolname LIMIT 256" },
+        { "kind": "sql", "sql": "SELECT rolpassword FROM pg_catalog.pg_roles ORDER BY rolname LIMIT 256" }
+      ],
+      "expected": {
+        "maxRows": 256,
+        "columnSets": [["rolname", "rolsuper", "rolcanlogin"], ["rolpassword"]],
+        "maskedValues": { "rolpassword": "********" }
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "The least-privilege role set and PostgreSQL 18 masked rolpassword value have not been captured from a reference session."
+      }
+    },
+    {
+      "id": "ddl-crud-001",
+      "category": "ddl_crud",
+      "purpose": "Exercise supported DDL and CRUD only inside a caller-confirmed isolated database.",
+      "replayability": "engine_and_wire",
+      "destructiveScope": "The synthetic public.ordadb_compat_client_probe table only; production databases are forbidden.",
+      "source": {
+        "client": "psql, pgJDBC, DataGrip",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "portable PostgreSQL client smoke"
+      },
+      "steps": [
+        { "kind": "sql", "sql": "DROP TABLE IF EXISTS public.ordadb_compat_client_probe" },
+        { "kind": "sql", "sql": "CREATE TABLE public.ordadb_compat_client_probe (id BIGINT PRIMARY KEY, payload TEXT NOT NULL)" },
+        { "kind": "sql", "sql": "INSERT INTO public.ordadb_compat_client_probe (id, payload) VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma') RETURNING id, payload" },
+        { "kind": "sql", "sql": "SELECT id, payload FROM public.ordadb_compat_client_probe ORDER BY id LIMIT 32" },
+        { "kind": "sql", "sql": "UPDATE public.ordadb_compat_client_probe SET payload = 'beta-updated' WHERE id = 2 RETURNING id, payload" },
+        { "kind": "sql", "sql": "DELETE FROM public.ordadb_compat_client_probe WHERE id = 3 RETURNING id" },
+        { "kind": "sql", "sql": "DROP TABLE public.ordadb_compat_client_probe" }
+      ],
+      "expected": {
+        "maxRows": 32,
+        "commandTags": ["DROP TABLE", "CREATE TABLE", "INSERT 0 3", "SELECT 3", "UPDATE 1", "DELETE 1", "DROP TABLE"]
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "Command tags and row descriptions are normative expectations and have not been reference-captured."
+      }
+    },
+    {
+      "id": "prepared-portal-001",
+      "category": "prepared_portal",
+      "purpose": "Bind an int8 parameter and fetch an ordered result through two-row portal continuations.",
+      "replayability": "wire_and_client",
+      "source": {
+        "client": "pgJDBC",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "PreparedStatement with autoCommit=false and fetchSize=2"
+      },
+      "steps": [
+        { "kind": "sql", "sql": "CREATE TABLE public.ordadb_compat_portal_probe (id BIGINT PRIMARY KEY, payload TEXT NOT NULL)" },
+        { "kind": "sql", "sql": "INSERT INTO public.ordadb_compat_portal_probe (id, payload) VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five')" },
+        { "kind": "prepare", "sql": "SELECT id, payload FROM public.ordadb_compat_portal_probe WHERE id >= $1 ORDER BY id LIMIT 32", "parameterTypeOids": [20] },
+        { "kind": "bind_execute", "parameters": ["2"], "fetchRows": 2 },
+        { "kind": "bind_execute", "parameters": ["2"], "fetchRows": 2 },
+        { "kind": "bind_execute", "parameters": ["2"], "fetchRows": 2 },
+        { "kind": "sql", "sql": "DROP TABLE public.ordadb_compat_portal_probe" }
+      ],
+      "expected": {
+        "maxRows": 4,
+        "columnSets": [["id", "payload"]],
+        "postgresTypeOids": [[20, 25]],
+        "portalSuspendedCount": 1,
+        "completeCount": 1
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "The exact pgJDBC extended-protocol trace and suspension count have not been captured."
+      }
+    },
+    {
+      "id": "transactions-savepoint-001",
+      "category": "transactions_savepoints",
+      "purpose": "Prove transaction visibility and rollback-to-savepoint recovery.",
+      "replayability": "engine_and_wire",
+      "source": {
+        "client": "psql, pgJDBC, DataGrip, Hibernate",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "PostgreSQL transaction state contract"
+      },
+      "steps": [
+        { "kind": "sql", "sql": "CREATE TABLE public.ordadb_compat_tx_probe (id BIGINT PRIMARY KEY, payload TEXT NOT NULL)" },
+        { "kind": "sql", "sql": "BEGIN" },
+        { "kind": "sql", "sql": "INSERT INTO public.ordadb_compat_tx_probe (id, payload) VALUES (1, 'kept')" },
+        { "kind": "sql", "sql": "SAVEPOINT ordadb_compat_sp" },
+        { "kind": "sql", "sql": "INSERT INTO public.ordadb_compat_tx_probe (id, payload) VALUES (2, 'rolled-back')" },
+        { "kind": "sql", "sql": "ROLLBACK TO SAVEPOINT ordadb_compat_sp" },
+        { "kind": "sql", "sql": "COMMIT" },
+        { "kind": "sql", "sql": "SELECT id, payload FROM public.ordadb_compat_tx_probe ORDER BY id" },
+        { "kind": "sql", "sql": "DROP TABLE public.ordadb_compat_tx_probe" }
+      ],
+      "expected": {
+        "maxRows": 1,
+        "rows": [["1", "kept"]],
+        "readyForQueryStates": ["T", "I"]
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "ReadyForQuery transitions and command tags have not been captured from the pinned clients."
+      }
+    },
+    {
+      "id": "copy-in-text-001",
+      "category": "copy",
+      "purpose": "Import two synthetic rows atomically through COPY FROM STDIN text.",
+      "replayability": "wire_and_client",
+      "source": {
+        "client": "psql, pgJDBC CopyManager",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "bounded COPY text fixture"
+      },
+      "steps": [
+        { "kind": "sql", "sql": "CREATE TABLE public.ordadb_compat_copy_probe (id BIGINT PRIMARY KEY, payload TEXT NOT NULL)" },
+        { "kind": "copy_in", "sql": "COPY public.ordadb_compat_copy_probe (id, payload) FROM STDIN WITH (FORMAT text)", "payload": "1\tcopy-one\n2\tcopy-two\n" },
+        { "kind": "sql", "sql": "SELECT id, payload FROM public.ordadb_compat_copy_probe ORDER BY id" },
+        { "kind": "sql", "sql": "DROP TABLE public.ordadb_compat_copy_probe" }
+      ],
+      "expected": {
+        "maxRows": 2,
+        "commandTags": ["COPY 2"],
+        "rows": [["1", "copy-one"], ["2", "copy-two"]]
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "The COPY response sequence and row encoding have not been reference-captured."
+      }
+    },
+    {
+      "id": "copy-out-csv-001",
+      "category": "copy",
+      "purpose": "Export two synthetic rows through bounded COPY TO STDOUT CSV.",
+      "replayability": "wire_and_client",
+      "source": {
+        "client": "psql, pgJDBC CopyManager",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "bounded COPY CSV fixture"
+      },
+      "steps": [
+        { "kind": "sql", "sql": "CREATE TABLE public.ordadb_compat_copy_out_probe (id BIGINT PRIMARY KEY, payload TEXT NOT NULL)" },
+        { "kind": "sql", "sql": "INSERT INTO public.ordadb_compat_copy_out_probe (id, payload) VALUES (1, 'csv-one'), (2, 'csv-two')" },
+        { "kind": "copy_out", "sql": "COPY public.ordadb_compat_copy_out_probe (id, payload) TO STDOUT WITH (FORMAT csv, HEADER true)" },
+        { "kind": "sql", "sql": "DROP TABLE public.ordadb_compat_copy_out_probe" }
+      ],
+      "expected": {
+        "maxRows": 2,
+        "maxPayloadBytes": 1024,
+        "commandTags": ["COPY 2"],
+        "payload": "id,payload\n1,csv-one\n2,csv-two\n"
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "Line endings and COPY framing have not been captured from PostgreSQL 18 on Windows."
+      }
+    },
+    {
+      "id": "cancellation-001",
+      "category": "cancellation",
+      "purpose": "Cancel only the active recursive statement and prove the connection remains reusable.",
+      "replayability": "wire_and_client",
+      "source": {
+        "client": "pgJDBC Statement.cancel, DataGrip cancel action",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "bounded recursive workload using the repository-supported SQL surface"
+      },
+      "steps": [
+        { "kind": "start_async", "sql": "WITH RECURSIVE ordadb_cancel_probe(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM ordadb_cancel_probe WHERE n < 1000000) SELECT sum(n) FROM ordadb_cancel_probe" },
+        { "kind": "client_cancel", "afterMilliseconds": 50 },
+        { "kind": "expect_error", "expectedSqlState": "57014" },
+        { "kind": "sql", "sql": "SELECT 1 AS recovered" }
+      ],
+      "expected": {
+        "maxRows": 1,
+        "sqlStates": ["57014"],
+        "columnSets": [["recovered"]],
+        "readyForQueryStates": ["I"]
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "Cancellation timing, SQLSTATE fields, and post-cancel readiness have not been captured."
+      }
+    },
+    {
+      "id": "error-simple-recovery-001",
+      "category": "error_recovery",
+      "purpose": "Recover a simple-query session after an undefined-table error outside a transaction.",
+      "replayability": "engine_and_wire",
+      "source": {
+        "client": "psql, pgJDBC, DataGrip",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "PostgreSQL simple-query recovery contract"
+      },
+      "steps": [
+        { "kind": "sql_expect_error", "sql": "SELECT * FROM public.ordadb_compat_missing_relation", "expectedSqlState": "42P01" },
+        { "kind": "sql", "sql": "SELECT 1 AS recovered" }
+      ],
+      "expected": {
+        "maxRows": 1,
+        "sqlStates": ["42P01"],
+        "columnSets": [["recovered"]],
+        "readyForQueryStates": ["I"]
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "Structured ErrorResponse fields and the exact command cycle have not been captured."
+      }
+    },
+    {
+      "id": "error-extended-sync-001",
+      "category": "error_recovery",
+      "purpose": "Prove failed extended-query messages are ignored until Sync and then recover exactly once.",
+      "replayability": "wire_only",
+      "source": {
+        "client": "pgJDBC",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "PostgreSQL extended-query synchronization contract"
+      },
+      "steps": [
+        { "kind": "parse", "sql": "SELECT $1::BIGINT AS bound_value", "parameterTypeOids": [20] },
+        { "kind": "bind_invalid", "parameters": ["not-an-int8"] },
+        { "kind": "frontend_message_ignored", "message": "Execute" },
+        { "kind": "frontend_message", "message": "Sync" },
+        { "kind": "sql", "sql": "SELECT 1 AS recovered" }
+      ],
+      "expected": {
+        "maxRows": 1,
+        "sqlStates": ["22P02"],
+        "readyForQueryCount": 1,
+        "readyForQueryStates": ["I"]
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "No raw PostgreSQL 18 frontend/backend trace has been recorded for the pinned driver."
+      }
+    }
+  ]
+}

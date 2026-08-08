@@ -9,7 +9,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use ordadb_catalog::TableDefinition;
 use ordadb_engine::Engine;
-use ordadb_types::{DbError, Identifier, PgArray, QueryEvent, Result, ScalarType, Value};
+use ordadb_types::{
+    DbError, Identifier, MAX_POSTGRES_NAME_BYTES, PgArray, QueryEvent, Result, ScalarType, Value,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number};
@@ -409,6 +411,9 @@ fn json_to_value(value: &serde_json::Value, data_type: &ScalarType) -> Result<Va
             .map(Value::Int32)
             .map_err(|_| type_error("JSON integer is outside INT4 range")),
         ScalarType::Int64 => json_integer(value, "INT8").map(Value::Int64),
+        ScalarType::Oid => u32::try_from(json_integer(value, "OID")?)
+            .map(|value| Value::Int64(i64::from(value)))
+            .map_err(|_| DbError::new("22003", "JSON integer is outside OID range")),
         ScalarType::Float32 => {
             json_float(value, "FLOAT4").map(|value| Value::Float32(value as f32))
         }
@@ -466,6 +471,21 @@ fn text_to_value(value: &str, data_type: &ScalarType) -> Result<Value> {
         ScalarType::Int16 => Value::Int16(parse_text(value, "INT2")?),
         ScalarType::Int32 => Value::Int32(parse_text(value, "INT4")?),
         ScalarType::Int64 => Value::Int64(parse_text(value, "INT8")?),
+        ScalarType::Oid => Value::Int64(i64::from(parse_oid_text(value)?)),
+        ScalarType::Name => {
+            if value.len() > MAX_POSTGRES_NAME_BYTES {
+                return Err(DbError::new("22001", "NAME text exceeds 63 bytes"));
+            }
+            Value::Text(value.to_owned())
+        }
+        ScalarType::InternalChar => {
+            if value.len() != 1 {
+                return Err(type_error(
+                    "internal CHAR text must contain exactly one byte",
+                ));
+            }
+            Value::Text(value.to_owned())
+        }
         ScalarType::Float32 => {
             let value: f32 = parse_text(value, "FLOAT4")?;
             if !value.is_finite() {
@@ -679,6 +699,13 @@ fn parse_text<T: FromStr>(value: &str, label: &str) -> Result<T> {
         .map_err(|_| type_error(format!("invalid {label} text")))
 }
 
+fn parse_oid_text(value: &str) -> Result<u32> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| type_error("invalid OID text"))?;
+    u32::try_from(parsed).map_err(|_| DbError::new("22003", "OID text is out of range"))
+}
+
 fn invalid(message: impl Into<String>) -> DbError {
     DbError::new("22023", message)
 }
@@ -785,6 +812,40 @@ mod tests {
         )
         .expect("JSON import");
         assert_eq!(row_count(&destination), 2);
+    }
+
+    #[test]
+    fn postgres_catalog_scalar_transfer_values_preserve_bounds() {
+        assert_eq!(
+            json_to_value(&serde_json::json!(u32::MAX), &ScalarType::Oid)
+                .expect("maximum JSON OID"),
+            Value::Int64(i64::from(u32::MAX))
+        );
+        assert_eq!(
+            json_to_value(
+                &serde_json::json!(u64::from(u32::MAX) + 1),
+                &ScalarType::Oid
+            )
+            .expect_err("out-of-range JSON OID")
+            .sql_state,
+            "22003"
+        );
+        assert_eq!(
+            text_to_value("42", &ScalarType::Oid).expect("text OID"),
+            Value::Int64(42)
+        );
+        assert_eq!(
+            text_to_value(&"n".repeat(MAX_POSTGRES_NAME_BYTES + 1), &ScalarType::Name)
+                .expect_err("oversized name")
+                .sql_state,
+            "22001"
+        );
+        assert_eq!(
+            text_to_value("é", &ScalarType::InternalChar)
+                .expect_err("multibyte internal char")
+                .sql_state,
+            "22P02"
+        );
     }
 
     #[test]
