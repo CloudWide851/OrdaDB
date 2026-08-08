@@ -19,8 +19,8 @@ use ordadb_sql::{
     ScalarFunction, UnaryOperator,
 };
 use ordadb_types::{
-    ArrayDimension, Batch, DbError, IndexId, PgArray, PgInterval, Result, Row, ScalarType, Schema,
-    TableId, Value,
+    ArrayDimension, Batch, DbError, IndexId, MAX_POSTGRES_NAME_BYTES, PgArray, PgInterval, Result,
+    Row, ScalarType, Schema, TableId, Value,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
@@ -2653,6 +2653,13 @@ fn evaluate_offset_program(program: &ExpressionProgram, params: &[Value]) -> Res
 
 fn evaluate_scalar_function(function: ScalarFunction, arguments: Vec<Value>) -> Result<Value> {
     match function {
+        ScalarFunction::Version
+        | ScalarFunction::CurrentDatabase
+        | ScalarFunction::CurrentUser
+        | ScalarFunction::SessionUser
+        | ScalarFunction::CurrentSetting => Err(DbError::internal(
+            "session scalar function reached execution without binding metadata",
+        )),
         ScalarFunction::Coalesce => Ok(arguments
             .into_iter()
             .find(|value| !value.is_null())
@@ -2896,7 +2903,11 @@ pub fn cast_value(value: Value, target: &ScalarType) -> Result<Value> {
     }
     if matches!(
         target,
-        ScalarType::Text | ScalarType::Char { .. } | ScalarType::Varchar { .. }
+        ScalarType::Text
+            | ScalarType::Char { .. }
+            | ScalarType::Varchar { .. }
+            | ScalarType::Name
+            | ScalarType::InternalChar
     ) {
         return cast_text_result(value_to_cast_text(&value)?, target);
     }
@@ -2965,6 +2976,7 @@ fn is_numeric_type(data_type: &ScalarType) -> bool {
         ScalarType::Int16
             | ScalarType::Int32
             | ScalarType::Int64
+            | ScalarType::Oid
             | ScalarType::Float32
             | ScalarType::Float64
             | ScalarType::Decimal { .. }
@@ -2982,6 +2994,9 @@ fn cast_numeric(value: Value, target: &ScalarType) -> Result<Value> {
         ScalarType::Int64 => numeric_to_i128(&value)
             .and_then(|value| i64::try_from(value).map_err(|_| cast_numeric_out_of_range(target)))
             .map(Value::Int64),
+        ScalarType::Oid => numeric_to_i128(&value)
+            .and_then(|value| u32::try_from(value).map_err(|_| cast_numeric_out_of_range(target)))
+            .map(|value| Value::Int64(i64::from(value))),
         ScalarType::Float32 => {
             let value = numeric_to_f64(&value)?;
             let narrowed = value as f32;
@@ -3082,6 +3097,10 @@ fn cast_numeric_text(value: &str, target: &ScalarType) -> Result<Value> {
             .parse::<i64>()
             .map(Value::Int64)
             .map_err(|_| invalid()),
+        ScalarType::Oid => value
+            .parse::<u32>()
+            .map(|value| Value::Int64(i64::from(value)))
+            .map_err(|_| invalid()),
         ScalarType::Float32 => value
             .parse::<f32>()
             .map_err(|_| invalid())
@@ -3124,6 +3143,21 @@ fn cast_text_result(value: String, target: &ScalarType) -> Result<Value> {
     let limit = match target {
         ScalarType::Char { length } | ScalarType::Varchar { length } => *length,
         ScalarType::Text => None,
+        ScalarType::Name => {
+            if value.len() > MAX_POSTGRES_NAME_BYTES {
+                return Err(DbError::new("22001", "PostgreSQL name exceeds 63 bytes"));
+            }
+            None
+        }
+        ScalarType::InternalChar => {
+            if value.len() != 1 {
+                return Err(DbError::new(
+                    "22001",
+                    "PostgreSQL internal char must contain exactly one byte",
+                ));
+            }
+            None
+        }
         _ => return Err(DbError::internal("text cast received a non-text target")),
     };
     let value = limit.map_or(value.clone(), |length| {
@@ -3284,6 +3318,9 @@ pub fn coerce_value(value: Value, target: &ScalarType) -> Result<Value> {
         (Value::Int16(value), ScalarType::Int16) => Ok(Value::Int16(value)),
         (Value::Int16(value), ScalarType::Int32) => Ok(Value::Int32(i32::from(value))),
         (Value::Int16(value), ScalarType::Int64) => Ok(Value::Int64(i64::from(value))),
+        (Value::Int16(value), ScalarType::Oid) => u32::try_from(value)
+            .map(|value| Value::Int64(i64::from(value)))
+            .map_err(|_| cast_numeric_out_of_range(target)),
         (Value::Int16(value), ScalarType::Float32) => Ok(Value::Float32(f32::from(value))),
         (Value::Int16(value), ScalarType::Float64) => Ok(Value::Float64(f64::from(value))),
         (Value::Int16(value), ScalarType::Decimal { .. }) => {
@@ -3291,11 +3328,17 @@ pub fn coerce_value(value: Value, target: &ScalarType) -> Result<Value> {
         }
         (Value::Int32(value), ScalarType::Int32) => Ok(Value::Int32(value)),
         (Value::Int32(value), ScalarType::Int64) => Ok(Value::Int64(i64::from(value))),
+        (Value::Int32(value), ScalarType::Oid) => u32::try_from(value)
+            .map(|value| Value::Int64(i64::from(value)))
+            .map_err(|_| cast_numeric_out_of_range(target)),
         (Value::Int32(value), ScalarType::Float64) => Ok(Value::Float64(f64::from(value))),
         (Value::Int32(value), ScalarType::Decimal { .. }) => {
             Ok(Value::Decimal(Decimal::from(value)))
         }
         (Value::Int64(value), ScalarType::Int64) => Ok(Value::Int64(value)),
+        (Value::Int64(value), ScalarType::Oid) => u32::try_from(value)
+            .map(|value| Value::Int64(i64::from(value)))
+            .map_err(|_| cast_numeric_out_of_range(target)),
         (Value::Int64(value), ScalarType::Float64) => Ok(Value::Float64(value as f64)),
         (Value::Int64(value), ScalarType::Decimal { .. }) => {
             Ok(Value::Decimal(Decimal::from(value)))
@@ -3307,6 +3350,19 @@ pub fn coerce_value(value: Value, target: &ScalarType) -> Result<Value> {
             Value::Text(value),
             ScalarType::Text | ScalarType::Char { .. } | ScalarType::Varchar { .. },
         ) => Ok(Value::Text(value)),
+        (Value::Text(value), ScalarType::Name) if value.len() <= MAX_POSTGRES_NAME_BYTES => {
+            Ok(Value::Text(value))
+        }
+        (Value::Text(_), ScalarType::Name) => {
+            Err(DbError::new("22001", "PostgreSQL name exceeds 63 bytes"))
+        }
+        (Value::Text(value), ScalarType::InternalChar) if value.len() == 1 => {
+            Ok(Value::Text(value))
+        }
+        (Value::Text(_), ScalarType::InternalChar) => Err(DbError::new(
+            "22001",
+            "PostgreSQL internal char must contain exactly one byte",
+        )),
         (Value::Text(value), ScalarType::Enum { labels, .. }) => {
             if labels.iter().any(|label| label == &value) {
                 Ok(Value::Text(value))

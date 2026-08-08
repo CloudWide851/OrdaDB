@@ -135,12 +135,15 @@ pub struct ServiceStartupFailureV1 {
 
 struct ServiceRunFailure {
     phase: ServiceStartupPhase,
-    error: DbError,
+    error: Box<DbError>,
 }
 
 impl ServiceRunFailure {
     fn new(phase: ServiceStartupPhase, error: DbError) -> Self {
-        Self { phase, error }
+        Self {
+            phase,
+            error: Box::new(error),
+        }
     }
 }
 
@@ -665,7 +668,7 @@ fn report_registered_service_failure(
 }
 
 fn attach_startup_diagnostic(data_dir: &Path, failure: &ServiceRunFailure) -> DbError {
-    let diagnostic = ServiceStartupFailureV1::from_error(failure.phase, &failure.error);
+    let diagnostic = ServiceStartupFailureV1::from_error(failure.phase, failure.error.as_ref());
     match write_service_startup_failure(data_dir, &diagnostic) {
         Ok(path) => {
             let diagnostic_hint = format!("inspect the startup diagnostic at {}", path.display());
@@ -673,10 +676,10 @@ fn attach_startup_diagnostic(data_dir: &Path, failure: &ServiceRunFailure) -> Db
                 Some(hint) => format!("{hint}; {diagnostic_hint}"),
                 None => diagnostic_hint,
             };
-            failure.error.clone().with_hint(hint)
+            failure.error.as_ref().clone().with_hint(hint)
         }
         Err(diagnostic_error) => append_error_context(
-            failure.error.clone(),
+            failure.error.as_ref().clone(),
             format!(
                 "failed to persist startup diagnostic: {}",
                 diagnostic_error.message

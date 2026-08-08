@@ -718,14 +718,14 @@ fn authenticate(
 
 struct ApiError {
     status: StatusCode,
-    error: DbError,
+    error: Box<DbError>,
 }
 
 impl ApiError {
     fn unsupported(message: &str) -> Self {
         Self {
             status: StatusCode::NOT_IMPLEMENTED,
-            error: DbError::new("0A000", message),
+            error: Box::new(DbError::new("0A000", message)),
         }
     }
 }
@@ -746,7 +746,10 @@ impl From<DbError> for ApiError {
                 _ => StatusCode::FORBIDDEN,
             }
         };
-        Self { status, error }
+        Self {
+            status,
+            error: Box::new(error),
+        }
     }
 }
 
@@ -762,7 +765,7 @@ impl IntoResponse for ApiError {
             self.status,
             Json(ApiErrorEnvelope {
                 api_version: API_VERSION,
-                error: self.error,
+                error: *self.error,
             }),
         )
             .into_response()

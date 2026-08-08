@@ -4,6 +4,8 @@
 //! encoding belongs to `ordadb-storage`; WAL and crash recovery belong to
 //! `ordadb-transaction`.
 
+mod system_catalog;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -43,9 +45,9 @@ use ordadb_sql::{
     BoundJoinSource, BoundMerge, BoundMergeAction, BoundMergeClauseKind, BoundOnConflict,
     BoundOrder, BoundProjection, BoundReturning, BoundSequenceOperation, BoundStatement,
     BoundTable, BoundWindow, BoundWindowFrameBound, DdlObjectKind, JoinKind, ParsedStatement,
-    QuerySetOperator, SqlDialect, SubqueryQuantifier, TransactionChain, bind,
+    QuerySetOperator, SessionBindValues, SqlDialect, SubqueryQuantifier, TransactionChain, bind,
     bind_catalog_expression_with_catalog, bind_catalog_expression_with_parameter_types_and_catalog,
-    parse, parse_with_dialect,
+    bind_with_session, parse, parse_with_dialect,
 };
 use ordadb_storage::{
     ApplyPoint, DataFormat, DatabaseStore, DurabilityBarrier, FROZEN_TRANSACTION_ID,
@@ -72,6 +74,11 @@ use sha2::{Digest, Sha256};
 const AUTOMATIC_CHECKPOINT_INTERVAL: u64 = 64;
 const MAX_REFERENTIAL_ACTIONS: usize = 16_384;
 const MAX_DML_LOCK_RECHECKS: usize = 32;
+const MAX_SYSTEM_CATALOG_ROLES: usize = 10_000;
+const MAX_SYSTEM_CATALOG_SETTINGS: usize = 256;
+const MAX_SYSTEM_CATALOG_TEXT_BYTES: usize = 1_024;
+const MAX_SESSION_RUNTIME_TEXT_BYTES: usize = 1_024;
+const MAX_SESSION_RUNTIME_SETTINGS: usize = 256;
 const PLPGSQL_EXECUTION_STACK_BYTES: usize = 8 * 1024 * 1024;
 pub const LOGICAL_SNAPSHOT_VERSION: u16 = 1;
 
@@ -88,9 +95,206 @@ pub struct SessionOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRuntimeMetadata {
+    version: String,
+    current_database: String,
+    current_user: String,
+    session_user: String,
+    settings: BTreeMap<String, String>,
+}
+
+impl SessionRuntimeMetadata {
+    pub fn postgres_compatible(
+        server_version: &str,
+        current_database: impl Into<String>,
+        current_user: impl Into<String>,
+        session_user: impl Into<String>,
+    ) -> Result<Self> {
+        let session_user = session_user.into();
+        Self::new(
+            format!("PostgreSQL {server_version} compatible OrdaDB on x86_64-pc-windows-msvc"),
+            current_database,
+            current_user,
+            session_user.clone(),
+        )
+        .and_then(|metadata| {
+            metadata.with_settings([
+                ("server_version", server_version),
+                ("server_encoding", "UTF8"),
+                ("client_encoding", "UTF8"),
+                ("datestyle", "ISO, YMD"),
+                ("timezone", "UTC"),
+                ("integer_datetimes", "on"),
+                ("standard_conforming_strings", "on"),
+                ("default_transaction_isolation", "read committed"),
+                ("transaction_isolation", "read committed"),
+                ("default_transaction_read_only", "off"),
+                ("session_authorization", session_user.as_str()),
+                ("application_name", ""),
+                ("extra_float_digits", "1"),
+            ])
+        })
+    }
+
+    pub fn new(
+        version: impl Into<String>,
+        current_database: impl Into<String>,
+        current_user: impl Into<String>,
+        session_user: impl Into<String>,
+    ) -> Result<Self> {
+        let metadata = Self {
+            version: version.into(),
+            current_database: current_database.into(),
+            current_user: current_user.into(),
+            session_user: session_user.into(),
+            settings: BTreeMap::new(),
+        };
+        for (value, field) in [
+            (metadata.version.as_str(), "version"),
+            (metadata.current_database.as_str(), "current database"),
+            (metadata.current_user.as_str(), "current user"),
+            (metadata.session_user.as_str(), "session user"),
+        ] {
+            if value.is_empty()
+                || value.len() > MAX_SESSION_RUNTIME_TEXT_BYTES
+                || value.as_bytes().contains(&0)
+            {
+                return Err(DbError::new(
+                    "22023",
+                    format!(
+                        "{field} must contain between 1 and {MAX_SESSION_RUNTIME_TEXT_BYTES} bytes without NUL"
+                    ),
+                ));
+            }
+        }
+        Ok(metadata)
+    }
+
+    pub fn with_settings<K, V>(mut self, settings: impl IntoIterator<Item = (K, V)>) -> Result<Self>
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let mut values = BTreeMap::new();
+        for (name, value) in settings {
+            if values.len() >= MAX_SESSION_RUNTIME_SETTINGS {
+                return Err(DbError::new(
+                    "54000",
+                    "session setting snapshot exceeds the 256-entry limit",
+                ));
+            }
+            let name = name.into().trim().to_ascii_lowercase();
+            let value = value.into();
+            if name.is_empty()
+                || name.len() > MAX_SESSION_RUNTIME_TEXT_BYTES
+                || name.as_bytes().contains(&0)
+                || value.len() > MAX_SESSION_RUNTIME_TEXT_BYTES
+                || value.as_bytes().contains(&0)
+            {
+                return Err(DbError::new(
+                    "22023",
+                    "session setting names must be non-empty and setting names and values must fit the 1024-byte limit without NUL",
+                ));
+            }
+            if values.insert(name.clone(), value).is_some() {
+                return Err(DbError::new(
+                    "42710",
+                    format!("session setting {name} is defined more than once"),
+                ));
+            }
+        }
+        self.settings = values;
+        Ok(self)
+    }
+
+    fn bind_values(&self) -> SessionBindValues<'_> {
+        SessionBindValues {
+            version: &self.version,
+            current_database: &self.current_database,
+            current_user: &self.current_user,
+            session_user: &self.session_user,
+            settings: &self.settings,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionAuthorization {
     owner: CatalogOwner,
     bypass_ownership: bool,
+    catalog_visibility: CatalogVisibility,
+    catalog_roles: Vec<CatalogRoleMetadata>,
+    catalog_settings: Vec<CatalogSettingMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogVisibilityScope {
+    All,
+    Schema { schema: String },
+    Object { schema: String, name: String },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CatalogVisibility {
+    allow_all: bool,
+    schemas: BTreeSet<String>,
+    objects: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl CatalogVisibility {
+    pub fn from_scopes(scopes: impl IntoIterator<Item = CatalogVisibilityScope>) -> Result<Self> {
+        let mut visibility = Self::default();
+        for scope in scopes {
+            match scope {
+                CatalogVisibilityScope::All => visibility.allow_all = true,
+                CatalogVisibilityScope::Schema { schema } => {
+                    validate_system_catalog_text(&schema, "catalog visibility schema")?;
+                    visibility.schemas.insert(schema);
+                }
+                CatalogVisibilityScope::Object { schema, name } => {
+                    validate_system_catalog_text(&schema, "catalog visibility schema")?;
+                    validate_system_catalog_text(&name, "catalog visibility object")?;
+                    visibility.objects.entry(schema).or_default().insert(name);
+                }
+            }
+        }
+        Ok(visibility)
+    }
+
+    fn allows(&self, schema: &str, object: Option<&str>) -> bool {
+        self.allow_all
+            || self.schemas.contains(schema)
+            || object.is_some_and(|object| {
+                self.objects
+                    .get(schema)
+                    .is_some_and(|objects| objects.contains(object))
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogRoleMetadata {
+    pub postgres_oid: u32,
+    pub name: String,
+    pub can_login: bool,
+    pub login_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogSettingMetadata {
+    pub name: String,
+    pub setting: String,
+    pub unit: Option<String>,
+    pub category: String,
+    pub short_description: String,
+    pub context: String,
+    pub value_type: String,
+    pub source: String,
+    pub minimum: Option<String>,
+    pub maximum: Option<String>,
+    pub enum_values: Option<String>,
+    pub boot_value: String,
+    pub reset_value: String,
 }
 
 impl SessionAuthorization {
@@ -98,7 +302,25 @@ impl SessionAuthorization {
         Ok(Self {
             owner: CatalogOwner::new(owner)?,
             bypass_ownership,
+            catalog_visibility: CatalogVisibility::default(),
+            catalog_roles: Vec::new(),
+            catalog_settings: Vec::new(),
         })
+    }
+
+    #[must_use]
+    pub fn with_catalog_visibility(mut self, visibility: CatalogVisibility) -> Self {
+        self.catalog_visibility = visibility;
+        self
+    }
+
+    pub fn with_system_catalog_metadata(
+        mut self,
+        roles: Vec<CatalogRoleMetadata>,
+        settings: Vec<CatalogSettingMetadata>,
+    ) -> Result<Self> {
+        self.replace_system_catalog_metadata(roles, settings)?;
+        Ok(self)
     }
 
     #[must_use]
@@ -110,6 +332,118 @@ impl SessionAuthorization {
     pub const fn bypasses_ownership(&self) -> bool {
         self.bypass_ownership
     }
+
+    fn replace_system_catalog_metadata(
+        &mut self,
+        roles: Vec<CatalogRoleMetadata>,
+        settings: Vec<CatalogSettingMetadata>,
+    ) -> Result<()> {
+        validate_system_catalog_metadata(&roles, &settings)?;
+        self.catalog_roles = roles;
+        self.catalog_settings = settings;
+        Ok(())
+    }
+
+    pub(crate) fn catalog_roles(&self) -> &[CatalogRoleMetadata] {
+        &self.catalog_roles
+    }
+
+    pub(crate) fn catalog_settings(&self) -> &[CatalogSettingMetadata] {
+        &self.catalog_settings
+    }
+
+    pub(crate) fn can_discover(&self, schema: &str, object: Option<&str>) -> bool {
+        self.catalog_visibility.allows(schema, object)
+    }
+}
+
+fn validate_system_catalog_metadata(
+    roles: &[CatalogRoleMetadata],
+    settings: &[CatalogSettingMetadata],
+) -> Result<()> {
+    if roles.len() > MAX_SYSTEM_CATALOG_ROLES {
+        return Err(DbError::new(
+            "54000",
+            "system catalog role snapshot exceeds the bounded role limit",
+        ));
+    }
+    if settings.len() > MAX_SYSTEM_CATALOG_SETTINGS {
+        return Err(DbError::new(
+            "54000",
+            "system catalog settings snapshot exceeds the bounded setting limit",
+        ));
+    }
+    let mut role_oids = BTreeSet::new();
+    let mut role_names = BTreeSet::new();
+    for role in roles {
+        validate_system_catalog_text(&role.name, "role name")?;
+        if role.postgres_oid == 0
+            || !role_oids.insert(role.postgres_oid)
+            || !role_names.insert(role.name.as_str())
+        {
+            return Err(DbError::new(
+                "XX001",
+                "system catalog role snapshot contains a duplicate or invalid identity",
+            ));
+        }
+    }
+    let mut setting_names = BTreeSet::new();
+    for setting in settings {
+        for (value, field) in [
+            (setting.name.as_str(), "setting name"),
+            (setting.category.as_str(), "setting category"),
+            (setting.short_description.as_str(), "setting description"),
+            (setting.context.as_str(), "setting context"),
+            (setting.value_type.as_str(), "setting type"),
+            (setting.source.as_str(), "setting source"),
+        ] {
+            validate_system_catalog_text(value, field)?;
+        }
+        for (value, field) in [
+            (setting.setting.as_str(), "setting value"),
+            (setting.boot_value.as_str(), "setting boot value"),
+            (setting.reset_value.as_str(), "setting reset value"),
+        ] {
+            validate_system_catalog_bounded_text(value, field)?;
+        }
+        for (value, field) in [
+            (setting.unit.as_deref(), "setting unit"),
+            (setting.minimum.as_deref(), "setting minimum"),
+            (setting.maximum.as_deref(), "setting maximum"),
+            (setting.enum_values.as_deref(), "setting enum values"),
+        ] {
+            if let Some(value) = value {
+                validate_system_catalog_bounded_text(value, field)?;
+            }
+        }
+        if !setting_names.insert(setting.name.to_ascii_lowercase()) {
+            return Err(DbError::new(
+                "XX001",
+                "system catalog settings snapshot contains a duplicate name",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_system_catalog_text(value: &str, field: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(DbError::new(
+            "22023",
+            format!("system catalog {field} is empty, oversized, or contains NUL"),
+        ));
+    }
+    validate_system_catalog_bounded_text(value, field)
+}
+
+fn validate_system_catalog_bounded_text(value: &str, field: &str) -> Result<()> {
+    if value.len() > MAX_SYSTEM_CATALOG_TEXT_BYTES || value.as_bytes().contains(&0) {
+        return Err(DbError::new(
+            "22023",
+            format!("system catalog {field} is oversized or contains NUL"),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -396,6 +730,15 @@ impl Engine {
         options: SessionOptions,
         authorization: Option<SessionAuthorization>,
     ) -> Result<Session> {
+        let session_user = authorization
+            .as_ref()
+            .map_or("ordadb", |authorization| authorization.owner().as_str());
+        let runtime_metadata = SessionRuntimeMetadata::postgres_compatible(
+            "18",
+            "ordadb",
+            session_user,
+            session_user,
+        )?;
         Ok(Session {
             state: Arc::clone(&self.state),
             store: Arc::clone(&self.store),
@@ -411,6 +754,7 @@ impl Engine {
             sequence_currvals: BTreeMap::new(),
             options,
             authorization,
+            runtime_metadata,
         })
     }
 
@@ -592,6 +936,7 @@ pub struct Session {
     sequence_currvals: BTreeMap<SequenceId, i64>,
     options: SessionOptions,
     authorization: Option<SessionAuthorization>,
+    runtime_metadata: SessionRuntimeMetadata,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -737,7 +1082,13 @@ impl Session {
         }
         let snapshot = self.statement_snapshot()?;
         let described = parse_with_dialect(sql, self.options.dialect)
-            .and_then(|statement| bind(statement, &snapshot.catalog))
+            .and_then(|statement| {
+                bind_with_session(
+                    statement,
+                    &snapshot.catalog,
+                    self.runtime_metadata.bind_values(),
+                )
+            })
             .and_then(|statement| {
                 Ok(StatementDescription {
                     schema: bound_statement_schema(&statement),
@@ -761,6 +1112,27 @@ impl Session {
         cancellation: Arc<AtomicBool>,
     ) -> Result<TryQueryStream> {
         self.execute_stream_controlled(sql, params, Some(cancellation))
+    }
+
+    pub fn set_runtime_metadata(&mut self, metadata: SessionRuntimeMetadata) {
+        self.runtime_metadata = metadata;
+    }
+
+    pub fn refresh_system_catalog_metadata(
+        &mut self,
+        roles: Vec<CatalogRoleMetadata>,
+        settings: Vec<CatalogSettingMetadata>,
+        visibility: CatalogVisibility,
+    ) -> Result<()> {
+        let authorization = self.authorization.as_mut().ok_or_else(|| {
+            DbError::new(
+                "55000",
+                "system catalog role metadata requires an authenticated session",
+            )
+        })?;
+        authorization.replace_system_catalog_metadata(roles, settings)?;
+        authorization.catalog_visibility = visibility;
+        Ok(())
     }
 
     fn execute_stream_controlled(
@@ -796,8 +1168,12 @@ impl Session {
         }
         let mut snapshot = self.statement_snapshot()?;
         snapshot.cancellation = cancellation;
-        let statement = match bind(parsed, &snapshot.catalog)
-            .and_then(|statement| resolve_sequence_currval(statement, &self.sequence_currvals))
+        let statement = match bind_with_session(
+            parsed,
+            &snapshot.catalog,
+            self.runtime_metadata.bind_values(),
+        )
+        .and_then(|statement| resolve_sequence_currval(statement, &self.sequence_currvals))
         {
             Ok(statement) => statement,
             Err(error) => {
@@ -805,6 +1181,34 @@ impl Session {
                 return Err(error);
             }
         };
+        if let Err(error) = reject_system_catalog_write(&statement) {
+            self.fail_sql_transaction();
+            return Err(error);
+        }
+        if statement_write_scope(&statement) == StatementWriteScope::ReadOnly {
+            let system_table_ids = statement_read_table_ids(&statement)
+                .into_iter()
+                .filter(|table_id| Catalog::is_system_table(*table_id))
+                .collect::<BTreeSet<_>>();
+            let system_catalog = match system_catalog::build_system_catalog_snapshot(
+                &snapshot.catalog,
+                self.authorization.as_ref(),
+                &system_table_ids,
+            ) {
+                Ok(snapshot) => Arc::new(snapshot),
+                Err(error) => {
+                    self.fail_sql_transaction();
+                    return Err(error);
+                }
+            };
+            snapshot.rows.extend(
+                system_catalog
+                    .tables()
+                    .iter()
+                    .map(|(table_id, rows)| (*table_id, Arc::clone(rows))),
+            );
+            snapshot.system_catalog = Some(system_catalog);
+        }
 
         match &statement {
             BoundStatement::Begin { characteristics } => {
@@ -881,6 +1285,7 @@ impl Session {
             sequence_currvals: &mut self.sequence_currvals,
             dialect: self.options.dialect,
             authorization: self.authorization.clone(),
+            runtime_metadata: self.runtime_metadata.clone(),
             transaction,
             base: None,
             working: None,
@@ -903,6 +1308,14 @@ impl Session {
             SqlTransactionState::Active(_) => TransactionStatus::Active,
             SqlTransactionState::Failed(_) => TransactionStatus::Failed,
         }
+    }
+
+    /// Mark an explicit SQL transaction as failed when a protocol adapter
+    /// executes a statement through a specialized path outside the normal
+    /// bound-statement dispatcher.
+    pub fn mark_transaction_failed(&mut self) {
+        self.normalize_sql_transaction_failure();
+        self.fail_sql_transaction();
     }
 
     pub fn search(&self, request: SearchRequest) -> Result<Vec<SearchResult>> {
@@ -1409,6 +1822,7 @@ impl Session {
             Arc::clone(&self.storage_access),
             snapshot.generation,
             &snapshot.rows,
+            snapshot.system_catalog.as_deref(),
         );
         if let Some(stream) =
             prepare_read_stream(&snapshot, statement.clone(), params, Some(&table_provider))?
@@ -1447,8 +1861,11 @@ impl Session {
                     &snapshot,
                     sql,
                     params,
-                    self.options.dialect,
-                    self.authorization.as_ref(),
+                    StatementExecutionContext {
+                        dialect: self.options.dialect,
+                        runtime_metadata: &self.runtime_metadata,
+                        authorization: self.authorization.as_ref(),
+                    },
                     Some(version_mutation_context(&transaction)?),
                     maintenance,
                 )?;
@@ -1487,8 +1904,11 @@ impl Session {
             &committed,
             sql,
             params,
-            self.options.dialect,
-            self.authorization.as_ref(),
+            StatementExecutionContext {
+                dialect: self.options.dialect,
+                runtime_metadata: &self.runtime_metadata,
+                authorization: self.authorization.as_ref(),
+            },
             Some(version_mutation_context(&transaction)?),
             maintenance,
         )?;
@@ -1618,8 +2038,11 @@ impl Session {
                             &recheck_base,
                             sql,
                             params,
-                            self.options.dialect,
-                            self.authorization.as_ref(),
+                            StatementExecutionContext {
+                                dialect: self.options.dialect,
+                                runtime_metadata: &self.runtime_metadata,
+                                authorization: self.authorization.as_ref(),
+                            },
                             Some(version_mutation_context(&transaction.transaction)?),
                             maintenance,
                         )?;
@@ -1709,8 +2132,11 @@ impl Session {
                         &upgraded_working,
                         sql,
                         params,
-                        self.options.dialect,
-                        self.authorization.as_ref(),
+                        StatementExecutionContext {
+                            dialect: self.options.dialect,
+                            runtime_metadata: &self.runtime_metadata,
+                            authorization: self.authorization.as_ref(),
+                        },
                         Some(version_mutation_context(&transaction.transaction)?),
                         maintenance,
                     )?;
@@ -1773,8 +2199,11 @@ impl Session {
             &committed,
             sql,
             params,
-            self.options.dialect,
-            self.authorization.as_ref(),
+            StatementExecutionContext {
+                dialect: self.options.dialect,
+                runtime_metadata: &self.runtime_metadata,
+                authorization: self.authorization.as_ref(),
+            },
             Some(version_mutation_context(&transaction.transaction)?),
             maintenance,
         )?;
@@ -1852,6 +2281,7 @@ fn bound_statement_schema(statement: &BoundStatement) -> Schema {
         | BoundStatement::SetOperation { schema, .. }
         | BoundStatement::With { schema, .. }
         | BoundStatement::ViewSelect { schema, .. }
+        | BoundStatement::ScalarSelect { schema, .. }
         | BoundStatement::RoutineSelect { schema, .. }
         | BoundStatement::SequenceValue { schema, .. } => schema.clone(),
         BoundStatement::Insert {
@@ -1930,6 +2360,9 @@ fn bound_statement_parameter_types(statement: &BoundStatement) -> Result<Vec<Sca
             BoundStatement::Call { arguments, .. }
             | BoundStatement::RoutineSelect { arguments, .. } => {
                 expressions.extend(arguments);
+            }
+            BoundStatement::ScalarSelect { projection, .. } => {
+                expressions.extend(projection.iter().map(|projection| &projection.expr));
             }
             BoundStatement::SequenceValue { operation, .. } => {
                 if let BoundSequenceOperation::SetValue { value, .. } = operation {
@@ -2210,6 +2643,7 @@ pub struct Transaction<'session> {
     sequence_currvals: &'session mut BTreeMap<SequenceId, i64>,
     dialect: SqlDialect,
     authorization: Option<SessionAuthorization>,
+    runtime_metadata: SessionRuntimeMetadata,
     transaction: DurableTransaction,
     base: Option<DatabaseState>,
     working: Option<DatabaseState>,
@@ -2322,7 +2756,11 @@ impl Transaction<'_> {
             }
         };
         let statement = resolve_sequence_currval(
-            bind(parse_with_dialect(sql, self.dialect)?, &snapshot.catalog)?,
+            bind_with_session(
+                parse_with_dialect(sql, self.dialect)?,
+                &snapshot.catalog,
+                self.runtime_metadata.bind_values(),
+            )?,
             self.sequence_currvals,
         )?;
         if matches!(
@@ -2405,8 +2843,11 @@ impl Transaction<'_> {
                         &upgraded_working,
                         sql,
                         params,
-                        self.dialect,
-                        self.authorization.as_ref(),
+                        StatementExecutionContext {
+                            dialect: self.dialect,
+                            runtime_metadata: &self.runtime_metadata,
+                            authorization: self.authorization.as_ref(),
+                        },
                         Some(version_mutation_context(&self.transaction)?),
                         maintenance,
                     )?;
@@ -2463,8 +2904,11 @@ impl Transaction<'_> {
             &committed,
             sql,
             params,
-            self.dialect,
-            self.authorization.as_ref(),
+            StatementExecutionContext {
+                dialect: self.dialect,
+                runtime_metadata: &self.runtime_metadata,
+                authorization: self.authorization.as_ref(),
+            },
             Some(version_mutation_context(&self.transaction)?),
             maintenance,
         )?;
@@ -2740,6 +3184,7 @@ impl Iterator for QueryStream {
 struct DatabaseState {
     catalog: Arc<Catalog>,
     rows: BTreeMap<TableId, Arc<Vec<Row>>>,
+    system_catalog: Option<Arc<system_catalog::SystemCatalogSnapshot>>,
     versions: BTreeMap<TableId, Arc<Vec<VersionedRow>>>,
     visible_versions: BTreeMap<TableId, Arc<Vec<u32>>>,
     indexes: BTreeMap<IndexId, Arc<BPlusTree>>,
@@ -2953,6 +3398,7 @@ impl DatabaseState {
             let mut state = Self {
                 catalog: Arc::new(catalog),
                 rows,
+                system_catalog: None,
                 versions: version_rows,
                 visible_versions,
                 indexes: BTreeMap::new(),
@@ -2989,6 +3435,7 @@ impl DatabaseState {
         Ok(Self {
             catalog: Arc::new(catalog),
             rows,
+            system_catalog: None,
             versions,
             visible_versions,
             indexes,
@@ -3046,6 +3493,7 @@ impl DatabaseState {
         let mut state = Self {
             catalog: snapshot.catalog,
             rows,
+            system_catalog: None,
             versions: BTreeMap::new(),
             visible_versions: BTreeMap::new(),
             indexes: BTreeMap::new(),
@@ -3189,6 +3637,7 @@ pub struct StorageTableProviderV2<'a> {
     storage_access: Arc<StorageAccessGate>,
     generation: u64,
     rows: &'a BTreeMap<TableId, Arc<Vec<Row>>>,
+    system_catalog: Option<&'a system_catalog::SystemCatalogSnapshot>,
 }
 
 impl<'a> StorageTableProviderV2<'a> {
@@ -3197,18 +3646,26 @@ impl<'a> StorageTableProviderV2<'a> {
         storage_access: Arc<StorageAccessGate>,
         generation: u64,
         rows: &'a BTreeMap<TableId, Arc<Vec<Row>>>,
+        system_catalog: Option<&'a system_catalog::SystemCatalogSnapshot>,
     ) -> Self {
         Self {
             store,
             storage_access,
             generation,
             rows,
+            system_catalog,
         }
     }
 }
 
 impl TableProvider for StorageTableProviderV2<'_> {
     fn scan(&self, table_id: TableId) -> Result<Box<dyn TableScan>> {
+        if Catalog::is_system_table(table_id) {
+            return self
+                .system_catalog
+                .ok_or_else(|| internal_error("system catalog snapshot is unavailable"))?
+                .scan(table_id);
+        }
         let lease = self.storage_access.acquire_read()?;
         let cursor = self
             .store
@@ -3374,6 +3831,13 @@ struct VersionMutationContext {
 }
 
 #[derive(Clone, Copy)]
+struct StatementExecutionContext<'a> {
+    dialect: SqlDialect,
+    runtime_metadata: &'a SessionRuntimeMetadata,
+    authorization: Option<&'a SessionAuthorization>,
+}
+
+#[derive(Clone, Copy)]
 struct MaintenanceContext<'a> {
     horizon: TransactionId,
     expired_snapshot: Option<TransactionId>,
@@ -3409,6 +3873,7 @@ fn statement_write_scope(statement: &BoundStatement) -> StatementWriteScope {
         | BoundStatement::SetOperation { .. }
         | BoundStatement::With { .. }
         | BoundStatement::ViewSelect { .. }
+        | BoundStatement::ScalarSelect { .. }
         | BoundStatement::RoutineSelect { .. }
         | BoundStatement::Explain { .. }
         | BoundStatement::NoOp { .. } => StatementWriteScope::ReadOnly,
@@ -3416,7 +3881,40 @@ fn statement_write_scope(statement: &BoundStatement) -> StatementWriteScope {
     }
 }
 
+fn reject_system_catalog_write(statement: &BoundStatement) -> Result<()> {
+    let mut pending = vec![statement];
+    while let Some(statement) = pending.pop() {
+        let target = match statement {
+            BoundStatement::Insert { table_id, .. }
+            | BoundStatement::Update { table_id, .. }
+            | BoundStatement::Delete { table_id, .. } => Some(*table_id),
+            BoundStatement::Merge(merge) => Some(merge.target.table_id),
+            BoundStatement::With { body, .. } => {
+                pending.push(body);
+                None
+            }
+            _ => None,
+        };
+        if target.is_some_and(Catalog::is_system_table) {
+            return Err(
+                DbError::new("42501", "system catalog relations are read-only")
+                    .with_hint("query pg_catalog and information_schema with SELECT"),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn statement_read_predicates(statement: &BoundStatement) -> Vec<PredicateLock> {
+    statement_read_table_ids(statement)
+        .into_iter()
+        .map(|table_id| PredicateLock::Table {
+            table_id: table_id.get(),
+        })
+        .collect()
+}
+
+fn statement_read_table_ids(statement: &BoundStatement) -> BTreeSet<TableId> {
     let mut table_ids = BTreeSet::new();
     let mut pending = vec![statement];
     while let Some(statement) = pending.pop() {
@@ -3466,11 +3964,6 @@ fn statement_read_predicates(statement: &BoundStatement) -> Vec<PredicateLock> {
         }
     }
     table_ids
-        .into_iter()
-        .map(|table_id| PredicateLock::Table {
-            table_id: table_id.get(),
-        })
-        .collect()
 }
 
 fn changed_table_ids(before: &DatabaseState, after: &DatabaseState) -> BTreeSet<TableId> {
@@ -3653,18 +4146,21 @@ fn execute_candidate(
     state: &DatabaseState,
     sql: &str,
     params: &[Value],
-    dialect: SqlDialect,
-    authorization: Option<&SessionAuthorization>,
+    context: StatementExecutionContext<'_>,
     version_context: Option<VersionMutationContext>,
     maintenance: MaintenanceContext<'_>,
 ) -> Result<(DatabaseState, Vec<QueryEvent>, bool)> {
-    let parsed = parse_with_dialect(sql, dialect)?;
-    let statement = bind(parsed, &state.catalog)?;
+    let parsed = parse_with_dialect(sql, context.dialect)?;
+    let statement = bind_with_session(
+        parsed,
+        &state.catalog,
+        context.runtime_metadata.bind_values(),
+    )?;
     let mut candidate = state.clone();
     candidate.trigger_depth = 0;
     candidate.triggers_fired = 0;
     candidate.routine_depth = 0;
-    candidate.authorization = authorization.cloned();
+    candidate.authorization = context.authorization.cloned();
     let reconciles_versions = !matches!(
         &statement,
         BoundStatement::Analyze { .. } | BoundStatement::Vacuum { .. }
@@ -4965,6 +5461,24 @@ fn execute_bound(
         } => {
             execute_routine_program(state, routine_id, &arguments, params)?;
             Ok((command_events(Schema::empty(), "CALL", 0, None), true))
+        }
+        BoundStatement::ScalarSelect { projection, schema } => {
+            let values = projection
+                .iter()
+                .map(|projection| evaluate_scalar(&projection.expr, &[], params))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((
+                command_events(
+                    schema.clone(),
+                    "SELECT 1",
+                    1,
+                    Some(Batch {
+                        schema,
+                        rows: vec![Row::new(values)],
+                    }),
+                ),
+                false,
+            ))
         }
         BoundStatement::RoutineSelect {
             routine_id,
@@ -9678,6 +10192,500 @@ mod tests {
             .collect()
     }
 
+    fn catalog_setting(name: &str, setting: &str) -> CatalogSettingMetadata {
+        CatalogSettingMetadata {
+            name: name.to_owned(),
+            setting: setting.to_owned(),
+            unit: None,
+            category: "OrdaDB test settings".to_owned(),
+            short_description: format!("Test projection for {name}."),
+            context: "user".to_owned(),
+            value_type: "string".to_owned(),
+            source: "session".to_owned(),
+            minimum: None,
+            maximum: None,
+            enum_values: None,
+            boot_value: setting.to_owned(),
+            reset_value: setting.to_owned(),
+        }
+    }
+
+    #[test]
+    fn system_catalog_queries_use_normal_relational_execution() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE catalog_widgets (id BIGINT PRIMARY KEY, label TEXT)",
+            &[],
+        );
+
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT nspname FROM pg_catalog.pg_namespace \
+                 WHERE nspname <> $1 ORDER BY nspname LIMIT 2",
+                &[Value::Text("information_schema".into())],
+            )),
+            vec![
+                Row::new(vec![Value::Text("pg_catalog".into())]),
+                Row::new(vec![Value::Text("public".into())]),
+            ]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT n.nspname, c.relname \
+                 FROM pg_catalog.pg_namespace AS n \
+                 JOIN pg_catalog.pg_class AS c ON c.relnamespace = n.oid \
+                 WHERE c.relname = 'catalog_widgets'",
+                &[],
+            )),
+            vec![Row::new(vec![
+                Value::Text("public".into()),
+                Value::Text("catalog_widgets".into()),
+            ])]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "WITH matching AS (\
+                    SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = $1\
+                 ) SELECT nspname FROM matching",
+                &[Value::Text("public".into())],
+            )),
+            vec![Row::new(vec![Value::Text("public".into())])]
+        );
+    }
+
+    #[test]
+    fn system_catalog_materializes_only_relations_referenced_by_the_statement() {
+        let catalog = Catalog::default();
+        let requested = BTreeSet::from([
+            ordadb_catalog::PG_NAMESPACE_TABLE_ID,
+            ordadb_catalog::PG_CLASS_TABLE_ID,
+        ]);
+        let snapshot = system_catalog::build_system_catalog_snapshot(&catalog, None, &requested)
+            .expect("requested system rows");
+        assert_eq!(
+            snapshot.tables().keys().copied().collect::<BTreeSet<_>>(),
+            requested
+        );
+        assert!(!snapshot.tables()[&ordadb_catalog::PG_NAMESPACE_TABLE_ID].is_empty());
+        assert!(!snapshot.tables()[&ordadb_catalog::PG_CLASS_TABLE_ID].is_empty());
+        let grant = MemoryGrant::new(64 * 1024, 1024 * 1024).expect("scan grant");
+        let mut scan = snapshot
+            .scan(ordadb_catalog::PG_NAMESPACE_TABLE_ID)
+            .expect("virtual scan");
+        let first = scan
+            .next_chunk(1, &grant)
+            .expect("first virtual chunk")
+            .expect("virtual row");
+        assert_eq!(first.chunk().len(), 1);
+        assert!(grant.peak_bytes() > 0);
+    }
+
+    #[test]
+    fn system_catalog_supporting_relations_and_information_schema_are_relational() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE catalog_parent (
+                tenant BIGINT,
+                id BIGINT,
+                code TEXT,
+                CONSTRAINT catalog_parent_pk PRIMARY KEY (tenant, id),
+                CONSTRAINT catalog_parent_code_unique UNIQUE (tenant, code),
+                CONSTRAINT catalog_parent_code_check CHECK (code <> '')
+            )",
+            &[],
+        );
+        execute(
+            &mut session,
+            "CREATE TABLE catalog_child (
+                tenant BIGINT,
+                parent_id BIGINT,
+                CONSTRAINT catalog_child_parent_fk FOREIGN KEY (tenant, parent_id)
+                    REFERENCES catalog_parent (tenant, id)
+            )",
+            &[],
+        );
+        execute(
+            &mut session,
+            "CREATE VIEW catalog_parent_view AS SELECT tenant, id, code FROM catalog_parent",
+            &[],
+        );
+        execute(
+            &mut session,
+            "CREATE SEQUENCE catalog_sequence INCREMENT BY 2 START WITH 10",
+            &[],
+        );
+        execute(
+            &mut session,
+            "CREATE FUNCTION catalog_echo(value BIGINT)
+             RETURNS BIGINT
+             LANGUAGE plpgsql
+             AS $$
+             BEGIN
+             RETURN value;
+             END;
+             $$",
+            &[],
+        );
+
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT a.amname, p.proname
+                 FROM pg_catalog.pg_am AS a
+                 JOIN pg_catalog.pg_proc AS p ON p.oid = a.amhandler
+                 ORDER BY a.amname",
+                &[],
+            )),
+            vec![
+                Row::new(vec![
+                    Value::Text("btree".into()),
+                    Value::Text("bthandler".into()),
+                ]),
+                Row::new(vec![
+                    Value::Text("heap".into()),
+                    Value::Text("heap_tableam_handler".into()),
+                ]),
+            ]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT collname FROM pg_catalog.pg_collation ORDER BY oid",
+                &[],
+            )),
+            vec![
+                Row::new(vec![Value::Text("C".into())]),
+                Row::new(vec![Value::Text("POSIX".into())]),
+            ]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT table_name, check_option, is_updatable
+                 FROM information_schema.views
+                 WHERE table_name = 'catalog_parent_view'",
+                &[],
+            )),
+            vec![Row::new(vec![
+                Value::Text("catalog_parent_view".into()),
+                Value::Text("NONE".into()),
+                Value::Text("NO".into()),
+            ])]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT sequence_name, data_type, numeric_precision, increment, cycle_option
+                 FROM information_schema.sequences
+                 WHERE sequence_name = 'catalog_sequence'",
+                &[],
+            )),
+            vec![Row::new(vec![
+                Value::Text("catalog_sequence".into()),
+                Value::Text("bigint".into()),
+                Value::Int32(64),
+                Value::Text("2".into()),
+                Value::Text("NO".into()),
+            ])]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT constraint_name, constraint_type
+                 FROM information_schema.table_constraints
+                 WHERE table_name = 'catalog_parent'
+                 ORDER BY constraint_name",
+                &[],
+            )),
+            vec![
+                Row::new(vec![
+                    Value::Text("catalog_parent_code_check".into()),
+                    Value::Text("CHECK".into()),
+                ]),
+                Row::new(vec![
+                    Value::Text("catalog_parent_code_unique".into()),
+                    Value::Text("UNIQUE".into()),
+                ]),
+                Row::new(vec![
+                    Value::Text("catalog_parent_pk".into()),
+                    Value::Text("PRIMARY KEY".into()),
+                ]),
+            ]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT column_name, ordinal_position, position_in_unique_constraint
+                 FROM information_schema.key_column_usage
+                 WHERE constraint_name = 'catalog_child_parent_fk'
+                 ORDER BY ordinal_position",
+                &[],
+            )),
+            vec![
+                Row::new(vec![
+                    Value::Text("tenant".into()),
+                    Value::Int32(1),
+                    Value::Int32(1),
+                ]),
+                Row::new(vec![
+                    Value::Text("parent_id".into()),
+                    Value::Int32(2),
+                    Value::Int32(2),
+                ]),
+            ]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT routine_name, routine_type, data_type, routine_definition
+                 FROM information_schema.routines
+                 WHERE routine_name = 'catalog_echo'",
+                &[],
+            )),
+            vec![Row::new(vec![
+                Value::Text("catalog_echo".into()),
+                Value::Text("FUNCTION".into()),
+                Value::Text("bigint".into()),
+                Value::Null,
+            ])]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT p.ordinal_position, p.parameter_mode, p.parameter_name, p.data_type
+                 FROM information_schema.parameters AS p
+                 JOIN information_schema.routines AS r
+                   ON r.specific_name = p.specific_name
+                 WHERE r.routine_name = 'catalog_echo'
+                 ORDER BY p.ordinal_position",
+                &[],
+            )),
+            vec![
+                Row::new(vec![
+                    Value::Int32(0),
+                    Value::Null,
+                    Value::Null,
+                    Value::Text("bigint".into()),
+                ]),
+                Row::new(vec![
+                    Value::Int32(1),
+                    Value::Text("IN".into()),
+                    Value::Text("value".into()),
+                    Value::Text("bigint".into()),
+                ]),
+            ]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT dependent.relname, referenced.relname, d.deptype
+                 FROM pg_catalog.pg_depend AS d
+                 JOIN pg_catalog.pg_class AS dependent ON dependent.oid = d.objid
+                 JOIN pg_catalog.pg_class AS referenced ON referenced.oid = d.refobjid
+                 WHERE dependent.relname = 'catalog_parent_view'",
+                &[],
+            )),
+            vec![Row::new(vec![
+                Value::Text("catalog_parent_view".into()),
+                Value::Text("catalog_parent".into()),
+                Value::Text("n".into()),
+            ])]
+        );
+        assert!(
+            rows(&execute(
+                &mut session,
+                "SELECT * FROM pg_catalog.pg_description",
+                &[],
+            ))
+            .is_empty()
+        );
+        assert!(
+            rows(&execute(
+                &mut session,
+                "SELECT * FROM pg_catalog.pg_inherits",
+                &[],
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn system_catalog_oids_survive_engine_reopen() {
+        let (directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        execute(
+            &mut session,
+            "CREATE TABLE reopen_catalog_oid (id BIGINT PRIMARY KEY)",
+            &[],
+        );
+        let before = rows(&execute(
+            &mut session,
+            "SELECT oid FROM pg_catalog.pg_class WHERE relname = 'reopen_catalog_oid'",
+            &[],
+        ));
+        assert_eq!(before.len(), 1);
+        drop(session);
+        drop(engine);
+
+        let reopened = Engine::open(EngineConfig::new(directory.path())).expect("reopen engine");
+        let mut session = reopened.connect().expect("reconnect");
+        assert_eq!(
+            rows(&execute(
+                &mut session,
+                "SELECT oid FROM pg_catalog.pg_class WHERE relname = 'reopen_catalog_oid'",
+                &[],
+            )),
+            before
+        );
+    }
+
+    #[test]
+    fn system_catalog_visibility_roles_settings_and_writes_are_safe() {
+        let (_directory, engine) = engine();
+        let mut alice = engine
+            .connect_authenticated(
+                SessionAuthorization::new("alice", false)
+                    .expect("alice authorization")
+                    .with_system_catalog_metadata(
+                        vec![
+                            CatalogRoleMetadata {
+                                postgres_oid: 20_001,
+                                name: "alice".to_owned(),
+                                can_login: true,
+                                login_enabled: true,
+                            },
+                            CatalogRoleMetadata {
+                                postgres_oid: 20_002,
+                                name: "reporting".to_owned(),
+                                can_login: false,
+                                login_enabled: false,
+                            },
+                        ],
+                        vec![catalog_setting("application_name", "catalog-test")],
+                    )
+                    .expect("system catalog metadata"),
+            )
+            .expect("alice session");
+        execute(
+            &mut alice,
+            "CREATE TABLE alice_private (id BIGINT PRIMARY KEY)",
+            &[],
+        );
+        let catalog = engine.catalog_snapshot().expect("catalog snapshot");
+        let public_schema = catalog
+            .schema(&Identifier::unquoted("public"))
+            .expect("public schema");
+        let public_schema_oid = i64::from(
+            catalog
+                .postgres_oid(ordadb_catalog::PostgresOidObject::Schema(public_schema.id))
+                .expect("public schema OID")
+                .get(),
+        );
+
+        let role_rows = rows(&execute(
+            &mut alice,
+            "SELECT rolname, oid, rolpassword FROM pg_catalog.pg_roles ORDER BY oid",
+            &[],
+        ));
+        assert_eq!(
+            role_rows,
+            vec![
+                Row::new(vec![
+                    Value::Text("alice".into()),
+                    Value::Int64(20_001),
+                    Value::Text("********".into()),
+                ]),
+                Row::new(vec![
+                    Value::Text("reporting".into()),
+                    Value::Int64(20_002),
+                    Value::Text("********".into()),
+                ]),
+            ]
+        );
+        assert_eq!(
+            rows(&execute(
+                &mut alice,
+                "SELECT setting FROM pg_catalog.pg_settings \
+                 WHERE name = 'application_name'",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Text("catalog-test".into())])]
+        );
+        let namespace_events = execute(
+            &mut alice,
+            "SELECT n.oid, n.nspname, r.rolname \
+             FROM pg_catalog.pg_namespace AS n \
+             LEFT JOIN pg_catalog.pg_roles AS r ON r.oid = n.nspowner \
+             WHERE n.nspname = 'public'",
+            &[],
+        );
+        let namespace_schema = namespace_events
+            .iter()
+            .find_map(|event| match event {
+                QueryEvent::Schema(schema) => Some(schema),
+                _ => None,
+            })
+            .expect("namespace schema");
+        assert_eq!(namespace_schema.fields[0].data_type, ScalarType::Oid);
+        assert_eq!(namespace_schema.fields[1].data_type, ScalarType::Name);
+        assert_eq!(namespace_schema.fields[2].data_type, ScalarType::Name);
+        assert_eq!(
+            rows(&namespace_events),
+            vec![Row::new(vec![
+                Value::Int64(public_schema_oid),
+                Value::Text("public".into()),
+                Value::Null,
+            ])]
+        );
+
+        let mut bob = engine
+            .connect_authenticated(SessionAuthorization::new("bob", false).expect("bob auth"))
+            .expect("bob session");
+        assert!(
+            rows(&execute(
+                &mut bob,
+                "SELECT relname FROM pg_catalog.pg_class WHERE relname = 'alice_private'",
+                &[],
+            ))
+            .is_empty()
+        );
+        let visibility = CatalogVisibility::from_scopes([CatalogVisibilityScope::Object {
+            schema: "public".to_owned(),
+            name: "alice_private".to_owned(),
+        }])
+        .expect("catalog visibility");
+        let mut reporting = engine
+            .connect_authenticated(
+                SessionAuthorization::new("reporter", false)
+                    .expect("reporter auth")
+                    .with_catalog_visibility(visibility),
+            )
+            .expect("reporter session");
+        assert_eq!(
+            rows(&execute(
+                &mut reporting,
+                "SELECT relname FROM pg_catalog.pg_class WHERE relname = 'alice_private'",
+                &[],
+            )),
+            vec![Row::new(vec![Value::Text("alice_private".into())])]
+        );
+        let error = bob
+            .execute("DELETE FROM pg_catalog.pg_namespace", &[])
+            .expect_err("system DML must fail");
+        assert_eq!(error.sql_state, "42501");
+        let error = bob
+            .execute("DROP TABLE pg_catalog.pg_namespace", &[])
+            .expect_err("system DDL must fail");
+        assert_eq!(error.sql_state, "42501");
+    }
+
     fn create_documents(session: &mut Session) {
         execute(
             session,
@@ -9833,6 +10841,91 @@ mod tests {
             .describe_statement("SELECT id FROM documents WHERE id = $1 OR score = $1")
             .expect_err("conflicting parameter types");
         assert_eq!(conflict.sql_state, "42804");
+    }
+
+    #[test]
+    fn scalar_select_describe_and_execute_share_runtime_metadata() {
+        let (_directory, engine) = engine();
+        let mut session = engine.connect().expect("connect");
+        session.set_runtime_metadata(
+            SessionRuntimeMetadata::new(
+                "PostgreSQL 18 compatible OrdaDB test",
+                "metadata_db",
+                "alice",
+                "bootstrap",
+            )
+            .expect("runtime metadata")
+            .with_settings([
+                ("client_encoding", "UTF8"),
+                ("standard_conforming_strings", "on"),
+            ])
+            .expect("runtime settings"),
+        );
+
+        let description = session
+            .describe_statement("SELECT current_database()")
+            .expect("describe scalar select");
+        assert!(description.parameter_types.is_empty());
+        assert_eq!(description.schema.fields.len(), 1);
+        assert_eq!(description.schema.fields[0].name, "current_database");
+        assert_eq!(description.schema.fields[0].data_type, ScalarType::Text);
+        assert!(!description.schema.fields[0].nullable);
+
+        let settings_description = session
+            .describe_statement(
+                "SELECT current_setting('client_encoding'), \
+                 current_setting('standard_conforming_strings')",
+            )
+            .expect("describe settings");
+        assert_eq!(settings_description.schema.fields.len(), 2);
+        let settings_events = execute(
+            &mut session,
+            "SELECT current_setting('client_encoding'), \
+             current_setting('standard_conforming_strings')",
+            &[],
+        );
+        assert_eq!(
+            rows(&settings_events),
+            vec![Row::new(vec![
+                Value::Text("UTF8".into()),
+                Value::Text("on".into()),
+            ])]
+        );
+
+        for (sql, expected) in [
+            (
+                "SELECT version()",
+                Value::Text("PostgreSQL 18 compatible OrdaDB test".into()),
+            ),
+            (
+                "SELECT current_database()",
+                Value::Text("metadata_db".into()),
+            ),
+            ("SELECT CURRENT_USER", Value::Text("alice".into())),
+            ("SELECT SESSION_USER", Value::Text("bootstrap".into())),
+            ("SELECT 1", Value::Int32(1)),
+        ] {
+            let events = execute(&mut session, sql, &[]);
+            assert_eq!(rows(&events), vec![Row::new(vec![expected])], "{sql}");
+            assert!(matches!(
+                events.last(),
+                Some(QueryEvent::Complete(CommandComplete { tag, rows_affected: 1 }))
+                    if tag == "SELECT 1"
+            ));
+        }
+
+        for invalid in [
+            SessionRuntimeMetadata::new("", "db", "user", "user"),
+            SessionRuntimeMetadata::new("version", "bad\0db", "user", "user"),
+            SessionRuntimeMetadata::new(
+                "version",
+                "db",
+                "x".repeat(MAX_SESSION_RUNTIME_TEXT_BYTES + 1),
+                "user",
+            ),
+        ] {
+            assert_eq!(invalid.expect_err("invalid metadata").sql_state, "22023");
+        }
     }
 
     #[test]
@@ -10585,7 +11678,7 @@ mod tests {
                 )
                 .expect_err("stale Repeatable Read UPSERT");
             second.execute("ROLLBACK", &[])?.for_each(drop);
-            Ok(error.sql_state)
+            Ok(error.sql_state.to_string())
         });
         let mut waiting_observed = false;
         for _ in 0..100 {
@@ -13643,6 +14736,7 @@ mod tests {
             Arc::clone(&engine.storage_access),
             generation,
             &snapshot.rows,
+            snapshot.system_catalog.as_deref(),
         );
         let error = match provider.scan(TableId::new(u64::MAX)) {
             Ok(_) => panic!("unknown table scan must fail"),
@@ -13696,6 +14790,7 @@ mod tests {
             Arc::clone(&engine.storage_access),
             snapshot.generation,
             &mismatched_rows,
+            None,
         );
 
         let error = match provider.scan(table_id) {

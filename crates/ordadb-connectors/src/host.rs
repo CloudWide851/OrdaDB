@@ -489,6 +489,10 @@ fn query_event_v1(
         ConnectorQueryEventV2::Notice { notice } => Ok(QueryEvent::Notice(DbNotice {
             sql_state: notice.code.unwrap_or_else(|| "00000".into()),
             message: notice.message,
+            detail: None,
+            hint: None,
+            position: None,
+            object_identity: None,
         })),
         ConnectorQueryEventV2::Complete {
             command_tag,
@@ -734,6 +738,15 @@ fn connector_type(data_type: &ScalarType) -> ConnectorTypeV2 {
             None,
             None,
         ),
+        ScalarType::Oid => (
+            "oid",
+            ConnectorLogicalTypeV2::UnsignedInteger,
+            None,
+            None,
+            None,
+        ),
+        ScalarType::Name => ("name", ConnectorLogicalTypeV2::Text, None, None, Some(63)),
+        ScalarType::InternalChar => ("char", ConnectorLogicalTypeV2::Text, None, None, Some(1)),
         ScalarType::Float32 => (
             "real",
             ConnectorLogicalTypeV2::FloatingPoint,
@@ -1092,6 +1105,21 @@ mod tests {
 
         let interval_type = connector_type(&ScalarType::Interval);
         assert_eq!(interval_type.logical_type, ConnectorLogicalTypeV2::Interval);
+        let oid_type = connector_type(&ScalarType::Oid);
+        assert_eq!(
+            oid_type.logical_type,
+            ConnectorLogicalTypeV2::UnsignedInteger
+        );
+        assert_eq!(oid_type.vendor_name, "oid");
+        let name_type = connector_type(&ScalarType::Name);
+        assert_eq!(name_type.logical_type, ConnectorLogicalTypeV2::Text);
+        assert_eq!(name_type.length, Some(63));
+        let internal_char_type = connector_type(&ScalarType::InternalChar);
+        assert_eq!(
+            internal_char_type.logical_type,
+            ConnectorLogicalTypeV2::Text
+        );
+        assert_eq!(internal_char_type.length, Some(1));
         let enum_type = connector_type(&ScalarType::Enum {
             type_id: TypeId::new(42),
             labels: vec!["queued".into(), "done".into()],

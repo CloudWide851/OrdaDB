@@ -10,9 +10,10 @@ OrdaDB 是一个以 Rust 构建的单机持久化关系数据库与 Windows SQL
 
 ## 当前能力
 
-- 8 KiB 校验和页面、Heap、Buffer Pool、B+Tree、WAL、检查点和启动恢复
-- 单写多读 Read Committed、Undo、Commit/Rollback 和结构化 SQL 错误
-- PostgreSQL v3、SCRAM-SHA-256、RBAC、Simple/Extended Query、取消和 COPY
+- v2 多数据库目录、8 KiB 校验和页面、Heap、Buffer Pool、B+Tree、WAL、检查点和启动恢复
+- MVCC 多 writer、Read Committed/Repeatable Read/Serializable SSI、savepoint、锁、死锁检测、VACUUM/ANALYZE
+- PostgreSQL v3、SCRAM-SHA-256、RBAC、Simple/Extended Query、portal、取消和有界 text/CSV COPY
+- 可关系化查询且按权限过滤的 `pg_catalog`/`information_schema`、稳定 PostgreSQL OID 和会话设置
 - 常用关系 SQL、DDL、PL/pgSQL 子集、触发器、全文索引、VECTOR/HNSW 和混合检索
 - Axum 管理 API、Windows LocalService 服务、机器可读 CLI
 - 一致性逻辑归档 v1、原子恢复、CSV/JSON Lines 原子导入导出
@@ -65,10 +66,15 @@ cargo build --workspace --release --target x86_64-pc-windows-msvc
 cargo deny check
 cargo audit
 cargo llvm-cov --no-clean -p <affected-crate> --target x86_64-pc-windows-msvc --summary-only -- --test-threads=1
+
+pwsh -NoProfile -File scripts/test_pg18_clients.ps1 -Mode Validate
 ```
 
 Cargo 检查必须串行运行；Playwright 应独占运行，避免与 release/installer 构建争用。
-覆盖率按受影响 crate 拆分，不在此 Windows 主机运行整 workspace 聚合插桩。
+覆盖率按受影响 crate 拆分，不在此 Windows 主机运行整 workspace 聚合插桩。客户端
+`Validate` 只验证版本化矩阵和 SQL 语料，不连接服务器，也不能作为 psql、pgJDBC、
+DataGrip 或 Hibernate 的运行通过证据；真实验收使用 `Preflight`/`Run` 和隔离的
+verify-full TLS 数据库。
 
 ## 最终规模门禁
 
@@ -89,7 +95,7 @@ pnpm scale:full:x64
 ```
 
 JSON 证据默认写入 `target\final-scale\evidence`，包含实际文件大小、行数与 ID
-校验和、执行器计量的峰值内存、连接/第二 writer 结果、恢复状态及各阶段耗时。完整
+校验和、执行器计量的峰值内存、连接/多 writer 结果、恢复状态及各阶段耗时。完整
 profile 不接受缩小目标的覆盖参数；资源不足时会在创建数据前明确拒绝，并写出包含
 可用/所需资源的 failed JSON，不会把 Smoke 结果标成完整门禁。
 
@@ -158,9 +164,12 @@ $credential.GetNetworkCredential().Password |
 
 ## 兼容性边界
 
-- 支持的是 PostgreSQL 与 DataGrip 的可验证子集，不是完整 PostgreSQL 实现。
-- 事务是单 writer Read Committed，不是 MVCC、SSI 或分布式事务。
+- 支持的是 PostgreSQL 18 核心语义和已记录客户端矩阵中的可验证子集，不是完整 PostgreSQL 实现；
+  静态矩阵通过不代表尚未执行的 psql、pgJDBC、DataGrip 或 Hibernate 已通过。
+- DML 使用持久化 MVCC 与多 writer；DDL、全库维护和其他全局候选发布仍使用排他边界，
+  不提供分布式事务。
 - 不提供复制、物理备份、WAL 归档、PITR、任意第三方插件或 AI 模型推理。
 - MySQL、SQLite、SQL Server 方言只处理可靠的引号、参数、分页、类型别名和常用
   DDL；无法归一化的厂商特性返回 `0A000`。
-- 数据文件和逻辑归档均从 v1 开始；未知格式版本拒绝打开，不静默迁移或修复。
+- 当前可写数据格式为 v2；v1 只作为显式离线迁移输入。逻辑归档格式仍为 v1；未知
+  格式版本拒绝打开，不静默迁移或修复。

@@ -828,6 +828,27 @@ fn decode_error(payload: &[u8]) -> DbError {
     if let Some(hint) = fields.get(&b'H') {
         error = error.with_hint(hint.clone());
     }
+    if let Some(position) = fields
+        .get(&b'P')
+        .and_then(|position| position.parse::<usize>().ok())
+    {
+        error = error.with_position(position);
+    }
+    if let Some(name) = fields.get(&b's') {
+        error = error.with_schema_name(name.clone());
+    }
+    if let Some(name) = fields.get(&b't') {
+        error = error.with_table_name(name.clone());
+    }
+    if let Some(name) = fields.get(&b'c') {
+        error = error.with_column_name(name.clone());
+    }
+    if let Some(name) = fields.get(&b'd') {
+        error = error.with_data_type_name(name.clone());
+    }
+    if let Some(name) = fields.get(&b'n') {
+        error = error.with_constraint_name(name.clone());
+    }
     error
 }
 
@@ -913,11 +934,19 @@ mod tests {
 
     #[test]
     fn error_response_preserves_sqlstate_message_and_detail() {
-        let payload = b"SERROR\0C42P01\0Mmissing table\0Dpublic.items\0\0";
+        let payload = b"SERROR\0C42P01\0Mmissing table\0Dpublic.items\0Hcheck the name\0P9\0spublic\0titems\0cid\0dint8\0nitems_pkey\0\0";
         let error = decode_error(payload);
         assert_eq!(error.sql_state, "42P01");
         assert_eq!(error.message, "missing table");
         assert_eq!(error.detail.as_deref(), Some("public.items"));
+        assert_eq!(error.hint.as_deref(), Some("check the name"));
+        assert_eq!(error.position, Some(9));
+        let identity = error.object_identity.as_deref().expect("object identity");
+        assert_eq!(identity.schema_name.as_deref(), Some("public"));
+        assert_eq!(identity.table_name.as_deref(), Some("items"));
+        assert_eq!(identity.column_name.as_deref(), Some("id"));
+        assert_eq!(identity.data_type_name.as_deref(), Some("int8"));
+        assert_eq!(identity.constraint_name.as_deref(), Some("items_pkey"));
     }
 
     #[test]

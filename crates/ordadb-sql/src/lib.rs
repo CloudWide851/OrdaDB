@@ -307,6 +307,11 @@ pub enum AggregateFunction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarFunction {
+    Version,
+    CurrentDatabase,
+    CurrentUser,
+    SessionUser,
+    CurrentSetting,
     Lower,
     Upper,
     CharacterLength,
@@ -326,6 +331,15 @@ pub enum ScalarFunction {
     JsonbTypeof,
     ArrayLength,
     Cardinality,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionBindValues<'a> {
+    pub version: &'a str,
+    pub current_database: &'a str,
+    pub current_user: &'a str,
+    pub session_user: &'a str,
+    pub settings: &'a BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -802,6 +816,9 @@ pub enum ParsedStatement {
     Call {
         name: ParsedObjectName,
         arguments: Vec<ParsedExpr>,
+    },
+    ScalarSelect {
+        projection: Vec<ParsedProjection>,
     },
     RoutineSelect {
         name: ParsedObjectName,
@@ -1301,6 +1318,10 @@ pub enum BoundStatement {
     Call {
         routine_id: RoutineId,
         arguments: Vec<BoundExpr>,
+    },
+    ScalarSelect {
+        projection: Vec<BoundProjection>,
+        schema: Schema,
     },
     RoutineSelect {
         routine_id: RoutineId,
@@ -2572,15 +2593,34 @@ pub fn bind_catalog_expression_with_parameter_types_and_catalog(
         ));
     }
     let mut expression = convert_expr(parsed, &expression.sql)?;
-    resolve_expr_types(&mut expression, parameter_types, catalog, 0)?;
+    resolve_expr_types(&mut expression, parameter_types, catalog, 0, None)?;
     bind_expr_with_parameter_types(expression, table, expected, parameter_types)
 }
 
 /// Bind an OrdaDB-owned parsed statement against an immutable catalog view.
-pub fn bind(mut statement: ParsedStatement, catalog: &Catalog) -> Result<BoundStatement> {
-    resolve_statement_types(&mut statement, &BTreeMap::new(), Some(catalog), 0)?;
+pub fn bind(statement: ParsedStatement, catalog: &Catalog) -> Result<BoundStatement> {
+    bind_internal(statement, catalog, None)
+}
+
+/// Bind a parsed statement with the values owned by the current database
+/// session. Session-dependent scalar functions are materialized before type
+/// solving so Describe and Execute observe one immutable statement value.
+pub fn bind_with_session(
+    statement: ParsedStatement,
+    catalog: &Catalog,
+    session: SessionBindValues<'_>,
+) -> Result<BoundStatement> {
+    bind_internal(statement, catalog, Some(session))
+}
+
+fn bind_internal(
+    mut statement: ParsedStatement,
+    catalog: &Catalog,
+    session: Option<SessionBindValues<'_>>,
+) -> Result<BoundStatement> {
+    resolve_statement_types(&mut statement, &BTreeMap::new(), Some(catalog), 0, session)?;
     let parameter_types = ParameterTypeSolver::solve(&statement, catalog)?;
-    resolve_statement_types(&mut statement, &parameter_types, None, 0)?;
+    resolve_statement_types(&mut statement, &parameter_types, None, 0, session)?;
     bind_with_view_depth(statement, catalog, 0)
 }
 
@@ -2926,6 +2966,9 @@ impl ParameterTypeSolver {
                 self.collect_routine_arguments(name, arguments, catalog, depth)?;
                 Ok(Vec::new())
             }
+            ParsedStatement::ScalarSelect { projection } => {
+                self.collect_projection(projection, &[], expected_output, catalog, depth)
+            }
             ParsedStatement::SequenceValue { operation, .. } => {
                 if let ParsedSequenceOperation::SetValue { value, .. } = operation {
                     self.collect_expr(value, &[], Some(&ScalarType::Int64), catalog, depth)?;
@@ -3260,6 +3303,11 @@ impl ParameterTypeSolver {
         depth: usize,
     ) -> Result<Option<ScalarType>> {
         match function {
+            ScalarFunction::Version
+            | ScalarFunction::CurrentDatabase
+            | ScalarFunction::CurrentUser
+            | ScalarFunction::SessionUser
+            | ScalarFunction::CurrentSetting => Ok(Some(ScalarType::Text)),
             ScalarFunction::Lower
             | ScalarFunction::Upper
             | ScalarFunction::Btrim
@@ -3745,7 +3793,7 @@ impl ParameterTypeSolver {
         depth: usize,
     ) -> Option<Schema> {
         let mut statement = statement.clone();
-        resolve_statement_types(&mut statement, &self.types, None, depth).ok()?;
+        resolve_statement_types(&mut statement, &self.types, None, depth, None).ok()?;
         let statement = if outer_inputs.is_empty() {
             bind_with_view_depth(statement, catalog, depth).ok()?
         } else {
@@ -3827,6 +3875,7 @@ fn resolve_statement_types(
     parameter_types: &BTreeMap<usize, ScalarType>,
     catalog: Option<&Catalog>,
     depth: usize,
+    session: Option<SessionBindValues<'_>>,
 ) -> Result<()> {
     if depth >= MAX_PARAMETER_SOLVER_DEPTH {
         return Err(DbError::new(
@@ -3847,11 +3896,12 @@ fn resolve_statement_types(
                         parameter_types,
                         catalog,
                         depth + 1,
+                        session,
                     )?;
                 }
             }
             for constraint in constraints {
-                resolve_constraint_types(constraint, parameter_types, catalog, depth + 1)?;
+                resolve_constraint_types(constraint, parameter_types, catalog, depth + 1, session)?;
             }
         }
         ParsedStatement::AlterTable { operations, .. } => {
@@ -3864,6 +3914,7 @@ fn resolve_statement_types(
                                 parameter_types,
                                 catalog,
                                 depth + 1,
+                                session,
                             )?;
                         }
                     }
@@ -3873,10 +3924,17 @@ fn resolve_statement_types(
                             parameter_types,
                             catalog,
                             depth + 1,
+                            session,
                         )?;
                     }
                     ParsedAlterTableOperation::AddConstraint { constraint } => {
-                        resolve_constraint_types(constraint, parameter_types, catalog, depth + 1)?;
+                        resolve_constraint_types(
+                            constraint,
+                            parameter_types,
+                            catalog,
+                            depth + 1,
+                            session,
+                        )?;
                     }
                     _ => {}
                 }
@@ -3886,29 +3944,44 @@ fn resolve_statement_types(
             default: Some(default),
             ..
         } => {
-            resolve_expr_types(&mut default.expression, parameter_types, catalog, depth + 1)?;
+            resolve_expr_types(
+                &mut default.expression,
+                parameter_types,
+                catalog,
+                depth + 1,
+                session,
+            )?;
         }
         ParsedStatement::AlterDomain {
             operation: ParsedAlterDomainOperation::SetDefault(default),
             ..
         } => {
-            resolve_expr_types(&mut default.expression, parameter_types, catalog, depth + 1)?;
+            resolve_expr_types(
+                &mut default.expression,
+                parameter_types,
+                catalog,
+                depth + 1,
+                session,
+            )?;
         }
         ParsedStatement::CreateView { query, .. }
         | ParsedStatement::Explain { statement: query } => {
-            resolve_statement_types(query, parameter_types, catalog, depth + 1)?;
+            resolve_statement_types(query, parameter_types, catalog, depth + 1, session)?;
         }
         ParsedStatement::Call { arguments, .. }
         | ParsedStatement::RoutineSelect { arguments, .. } => {
             for argument in arguments {
-                resolve_expr_types(argument, parameter_types, catalog, depth + 1)?;
+                resolve_expr_types(argument, parameter_types, catalog, depth + 1, session)?;
             }
+        }
+        ParsedStatement::ScalarSelect { projection } => {
+            resolve_projection_types(projection, parameter_types, catalog, depth + 1, session)?
         }
         ParsedStatement::SequenceValue {
             operation: ParsedSequenceOperation::SetValue { value, .. },
             ..
         } => {
-            resolve_expr_types(value, parameter_types, catalog, depth + 1)?;
+            resolve_expr_types(value, parameter_types, catalog, depth + 1, session)?;
         }
         ParsedStatement::Insert {
             rows,
@@ -3917,7 +3990,7 @@ fn resolve_statement_types(
             ..
         } => {
             for expression in rows.iter_mut().flatten() {
-                resolve_expr_types(expression, parameter_types, catalog, depth + 1)?;
+                resolve_expr_types(expression, parameter_types, catalog, depth + 1, session)?;
             }
             if let Some(on_conflict) = on_conflict
                 && let ParsedConflictAction::DoUpdate {
@@ -3926,41 +3999,65 @@ fn resolve_statement_types(
                 } = &mut on_conflict.action
             {
                 for (_, expression) in assignments {
-                    resolve_expr_types(expression, parameter_types, catalog, depth + 1)?;
+                    resolve_expr_types(expression, parameter_types, catalog, depth + 1, session)?;
                 }
                 if let Some(filter) = filter {
-                    resolve_expr_types(filter, parameter_types, catalog, depth + 1)?;
+                    resolve_expr_types(filter, parameter_types, catalog, depth + 1, session)?;
                 }
             }
-            resolve_projection_types(returning, parameter_types, catalog, depth + 1)?;
+            resolve_projection_types(returning, parameter_types, catalog, depth + 1, session)?;
         }
         ParsedStatement::Merge(merge) => {
-            resolve_expr_types(&mut merge.on, parameter_types, catalog, depth + 1)?;
+            resolve_expr_types(&mut merge.on, parameter_types, catalog, depth + 1, session)?;
             for clause in &mut merge.clauses {
                 if let Some(predicate) = &mut clause.predicate {
-                    resolve_expr_types(predicate, parameter_types, catalog, depth + 1)?;
+                    resolve_expr_types(predicate, parameter_types, catalog, depth + 1, session)?;
                 }
                 match &mut clause.action {
                     ParsedMergeAction::Update { assignments } => {
                         for (_, expression) in assignments {
-                            resolve_expr_types(expression, parameter_types, catalog, depth + 1)?;
+                            resolve_expr_types(
+                                expression,
+                                parameter_types,
+                                catalog,
+                                depth + 1,
+                                session,
+                            )?;
                         }
                     }
                     ParsedMergeAction::Insert { values, .. } => {
                         for expression in values {
-                            resolve_expr_types(expression, parameter_types, catalog, depth + 1)?;
+                            resolve_expr_types(
+                                expression,
+                                parameter_types,
+                                catalog,
+                                depth + 1,
+                                session,
+                            )?;
                         }
                     }
                     ParsedMergeAction::Delete | ParsedMergeAction::DoNothing => {}
                 }
             }
-            resolve_projection_types(&mut merge.returning, parameter_types, catalog, depth + 1)?;
+            resolve_projection_types(
+                &mut merge.returning,
+                parameter_types,
+                catalog,
+                depth + 1,
+                session,
+            )?;
         }
         ParsedStatement::With { ctes, body, .. } => {
             for cte in ctes {
-                resolve_statement_types(&mut cte.query, parameter_types, catalog, depth + 1)?;
+                resolve_statement_types(
+                    &mut cte.query,
+                    parameter_types,
+                    catalog,
+                    depth + 1,
+                    session,
+                )?;
             }
-            resolve_statement_types(body, parameter_types, catalog, depth + 1)?;
+            resolve_statement_types(body, parameter_types, catalog, depth + 1, session)?;
         }
         ParsedStatement::SetOperation {
             left,
@@ -3970,11 +4067,11 @@ fn resolve_statement_types(
             limit,
             ..
         } => {
-            resolve_statement_types(left, parameter_types, catalog, depth + 1)?;
-            resolve_statement_types(right, parameter_types, catalog, depth + 1)?;
-            resolve_orders_types(order_by, parameter_types, catalog, depth + 1)?;
-            resolve_optional_expr_types(offset, parameter_types, catalog, depth + 1)?;
-            resolve_optional_expr_types(limit, parameter_types, catalog, depth + 1)?;
+            resolve_statement_types(left, parameter_types, catalog, depth + 1, session)?;
+            resolve_statement_types(right, parameter_types, catalog, depth + 1, session)?;
+            resolve_orders_types(order_by, parameter_types, catalog, depth + 1, session)?;
+            resolve_optional_expr_types(offset, parameter_types, catalog, depth + 1, session)?;
+            resolve_optional_expr_types(limit, parameter_types, catalog, depth + 1, session)?;
         }
         ParsedStatement::Select {
             projection,
@@ -3984,11 +4081,11 @@ fn resolve_statement_types(
             limit,
             ..
         } => {
-            resolve_projection_types(projection, parameter_types, catalog, depth + 1)?;
-            resolve_optional_expr_types(filter, parameter_types, catalog, depth + 1)?;
-            resolve_orders_types(order_by, parameter_types, catalog, depth + 1)?;
-            resolve_optional_expr_types(offset, parameter_types, catalog, depth + 1)?;
-            resolve_optional_expr_types(limit, parameter_types, catalog, depth + 1)?;
+            resolve_projection_types(projection, parameter_types, catalog, depth + 1, session)?;
+            resolve_optional_expr_types(filter, parameter_types, catalog, depth + 1, session)?;
+            resolve_orders_types(order_by, parameter_types, catalog, depth + 1, session)?;
+            resolve_optional_expr_types(offset, parameter_types, catalog, depth + 1, session)?;
+            resolve_optional_expr_types(limit, parameter_types, catalog, depth + 1, session)?;
         }
         ParsedStatement::AdvancedSelect {
             joins,
@@ -4003,19 +4100,19 @@ fn resolve_statement_types(
         } => {
             for join in joins {
                 if let ParsedJoinSource::Derived { query, .. } = &mut join.source {
-                    resolve_statement_types(query, parameter_types, catalog, depth + 1)?;
+                    resolve_statement_types(query, parameter_types, catalog, depth + 1, session)?;
                 }
-                resolve_expr_types(&mut join.on, parameter_types, catalog, depth + 1)?;
+                resolve_expr_types(&mut join.on, parameter_types, catalog, depth + 1, session)?;
             }
-            resolve_projection_types(projection, parameter_types, catalog, depth + 1)?;
-            resolve_optional_expr_types(filter, parameter_types, catalog, depth + 1)?;
+            resolve_projection_types(projection, parameter_types, catalog, depth + 1, session)?;
+            resolve_optional_expr_types(filter, parameter_types, catalog, depth + 1, session)?;
             for expression in group_by {
-                resolve_expr_types(expression, parameter_types, catalog, depth + 1)?;
+                resolve_expr_types(expression, parameter_types, catalog, depth + 1, session)?;
             }
-            resolve_optional_expr_types(having, parameter_types, catalog, depth + 1)?;
-            resolve_orders_types(order_by, parameter_types, catalog, depth + 1)?;
-            resolve_optional_expr_types(offset, parameter_types, catalog, depth + 1)?;
-            resolve_optional_expr_types(limit, parameter_types, catalog, depth + 1)?;
+            resolve_optional_expr_types(having, parameter_types, catalog, depth + 1, session)?;
+            resolve_orders_types(order_by, parameter_types, catalog, depth + 1, session)?;
+            resolve_optional_expr_types(offset, parameter_types, catalog, depth + 1, session)?;
+            resolve_optional_expr_types(limit, parameter_types, catalog, depth + 1, session)?;
         }
         ParsedStatement::Update {
             assignments,
@@ -4024,16 +4121,16 @@ fn resolve_statement_types(
             ..
         } => {
             for (_, expression) in assignments {
-                resolve_expr_types(expression, parameter_types, catalog, depth + 1)?;
+                resolve_expr_types(expression, parameter_types, catalog, depth + 1, session)?;
             }
-            resolve_optional_expr_types(filter, parameter_types, catalog, depth + 1)?;
-            resolve_projection_types(returning, parameter_types, catalog, depth + 1)?;
+            resolve_optional_expr_types(filter, parameter_types, catalog, depth + 1, session)?;
+            resolve_projection_types(returning, parameter_types, catalog, depth + 1, session)?;
         }
         ParsedStatement::Delete {
             filter, returning, ..
         } => {
-            resolve_optional_expr_types(filter, parameter_types, catalog, depth + 1)?;
-            resolve_projection_types(returning, parameter_types, catalog, depth + 1)?;
+            resolve_optional_expr_types(filter, parameter_types, catalog, depth + 1, session)?;
+            resolve_projection_types(returning, parameter_types, catalog, depth + 1, session)?;
         }
         _ => {}
     }
@@ -4045,9 +4142,10 @@ fn resolve_constraint_types(
     parameter_types: &BTreeMap<usize, ScalarType>,
     catalog: Option<&Catalog>,
     depth: usize,
+    session: Option<SessionBindValues<'_>>,
 ) -> Result<()> {
     if let ParsedTableConstraint::Check { expression, .. } = constraint {
-        resolve_expr_types(expression, parameter_types, catalog, depth)?;
+        resolve_expr_types(expression, parameter_types, catalog, depth, session)?;
     }
     Ok(())
 }
@@ -4057,13 +4155,36 @@ fn resolve_projection_types(
     parameter_types: &BTreeMap<usize, ScalarType>,
     catalog: Option<&Catalog>,
     depth: usize,
+    session: Option<SessionBindValues<'_>>,
 ) -> Result<()> {
     for item in projection {
-        if let ParsedProjection::Expression { expr, .. } = item {
-            resolve_expr_types(expr, parameter_types, catalog, depth)?;
+        if let ParsedProjection::Expression { expr, alias } = item {
+            if alias.is_none()
+                && let Some(name) = session_function_name(expr)
+            {
+                *alias = Some(ParsedIdentifier {
+                    name: Identifier::unquoted(name),
+                    position: expr.position,
+                });
+            }
+            resolve_expr_types(expr, parameter_types, catalog, depth, session)?;
         }
     }
     Ok(())
+}
+
+fn session_function_name(expression: &ParsedExpr) -> Option<&'static str> {
+    let ParsedExprKind::Function { function, .. } = &expression.kind else {
+        return None;
+    };
+    match function {
+        ScalarFunction::Version => Some("version"),
+        ScalarFunction::CurrentDatabase => Some("current_database"),
+        ScalarFunction::CurrentUser => Some("current_user"),
+        ScalarFunction::SessionUser => Some("session_user"),
+        ScalarFunction::CurrentSetting => Some("current_setting"),
+        _ => None,
+    }
 }
 
 fn resolve_orders_types(
@@ -4071,9 +4192,10 @@ fn resolve_orders_types(
     parameter_types: &BTreeMap<usize, ScalarType>,
     catalog: Option<&Catalog>,
     depth: usize,
+    session: Option<SessionBindValues<'_>>,
 ) -> Result<()> {
     for order in order_by {
-        resolve_expr_types(&mut order.expr, parameter_types, catalog, depth)?;
+        resolve_expr_types(&mut order.expr, parameter_types, catalog, depth, session)?;
     }
     Ok(())
 }
@@ -4083,11 +4205,76 @@ fn resolve_optional_expr_types(
     parameter_types: &BTreeMap<usize, ScalarType>,
     catalog: Option<&Catalog>,
     depth: usize,
+    session: Option<SessionBindValues<'_>>,
 ) -> Result<()> {
     if let Some(expression) = expression {
-        resolve_expr_types(expression, parameter_types, catalog, depth)?;
+        resolve_expr_types(expression, parameter_types, catalog, depth, session)?;
     }
     Ok(())
+}
+
+fn session_function_value(
+    function: ScalarFunction,
+    arguments: &[ParsedExpr],
+    session: Option<SessionBindValues<'_>>,
+    position: Option<usize>,
+) -> Result<Option<Value>> {
+    let Some(session) = session else {
+        return match function {
+            ScalarFunction::Version
+            | ScalarFunction::CurrentDatabase
+            | ScalarFunction::CurrentUser
+            | ScalarFunction::SessionUser
+            | ScalarFunction::CurrentSetting => Err(DbError::new(
+                "55000",
+                "session scalar function requires database session metadata",
+            )
+            .with_position_opt(position)),
+            _ => Ok(None),
+        };
+    };
+    let value = match function {
+        ScalarFunction::Version => Value::Text(session.version.to_owned()),
+        ScalarFunction::CurrentDatabase => Value::Text(session.current_database.to_owned()),
+        ScalarFunction::CurrentUser => Value::Text(session.current_user.to_owned()),
+        ScalarFunction::SessionUser => Value::Text(session.session_user.to_owned()),
+        ScalarFunction::CurrentSetting => {
+            let Some(ParsedExpr {
+                kind: ParsedExprKind::Literal(Value::Text(name)),
+                ..
+            }) = arguments.first()
+            else {
+                return unsupported_at("current_setting requires a literal setting name", position);
+            };
+            let missing_ok = match arguments.get(1) {
+                None => false,
+                Some(ParsedExpr {
+                    kind: ParsedExprKind::Literal(Value::Boolean(value)),
+                    ..
+                }) => *value,
+                Some(_) => {
+                    return unsupported_at(
+                        "current_setting missing_ok must be a boolean literal",
+                        position,
+                    );
+                }
+            };
+            let name = name.trim().to_ascii_lowercase();
+            match session.settings.get(&name) {
+                Some(value) => Value::Text(value.clone()),
+                None if missing_ok => Value::Null,
+                None => {
+                    return Err(DbError::new(
+                        "42704",
+                        format!("unrecognized configuration parameter {name}"),
+                    )
+                    .with_position_opt(position));
+                }
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(value))
 }
 
 fn resolve_expr_types(
@@ -4095,6 +4282,7 @@ fn resolve_expr_types(
     parameter_types: &BTreeMap<usize, ScalarType>,
     catalog: Option<&Catalog>,
     depth: usize,
+    session: Option<SessionBindValues<'_>>,
 ) -> Result<()> {
     if depth >= MAX_PARAMETER_SOLVER_DEPTH {
         return Err(DbError::new(
@@ -4121,35 +4309,46 @@ fn resolve_expr_types(
         };
         return Ok(());
     }
+    let session_value = match &expression.kind {
+        ParsedExprKind::Function {
+            function,
+            arguments,
+        } => session_function_value(*function, arguments, session, expression.position)?,
+        _ => None,
+    };
+    if let Some(value) = session_value {
+        expression.kind = ParsedExprKind::Literal(value);
+        return Ok(());
+    }
     match &mut expression.kind {
         ParsedExprKind::Unary { expr, .. } => {
-            resolve_expr_types(expr, parameter_types, catalog, depth + 1)?;
+            resolve_expr_types(expr, parameter_types, catalog, depth + 1, session)?;
         }
         ParsedExprKind::Cast { expr, .. } => {
-            resolve_expr_types(expr, parameter_types, catalog, depth + 1)?;
+            resolve_expr_types(expr, parameter_types, catalog, depth + 1, session)?;
         }
         ParsedExprKind::Array { elements, .. } => {
             for element in elements {
-                resolve_expr_types(element, parameter_types, catalog, depth + 1)?;
+                resolve_expr_types(element, parameter_types, catalog, depth + 1, session)?;
             }
         }
         ParsedExprKind::Function { arguments, .. } => {
             for argument in arguments {
-                resolve_expr_types(argument, parameter_types, catalog, depth + 1)?;
+                resolve_expr_types(argument, parameter_types, catalog, depth + 1, session)?;
             }
         }
         ParsedExprKind::Binary { left, right, .. } => {
-            resolve_expr_types(left, parameter_types, catalog, depth + 1)?;
-            resolve_expr_types(right, parameter_types, catalog, depth + 1)?;
+            resolve_expr_types(left, parameter_types, catalog, depth + 1, session)?;
+            resolve_expr_types(right, parameter_types, catalog, depth + 1, session)?;
         }
         ParsedExprKind::InList { expr, list, .. } => {
-            resolve_expr_types(expr, parameter_types, catalog, depth + 1)?;
+            resolve_expr_types(expr, parameter_types, catalog, depth + 1, session)?;
             for candidate in list {
-                resolve_expr_types(candidate, parameter_types, catalog, depth + 1)?;
+                resolve_expr_types(candidate, parameter_types, catalog, depth + 1, session)?;
             }
         }
         ParsedExprKind::ScalarSubquery(subquery) | ParsedExprKind::Exists { subquery, .. } => {
-            resolve_statement_types(subquery, parameter_types, catalog, depth + 1)?;
+            resolve_statement_types(subquery, parameter_types, catalog, depth + 1, session)?;
         }
         ParsedExprKind::InSubquery { expr, subquery, .. }
         | ParsedExprKind::QuantifiedSubquery {
@@ -4157,34 +4356,34 @@ fn resolve_expr_types(
             subquery,
             ..
         } => {
-            resolve_expr_types(expr, parameter_types, catalog, depth + 1)?;
-            resolve_statement_types(subquery, parameter_types, catalog, depth + 1)?;
+            resolve_expr_types(expr, parameter_types, catalog, depth + 1, session)?;
+            resolve_statement_types(subquery, parameter_types, catalog, depth + 1, session)?;
         }
         ParsedExprKind::RowSubquery { left, subquery, .. } => {
             for expression in left {
-                resolve_expr_types(expression, parameter_types, catalog, depth + 1)?;
+                resolve_expr_types(expression, parameter_types, catalog, depth + 1, session)?;
             }
-            resolve_statement_types(subquery, parameter_types, catalog, depth + 1)?;
+            resolve_statement_types(subquery, parameter_types, catalog, depth + 1, session)?;
         }
         ParsedExprKind::Aggregate {
             argument, filter, ..
         } => {
             if let Some(argument) = argument {
-                resolve_expr_types(argument, parameter_types, catalog, depth + 1)?;
+                resolve_expr_types(argument, parameter_types, catalog, depth + 1, session)?;
             }
             if let Some(filter) = filter {
-                resolve_expr_types(filter, parameter_types, catalog, depth + 1)?;
+                resolve_expr_types(filter, parameter_types, catalog, depth + 1, session)?;
             }
         }
         ParsedExprKind::Window { call, spec } => {
-            resolve_window_types(call, spec, parameter_types, catalog, depth + 1)?;
+            resolve_window_types(call, spec, parameter_types, catalog, depth + 1, session)?;
         }
         ParsedExprKind::NamedWindow { call, .. } => {
             for argument in &mut call.arguments {
-                resolve_expr_types(argument, parameter_types, catalog, depth + 1)?;
+                resolve_expr_types(argument, parameter_types, catalog, depth + 1, session)?;
             }
             if let Some(filter) = &mut call.filter {
-                resolve_expr_types(filter, parameter_types, catalog, depth + 1)?;
+                resolve_expr_types(filter, parameter_types, catalog, depth + 1, session)?;
             }
         }
         ParsedExprKind::Column(_)
@@ -4203,23 +4402,24 @@ fn resolve_window_types(
     parameter_types: &BTreeMap<usize, ScalarType>,
     catalog: Option<&Catalog>,
     depth: usize,
+    session: Option<SessionBindValues<'_>>,
 ) -> Result<()> {
     for argument in &mut call.arguments {
-        resolve_expr_types(argument, parameter_types, catalog, depth)?;
+        resolve_expr_types(argument, parameter_types, catalog, depth, session)?;
     }
     if let Some(filter) = &mut call.filter {
-        resolve_expr_types(filter, parameter_types, catalog, depth)?;
+        resolve_expr_types(filter, parameter_types, catalog, depth, session)?;
     }
     for expression in &mut spec.partition_by {
-        resolve_expr_types(expression, parameter_types, catalog, depth)?;
+        resolve_expr_types(expression, parameter_types, catalog, depth, session)?;
     }
-    resolve_orders_types(&mut spec.order_by, parameter_types, catalog, depth)?;
+    resolve_orders_types(&mut spec.order_by, parameter_types, catalog, depth, session)?;
     if let Some(frame) = &mut spec.frame {
         for bound in [&mut frame.start_bound, &mut frame.end_bound] {
             if let ParsedWindowFrameBound::Preceding(expression)
             | ParsedWindowFrameBound::Following(expression) = bound
             {
-                resolve_expr_types(expression, parameter_types, catalog, depth)?;
+                resolve_expr_types(expression, parameter_types, catalog, depth, session)?;
             }
         }
     }
@@ -4946,6 +5146,30 @@ fn bind_with_view_depth(
                 )
                 .with_position_opt(position)),
             }
+        }
+        ParsedStatement::ScalarSelect { projection } => {
+            let mut bound_projection = Vec::with_capacity(projection.len());
+            let mut fields = Vec::with_capacity(projection.len());
+            for projection in projection {
+                let ParsedProjection::Expression { expr, alias } = projection else {
+                    return unsupported("SELECT without FROM does not support wildcards");
+                };
+                let field_name = alias
+                    .as_ref()
+                    .map(|alias| alias.name.as_str().to_owned())
+                    .unwrap_or_else(|| projection_name(&expr));
+                let expr = bind_expr(expr, None, None)?;
+                let field = Field::new(field_name, expr.data_type.clone(), expr.nullable);
+                bound_projection.push(BoundProjection {
+                    expr,
+                    field: field.clone(),
+                });
+                fields.push(field);
+            }
+            Ok(BoundStatement::ScalarSelect {
+                projection: bound_projection,
+                schema: Schema::new(fields),
+            })
         }
         ParsedStatement::SequenceValue {
             name,
@@ -7092,28 +7316,37 @@ fn convert_routine_select(
     {
         return unsupported("scalar routine SELECT does not support query clauses");
     }
-    let [projection] = select.projection.as_slice() else {
-        return unsupported("scalar routine SELECT requires exactly one projection");
-    };
-    let (expression, alias) = match projection {
-        SelectItem::UnnamedExpr(expression) => (expression.clone(), None),
-        SelectItem::ExprWithAlias { expr, alias } => {
-            (expr.clone(), Some(convert_ident(alias.clone(), sql)))
+    if let [projection] = select.projection.as_slice() {
+        let (expression, alias) = match projection {
+            SelectItem::UnnamedExpr(expression) => (expression.clone(), None),
+            SelectItem::ExprWithAlias { expr, alias } => {
+                (expr.clone(), Some(convert_ident(alias.clone(), sql)))
+            }
+            _ => return unsupported("scalar SELECT does not support wildcards"),
+        };
+        if let SqlExpr::Function(function) = &expression {
+            let function_name = function.name.to_string().to_ascii_lowercase();
+            if scalar_function_from_name(&function_name).is_none() {
+                let (name, arguments) = convert_routine_invocation(function.clone(), sql)?;
+                if let Some(operation_name) = sequence_operation_name(&name) {
+                    return convert_sequence_value_select(operation_name, arguments, alias);
+                }
+                return Ok(ParsedStatement::RoutineSelect {
+                    name,
+                    arguments,
+                    alias,
+                });
+            }
         }
-        _ => return unsupported("scalar routine SELECT requires one routine call"),
-    };
-    let SqlExpr::Function(function) = expression else {
-        return unsupported("SELECT without FROM supports routine calls only");
-    };
-    let (name, arguments) = convert_routine_invocation(function, sql)?;
-    if let Some(operation_name) = sequence_operation_name(&name) {
-        return convert_sequence_value_select(operation_name, arguments, alias);
     }
-    Ok(ParsedStatement::RoutineSelect {
-        name,
-        arguments,
-        alias,
-    })
+    let projection = convert_projection_items(select.projection, sql)?;
+    if projection
+        .iter()
+        .any(|item| matches!(item, ParsedProjection::Wildcard))
+    {
+        return unsupported("SELECT without FROM does not support wildcards");
+    }
+    Ok(ParsedStatement::ScalarSelect { projection })
 }
 
 fn sequence_operation_name(name: &ParsedObjectName) -> Option<&str> {
@@ -7955,6 +8188,11 @@ fn convert_expr(expr: SqlExpr, sql: &str) -> Result<ParsedExpr> {
 fn scalar_function_from_name(name: &str) -> Option<ScalarFunction> {
     let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
     match name {
+        "version" => Some(ScalarFunction::Version),
+        "current_database" | "current_catalog" => Some(ScalarFunction::CurrentDatabase),
+        "current_user" | "user" => Some(ScalarFunction::CurrentUser),
+        "session_user" => Some(ScalarFunction::SessionUser),
+        "current_setting" => Some(ScalarFunction::CurrentSetting),
         "lower" => Some(ScalarFunction::Lower),
         "upper" => Some(ScalarFunction::Upper),
         "length" | "char_length" | "character_length" => Some(ScalarFunction::CharacterLength),
@@ -7983,8 +8221,12 @@ fn convert_scalar_function_arguments(
     sql: &str,
     position: Option<usize>,
 ) -> Result<Vec<ParsedExpr>> {
-    let FunctionArguments::List(arguments) = arguments else {
-        return unsupported_at("scalar function arguments must use parentheses", position);
+    let arguments = match arguments {
+        FunctionArguments::None => return Ok(Vec::new()),
+        FunctionArguments::List(arguments) => arguments,
+        _ => {
+            return unsupported_at("scalar function arguments must use parentheses", position);
+        }
     };
     if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
         return unsupported_at(
@@ -8013,6 +8255,11 @@ fn validate_scalar_function_arity(
     position: Option<usize>,
 ) -> Result<()> {
     let valid = match function {
+        ScalarFunction::Version
+        | ScalarFunction::CurrentDatabase
+        | ScalarFunction::CurrentUser
+        | ScalarFunction::SessionUser => count == 0,
+        ScalarFunction::CurrentSetting => matches!(count, 1 | 2),
         ScalarFunction::Lower
         | ScalarFunction::Upper
         | ScalarFunction::CharacterLength
@@ -8874,6 +9121,9 @@ fn convert_column_data_type_with_array_depth(
                 && !name.to_string().eq_ignore_ascii_case("uniqueidentifier")
                 && !name.to_string().eq_ignore_ascii_case("vector") =>
         {
+            if let Some(data_type) = postgres_catalog_scalar_type(&name, &modifiers) {
+                return Ok((data_type, None));
+            }
             Ok((ScalarType::Text, Some(convert_object_name(name, sql)?)))
         }
         DataType::Array(ArrayElemTypeDef::SquareBracket(element, _)) => {
@@ -8975,6 +9225,12 @@ fn convert_data_type_with_array_depth(
         DataType::JSON => Ok(ScalarType::Json),
         DataType::JSONB => Ok(ScalarType::Jsonb),
         DataType::Uuid => Ok(ScalarType::Uuid),
+        DataType::Custom(name, modifiers)
+            if postgres_catalog_scalar_type(&name, &modifiers).is_some() =>
+        {
+            Ok(postgres_catalog_scalar_type(&name, &modifiers)
+                .expect("guard established PostgreSQL catalog scalar type"))
+        }
         DataType::Custom(name, modifiers) if name.to_string().eq_ignore_ascii_case("vector") => {
             let dimensions = match modifiers.as_slice() {
                 [] => None,
@@ -8992,6 +9248,18 @@ fn convert_data_type_with_array_depth(
             Ok(ScalarType::Uuid)
         }
         _ => unsupported("this SQL data type is not supported yet"),
+    }
+}
+
+fn postgres_catalog_scalar_type(name: &ObjectName, modifiers: &[String]) -> Option<ScalarType> {
+    if !modifiers.is_empty() {
+        return None;
+    }
+    match name.to_string().to_ascii_lowercase().as_str() {
+        "oid" | "pg_catalog.oid" => Some(ScalarType::Oid),
+        "name" | "pg_catalog.name" => Some(ScalarType::Name),
+        "\"char\"" | "pg_catalog.\"char\"" => Some(ScalarType::InternalChar),
+        _ => None,
     }
 }
 
@@ -10780,6 +11048,7 @@ fn bound_query_schema(statement: &BoundStatement) -> Result<Schema> {
         | BoundStatement::SetOperation { schema, .. }
         | BoundStatement::With { schema, .. }
         | BoundStatement::ViewSelect { schema, .. }
+        | BoundStatement::ScalarSelect { schema, .. }
         | BoundStatement::RoutineSelect { schema, .. }
         | BoundStatement::SequenceValue { schema, .. } => Ok(schema.clone()),
         _ => unsupported("views require a SELECT query"),
@@ -10827,6 +11096,7 @@ fn bound_statement_references(statement: &BoundStatement) -> Vec<CatalogObjectRe
             BoundStatement::ViewSelect { view_id, .. } => {
                 references.push(CatalogObjectRef::View(*view_id));
             }
+            BoundStatement::ScalarSelect { .. } => {}
             BoundStatement::RoutineSelect { routine_id, .. } => {
                 references.push(CatalogObjectRef::Routine(*routine_id));
             }
@@ -14994,6 +15264,16 @@ fn projection_name(expr: &ParsedExpr) -> String {
     {
         return column.name.as_str().to_owned();
     }
+    if let ParsedExprKind::Function { function, .. } = &expr.kind {
+        return match function {
+            ScalarFunction::Version => "version",
+            ScalarFunction::CurrentDatabase => "current_database",
+            ScalarFunction::CurrentUser => "current_user",
+            ScalarFunction::SessionUser => "session_user",
+            _ => "?column?",
+        }
+        .to_owned();
+    }
     "?column?".to_owned()
 }
 
@@ -15007,7 +15287,12 @@ where
     F: FnMut(&ParsedExpr) -> Result<Option<ScalarType>>,
 {
     match function {
-        ScalarFunction::Lower
+        ScalarFunction::Version
+        | ScalarFunction::CurrentDatabase
+        | ScalarFunction::CurrentUser
+        | ScalarFunction::SessionUser
+        | ScalarFunction::CurrentSetting
+        | ScalarFunction::Lower
         | ScalarFunction::Upper
         | ScalarFunction::Concat
         | ScalarFunction::Substring
@@ -15055,6 +15340,12 @@ fn scalar_function_argument_type(
     common: Option<&ScalarType>,
 ) -> Option<&ScalarType> {
     match function {
+        ScalarFunction::Version
+        | ScalarFunction::CurrentDatabase
+        | ScalarFunction::CurrentUser
+        | ScalarFunction::SessionUser => None,
+        ScalarFunction::CurrentSetting if index == 0 => Some(&ScalarType::Text),
+        ScalarFunction::CurrentSetting => Some(&ScalarType::Boolean),
         ScalarFunction::Lower
         | ScalarFunction::Upper
         | ScalarFunction::Btrim
@@ -15086,6 +15377,11 @@ fn validate_bound_scalar_function(
 ) -> Result<(ScalarType, bool)> {
     let invalid = |message: String| DbError::new("42883", message).with_position_opt(position);
     match function {
+        ScalarFunction::Version
+        | ScalarFunction::CurrentDatabase
+        | ScalarFunction::CurrentUser
+        | ScalarFunction::SessionUser => Ok((ScalarType::Text, false)),
+        ScalarFunction::CurrentSetting => Ok((ScalarType::Text, true)),
         ScalarFunction::Lower | ScalarFunction::Upper => {
             if !is_textual(&arguments[0].data_type) {
                 return Err(invalid(format!(
@@ -15196,6 +15492,19 @@ fn common_type(left: &ScalarType, right: &ScalarType) -> Option<ScalarType> {
     if left == right {
         return Some(left.clone());
     }
+    if matches!(left, ScalarType::Oid)
+        && matches!(
+            right,
+            ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64
+        )
+        || matches!(right, ScalarType::Oid)
+            && matches!(
+                left,
+                ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64
+            )
+    {
+        return Some(ScalarType::Oid);
+    }
     if is_numeric(left) && is_numeric(right) {
         return Some(if numeric_rank(left) >= numeric_rank(right) {
             left.clone()
@@ -15223,6 +15532,12 @@ fn common_type_with_literal(
             if left_expr.is_some_and(is_unknown_text_literal) =>
         {
             Some(right.clone())
+        }
+        (ScalarType::Oid, ScalarType::Text) if is_unknown_text_literal(right_expr) => {
+            Some(ScalarType::Oid)
+        }
+        (ScalarType::Text, ScalarType::Oid) if left_expr.is_some_and(is_unknown_text_literal) => {
+            Some(ScalarType::Oid)
         }
         (
             ScalarType::Array {
@@ -15292,6 +15607,7 @@ fn ensure_explicit_cast_supported(
                     | ScalarType::Int16
                     | ScalarType::Int32
                     | ScalarType::Int64
+                    | ScalarType::Oid
                     | ScalarType::Float32
                     | ScalarType::Float64
                     | ScalarType::Decimal { .. }
@@ -15318,6 +15634,14 @@ fn ensure_explicit_cast_supported(
             ) | (ScalarType::Timestamp { .. }, ScalarType::Timestamp { .. })
                 | (ScalarType::Json, ScalarType::Jsonb)
                 | (ScalarType::Jsonb, ScalarType::Json)
+                | (
+                    ScalarType::Oid,
+                    ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64
+                )
+                | (
+                    ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64,
+                    ScalarType::Oid
+                )
         )
         || matches!(
             (source, target),
@@ -15372,7 +15696,11 @@ fn numeric_rank(data_type: &ScalarType) -> u8 {
 fn is_textual(data_type: &ScalarType) -> bool {
     matches!(
         data_type,
-        ScalarType::Char { .. } | ScalarType::Varchar { .. } | ScalarType::Text
+        ScalarType::Name
+            | ScalarType::InternalChar
+            | ScalarType::Char { .. }
+            | ScalarType::Varchar { .. }
+            | ScalarType::Text
     )
 }
 
@@ -15750,6 +16078,114 @@ mod tests {
         assert_eq!(order_by[0].column_index, 0);
         assert!(!order_by[0].ascending);
         assert!(limit.is_some());
+    }
+
+    #[test]
+    fn binds_scalar_selects_with_immutable_session_values() {
+        let catalog = Catalog::default();
+        let settings = BTreeMap::from([
+            ("client_encoding".to_owned(), "UTF8".to_owned()),
+            ("standard_conforming_strings".to_owned(), "on".to_owned()),
+        ]);
+        let session_values = SessionBindValues {
+            version: "PostgreSQL 18 compatible OrdaDB test",
+            current_database: "metadata_db",
+            current_user: "alice",
+            session_user: "bootstrap",
+            settings: &settings,
+        };
+        let statement = bind_with_session(
+            parse("SELECT version()").expect("parse version"),
+            &catalog,
+            session_values,
+        )
+        .expect("bind version");
+        assert!(matches!(
+            statement,
+            BoundStatement::ScalarSelect {
+                projection,
+                ..
+            } if matches!(projection.as_slice(), [BoundProjection {
+                    expr: BoundExpr {
+                        kind: BoundExprKind::Literal(Value::Text(value)),
+                        data_type: ScalarType::Text,
+                        nullable: false,
+                    },
+                    field,
+                }] if value == "PostgreSQL 18 compatible OrdaDB test" && field.name == "version")
+        ));
+
+        let settings_statement = bind_with_session(
+            parse(
+                "SELECT current_setting('client_encoding'), \
+                 current_setting('standard_conforming_strings')",
+            )
+            .expect("parse settings"),
+            &catalog,
+            session_values,
+        )
+        .expect("bind settings");
+        let BoundStatement::ScalarSelect { projection, schema } = settings_statement else {
+            panic!("expected scalar setting select");
+        };
+        assert_eq!(schema.fields.len(), 2);
+        assert_eq!(projection.len(), 2);
+        assert!(matches!(
+            projection[0].expr.kind,
+            BoundExprKind::Literal(Value::Text(ref value)) if value == "UTF8"
+        ));
+        assert!(matches!(
+            projection[1].expr.kind,
+            BoundExprKind::Literal(Value::Text(ref value)) if value == "on"
+        ));
+
+        let missing_ok = bind_with_session(
+            parse("SELECT current_setting('ordadb.missing', true)").expect("parse missing_ok"),
+            &catalog,
+            session_values,
+        )
+        .expect("bind missing_ok");
+        assert!(matches!(
+            missing_ok,
+            BoundStatement::ScalarSelect { projection, .. }
+                if matches!(projection.as_slice(), [BoundProjection {
+                    expr: BoundExpr {
+                        kind: BoundExprKind::Literal(Value::Null),
+                        ..
+                    },
+                    ..
+                }])
+        ));
+        let missing = bind_with_session(
+            parse("SELECT current_setting('ordadb.missing')").expect("parse missing"),
+            &catalog,
+            session_values,
+        )
+        .expect_err("unknown setting");
+        assert_eq!(missing.sql_state, "42704");
+
+        let literal = bind(parse("SELECT 1").expect("parse literal"), &catalog)
+            .expect("bind literal scalar select");
+        assert!(matches!(
+            literal,
+            BoundStatement::ScalarSelect {
+                projection,
+                ..
+            } if matches!(projection.as_slice(), [BoundProjection {
+                    expr: BoundExpr {
+                        kind: BoundExprKind::Literal(Value::Int32(1)),
+                        ..
+                    },
+                    field,
+                }] if field.name == "?column?")
+        ));
+
+        let missing = bind(
+            parse("SELECT current_database()").expect("parse session function"),
+            &catalog,
+        )
+        .expect_err("session function requires immutable session values");
+        assert_eq!(missing.sql_state, "55000");
     }
 
     #[test]
@@ -17478,6 +17914,23 @@ mod tests {
             rows[0][1].kind,
             ParsedExprKind::Literal(Value::Timestamp(_))
         ));
+    }
+
+    #[test]
+    fn parses_postgres_catalog_scalar_type_names_without_user_type_lookup() {
+        let statement = parse(
+            "CREATE TABLE catalog_scalar_types (object_id OID, object_name NAME, kind \"char\")",
+        )
+        .expect("PostgreSQL catalog scalar types");
+        let ParsedStatement::CreateTable { columns, .. } = statement else {
+            panic!("create table");
+        };
+        assert_eq!(columns[0].data_type, ScalarType::Oid);
+        assert_eq!(columns[0].declared_type, None);
+        assert_eq!(columns[1].data_type, ScalarType::Name);
+        assert_eq!(columns[1].declared_type, None);
+        assert_eq!(columns[2].data_type, ScalarType::InternalChar);
+        assert_eq!(columns[2].declared_type, None);
     }
 
     #[test]

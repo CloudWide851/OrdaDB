@@ -118,6 +118,8 @@ impl fmt::Display for Identifier {
     }
 }
 
+pub const MAX_POSTGRES_NAME_BYTES: usize = 63;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ScalarType {
@@ -125,6 +127,9 @@ pub enum ScalarType {
     Int16,
     Int32,
     Int64,
+    Oid,
+    Name,
+    InternalChar,
     Float32,
     Float64,
     Decimal {
@@ -173,9 +178,14 @@ impl ScalarType {
             Value::Int32(_) => {
                 matches!(self, Self::Int64 | Self::Float64 | Self::Decimal { .. })
             }
-            Value::Int64(_) => matches!(self, Self::Float64 | Self::Decimal { .. }),
+            Value::Int64(value) => {
+                matches!(self, Self::Float64 | Self::Decimal { .. })
+                    || matches!(self, Self::Oid) && u32::try_from(*value).is_ok()
+            }
             Value::Text(value) => match self {
                 Self::Char { .. } | Self::Varchar { .. } => true,
+                Self::Name => value.len() <= MAX_POSTGRES_NAME_BYTES,
+                Self::InternalChar => value.len() == 1,
                 Self::Enum { labels, .. } => labels.iter().any(|label| label == value),
                 _ => false,
             },
@@ -643,9 +653,31 @@ pub struct QueryProgress {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DbObjectIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_name: Option<Box<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_name: Option<Box<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_name: Option<Box<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_type_name: Option<Box<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint_name: Option<Box<str>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DbNotice {
     pub sql_state: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Box<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<Box<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_identity: Option<Box<DbObjectIdentity>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -673,6 +705,8 @@ pub struct DbError {
     pub detail: Option<Box<str>>,
     pub hint: Option<Box<str>>,
     pub position: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_identity: Option<Box<DbObjectIdentity>>,
     pub query_id: Box<str>,
 }
 
@@ -685,6 +719,7 @@ impl DbError {
             detail: None,
             hint: None,
             position: None,
+            object_identity: None,
             query_id: Uuid::new_v4().to_string().into_boxed_str(),
         }
     }
@@ -705,6 +740,50 @@ impl DbError {
     pub const fn with_position(mut self, position: usize) -> Self {
         self.position = Some(position);
         self
+    }
+
+    #[must_use]
+    pub fn with_schema_name(mut self, name: impl Into<String>) -> Self {
+        self.object_identity_mut().schema_name = Some(name.into().into_boxed_str());
+        self
+    }
+
+    #[must_use]
+    pub fn with_table_name(mut self, name: impl Into<String>) -> Self {
+        self.object_identity_mut().table_name = Some(name.into().into_boxed_str());
+        self
+    }
+
+    #[must_use]
+    pub fn with_column_name(mut self, name: impl Into<String>) -> Self {
+        self.object_identity_mut().column_name = Some(name.into().into_boxed_str());
+        self
+    }
+
+    #[must_use]
+    pub fn with_data_type_name(mut self, name: impl Into<String>) -> Self {
+        self.object_identity_mut().data_type_name = Some(name.into().into_boxed_str());
+        self
+    }
+
+    #[must_use]
+    pub fn with_constraint_name(mut self, name: impl Into<String>) -> Self {
+        self.object_identity_mut().constraint_name = Some(name.into().into_boxed_str());
+        self
+    }
+
+    fn object_identity_mut(&mut self) -> &mut DbObjectIdentity {
+        self.object_identity
+            .get_or_insert_with(|| {
+                Box::new(DbObjectIdentity {
+                    schema_name: None,
+                    table_name: None,
+                    column_name: None,
+                    data_type_name: None,
+                    constraint_name: None,
+                })
+            })
+            .as_mut()
     }
 
     #[must_use]
@@ -730,7 +809,35 @@ mod tests {
     use rust_decimal::Decimal;
     use uuid::Uuid;
 
-    use super::{ArrayDimension, Identifier, PgArray, PgInterval, ScalarType, Value};
+    use super::{
+        ArrayDimension, DbError, Identifier, MAX_POSTGRES_NAME_BYTES, PgArray, PgInterval,
+        ScalarType, Value,
+    };
+
+    #[test]
+    fn database_errors_keep_string_sqlstates_and_optional_object_identity() {
+        let error = DbError::new("23505", "duplicate key")
+            .with_schema_name("public")
+            .with_table_name("items")
+            .with_constraint_name("items_pkey");
+        assert_eq!(error.sql_state, "23505");
+        let encoded = serde_json::to_string(&error).expect("serialize error");
+        assert!(encoded.contains("\"sql_state\":\"23505\""));
+        let decoded: DbError = serde_json::from_str(&encoded).expect("deserialize error");
+        assert_eq!(decoded, error);
+
+        let legacy = serde_json::json!({
+            "sql_state": "42P01",
+            "message": "missing table",
+            "detail": null,
+            "hint": null,
+            "position": null,
+            "query_id": "legacy-query"
+        });
+        let decoded: DbError = serde_json::from_value(legacy).expect("legacy error");
+        assert_eq!(decoded.sql_state, "42P01");
+        assert!(decoded.object_identity.is_none());
+    }
 
     #[test]
     fn normalizes_unquoted_identifiers_but_preserves_quoted_names() {
@@ -757,6 +864,20 @@ mod tests {
         assert!(ScalarType::Uuid.accepts(&Value::Null));
         assert!(ScalarType::Int64.accepts(&Value::Int32(42)));
         assert!(!ScalarType::Int16.accepts(&Value::Int64(42)));
+    }
+
+    #[test]
+    fn postgres_catalog_scalar_types_enforce_physical_bounds() {
+        assert!(ScalarType::Oid.accepts(&Value::Int64(0)));
+        assert!(ScalarType::Oid.accepts(&Value::Int64(i64::from(u32::MAX))));
+        assert!(!ScalarType::Oid.accepts(&Value::Int64(-1)));
+        assert!(!ScalarType::Oid.accepts(&Value::Int64(i64::from(u32::MAX) + 1)));
+
+        assert!(ScalarType::Name.accepts(&Value::Text("n".repeat(MAX_POSTGRES_NAME_BYTES))));
+        assert!(!ScalarType::Name.accepts(&Value::Text("n".repeat(MAX_POSTGRES_NAME_BYTES + 1))));
+        assert!(ScalarType::InternalChar.accepts(&Value::Text("r".into())));
+        assert!(!ScalarType::InternalChar.accepts(&Value::Text("".into())));
+        assert!(!ScalarType::InternalChar.accepts(&Value::Text("é".into())));
     }
 
     #[test]

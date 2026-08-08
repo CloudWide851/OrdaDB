@@ -97,7 +97,7 @@ struct ScenarioResult {
 }
 
 enum BenchmarkPlan {
-    Simple { plan: PlanNode, schema: Schema },
+    Simple { plan: Box<PlanNode>, schema: Schema },
     Advanced(Box<AdvancedExecutionPlan>),
 }
 
@@ -367,14 +367,14 @@ fn bind_plan(sql: &str, catalog: &Catalog) -> BenchmarkPlan {
             offset,
             limit,
         } => BenchmarkPlan::Simple {
-            plan: optimize_select(
+            plan: Box::new(optimize_select(
                 catalog.table_by_id(table_id).expect("benchmark table"),
                 projection,
                 filter,
                 order_by,
                 offset,
                 limit,
-            ),
+            )),
             schema,
         },
         BoundStatement::AdvancedSelect {

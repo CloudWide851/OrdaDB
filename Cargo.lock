@@ -3529,6 +3529,7 @@ dependencies = [
  "ordadb-admin",
  "ordadb-catalog",
  "ordadb-engine",
+ "ordadb-sql",
  "ordadb-types",
  "pbkdf2",
  "rand 0.8.7",

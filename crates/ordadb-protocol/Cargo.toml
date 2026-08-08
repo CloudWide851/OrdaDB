@@ -14,6 +14,7 @@ hmac.workspace = true
 ordadb-admin = { path = "../ordadb-admin" }
 ordadb-catalog = { path = "../ordadb-catalog" }
 ordadb-engine = { path = "../ordadb-engine" }
+ordadb-sql = { path = "../ordadb-sql" }
 ordadb-types = { path = "../ordadb-types" }
 pbkdf2.workspace = true
 rand.workspace = true

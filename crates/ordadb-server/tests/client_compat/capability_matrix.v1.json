@@ -1,0 +1,272 @@
+{
+  "schemaVersion": 1,
+  "matrixId": "ordadb-postgresql-18-windows-x64-clients",
+  "recordedAt": "2026-08-05",
+  "target": {
+    "semanticStandard": "PostgreSQL 18.0",
+    "wireProtocol": 3,
+    "operatingSystem": "Windows",
+    "architecture": "AMD64",
+    "rustTarget": "x86_64-pc-windows-msvc"
+  },
+  "statusPolicy": {
+    "passRequiresExecutedEvidence": true,
+    "allowedBaselineStatuses": [
+      "not_run_missing_client",
+      "not_run_missing_inputs",
+      "not_run_manual",
+      "not_run_dependency_gap",
+      "not_applicable"
+    ],
+    "note": "This baseline contains no passed client cases. A present executable or JAR is not execution evidence."
+  },
+  "clients": [
+    {
+      "id": "psql",
+      "displayName": "PostgreSQL psql",
+      "supportedVersion": "18.0",
+      "versionMatch": "^psql \\(PostgreSQL\\) 18\\.0(?:\\s|$)",
+      "artifactSha256": null,
+      "executionKind": "automated",
+      "baselineAvailability": {
+        "status": "missing",
+        "observation": "psql was not present on PATH and no ORDADB_PG18_PSQL_PATH was supplied."
+      }
+    },
+    {
+      "id": "pgjdbc",
+      "displayName": "PostgreSQL JDBC Driver",
+      "supportedVersion": "42.7.10",
+      "versionMatch": "^42\\.7\\.10$",
+      "artifactSha256": "cab1cd67cfa25c25de4348e532298028288a877ba01c77d1619fe45416193387",
+      "executionKind": "automated",
+      "baselineAvailability": {
+        "status": "present_not_executed",
+        "artifactLength": 1137016,
+        "observation": "The pinned JAR was found in the local Maven repository; no endpoint or credentials were used."
+      }
+    },
+    {
+      "id": "datagrip",
+      "displayName": "JetBrains DataGrip",
+      "supportedVersion": "2026.1",
+      "supportedBuild": "DB-261.22158.299",
+      "versionMatch": "DB-261\\.22158\\.299",
+      "artifactSha256": "1204f969f61d18b84fa9229bf994c0559c87ca15761c8f88527beb7a83bc4184",
+      "executionKind": "manual_ui",
+      "baselineAvailability": {
+        "status": "present_not_executed",
+        "artifactLength": 1486184,
+        "observation": "The executable and reported build were observed locally; the UI was not launched for this baseline."
+      }
+    },
+    {
+      "id": "hibernate",
+      "displayName": "Hibernate ORM",
+      "supportedVersion": "6.6.29.Final",
+      "versionMatch": "^6\\.6\\.29\\.Final$",
+      "artifactSha256": "a769334ed1b477afc7f3c1ec4f368d1dcd9f6535ab272a8560037e4f163a0a1f",
+      "executionKind": "automated",
+      "adapter": "Hibernate PostgreSQLDialect with pgJDBC 42.7.10",
+      "baselineAvailability": {
+        "status": "dependency_gap",
+        "artifactLength": 12091416,
+        "observation": "hibernate-core was found, but the pinned Byte Buddy 1.15.11 runtime JAR was absent; ORM execution was not attempted."
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "connect-tls-scram-001",
+      "category": "connection",
+      "corpusCaseId": null,
+      "description": "Protocol v3 connection using verify-full TLS and SCRAM-SHA-256.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent." },
+        "pgjdbc": { "status": "not_run_missing_inputs", "reason": "No isolated endpoint, certificate, or credentials were supplied." },
+        "datagrip": { "status": "not_run_manual", "reason": "The documented UI smoke was not performed." },
+        "hibernate": { "status": "not_run_dependency_gap", "reason": "The pinned ORM runtime classpath is incomplete." }
+      }
+    },
+    {
+      "id": "session-startup-001",
+      "category": "session_startup",
+      "corpusCaseId": "session-startup-001",
+      "description": "Truthful PostgreSQL 18 session parameters and identity functions.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent." },
+        "pgjdbc": { "status": "not_run_missing_inputs", "reason": "No live isolated session was opened." },
+        "datagrip": { "status": "not_run_manual", "reason": "The documented UI smoke was not performed." },
+        "hibernate": { "status": "not_run_dependency_gap", "reason": "The pinned ORM runtime classpath is incomplete." }
+      }
+    },
+    {
+      "id": "catalog-schemas-001",
+      "category": "catalog_introspection",
+      "corpusCaseId": "catalog-schemas-001",
+      "description": "Schema discovery with ownership projection, ordering, and a row bound.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent." },
+        "pgjdbc": { "status": "not_run_missing_inputs", "reason": "No reference or OrdaDB endpoint was queried." },
+        "datagrip": { "status": "not_run_manual", "reason": "DataGrip metadata refresh was not captured or replayed." },
+        "hibernate": { "status": "not_applicable", "reason": "The ORM smoke does not enumerate schemas." }
+      }
+    },
+    {
+      "id": "catalog-relations-001",
+      "category": "catalog_introspection",
+      "corpusCaseId": "catalog-relations-001",
+      "description": "Relation discovery through pg_class and pg_namespace.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent." },
+        "pgjdbc": { "status": "not_run_missing_inputs", "reason": "No reference or OrdaDB endpoint was queried." },
+        "datagrip": { "status": "not_run_manual", "reason": "DataGrip metadata refresh was not captured or replayed." },
+        "hibernate": { "status": "not_applicable", "reason": "The ORM smoke does not enumerate relations." }
+      }
+    },
+    {
+      "id": "catalog-columns-001",
+      "category": "catalog_introspection",
+      "corpusCaseId": "catalog-columns-001",
+      "description": "Column discovery through information_schema with deterministic pagination.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent." },
+        "pgjdbc": { "status": "not_run_missing_inputs", "reason": "No reference or OrdaDB endpoint was queried." },
+        "datagrip": { "status": "not_run_manual", "reason": "DataGrip metadata refresh was not captured or replayed." },
+        "hibernate": { "status": "not_applicable", "reason": "The ORM smoke does not enumerate columns." }
+      }
+    },
+    {
+      "id": "catalog-visibility-001",
+      "category": "catalog_introspection",
+      "corpusCaseId": "catalog-visibility-001",
+      "description": "Safe role projection and explicit rejection of password-verifier discovery.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent." },
+        "pgjdbc": { "status": "not_run_missing_inputs", "reason": "No least-privilege live session was opened." },
+        "datagrip": { "status": "not_run_manual", "reason": "The documented least-privilege UI smoke was not performed." },
+        "hibernate": { "status": "not_applicable", "reason": "The ORM smoke does not inspect roles." }
+      }
+    },
+    {
+      "id": "ddl-crud-001",
+      "category": "ddl_crud",
+      "corpusCaseId": "ddl-crud-001",
+      "description": "Bounded table lifecycle and INSERT/SELECT/UPDATE/DELETE RETURNING.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent." },
+        "pgjdbc": { "status": "not_run_missing_inputs", "reason": "No caller-confirmed isolated database was supplied." },
+        "datagrip": { "status": "not_run_manual", "reason": "The documented UI smoke was not performed." },
+        "hibernate": { "status": "not_run_dependency_gap", "reason": "The pinned ORM runtime classpath is incomplete." }
+      }
+    },
+    {
+      "id": "prepared-portal-001",
+      "category": "prepared_portal",
+      "corpusCaseId": "prepared-portal-001",
+      "description": "Typed prepared parameter with a two-row portal fetch bound.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent." },
+        "pgjdbc": { "status": "not_run_missing_inputs", "reason": "The JDBC fetch-size probe was not executed." },
+        "datagrip": { "status": "not_run_manual", "reason": "The UI prepared-query smoke was not performed." },
+        "hibernate": { "status": "not_run_dependency_gap", "reason": "The pinned ORM runtime classpath is incomplete." }
+      }
+    },
+    {
+      "id": "transactions-savepoint-001",
+      "category": "transactions_savepoints",
+      "corpusCaseId": "transactions-savepoint-001",
+      "description": "Commit plus rollback-to-savepoint recovery.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent." },
+        "pgjdbc": { "status": "not_run_missing_inputs", "reason": "No caller-confirmed isolated database was supplied." },
+        "datagrip": { "status": "not_run_manual", "reason": "The UI transaction smoke was not performed." },
+        "hibernate": { "status": "not_run_dependency_gap", "reason": "The pinned ORM runtime classpath is incomplete." }
+      }
+    },
+    {
+      "id": "copy-in-text-001",
+      "category": "copy",
+      "corpusCaseId": "copy-in-text-001",
+      "description": "Atomic COPY FROM STDIN text input with a bounded payload.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent." },
+        "pgjdbc": { "status": "not_run_missing_inputs", "reason": "The pgJDBC CopyManager probe was not executed." },
+        "datagrip": { "status": "not_applicable", "reason": "The manual UI checklist does not send COPY FROM STDIN." },
+        "hibernate": { "status": "not_applicable", "reason": "The selected ORM adapter does not expose PostgreSQL COPY." }
+      }
+    },
+    {
+      "id": "copy-out-csv-001",
+      "category": "copy",
+      "corpusCaseId": "copy-out-csv-001",
+      "description": "Streaming COPY TO STDOUT CSV with a bounded fixture.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent." },
+        "pgjdbc": { "status": "not_run_missing_inputs", "reason": "The pgJDBC CopyManager probe was not executed." },
+        "datagrip": { "status": "not_applicable", "reason": "The manual UI checklist does not request COPY TO STDOUT." },
+        "hibernate": { "status": "not_applicable", "reason": "The selected ORM adapter does not expose PostgreSQL COPY." }
+      }
+    },
+    {
+      "id": "cancellation-001",
+      "category": "cancellation",
+      "corpusCaseId": "cancellation-001",
+      "description": "Cancel an active bounded recursive query and recover the connection with SQLSTATE 57014.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent and no interactive cancellation was attempted." },
+        "pgjdbc": { "status": "not_run_missing_inputs", "reason": "Statement.cancel was not executed." },
+        "datagrip": { "status": "not_run_manual", "reason": "The documented cancel-button smoke was not performed." },
+        "hibernate": { "status": "not_applicable", "reason": "Cancellation is owned by the direct JDBC probe." }
+      }
+    },
+    {
+      "id": "error-simple-recovery-001",
+      "category": "error_recovery",
+      "corpusCaseId": "error-simple-recovery-001",
+      "description": "A statement error is followed by a successful query outside a transaction.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent." },
+        "pgjdbc": { "status": "not_run_missing_inputs", "reason": "No error/recovery sequence was executed." },
+        "datagrip": { "status": "not_run_manual", "reason": "The documented console recovery smoke was not performed." },
+        "hibernate": { "status": "not_run_dependency_gap", "reason": "The pinned ORM runtime classpath is incomplete." }
+      }
+    },
+    {
+      "id": "error-extended-sync-001",
+      "category": "error_recovery",
+      "corpusCaseId": "error-extended-sync-001",
+      "description": "Extended-query error ignores messages until Sync, then returns one ReadyForQuery.",
+      "statuses": {
+        "psql": { "status": "not_applicable", "reason": "The psql harness does not expose raw extended-message ordering." },
+        "pgjdbc": { "status": "not_run_missing_inputs", "reason": "The prepared-statement recovery probe was not executed." },
+        "datagrip": { "status": "not_applicable", "reason": "The UI smoke cannot prove raw message ordering." },
+        "hibernate": { "status": "not_applicable", "reason": "Raw extended-message ordering belongs to direct JDBC/protocol evidence." }
+      }
+    },
+    {
+      "id": "datagrip-ui-001",
+      "category": "manual_ui",
+      "corpusCaseId": null,
+      "description": "Create a datasource, refresh metadata, open a console, run CRUD, cancel, reconnect, and inspect errors.",
+      "statuses": {
+        "psql": { "status": "not_applicable", "reason": "DataGrip-only manual case." },
+        "pgjdbc": { "status": "not_applicable", "reason": "DataGrip-only manual case." },
+        "datagrip": { "status": "not_run_manual", "reason": "DataGrip was not launched." },
+        "hibernate": { "status": "not_applicable", "reason": "DataGrip-only manual case." }
+      }
+    },
+    {
+      "id": "hibernate-orm-001",
+      "category": "orm",
+      "corpusCaseId": null,
+      "description": "Hibernate PostgreSQLDialect schema create/drop, persist, HQL query, update, and transaction rollback.",
+      "statuses": {
+        "psql": { "status": "not_applicable", "reason": "Hibernate-only case." },
+        "pgjdbc": { "status": "not_applicable", "reason": "Hibernate-only case; pgJDBC is the transport dependency." },
+        "datagrip": { "status": "not_applicable", "reason": "Hibernate-only case." },
+        "hibernate": { "status": "not_run_dependency_gap", "reason": "Byte Buddy 1.15.11 was not present in the local Maven repository." }
+      }
+    }
+  ]
+}
