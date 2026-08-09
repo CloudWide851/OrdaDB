@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { ConnectorDescriptor, ConnectorKind } from "./consoleClient";
 import type { SqlDialect } from "../types";
 import { isTauriRuntime } from "./tauri";
 
@@ -25,10 +26,13 @@ export interface CredentialSaved {
 
 export interface DbmsConnectionRequest {
   connectorId: string;
-  dialect: SqlDialect;
+  connectorKind: ConnectorKind;
+  commandLanguage: string;
+  dialect?: SqlDialect;
   endpoint: string;
   adminEndpoint?: string;
   database?: string;
+  tlsMode: ConnectorDescriptor["defaultTlsMode"];
   credentialId: string;
 }
 
@@ -87,7 +91,9 @@ export interface DbmsCapabilities {
 export interface DbmsConnectionSnapshot {
   connectionId: string;
   connectorId: string;
-  dialect: SqlDialect;
+  connectorKind: ConnectorKind;
+  commandLanguage: string;
+  dialect: SqlDialect | null;
   endpoint: string;
   database: string;
   mode: "native" | "plugin" | "preview";
@@ -95,8 +101,10 @@ export interface DbmsConnectionSnapshot {
 }
 
 export interface DbmsCatalogObject {
+  id: string | null;
   kind: string;
   schema: string;
+  namespace: string | null;
   name: string;
   parent: string | null;
   details: unknown;
@@ -112,9 +120,26 @@ export interface DbmsQueryColumn {
   dataType: string;
 }
 
+export type DbmsCommand =
+  | {
+      kind: "text";
+      languageId: string;
+      text: string;
+      params: Array<string | null>;
+    }
+  | { kind: "document"; languageId: string; document: unknown }
+  | { kind: "arguments"; languageId: string; arguments: string[] };
+
+export interface DbmsKeyValue {
+  key: unknown;
+  value: unknown;
+}
+
 export type DbmsQueryEvent =
   | { kind: "schema"; columns: DbmsQueryColumn[] }
   | { kind: "batch"; rows: Array<Array<string | null>> }
+  | { kind: "documents"; documents: unknown[] }
+  | { kind: "keyValues"; entries: DbmsKeyValue[] }
   | { kind: "progress"; rowsProcessed: number }
   | {
       kind: "notice";
@@ -252,8 +277,7 @@ export interface DbmsClient {
   catalog(connectionId: string): Promise<DbmsCatalogSnapshot>;
   execute(
     connectionId: string,
-    sql: string,
-    params?: Array<string | null>,
+    command: DbmsCommand,
   ): Promise<DbmsQueryOperation>;
   cancel(requestId: string): Promise<void>;
   begin(connectionId: string): Promise<DbmsCommandResult>;
@@ -294,6 +318,8 @@ const previewCapabilities: DbmsCapabilities = {
 export const previewConnection: DbmsConnectionSnapshot = {
   connectionId: "preview-connection",
   connectorId: "ordadb-native",
+  connectorKind: "sql",
+  commandLanguage: "postgresql-sql",
   dialect: "postgresql",
   endpoint: "Preview fixture",
   database: "ordadb_preview",
@@ -303,22 +329,28 @@ export const previewConnection: DbmsConnectionSnapshot = {
 
 const previewCatalog: DbmsCatalogObject[] = [
   {
+    id: "preview-database",
     kind: "database",
     schema: "",
+    namespace: null,
     name: "ordadb_preview",
     parent: null,
     details: { mode: "Preview fixture" },
   },
   {
+    id: "preview-schema-public",
     kind: "schema",
     schema: "public",
+    namespace: "public",
     name: "public",
     parent: "ordadb_preview",
     details: { mode: "Preview fixture" },
   },
   {
+    id: "preview-table-documents",
     kind: "table",
     schema: "public",
+    namespace: "public",
     name: "documents",
     parent: null,
     details: {
@@ -332,15 +364,19 @@ const previewCatalog: DbmsCatalogObject[] = [
     },
   },
   {
+    id: "preview-view-recent-documents",
     kind: "view",
     schema: "public",
+    namespace: "public",
     name: "recent_documents",
     parent: null,
     details: { mode: "Preview fixture" },
   },
   {
+    id: "preview-index-documents-search",
     kind: "index",
     schema: "public",
+    namespace: "public",
     name: "documents_search_idx",
     parent: "documents",
     details: { method: "Hybrid", mode: "Preview fixture" },
@@ -380,14 +416,13 @@ class TauriDbmsClient implements DbmsClient {
 
   async execute(
     connectionId: string,
-    sql: string,
-    params: Array<string | null> = [],
+    command: DbmsCommand,
   ): Promise<DbmsQueryOperation> {
     const stream = createQueryEventStream();
     try {
       await stream.listen();
       const started = await invoke<OperationStarted>("dbms_execute", {
-        request: { connectionId, sql, params },
+        request: { connectionId, command },
       });
       stream.select(started.requestId);
       return {
@@ -503,8 +538,11 @@ export class PreviewDbmsClient implements DbmsClient {
   connect: DbmsClient["connect"] = async (request) => ({
     ...previewConnection,
     connectorId: request.connectorId,
-    dialect: request.dialect,
+    connectorKind: request.connectorKind,
+    commandLanguage: request.commandLanguage,
+    dialect: request.dialect ?? null,
     database: request.database ?? previewConnection.database,
+    capabilities: previewCapabilitiesFor(request.connectorKind),
   });
 
   disconnect: DbmsClient["disconnect"] = async () => {};
@@ -514,11 +552,11 @@ export class PreviewDbmsClient implements DbmsClient {
     objects: previewCatalog,
   });
 
-  execute: DbmsClient["execute"] = async (_connectionId, sql) => {
+  execute: DbmsClient["execute"] = async (_connectionId, command) => {
     const requestId = `preview-${Date.now()}`;
     return {
       requestId,
-      events: previewQueryEvents(sql),
+      events: previewQueryEvents(command),
     };
   };
 
@@ -696,9 +734,39 @@ function createQueryEventStream() {
 }
 
 async function* previewQueryEvents(
-  sql: string,
+  command: DbmsCommand,
 ): AsyncIterable<DbmsQueryEvent> {
   await new Promise<void>((resolve) => window.setTimeout(resolve, 120));
+  if (command.kind === "document") {
+    yield {
+      kind: "documents",
+      documents: [
+        {
+          _id: { $oid: "64f000000000000000000001" },
+          operation: command.document,
+          source: "Preview fixture",
+        },
+      ],
+    };
+    yield { kind: "progress", rowsProcessed: 1 };
+    yield { kind: "complete", commandTag: "MONGODB PREVIEW", durationMs: 18 };
+    return;
+  }
+  if (command.kind === "arguments") {
+    yield {
+      kind: "keyValues",
+      entries: [
+        {
+          key: command.arguments[0] ?? "COMMAND",
+          value: command.arguments.slice(1),
+        },
+      ],
+    };
+    yield { kind: "progress", rowsProcessed: 1 };
+    yield { kind: "complete", commandTag: "REDIS PREVIEW", durationMs: 9 };
+    return;
+  }
+  const sql = command.text;
   if (/\berror\b/i.test(sql)) {
     yield {
       kind: "error",
@@ -759,6 +827,22 @@ async function* previewQueryEvents(
     message: "Preview fixture · 不连接真实数据库",
   };
   yield { kind: "complete", commandTag: "SELECT 5 PREVIEW", durationMs: 36 };
+}
+
+function previewCapabilitiesFor(kind: ConnectorKind): DbmsCapabilities {
+  if (kind === "sql") return { ...previewCapabilities };
+  return {
+    ...previewCapabilities,
+    transactions: false,
+    explain: false,
+    sessions: false,
+    locks: false,
+    metrics: false,
+    wal: false,
+    checkpoint: false,
+    backup: false,
+    importExport: false,
+  };
 }
 
 function emptyEngineStatus(): DbmsEngineStatus {

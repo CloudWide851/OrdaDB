@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Redis">
+  <path fill="#D82C20" d="m8 39 24-10 24 10-24 11L8 39Zm0-10 24-10 24 10-24 10L8 29Zm0-10L32 8l24 11-24 10L8 19Z"/>
+  <path fill="#FFF" d="m21 18 11-5 11 5-11 5-11-5Z" opacity=".9"/>
+</svg>

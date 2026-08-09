@@ -6,9 +6,14 @@ members = [
   "crates/ordadb-backup",
   "crates/ordadb-cli",
   "crates/ordadb-cluster",
+  "crates/ordadb-connector-clickhouse",
+  "crates/ordadb-connector-mariadb",
+  "crates/ordadb-connector-mongodb",
   "crates/ordadb-connector-mysql",
+  "crates/ordadb-connector-oracle",
   "crates/ordadb-connector-postgresql",
   "crates/ordadb-connector-publisher",
+  "crates/ordadb-connector-redis",
   "crates/ordadb-connector-sdk",
   "crates/ordadb-connector-sql-server",
   "crates/ordadb-connector-sqlite",
@@ -52,7 +57,7 @@ futures-util = "0.3.32"
 hmac = "0.12.1"
 pbkdf2 = "0.12.2"
 rand = "0.8.7"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "rustls", "stream"] }
 rusqlite = { version = "0.39.0", features = ["bundled", "chrono", "uuid"] }
 rustls = "0.23.36"
 rust_decimal = { version = "1.42.1", features = ["serde", "db-tokio-postgres"] }
@@ -86,4 +91,7 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 zeroize = { version = "1.9.0", features = ["derive"] }
 mysql_async = { version = "0.37.0", default-features = false, features = ["default-rustls-ring", "chrono", "rust_decimal"] }
+mongodb = "3.8.0"
+oracle = "0.6.3"
+redis = { version = "1.5.0", default-features = false, features = ["tokio-rustls-comp", "cluster-async"] }
 tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "native-tls", "tokio", "chrono", "rust_decimal", "sql-browser-tokio"] }

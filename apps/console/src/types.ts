@@ -15,7 +15,14 @@ export interface QueryRow {
 
 export type QueryState = "idle" | "running" | "success" | "error";
 export type ResultTab = "data" | "logs" | "plan";
-export type SqlDialect = "postgresql" | "mysql" | "sqlite" | "sqlServer";
+export type SqlDialect =
+  | "postgresql"
+  | "mysql"
+  | "sqlite"
+  | "sqlServer"
+  | "mariadb"
+  | "clickhouse"
+  | "oracle";
 export type InspectorTab =
   | "properties"
   | "ddl"

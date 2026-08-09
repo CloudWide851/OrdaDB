@@ -201,6 +201,16 @@ export function EditorPane() {
     (state) => state.transactionActive,
   );
   const connection = useWorkbenchStore((state) => state.connection);
+  const sqlMode =
+    connection?.connectorKind !== "document" &&
+    connection?.connectorKind !== "keyValue";
+  const editorLanguage =
+    connection?.connectorKind === "document"
+      ? "json"
+      : connection?.connectorKind === "keyValue"
+        ? "plaintext"
+        : "sql";
+  const editorLabel = sqlMode ? "SQL 编辑器" : "命令编辑器";
   const dialectDescriptor = getSqlDialect(dialect);
   const editorTheme =
     settings.appearance.theme === "dark" ||
@@ -222,12 +232,14 @@ export function EditorPane() {
   const installCompletion = useCallback(
     (monaco: Monaco) => {
       completionRef.current?.dispose();
+      completionRef.current = null;
+      if (!sqlMode) return;
       completionRef.current = registerDialectCompletion(
         monaco,
         dialectDescriptor,
       );
     },
-    [dialectDescriptor],
+    [dialectDescriptor, sqlMode],
   );
 
   const handleEditorMount: OnMount = (editor, monaco) => {
@@ -259,7 +271,7 @@ export function EditorPane() {
   );
 
   return (
-    <section className="editor-pane" aria-label="SQL 编辑器">
+    <section className="editor-pane" aria-label={editorLabel}>
       <div className="query-tabs" role="tablist" aria-label="查询标签">
         {documents.map((document) => {
           const active = document.path === activeDocumentPath;
@@ -316,7 +328,7 @@ export function EditorPane() {
           onClick={() => void createDocument()}
         />
         <span className="query-tabs-spacer" />
-        <label className="dialect-selector">
+        {sqlMode && <label className="dialect-selector">
           <Braces size={13} aria-hidden="true" />
           <select
             aria-label="SQL 方言"
@@ -346,7 +358,7 @@ export function EditorPane() {
           >
             SQL 方言 · 参数 {dialectDescriptor.parameterExample}
           </span>
-        </label>
+        </label>}
       </div>
 
       <div className="editor-toolbar">
@@ -357,22 +369,28 @@ export function EditorPane() {
           onClick={() => void runQuery()}
         >
           <Play size={15} fill="currentColor" aria-hidden="true" />
-          {queryState === "running" ? "运行中" : "运行"}
+          {queryState === "running"
+            ? "运行中"
+            : sqlMode
+              ? "运行查询"
+              : "运行命令"}
           <kbd>Ctrl↵</kbd>
         </button>
         <IconAction
-          label="停止查询"
+          label="停止命令"
           disabled={queryState !== "running"}
           icon={<Square size={14} fill="currentColor" aria-hidden="true" />}
           onClick={() => void cancelQuery()}
         />
         <span className="toolbar-divider" aria-hidden="true" />
-        <IconAction
-          label="格式化 SQL"
-          disabled={!activeDocumentPath}
-          icon={<AlignLeft size={17} aria-hidden="true" />}
-          onClick={formatActiveDocument}
-        />
+        {sqlMode && (
+          <IconAction
+            label="格式化 SQL"
+            disabled={!activeDocumentPath}
+            icon={<AlignLeft size={17} aria-hidden="true" />}
+            onClick={formatActiveDocument}
+          />
+        )}
         <IconAction
           label="保存 SQL 文件"
           disabled={!activeDocumentPath}
@@ -443,14 +461,20 @@ export function EditorPane() {
             beforeMount={configureMonaco}
             onMount={handleEditorMount}
             height="100%"
-            language="sql"
-            path={`${encodeURIComponent(activeDocumentPath)}.${dialect}`}
+            language={editorLanguage}
+            path={
+              encodeURIComponent(activeDocumentPath) +
+              "." +
+              editorLanguage +
+              "." +
+              dialect
+            }
             theme={editorTheme}
             value={sql}
             onChange={(value) => setSql(value ?? "")}
-            loading={<span className="editor-loading">正在加载 SQL 编辑器</span>}
+            loading={<span className="editor-loading">正在加载{editorLabel}</span>}
             options={{
-              ariaLabel: "SQL 编辑器",
+              ariaLabel: editorLabel,
               fontFamily: settings.editor.fontFamily,
               fontSize: settings.editor.fontSize,
               lineHeight: settings.editor.fontSize + 7,

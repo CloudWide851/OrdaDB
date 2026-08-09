@@ -3,7 +3,7 @@ import {
   defaultConnectorDescriptors,
   defaultConsoleSettings,
   PreviewConsoleClient,
-  type ConnectionProfileV2,
+  type ConnectionProfileV3,
 } from "./consoleClient";
 
 describe("PreviewConsoleClient", () => {
@@ -72,12 +72,14 @@ describe("PreviewConsoleClient", () => {
         reopenLastProject: true,
       },
     };
-    const profile: ConnectionProfileV2 = {
-      formatVersion: 2,
+    const profile: ConnectionProfileV3 = {
+      formatVersion: 3,
       profileId: "local",
       label: "本地",
       dataSourceKind: "ordadbNative",
       connectorId: "ordadb-native",
+      connectorKind: "sql",
+      commandLanguage: "postgresql-sql",
       dialect: "postgresql",
       endpoint: "127.0.0.1:54329",
       adminEndpoint: "http://127.0.0.1:9080",

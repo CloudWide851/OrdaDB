@@ -27,8 +27,8 @@ pub use protocol_v3::{
     ConnectorResultBatchV3, ConnectorResultEventV3, ConnectorResultStreamValidatorV3,
     MAX_CONNECTOR_CATALOG_PAGE_NODES, MAX_CONNECTOR_COMMAND_ARGUMENTS, MAX_CONNECTOR_CURSOR_BYTES,
     MAX_CONNECTOR_JSON_DEPTH, MAX_CONNECTOR_LANGUAGES, ProtocolHelloV3, ProtocolReadyV3,
-    read_connector_frame_v3, validate_capabilities_v3, validate_catalog_page_v3,
-    validate_catalog_request_v3, validate_command_v3, validate_error_v3,
+    read_connector_frame_v3, validate_capabilities_v3, validate_capability_subset_v3,
+    validate_catalog_page_v3, validate_catalog_request_v3, validate_command_v3, validate_error_v3,
     validate_protocol_ready_v3, write_connector_frame_v3,
 };
 #[cfg(windows)]

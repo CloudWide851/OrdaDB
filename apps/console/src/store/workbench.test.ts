@@ -70,6 +70,88 @@ describe("workbench store", () => {
     );
   });
 
+  it("routes MongoDB JSON and Redis arguments without SQL parsing or monitor calls", async () => {
+    const mongodbClient = new PreviewDbmsClient();
+    const mongodbMonitor = vi.spyOn(mongodbClient, "monitor");
+    const mongodbExecute = vi.spyOn(mongodbClient, "execute");
+    const mongodb = createWorkbenchStore(mongodbClient);
+    await mongodb.getState().connectDataSource({
+      connectorId: "mongodb",
+      connectorKind: "document",
+      commandLanguage: "mongodb-json",
+      endpoint: "preview",
+      database: "admin",
+      credentialId: "preview-mongodb",
+      username: "dba",
+      tlsMode: "prefer",
+    });
+    await mongodb
+      .getState()
+      .runQuery({ sql: '{"operation":"find","collection":"items"}' });
+
+    expect(mongodbMonitor).not.toHaveBeenCalled();
+    expect(mongodbExecute).toHaveBeenCalledWith(
+      "preview-connection",
+      expect.objectContaining({
+        kind: "document",
+        languageId: "mongodb-json",
+        document: { operation: "find", collection: "items" },
+      }),
+    );
+    expect(mongodb.getState()).toMatchObject({
+      queryState: "success",
+      documentResults: [expect.any(Object)],
+      resultBuffer: { rowCount: 0 },
+    });
+
+    const redisClient = new PreviewDbmsClient();
+    const redisExecute = vi.spyOn(redisClient, "execute");
+    const redis = createWorkbenchStore(redisClient);
+    await redis.getState().connectDataSource({
+      connectorId: "redis",
+      connectorKind: "keyValue",
+      commandLanguage: "redis-resp3",
+      endpoint: "preview",
+      database: "0",
+      credentialId: "preview-redis",
+      username: "default",
+      tlsMode: "disable",
+    });
+    await redis.getState().runQuery({ sql: 'SET "customer name" "Ada Lovelace"' });
+
+    expect(redisExecute).toHaveBeenCalledWith("preview-connection", {
+      kind: "arguments",
+      languageId: "redis-resp3",
+      arguments: ["SET", "customer name", "Ada Lovelace"],
+    });
+    expect(redis.getState()).toMatchObject({
+      queryState: "success",
+      keyValueResults: [expect.any(Object)],
+      resultBuffer: { rowCount: 0 },
+    });
+  });
+
+  it("rejects invalid MongoDB JSON before invoking the connector", async () => {
+    const client = new PreviewDbmsClient();
+    const execute = vi.spyOn(client, "execute");
+    const store = createWorkbenchStore(client);
+    await store.getState().connectDataSource({
+      connectorId: "mongodb",
+      connectorKind: "document",
+      commandLanguage: "mongodb-json",
+      endpoint: "preview",
+      database: "admin",
+      credentialId: "preview-mongodb-invalid",
+      username: "dba",
+      tlsMode: "prefer",
+    });
+
+    await store.getState().runQuery({ sql: "{ invalid" });
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(store.getState().error).toMatchObject({ sqlState: "22023" });
+  });
+
   it("applies configured result paging and resident limits", async () => {
     class LargeResultClient extends PreviewDbmsClient {
       override execute: DbmsClient["execute"] = async () => ({
@@ -187,6 +269,8 @@ describe("workbench store", () => {
 
     await store.getState().connectDataSource({
       connectorId: "ordadb-native",
+      connectorKind: "sql",
+      commandLanguage: "postgresql-sql",
       dialect: "postgresql",
       endpoint: "preview",
       database: "ordadb_preview",
@@ -239,10 +323,13 @@ describe("workbench store", () => {
       ticket: "local-bootstrap-ticket",
       connection: {
         connectorId: "ordadb-native",
+        connectorKind: "sql",
+        commandLanguage: "postgresql-sql",
         dialect: "postgresql",
         endpoint: "127.0.0.1:54329",
         adminEndpoint: "http://127.0.0.1:9080",
         database: "ordadb",
+        tlsMode: "disable",
         credentialId: "ordadb-local",
       },
       suggestedUsername: "ordadb_admin",
@@ -265,6 +352,8 @@ describe("workbench store", () => {
     const store = createWorkbenchStore(dbms, new PreviewConsoleClient());
     const values: DataSourceValues = {
       connectorId: "postgresql",
+      connectorKind: "sql",
+      commandLanguage: "postgresql-sql",
       dialect: "postgresql",
       endpoint: "db.example.test:5432",
       database: "app",
@@ -278,10 +367,13 @@ describe("workbench store", () => {
     expect(probe).toHaveBeenCalledTimes(1);
     expect(probe).toHaveBeenCalledWith({
       connectorId: "postgresql",
+      connectorKind: "sql",
+      commandLanguage: "postgresql-sql",
       dialect: "postgresql",
       endpoint: "db.example.test:5432",
       adminEndpoint: undefined,
       database: "app",
+      tlsMode: "verifyFull",
       credentialId: "postgresql-app",
     });
     expect(promptCredential).toHaveBeenCalledWith({
@@ -315,6 +407,8 @@ describe("workbench store", () => {
         .getState()
         .connectDataSource({
           connectorId: "postgresql",
+          connectorKind: "sql",
+          commandLanguage: "postgresql-sql",
           dialect: "postgresql",
           endpoint: "db.example.test:5432",
           database: "app",
@@ -799,6 +893,8 @@ async function connectPreview(
 ) {
   await store.getState().connectDataSource({
     connectorId: "ordadb-native",
+    connectorKind: "sql",
+    commandLanguage: "postgresql-sql",
     dialect: "postgresql",
     endpoint: "preview",
     database: "ordadb_preview",
@@ -811,6 +907,8 @@ async function connectPreview(
 function nativeDataSourceValues(): DataSourceValues {
   return {
     connectorId: "ordadb-native",
+    connectorKind: "sql",
+    commandLanguage: "postgresql-sql",
     dialect: "postgresql",
     endpoint: "127.0.0.1:54329",
     adminEndpoint: "http://127.0.0.1:9080",

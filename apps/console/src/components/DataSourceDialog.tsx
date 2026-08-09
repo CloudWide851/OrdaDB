@@ -31,6 +31,8 @@ interface DataSourceDialogProps {
 
 const defaults: DataSourceValues = {
   connectorId: "ordadb-native",
+  connectorKind: "sql",
+  commandLanguage: "postgresql-sql",
   dialect: "postgresql",
   endpoint: "127.0.0.1:54329",
   adminEndpoint: "http://127.0.0.1:9080",
@@ -80,7 +82,8 @@ export function DataSourceDialog({
 
   const selectedConnector = getConnectorDefinition(values.connectorId);
   const native = selectedConnector.id === "ordadb-native";
-  const postgresql = selectedConnector.id === "postgresql";
+  const networked =
+    !native && selectedConnector.permissions.includes("network");
   const preview = runtimeMode === "preview";
   const activeConnector = connection
     ? getConnectorDefinition(connection.connectorId)
@@ -242,6 +245,8 @@ export function DataSourceDialog({
                     setValues((current) => ({
                       ...current,
                       connectorId: connector.id,
+                      connectorKind: connector.connectorKind,
+                      commandLanguage: connector.commandLanguage,
                       dialect: connector.sqlDialect,
                       endpoint: connector.defaultEndpoint,
                       adminEndpoint: connector.defaultAdminEndpoint,
@@ -266,13 +271,25 @@ export function DataSourceDialog({
             <div>
               <strong>{selectedConnector.displayName}</strong>
               <span>
-                {native ? "OrdaDB 本地服务" : "外部数据库"}
+                {native
+                  ? "OrdaDB 本地服务"
+                  : selectedConnector.connectorKind === "sql"
+                    ? "外部 SQL 数据库"
+                    : selectedConnector.connectorKind === "document"
+                      ? "文档数据库"
+                      : "键值数据库"}
               </span>
             </div>
           </div>
 
           <label className="form-field">
-            <span>{native ? "服务地址" : "主机与端口"}</span>
+            <span>
+              {native
+                ? "服务地址"
+                : selectedConnector.id === "sqlite"
+                  ? "数据库文件"
+                  : "主机与端口"}
+            </span>
             <input
               required
               autoComplete="off"
@@ -288,7 +305,7 @@ export function DataSourceDialog({
           </label>
 
           <label className="form-field">
-            <span>数据库</span>
+            <span>{databaseFieldLabel(selectedConnector.id)}</span>
             <input
               value={values.database ?? ""}
               onChange={(event) =>
@@ -317,7 +334,7 @@ export function DataSourceDialog({
             </label>
           )}
 
-          {postgresql && (
+          {networked && (
             <label className="form-field form-field--wide">
               <span>TLS</span>
               <select
@@ -443,5 +460,18 @@ function probeStageLabel(stage: ConnectionProbeStageName) {
       return "认证";
     case "catalog":
       return "Catalog";
+  }
+}
+
+function databaseFieldLabel(connectorId: string) {
+  switch (connectorId) {
+    case "redis":
+      return "逻辑数据库";
+    case "oracle":
+      return "Service name";
+    case "mongodb":
+      return "数据库 / Auth source";
+    default:
+      return "数据库";
   }
 }

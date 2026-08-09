@@ -1182,6 +1182,56 @@ button.tree-row:hover {
   box-shadow: var(--shadow-soft);
 }
 
+.structured-result-list {
+  height: 100%;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  padding: 10px;
+}
+
+.structured-result-card {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: var(--surface-solid);
+}
+
+.structured-result-card > span {
+  color: var(--ink-muted);
+  font-size: var(--font-ui);
+  font-variant-numeric: tabular-nums;
+}
+
+.structured-result-card pre,
+.key-value-result-table pre {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-family: var(--editor-font-family);
+  font-size: var(--font-data);
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.key-value-result-table {
+  min-width: 560px;
+}
+
+.key-value-result-table td {
+  height: auto;
+  min-width: 180px;
+  padding-block: 8px;
+  vertical-align: top;
+  white-space: normal;
+}
+
 .result-table .cell-id,
 .result-table .cell-score {
   color: var(--brand-strong);

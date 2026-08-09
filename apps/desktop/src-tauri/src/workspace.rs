@@ -22,11 +22,12 @@ const SETTINGS_FILE: &str = "console-settings-v2.json";
 const LEGACY_SETTINGS_FILE: &str = "console-settings-v1.json";
 const SESSION_FILE: &str = "workspace-session-v1.json";
 const RECENT_FILES_FILE: &str = "recent-files-v1.json";
-const PROFILES_FILE: &str = "connection-profiles-v2.json";
+const PROFILES_FILE: &str = "connection-profiles-v3.json";
+const LEGACY_PROFILES_V2_FILE: &str = "connection-profiles-v2.json";
 const LEGACY_PROFILES_FILE: &str = "connection-profiles-v1.json";
 const SETTINGS_VERSION: u32 = 2;
 const SESSION_VERSION: u32 = 1;
-const PROFILES_VERSION: u32 = 2;
+const PROFILES_VERSION: u32 = 3;
 const MAX_SQL_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DIRECTORY_DEPTH: usize = 32;
 const MAX_WORKSPACE_ENTRIES: usize = 10_000;
@@ -453,11 +454,24 @@ pub enum DataSourceKind {
     Mysql,
     Sqlite,
     SqlServer,
+    Mongodb,
+    Redis,
+    Mariadb,
+    Clickhouse,
+    Oracle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConnectorKind {
+    Sql,
+    Document,
+    KeyValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ConnectionProfileV2 {
+struct ConnectionProfileV2 {
     format_version: u32,
     profile_id: String,
     label: String,
@@ -482,8 +496,65 @@ struct ConnectionProfilesV2 {
 impl Default for ConnectionProfilesV2 {
     fn default() -> Self {
         Self {
+            format_version: 2,
+            profiles: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConnectionProfileV3 {
+    format_version: u32,
+    profile_id: String,
+    label: String,
+    data_source_kind: DataSourceKind,
+    connector_id: String,
+    connector_kind: ConnectorKind,
+    command_language: String,
+    dialect: Option<String>,
+    endpoint: String,
+    admin_endpoint: Option<String>,
+    database: Option<String>,
+    tls_mode: String,
+    credential_id: String,
+    auto_reconnect: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConnectionProfilesV3 {
+    format_version: u32,
+    profiles: Vec<ConnectionProfileV3>,
+}
+
+impl Default for ConnectionProfilesV3 {
+    fn default() -> Self {
+        Self {
             format_version: PROFILES_VERSION,
             profiles: Vec::new(),
+        }
+    }
+}
+
+impl From<ConnectionProfileV2> for ConnectionProfileV3 {
+    fn from(legacy: ConnectionProfileV2) -> Self {
+        let connector_id = migrate_connector_id(&legacy.connector_id);
+        Self {
+            format_version: PROFILES_VERSION,
+            profile_id: legacy.profile_id,
+            label: legacy.label,
+            data_source_kind: data_source_kind(connector_id),
+            connector_id: connector_id.to_owned(),
+            connector_kind: ConnectorKind::Sql,
+            command_language: command_language(connector_id).to_owned(),
+            dialect: Some(legacy.dialect),
+            endpoint: legacy.endpoint,
+            admin_endpoint: legacy.admin_endpoint,
+            database: legacy.database,
+            tls_mode: legacy.tls_mode,
+            credential_id: legacy.credential_id,
+            auto_reconnect: legacy.auto_reconnect,
         }
     }
 }
@@ -498,7 +569,7 @@ impl From<ConnectionProfileV1> for ConnectionProfileV2 {
             "prefer"
         };
         Self {
-            format_version: PROFILES_VERSION,
+            format_version: 2,
             profile_id: legacy.profile_id,
             label: legacy.label,
             data_source_kind,
@@ -519,6 +590,10 @@ impl From<ConnectionProfileV1> for ConnectionProfileV2 {
 pub struct ConnectorDescriptor {
     data_source_kind: DataSourceKind,
     connector_id: &'static str,
+    connector_kind: ConnectorKind,
+    command_language: &'static str,
+    editor_mode: &'static str,
+    dialect: Option<&'static str>,
     display_name: &'static str,
     default_endpoint: &'static str,
     default_admin_endpoint: Option<&'static str>,
@@ -532,6 +607,10 @@ fn connector_descriptors() -> Vec<ConnectorDescriptor> {
         ConnectorDescriptor {
             data_source_kind: DataSourceKind::OrdadbNative,
             connector_id: NATIVE_CONNECTOR_ID,
+            connector_kind: ConnectorKind::Sql,
+            command_language: "postgresql-sql",
+            editor_mode: "sql",
+            dialect: Some("postgresql"),
             display_name: "OrdaDB",
             default_endpoint: "127.0.0.1:54329",
             default_admin_endpoint: Some("http://127.0.0.1:9080"),
@@ -542,6 +621,10 @@ fn connector_descriptors() -> Vec<ConnectorDescriptor> {
         ConnectorDescriptor {
             data_source_kind: DataSourceKind::Postgresql,
             connector_id: "postgresql",
+            connector_kind: ConnectorKind::Sql,
+            command_language: "postgresql-sql",
+            editor_mode: "sql",
+            dialect: Some("postgresql"),
             display_name: "PostgreSQL",
             default_endpoint: "127.0.0.1:5432",
             default_admin_endpoint: None,
@@ -552,6 +635,10 @@ fn connector_descriptors() -> Vec<ConnectorDescriptor> {
         ConnectorDescriptor {
             data_source_kind: DataSourceKind::Mysql,
             connector_id: "mysql",
+            connector_kind: ConnectorKind::Sql,
+            command_language: "mysql-sql",
+            editor_mode: "sql",
+            dialect: Some("mysql"),
             display_name: "MySQL",
             default_endpoint: "127.0.0.1:3306",
             default_admin_endpoint: None,
@@ -562,6 +649,10 @@ fn connector_descriptors() -> Vec<ConnectorDescriptor> {
         ConnectorDescriptor {
             data_source_kind: DataSourceKind::Sqlite,
             connector_id: "sqlite",
+            connector_kind: ConnectorKind::Sql,
+            command_language: "sqlite-sql",
+            editor_mode: "sql",
+            dialect: Some("sqlite"),
             display_name: "SQLite",
             default_endpoint: "",
             default_admin_endpoint: None,
@@ -572,6 +663,10 @@ fn connector_descriptors() -> Vec<ConnectorDescriptor> {
         ConnectorDescriptor {
             data_source_kind: DataSourceKind::SqlServer,
             connector_id: "sql-server",
+            connector_kind: ConnectorKind::Sql,
+            command_language: "sql-server-sql",
+            editor_mode: "sql",
+            dialect: Some("sqlServer"),
             display_name: "SQL Server",
             default_endpoint: "127.0.0.1:1433",
             default_admin_endpoint: None,
@@ -579,7 +674,83 @@ fn connector_descriptors() -> Vec<ConnectorDescriptor> {
             default_tls_mode: "require",
             logo_asset: "sql-server",
         },
+        ConnectorDescriptor {
+            data_source_kind: DataSourceKind::Mongodb,
+            connector_id: "mongodb",
+            connector_kind: ConnectorKind::Document,
+            command_language: "mongodb-json",
+            editor_mode: "json",
+            dialect: None,
+            display_name: "MongoDB",
+            default_endpoint: "127.0.0.1:27017",
+            default_admin_endpoint: None,
+            default_database: Some("admin"),
+            default_tls_mode: "prefer",
+            logo_asset: "mongodb",
+        },
+        ConnectorDescriptor {
+            data_source_kind: DataSourceKind::Redis,
+            connector_id: "redis",
+            connector_kind: ConnectorKind::KeyValue,
+            command_language: "redis-resp3",
+            editor_mode: "plaintext",
+            dialect: None,
+            display_name: "Redis",
+            default_endpoint: "127.0.0.1:6379",
+            default_admin_endpoint: None,
+            default_database: Some("0"),
+            default_tls_mode: "disable",
+            logo_asset: "redis",
+        },
+        ConnectorDescriptor {
+            data_source_kind: DataSourceKind::Mariadb,
+            connector_id: "mariadb",
+            connector_kind: ConnectorKind::Sql,
+            command_language: "mariadb-sql",
+            editor_mode: "sql",
+            dialect: Some("mariadb"),
+            display_name: "MariaDB",
+            default_endpoint: "127.0.0.1:3306",
+            default_admin_endpoint: None,
+            default_database: None,
+            default_tls_mode: "require",
+            logo_asset: "mariadb",
+        },
+        ConnectorDescriptor {
+            data_source_kind: DataSourceKind::Clickhouse,
+            connector_id: "clickhouse",
+            connector_kind: ConnectorKind::Sql,
+            command_language: "clickhouse-sql",
+            editor_mode: "sql",
+            dialect: Some("clickhouse"),
+            display_name: "ClickHouse",
+            default_endpoint: "127.0.0.1:8123",
+            default_admin_endpoint: None,
+            default_database: Some("default"),
+            default_tls_mode: "disable",
+            logo_asset: "clickhouse",
+        },
+        ConnectorDescriptor {
+            data_source_kind: DataSourceKind::Oracle,
+            connector_id: "oracle",
+            connector_kind: ConnectorKind::Sql,
+            command_language: "oracle-sql",
+            editor_mode: "sql",
+            dialect: Some("oracle"),
+            display_name: "Oracle",
+            default_endpoint: "127.0.0.1:1521",
+            default_admin_endpoint: None,
+            default_database: Some("ORCLPDB1"),
+            default_tls_mode: "disable",
+            logo_asset: "oracle",
+        },
     ]
+}
+
+impl From<ConnectionProfileV1> for ConnectionProfileV3 {
+    fn from(legacy: ConnectionProfileV1) -> Self {
+        Self::from(ConnectionProfileV2::from(legacy))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -588,7 +759,7 @@ pub struct ConsoleBootstrap {
     settings: ConsoleSettingsV2,
     recovery: Option<WorkspaceSessionV1>,
     recent_files: Vec<RecentFileEntry>,
-    connection_profiles: Vec<ConnectionProfileV2>,
+    connection_profiles: Vec<ConnectionProfileV3>,
     connector_descriptors: Vec<ConnectorDescriptor>,
 }
 
@@ -778,9 +949,9 @@ impl ConsoleRuntime {
 
     fn save_profile(
         &self,
-        profile: ConnectionProfileV2,
-    ) -> Result<Vec<ConnectionProfileV2>, DbError> {
-        validate_profile_v2(&profile)?;
+        profile: ConnectionProfileV3,
+    ) -> Result<Vec<ConnectionProfileV3>, DbError> {
+        validate_profile_v3(&profile)?;
         let _guard = self.lock_writes()?;
         let mut document = self.load_profiles()?;
         if let Some(current) = document
@@ -802,7 +973,7 @@ impl ConsoleRuntime {
         Ok(document.profiles)
     }
 
-    fn delete_profile(&self, profile_id: &str) -> Result<Vec<ConnectionProfileV2>, DbError> {
+    fn delete_profile(&self, profile_id: &str) -> Result<Vec<ConnectionProfileV3>, DbError> {
         validate_id(profile_id, "connection profile ID")?;
         let _guard = self.lock_writes()?;
         let mut document = self.load_profiles()?;
@@ -813,21 +984,36 @@ impl ConsoleRuntime {
         Ok(document.profiles)
     }
 
-    fn load_profiles(&self) -> Result<ConnectionProfilesV2, DbError> {
+    fn load_profiles(&self) -> Result<ConnectionProfilesV3, DbError> {
         self.load_profiles_with_migration()
             .map(|(document, _)| document)
     }
 
-    fn load_profiles_with_migration(&self) -> Result<(ConnectionProfilesV2, bool), DbError> {
+    fn load_profiles_with_migration(&self) -> Result<(ConnectionProfilesV3, bool), DbError> {
         let current = self.root.join(PROFILES_FILE);
         if current.exists() {
-            let document: ConnectionProfilesV2 = read_json_or_default(&current)?;
-            validate_profiles_v2(&document)?;
+            let document: ConnectionProfilesV3 = read_json_or_default(&current)?;
+            validate_profiles_v3(&document)?;
             return Ok((document, false));
+        }
+        let legacy_v2_path = self.root.join(LEGACY_PROFILES_V2_FILE);
+        if legacy_v2_path.exists() {
+            let legacy: ConnectionProfilesV2 = read_json_or_default(&legacy_v2_path)?;
+            validate_profiles_v2(&legacy)?;
+            let document = ConnectionProfilesV3 {
+                format_version: PROFILES_VERSION,
+                profiles: legacy
+                    .profiles
+                    .into_iter()
+                    .map(ConnectionProfileV3::from)
+                    .collect(),
+            };
+            validate_profiles_v3(&document)?;
+            return Ok((document, true));
         }
         let legacy_path = self.root.join(LEGACY_PROFILES_FILE);
         if !legacy_path.exists() {
-            return Ok((ConnectionProfilesV2::default(), false));
+            return Ok((ConnectionProfilesV3::default(), false));
         }
         let legacy: ConnectionProfilesV1 = read_json_or_default(&legacy_path)?;
         if legacy.format_version != 1 {
@@ -843,12 +1029,13 @@ impl ConsoleRuntime {
             .profiles
             .into_iter()
             .map(ConnectionProfileV2::from)
+            .map(ConnectionProfileV3::from)
             .collect();
-        let document = ConnectionProfilesV2 {
+        let document = ConnectionProfilesV3 {
             format_version: PROFILES_VERSION,
             profiles,
         };
-        validate_profiles_v2(&document)?;
+        validate_profiles_v3(&document)?;
         Ok((document, true))
     }
 
@@ -1240,8 +1427,8 @@ pub fn workspace_save_session(
 #[tauri::command(rename_all = "camelCase")]
 pub fn console_save_connection_profile(
     runtime: State<'_, Arc<ConsoleRuntime>>,
-    profile: ConnectionProfileV2,
-) -> DesktopResult<Vec<ConnectionProfileV2>> {
+    profile: ConnectionProfileV3,
+) -> DesktopResult<Vec<ConnectionProfileV3>> {
     runtime.save_profile(profile).map_err(Into::into)
 }
 
@@ -1249,7 +1436,7 @@ pub fn console_save_connection_profile(
 pub fn console_delete_connection_profile(
     runtime: State<'_, Arc<ConsoleRuntime>>,
     profile_id: String,
-) -> DesktopResult<Vec<ConnectionProfileV2>> {
+) -> DesktopResult<Vec<ConnectionProfileV3>> {
     runtime.delete_profile(&profile_id).map_err(Into::into)
 }
 
@@ -1356,7 +1543,7 @@ fn validate_document_locator(locator: &DocumentLocator) -> Result<(), DbError> {
 }
 
 fn validate_profiles_v2(document: &ConnectionProfilesV2) -> Result<(), DbError> {
-    if document.format_version != PROFILES_VERSION {
+    if document.format_version != 2 {
         return Err(unsupported_version(
             "connection profiles",
             document.format_version,
@@ -1376,7 +1563,7 @@ fn validate_profiles_v2(document: &ConnectionProfilesV2) -> Result<(), DbError> 
 }
 
 fn validate_profile_v2(profile: &ConnectionProfileV2) -> Result<(), DbError> {
-    if profile.format_version != PROFILES_VERSION {
+    if profile.format_version != 2 {
         return Err(unsupported_version(
             "connection profile",
             profile.format_version,
@@ -1439,6 +1626,109 @@ fn validate_profile_v2(profile: &ConnectionProfileV2) -> Result<(), DbError> {
                 return Err(invalid("SQL Server profile fields are inconsistent"));
             }
         }
+        DataSourceKind::Mongodb
+        | DataSourceKind::Redis
+        | DataSourceKind::Mariadb
+        | DataSourceKind::Clickhouse
+        | DataSourceKind::Oracle => {
+            return Err(invalid(
+                "connection profile v2 does not support this data source kind",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_profiles_v3(document: &ConnectionProfilesV3) -> Result<(), DbError> {
+    if document.format_version != PROFILES_VERSION {
+        return Err(unsupported_version(
+            "connection profiles",
+            document.format_version,
+        ));
+    }
+    if document.profiles.len() > MAX_CONNECTION_PROFILES {
+        return Err(resource("connection profile limit exceeded"));
+    }
+    let mut ids = BTreeSet::new();
+    for profile in &document.profiles {
+        validate_profile_v3(profile)?;
+        if !ids.insert(profile.profile_id.as_str()) {
+            return Err(invalid("connection profile IDs must be unique"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_profile_v3(profile: &ConnectionProfileV3) -> Result<(), DbError> {
+    if profile.format_version != PROFILES_VERSION {
+        return Err(unsupported_version(
+            "connection profile",
+            profile.format_version,
+        ));
+    }
+    validate_id(&profile.profile_id, "connection profile ID")?;
+    validate_id(&profile.credential_id, "credential ID")?;
+    validate_text(&profile.label, 1, 128, "connection profile label")?;
+    validate_text(&profile.connector_id, 1, 128, "connector ID")?;
+    validate_text(
+        &profile.command_language,
+        1,
+        64,
+        "connector command language",
+    )?;
+    validate_text(&profile.endpoint, 1, 2_048, "database endpoint")?;
+    if !matches!(
+        profile.connector_id.as_str(),
+        NATIVE_CONNECTOR_ID
+            | "postgresql"
+            | "mysql"
+            | "sqlite"
+            | "sql-server"
+            | "mongodb"
+            | "redis"
+            | "mariadb"
+            | "clickhouse"
+            | "oracle"
+    ) {
+        return Err(invalid("connection profile has an unknown connector ID"));
+    }
+    if let Some(dialect) = &profile.dialect {
+        validate_text(dialect, 1, 32, "SQL dialect")?;
+    }
+    if let Some(admin_endpoint) = &profile.admin_endpoint {
+        validate_text(admin_endpoint, 1, 2_048, "administration endpoint")?;
+    }
+    if let Some(database) = &profile.database {
+        validate_text(database, 1, 256, "database name")?;
+    }
+    validate_choice(
+        &profile.tls_mode,
+        &["disable", "prefer", "require", "verifyCa", "verifyFull"],
+        "TLS mode",
+    )?;
+    if profile.data_source_kind != data_source_kind(&profile.connector_id)
+        || profile.connector_kind != connector_kind(&profile.connector_id)
+        || profile.command_language != command_language(&profile.connector_id)
+    {
+        return Err(invalid(
+            "connection profile metadata does not match the connector identity",
+        ));
+    }
+    let expected_dialect = connector_dialect(&profile.connector_id);
+    if profile.dialect.as_deref() != expected_dialect {
+        return Err(invalid(
+            "connection profile SQL dialect does not match the connector identity",
+        ));
+    }
+    if profile.connector_id == NATIVE_CONNECTOR_ID
+        && (profile.admin_endpoint.is_none() || profile.tls_mode != "disable")
+    {
+        return Err(invalid("native OrdaDB profile fields are inconsistent"));
+    }
+    if profile.connector_id != NATIVE_CONNECTOR_ID && profile.admin_endpoint.is_some() {
+        return Err(invalid(
+            "external connector profiles do not accept an administration endpoint",
+        ));
     }
     Ok(())
 }
@@ -1460,7 +1750,49 @@ fn data_source_kind(connector_id: &str) -> DataSourceKind {
         "mysql" => DataSourceKind::Mysql,
         "sqlite" => DataSourceKind::Sqlite,
         "sql-server" => DataSourceKind::SqlServer,
+        "mongodb" => DataSourceKind::Mongodb,
+        "redis" => DataSourceKind::Redis,
+        "mariadb" => DataSourceKind::Mariadb,
+        "clickhouse" => DataSourceKind::Clickhouse,
+        "oracle" => DataSourceKind::Oracle,
         _ => DataSourceKind::Postgresql,
+    }
+}
+
+fn connector_kind(connector_id: &str) -> ConnectorKind {
+    match connector_id {
+        "mongodb" => ConnectorKind::Document,
+        "redis" => ConnectorKind::KeyValue,
+        _ => ConnectorKind::Sql,
+    }
+}
+
+fn command_language(connector_id: &str) -> &'static str {
+    match connector_id {
+        NATIVE_CONNECTOR_ID | "postgresql" => "postgresql-sql",
+        "mysql" => "mysql-sql",
+        "sqlite" => "sqlite-sql",
+        "sql-server" => "sql-server-sql",
+        "mongodb" => "mongodb-json",
+        "redis" => "redis-resp3",
+        "mariadb" => "mariadb-sql",
+        "clickhouse" => "clickhouse-sql",
+        "oracle" => "oracle-sql",
+        _ => "unknown",
+    }
+}
+
+fn connector_dialect(connector_id: &str) -> Option<&'static str> {
+    match connector_id {
+        NATIVE_CONNECTOR_ID | "postgresql" => Some("postgresql"),
+        "mysql" => Some("mysql"),
+        "sqlite" => Some("sqlite"),
+        "sql-server" => Some("sqlServer"),
+        "mariadb" => Some("mariadb"),
+        "clickhouse" => Some("clickhouse"),
+        "oracle" => Some("oracle"),
+        "mongodb" | "redis" => None,
+        _ => None,
     }
 }
 
@@ -2164,13 +2496,15 @@ mod tests {
 
     #[test]
     fn postgresql_profiles_cannot_carry_native_admin_fields() {
-        let mut profile = ConnectionProfileV2 {
+        let mut profile = ConnectionProfileV3 {
             format_version: PROFILES_VERSION,
             profile_id: "external-pg".into(),
             label: "PostgreSQL".into(),
             data_source_kind: DataSourceKind::Postgresql,
             connector_id: "postgresql".into(),
-            dialect: "postgresql".into(),
+            connector_kind: ConnectorKind::Sql,
+            command_language: "postgresql-sql".into(),
+            dialect: Some("postgresql".into()),
             endpoint: "127.0.0.1:5432".into(),
             admin_endpoint: None,
             database: Some("postgres".into()),
@@ -2178,9 +2512,83 @@ mod tests {
             credential_id: "external-credential".into(),
             auto_reconnect: false,
         };
-        validate_profile_v2(&profile).expect("valid external PostgreSQL");
+        validate_profile_v3(&profile).expect("valid external PostgreSQL");
         profile.admin_endpoint = Some("http://127.0.0.1:9080".into());
-        let error = validate_profile_v2(&profile).expect_err("native admin endpoint rejected");
+        let error = validate_profile_v3(&profile).expect_err("native admin endpoint rejected");
         assert_eq!(error.sql_state, "22023");
+    }
+
+    #[test]
+    fn connector_descriptors_cover_ten_unique_native_data_models() {
+        let descriptors = connector_descriptors();
+        assert_eq!(descriptors.len(), 10);
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|descriptor| descriptor.connector_id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            10
+        );
+        let mongodb = descriptors
+            .iter()
+            .find(|descriptor| descriptor.connector_id == "mongodb")
+            .expect("MongoDB descriptor");
+        assert_eq!(mongodb.connector_kind, ConnectorKind::Document);
+        assert_eq!(mongodb.command_language, "mongodb-json");
+        assert_eq!(mongodb.editor_mode, "json");
+        assert_eq!(mongodb.dialect, None);
+        let redis = descriptors
+            .iter()
+            .find(|descriptor| descriptor.connector_id == "redis")
+            .expect("Redis descriptor");
+        assert_eq!(redis.connector_kind, ConnectorKind::KeyValue);
+        assert_eq!(redis.command_language, "redis-resp3");
+        assert_eq!(redis.editor_mode, "plaintext");
+        assert_eq!(redis.dialect, None);
+    }
+
+    #[test]
+    fn profile_v3_rejects_unknown_and_sql_shaped_non_sql_connectors() {
+        let profile = ConnectionProfileV3 {
+            format_version: PROFILES_VERSION,
+            profile_id: "mongodb-local".into(),
+            label: "MongoDB".into(),
+            data_source_kind: DataSourceKind::Mongodb,
+            connector_id: "mongodb".into(),
+            connector_kind: ConnectorKind::Document,
+            command_language: "mongodb-json".into(),
+            dialect: None,
+            endpoint: "127.0.0.1:27017".into(),
+            admin_endpoint: None,
+            database: Some("admin".into()),
+            tls_mode: "prefer".into(),
+            credential_id: "mongodb-credential".into(),
+            auto_reconnect: false,
+        };
+        validate_profile_v3(&profile).expect("native MongoDB profile");
+
+        let mut sql_shaped = profile.clone();
+        sql_shaped.connector_kind = ConnectorKind::Sql;
+        sql_shaped.command_language = "postgresql-sql".into();
+        sql_shaped.dialect = Some("postgresql".into());
+        assert_eq!(
+            validate_profile_v3(&sql_shaped)
+                .expect_err("MongoDB cannot be represented as SQL")
+                .sql_state,
+            "22023"
+        );
+
+        let mut unknown = profile;
+        unknown.connector_id = "unknown-database".into();
+        unknown.data_source_kind = DataSourceKind::Postgresql;
+        unknown.connector_kind = ConnectorKind::Sql;
+        unknown.command_language = "unknown".into();
+        assert_eq!(
+            validate_profile_v3(&unknown)
+                .expect_err("unknown connector")
+                .sql_state,
+            "22023"
+        );
     }
 }

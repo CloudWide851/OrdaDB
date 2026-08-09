@@ -1,0 +1,18 @@
+[package]
+name = "ordadb-connector-mongodb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures-util.workspace = true
+mongodb.workspace = true
+ordadb-connector-sdk = { path = "../ordadb-connector-sdk" }
+ordadb-types = { path = "../ordadb-types" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

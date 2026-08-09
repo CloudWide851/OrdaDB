@@ -158,6 +158,11 @@ test.describe("OrdaDB SQL workbench", () => {
       "MySQL",
       "SQLite",
       "SQL Server",
+      "MongoDB",
+      "Redis",
+      "MariaDB",
+      "ClickHouse",
+      "Oracle",
     ]) {
       await expect(connectorManager.getByText(connector)).toBeVisible();
     }
@@ -195,7 +200,21 @@ test.describe("OrdaDB SQL workbench", () => {
     await page.keyboard.press("Escape");
     await expect(connectorManager).toHaveCount(0);
     const sourceDialog = page.getByRole("dialog", { name: "数据源" });
-    await sourceDialog.getByRole("button", { name: "关闭数据源" }).click();
+    await sourceDialog.getByRole("button", { name: "MongoDB", exact: true }).click();
+    await sourceDialog.getByRole("button", { name: "连接", exact: true }).click();
+    await expect(page.getByText("MongoDB JSON", { exact: true })).toBeVisible();
+
+    await page.keyboard.press("Control+Alt+Shift+S");
+    const redisDialog = page.getByRole("dialog", { name: "数据源" });
+    await redisDialog.getByRole("button", { name: "Redis", exact: true }).click();
+    await redisDialog.getByRole("button", { name: "连接", exact: true }).click();
+    await expect(page.getByText("Redis RESP3", { exact: true })).toBeVisible();
+
+    await page.keyboard.press("Control+Alt+Shift+S");
+    const nativeDialog = page.getByRole("dialog", { name: "数据源" });
+    await nativeDialog.getByRole("button", { name: "OrdaDB", exact: true }).click();
+    await nativeDialog.getByRole("button", { name: "连接", exact: true }).click();
+    await expect(page.getByText("SQL · PostgreSQL", { exact: true })).toBeVisible();
 
     await connectPreviewDatabase(page);
     await page.getByRole("tab", { name: "数据库" }).click();
@@ -233,7 +252,7 @@ test.describe("OrdaDB SQL workbench", () => {
     await expect(page.getByRole("tooltip")).toContainText("隐藏数据库浏览器");
 
     await page.getByRole("button", { name: /^运行/ }).click();
-    await expect(page.getByText("5 行 · 36 ms")).toBeVisible();
+    await expect(page.getByText("5 项 · 36 ms")).toBeVisible();
     await expect(page.getByText("WAL checkpoint overview")).toBeVisible();
     await expect(page.locator(".result-table")).toHaveCSS("font-size", "12px");
 
@@ -303,7 +322,7 @@ test.describe("OrdaDB SQL workbench", () => {
     await sqlEditor.focus();
     await expect(sqlEditor).toBeFocused();
     await page.keyboard.press("Control+Enter");
-    await expect(page.getByText("5 行 · 36 ms")).toBeVisible();
+    await expect(page.getByText("5 项 · 36 ms")).toBeVisible();
   });
 
   test("bounds large result buffers and virtualizes the visible rows", async ({
@@ -352,7 +371,7 @@ test.describe("OrdaDB SQL workbench", () => {
         ).__ordadbVirtualizedFixtureReady === true,
     );
 
-    await expect(page.getByText("显示 10000 / 12000 行 · 1 ms")).toBeVisible();
+    await expect(page.getByText("显示 10000 / 12000 项 · 1 ms")).toBeVisible();
     await expect(
       page.getByText("已保留前 10000 行，另有 2000 行未驻留。"),
     ).toBeVisible();
@@ -417,7 +436,7 @@ test.describe("OrdaDB SQL workbench", () => {
 
     await page.getByRole("button", { name: /^运行/ }).click();
     await expect(page.locator(".loading-orbit")).toBeVisible();
-    await expect(page.getByText("5 行 · 36 ms")).toBeVisible();
+    await expect(page.getByText("5 项 · 36 ms")).toBeVisible();
   });
 });
 
@@ -467,6 +486,27 @@ async function openPreviewConnectorManager(page: Page) {
   await page.keyboard.press("Control+Alt+Shift+S");
   const sources = page.getByRole("dialog", { name: "数据源" });
   await expect(sources).toBeVisible();
+  for (const sourceName of [
+    "OrdaDB",
+    "PostgreSQL",
+    "MySQL",
+    "SQLite",
+    "SQL Server",
+    "MongoDB",
+    "Redis",
+    "MariaDB",
+    "ClickHouse",
+    "Oracle",
+  ]) {
+    const source = sources.getByRole("button", {
+      name: sourceName,
+      exact: true,
+    });
+    await expect(source).toBeVisible();
+    const logoSource = await source.locator("img").getAttribute("src");
+    expect(logoSource).toBeTruthy();
+    expect(logoSource).not.toMatch(/^https?:/);
+  }
   await sources.getByRole("button", { name: "PostgreSQL" }).click();
   await sources.getByRole("button", { name: "连接插件" }).click();
   const manager = page.getByRole("dialog", { name: "连接插件" });

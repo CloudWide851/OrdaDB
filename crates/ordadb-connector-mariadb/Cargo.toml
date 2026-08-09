@@ -1,0 +1,12 @@
+[package]
+name = "ordadb-connector-mariadb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ordadb-connector-mysql = { path = "../ordadb-connector-mysql" }
+ordadb-connector-sdk = { path = "../ordadb-connector-sdk" }
+tokio.workspace = true

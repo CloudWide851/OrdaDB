@@ -48,6 +48,11 @@ cargo build --locked --release --target $target --target-dir $packageTargetRoot 
     --package ordadb-connector-mysql `
     --package ordadb-connector-sqlite `
     --package ordadb-connector-sql-server `
+    --package ordadb-connector-mongodb `
+    --package ordadb-connector-redis `
+    --package ordadb-connector-mariadb `
+    --package ordadb-connector-clickhouse `
+    --package ordadb-connector-oracle `
     --package ordadb-connector-publisher
 if ($LASTEXITCODE -ne 0) {
     throw "Windows x64 connector helper release build failed"
@@ -93,7 +98,12 @@ $connectorBinaries = @(
     "ordadb-connector-postgresql.exe",
     "ordadb-connector-mysql.exe",
     "ordadb-connector-sqlite.exe",
-    "ordadb-connector-sql-server.exe"
+    "ordadb-connector-sql-server.exe",
+    "ordadb-connector-mongodb.exe",
+    "ordadb-connector-redis.exe",
+    "ordadb-connector-mariadb.exe",
+    "ordadb-connector-clickhouse.exe",
+    "ordadb-connector-oracle.exe"
 )
 foreach ($binary in $connectorBinaries) {
     Assert-Amd64Pe -Path (Join-Path $connectorDirectory $binary)
@@ -105,7 +115,7 @@ if ($unexpectedConnectors) {
     throw "Connector staging contains unexpected files: $($unexpectedConnectors.Name -join ', ')"
 }
 if ((Get-ChildItem -LiteralPath $connectorDirectory -File).Count -ne $expectedConnectorFiles.Count) {
-    throw "Connector staging does not contain exactly four helpers and one catalog"
+    throw "Connector staging does not contain exactly nine helpers and one catalog"
 }
 
 $unexpected = Get-ChildItem -LiteralPath $stagingDirectory -File |
@@ -119,4 +129,4 @@ if ($unexpectedDirectories) {
     throw "Windows staging contains unexpected directories: $($unexpectedDirectories.Name -join ', ')"
 }
 
-Write-Output "Staged AMD64 product binaries and four signed connector resources in $stagingDirectory"
+Write-Output "Staged AMD64 product binaries and nine signed connector resources in $stagingDirectory"

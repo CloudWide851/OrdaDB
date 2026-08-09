@@ -33,6 +33,11 @@ export function ResultsPane() {
   const queryState = useWorkbenchStore((state) => state.queryState);
   const columns = useWorkbenchStore((state) => state.columns);
   const resultBuffer = useWorkbenchStore((state) => state.resultBuffer);
+  const documentResults = useWorkbenchStore((state) => state.documentResults);
+  const keyValueResults = useWorkbenchStore((state) => state.keyValueResults);
+  const droppedStructuredItems = useWorkbenchStore(
+    (state) => state.droppedStructuredItems,
+  );
   const logs = useWorkbenchStore((state) => state.logs);
   const error = useWorkbenchStore((state) => state.error);
   const durationMs = useWorkbenchStore((state) => state.durationMs);
@@ -40,7 +45,15 @@ export function ResultsPane() {
   const nullDisplay = useWorkbenchStore(
     (state) => state.settings.results.nullDisplay,
   );
-  const totalRows = Math.max(resultBuffer.totalRows, rowsProcessed);
+  const residentItems =
+    resultBuffer.rowCount + documentResults.length + keyValueResults.length;
+  const totalItems = Math.max(
+    resultBuffer.totalRows +
+      documentResults.length +
+      keyValueResults.length +
+      droppedStructuredItems,
+    rowsProcessed,
+  );
   const planRows = useMemo(
     () => (activeTab === "plan" ? resultRows(resultBuffer.pages) : []),
     [activeTab, resultBuffer.pages],
@@ -73,9 +86,9 @@ export function ResultsPane() {
           {queryState === "success" && (
             <span className="query-summary" aria-live="polite">
               <CheckCircle2 size={15} aria-hidden="true" />
-              {resultBuffer.rowCount === totalRows
-                ? `${totalRows} 行`
-                : `显示 ${resultBuffer.rowCount} / ${totalRows} 行`}{" "}
+              {residentItems === totalItems
+                ? `${totalItems} 项`
+                : `显示 ${residentItems} / ${totalItems} 项`}{" "}
               · {durationMs ?? 0} ms
             </span>
           )}
@@ -85,7 +98,7 @@ export function ResultsPane() {
           />
           <IconAction
             label="导出结果"
-            disabled={resultBuffer.rowCount === 0}
+            disabled={residentItems === 0}
             icon={<Download size={16} aria-hidden="true" />}
           />
         </div>
@@ -113,6 +126,9 @@ export function ResultsPane() {
             pages={resultBuffer.pages}
             rowCount={resultBuffer.rowCount}
             droppedRows={resultBuffer.droppedRows}
+            documents={documentResults}
+            keyValues={keyValueResults}
+            droppedStructuredItems={droppedStructuredItems}
             nullDisplay={nullDisplay}
           />
         )}
@@ -127,6 +143,9 @@ function DataView({
   pages,
   rowCount,
   droppedRows,
+  documents,
+  keyValues,
+  droppedStructuredItems,
   nullDisplay,
 }: {
   queryState: QueryState;
@@ -134,6 +153,9 @@ function DataView({
   pages: ResultPage[];
   rowCount: number;
   droppedRows: number;
+  documents: unknown[];
+  keyValues: Array<{ key: unknown; value: unknown }>;
+  droppedStructuredItems: number;
   nullDisplay: string;
 }) {
   if (queryState === "running" && rowCount === 0) {
@@ -149,9 +171,27 @@ function DataView({
     return (
       <div className="result-empty">
         <Braces size={24} strokeWidth={1.6} aria-hidden="true" />
-        <strong>运行查询</strong>
+        <strong>运行命令</strong>
         <span>Ctrl Enter</span>
       </div>
+    );
+  }
+
+  if (documents.length > 0) {
+    return (
+      <StructuredResultList
+        values={documents}
+        droppedItems={droppedStructuredItems}
+      />
+    );
+  }
+
+  if (keyValues.length > 0) {
+    return (
+      <KeyValueResultList
+        entries={keyValues}
+        droppedItems={droppedStructuredItems}
+      />
     );
   }
 
@@ -164,6 +204,81 @@ function DataView({
       nullDisplay={nullDisplay}
     />
   );
+}
+
+function StructuredResultList({
+  values,
+  droppedItems,
+}: {
+  values: unknown[];
+  droppedItems: number;
+}) {
+  return (
+    <div className="structured-result-list" aria-label="文档结果">
+      {values.map((value, index) => (
+        <article className="structured-result-card" key={index}>
+          <span>#{index + 1}</span>
+          <pre>{formatStructuredValue(value)}</pre>
+        </article>
+      ))}
+      {droppedItems > 0 && (
+        <div className="result-buffer-note" role="status">
+          已保留前 {values.length} 项，另有 {droppedItems} 项未驻留。
+        </div>
+      )}
+    </div>
+  );
+}
+
+function KeyValueResultList({
+  entries,
+  droppedItems,
+}: {
+  entries: Array<{ key: unknown; value: unknown }>;
+  droppedItems: number;
+}) {
+  return (
+    <div className="table-scroll" aria-label="键值结果">
+      <table className="result-table key-value-result-table">
+        <thead>
+          <tr>
+            <th>Key</th>
+            <th>Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          {entries.map((entry, index) => (
+            <tr key={index}>
+              <td className="cell-id">
+                <code>{formatCompactValue(entry.key)}</code>
+              </td>
+              <td>
+                <pre>{formatStructuredValue(entry.value)}</pre>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {droppedItems > 0 && (
+        <div className="result-buffer-note" role="status">
+          已保留前 {entries.length} 项，另有 {droppedItems} 项未驻留。
+        </div>
+      )}
+    </div>
+  );
+}
+
+function formatStructuredValue(value: unknown) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2) ?? "null";
+  } catch {
+    return "[无法序列化的值]";
+  }
+}
+
+function formatCompactValue(value: unknown) {
+  return formatStructuredValue(value).replace(/\s+/gu, " ");
 }
 
 const RESULT_ROW_HEIGHT = 32;

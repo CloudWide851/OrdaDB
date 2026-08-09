@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ordadb_connector_sdk::{CONNECTOR_PROTOCOL_V2, CONNECTOR_PROTOCOL_V3};
 use ordadb_types::{DbError, Result};
 use reqwest::Url;
 use semver::Version;
@@ -28,6 +29,11 @@ pub enum ConnectorDialect {
     MySql,
     Sqlite,
     SqlServer,
+    MongoDb,
+    Redis,
+    MariaDb,
+    ClickHouse,
+    Oracle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -36,6 +42,94 @@ pub enum ConnectorPermission {
     Network,
     LocalDatabaseFile,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OfficialConnectorDescriptor {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    pub package: &'static str,
+    pub dialect: ConnectorDialect,
+    pub permissions: &'static [ConnectorPermission],
+    pub api_version: u32,
+}
+
+const NETWORK: &[ConnectorPermission] = &[ConnectorPermission::Network];
+const LOCAL_FILE: &[ConnectorPermission] = &[ConnectorPermission::LocalDatabaseFile];
+
+pub const OFFICIAL_CONNECTOR_DESCRIPTORS: &[OfficialConnectorDescriptor] = &[
+    OfficialConnectorDescriptor {
+        id: "postgresql",
+        display_name: "PostgreSQL",
+        package: "ordadb-connector-postgresql",
+        dialect: ConnectorDialect::PostgreSql,
+        permissions: NETWORK,
+        api_version: CONNECTOR_PROTOCOL_V2,
+    },
+    OfficialConnectorDescriptor {
+        id: "mysql",
+        display_name: "MySQL",
+        package: "ordadb-connector-mysql",
+        dialect: ConnectorDialect::MySql,
+        permissions: NETWORK,
+        api_version: CONNECTOR_PROTOCOL_V2,
+    },
+    OfficialConnectorDescriptor {
+        id: "sqlite",
+        display_name: "SQLite",
+        package: "ordadb-connector-sqlite",
+        dialect: ConnectorDialect::Sqlite,
+        permissions: LOCAL_FILE,
+        api_version: CONNECTOR_PROTOCOL_V2,
+    },
+    OfficialConnectorDescriptor {
+        id: "sql-server",
+        display_name: "SQL Server",
+        package: "ordadb-connector-sql-server",
+        dialect: ConnectorDialect::SqlServer,
+        permissions: NETWORK,
+        api_version: CONNECTOR_PROTOCOL_V2,
+    },
+    OfficialConnectorDescriptor {
+        id: "mongodb",
+        display_name: "MongoDB",
+        package: "ordadb-connector-mongodb",
+        dialect: ConnectorDialect::MongoDb,
+        permissions: NETWORK,
+        api_version: CONNECTOR_PROTOCOL_V3,
+    },
+    OfficialConnectorDescriptor {
+        id: "redis",
+        display_name: "Redis",
+        package: "ordadb-connector-redis",
+        dialect: ConnectorDialect::Redis,
+        permissions: NETWORK,
+        api_version: CONNECTOR_PROTOCOL_V3,
+    },
+    OfficialConnectorDescriptor {
+        id: "mariadb",
+        display_name: "MariaDB",
+        package: "ordadb-connector-mariadb",
+        dialect: ConnectorDialect::MariaDb,
+        permissions: NETWORK,
+        api_version: CONNECTOR_PROTOCOL_V3,
+    },
+    OfficialConnectorDescriptor {
+        id: "clickhouse",
+        display_name: "ClickHouse",
+        package: "ordadb-connector-clickhouse",
+        dialect: ConnectorDialect::ClickHouse,
+        permissions: NETWORK,
+        api_version: CONNECTOR_PROTOCOL_V3,
+    },
+    OfficialConnectorDescriptor {
+        id: "oracle",
+        display_name: "Oracle",
+        package: "ordadb-connector-oracle",
+        dialect: ConnectorDialect::Oracle,
+        permissions: NETWORK,
+        api_version: CONNECTOR_PROTOCOL_V3,
+    },
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -197,6 +291,11 @@ pub fn manifest_signing_payload(manifest: &PluginManifestV1) -> Result<Vec<u8>> 
             ConnectorDialect::MySql => "mySql",
             ConnectorDialect::Sqlite => "sqlite",
             ConnectorDialect::SqlServer => "sqlServer",
+            ConnectorDialect::MongoDb => "mongoDb",
+            ConnectorDialect::Redis => "redis",
+            ConnectorDialect::MariaDb => "mariaDb",
+            ConnectorDialect::ClickHouse => "clickHouse",
+            ConnectorDialect::Oracle => "oracle",
         },
     )?;
     push_string(&mut payload, &manifest.publisher)?;

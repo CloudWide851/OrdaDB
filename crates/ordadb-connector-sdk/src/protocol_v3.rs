@@ -583,6 +583,51 @@ pub fn validate_capabilities_v3(capabilities: &ConnectorCapabilitiesV3) -> Resul
     Ok(())
 }
 
+pub fn validate_capability_subset_v3(
+    advertised: &ConnectorCapabilitiesV3,
+    session: &ConnectorCapabilitiesV3,
+) -> Result<()> {
+    validate_capabilities_v3(advertised)?;
+    validate_capabilities_v3(session)?;
+    if advertised.kind != session.kind
+        || advertised.command_languages != session.command_languages
+        || advertised.tls_modes != session.tls_modes
+    {
+        return Err(protocol_error(
+            "connector session identity capabilities differ from the handshake",
+        ));
+    }
+    if session.maximum_batch_rows > advertised.maximum_batch_rows
+        || session.maximum_catalog_page_size > advertised.maximum_catalog_page_size
+    {
+        return Err(protocol_error(
+            "connector session resource limits exceed the handshake",
+        ));
+    }
+    for (advertised_value, session_value, name) in [
+        (advertised.catalog, session.catalog, "Catalog"),
+        (
+            advertised.cancellation,
+            session.cancellation,
+            "cancellation",
+        ),
+        (
+            advertised.transactions,
+            session.transactions,
+            "transactions",
+        ),
+        (advertised.savepoints, session.savepoints, "savepoints"),
+        (advertised.batch_query, session.batch_query, "batch query"),
+    ] {
+        if session_value && !advertised_value {
+            return Err(protocol_error(format!(
+                "connector session enables {name} beyond the handshake",
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_command_v3(
     command: &ConnectorCommandV3,
     capabilities: &ConnectorCapabilitiesV3,
@@ -1126,6 +1171,20 @@ mod tests {
         assert_eq!(
             validate_capabilities_v3(&duplicate)
                 .expect_err("duplicate language")
+                .sql_state,
+            "08P01"
+        );
+
+        let advertised = capabilities(ConnectorKindV3::Document);
+        let mut session = advertised.clone();
+        session.transactions = false;
+        session.savepoints = false;
+        session.maximum_batch_rows = 128;
+        validate_capability_subset_v3(&advertised, &session).expect("safe session downgrade");
+        session.kind = ConnectorKindV3::Sql;
+        assert_eq!(
+            validate_capability_subset_v3(&advertised, &session)
+                .expect_err("kind change")
                 .sql_state,
             "08P01"
         );
