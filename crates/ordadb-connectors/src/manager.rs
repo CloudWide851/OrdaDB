@@ -19,9 +19,9 @@ use uuid::Uuid;
 
 use crate::manifest::{decode_sha256, validate_plugin_id};
 use crate::{
-    CONNECTOR_API_VERSION, CONNECTOR_MANIFEST_VERSION, ManifestPolicy, PluginManifestV1,
-    RegistryCatalogV1, decode_public_key, invalid, io_error, network_error, security_error,
-    validate_manifest,
+    CONNECTOR_API_VERSION, CONNECTOR_MANIFEST_VERSION, ManifestPolicy,
+    OFFICIAL_CONNECTOR_DESCRIPTORS, PluginManifestV1, RegistryCatalogV1, decode_public_key,
+    invalid, io_error, network_error, security_error, validate_manifest,
 };
 
 const STATE_VERSION: u32 = 1;
@@ -1005,6 +1005,7 @@ fn activate_bundled_connectors(
         "bundled connector catalog",
     )?;
     let manifests = parse_registry_catalog(&catalog_bytes, policy)?;
+    validate_bundled_manifest_set(&manifests)?;
     let verified = manifests
         .into_iter()
         .map(|manifest| {
@@ -1035,6 +1036,40 @@ fn activate_bundled_connectors(
         let _ = fs::remove_dir_all(&staging);
     }
     activation
+}
+
+fn validate_bundled_manifest_set(manifests: &[PluginManifestV1]) -> Result<()> {
+    if manifests.len() != OFFICIAL_CONNECTOR_DESCRIPTORS.len() {
+        return Err(security_error(format!(
+            "bundled connector catalog must contain exactly {} official helpers",
+            OFFICIAL_CONNECTOR_DESCRIPTORS.len()
+        )));
+    }
+    let manifests_by_id = manifests
+        .iter()
+        .map(|manifest| (manifest.id.as_str(), manifest))
+        .collect::<BTreeMap<_, _>>();
+    for descriptor in OFFICIAL_CONNECTOR_DESCRIPTORS {
+        let manifest = manifests_by_id.get(descriptor.id).ok_or_else(|| {
+            security_error(format!(
+                "bundled connector catalog is missing official helper {}",
+                descriptor.id
+            ))
+        })?;
+        let expected_entry = format!("{}.exe", descriptor.package);
+        if manifest.display_name != descriptor.display_name
+            || manifest.api_version != descriptor.api_version
+            || manifest.dialect != descriptor.dialect
+            || manifest.permissions.as_slice() != descriptor.permissions
+            || manifest.entry != expected_entry
+        {
+            return Err(security_error(format!(
+                "bundled connector identity does not match the official descriptor for {}",
+                descriptor.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn stage_and_activate_bundled(
@@ -1541,16 +1576,58 @@ mod tests {
         .expect("catalog")
     }
 
-    fn write_bundle(root: &Path, manifests: &[PluginManifestV1], artifacts: &[(&str, &[u8])]) {
+    fn write_official_bundle(
+        root: &Path,
+        signing_key: &SigningKey,
+        version: &str,
+        overrides: &[(&str, &[u8])],
+    ) -> Vec<PluginManifestV1> {
         fs::create_dir_all(root).expect("bundle directory");
+        let manifests = OFFICIAL_CONNECTOR_DESCRIPTORS
+            .iter()
+            .map(|descriptor| {
+                let artifact = overrides
+                    .iter()
+                    .find_map(|(id, artifact)| (*id == descriptor.id).then_some(*artifact))
+                    .unwrap_or(descriptor.id.as_bytes());
+                let entry = format!("{}.exe", descriptor.package);
+                let mut manifest = PluginManifestV1 {
+                    schema_version: CONNECTOR_MANIFEST_VERSION,
+                    id: descriptor.id.into(),
+                    display_name: descriptor.display_name.into(),
+                    version: version.into(),
+                    api_version: descriptor.api_version,
+                    architecture: ConnectorArchitecture::WindowsX64,
+                    dialect: descriptor.dialect,
+                    publisher: "OrdaDB".into(),
+                    permissions: descriptor.permissions.to_vec(),
+                    entry: entry.clone(),
+                    size: u64::try_from(artifact.len()).expect("artifact length"),
+                    sha256: Sha256::digest(artifact)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                    signature: String::new(),
+                    minimum_host_version: "0.1.0".into(),
+                    download_url: format!(
+                        "https://plugins.ordadb.test/v1/artifacts/{version}/{entry}"
+                    ),
+                };
+                manifest.signature = BASE64.encode(
+                    signing_key
+                        .sign(&manifest_signing_payload(&manifest).expect("payload"))
+                        .to_bytes(),
+                );
+                fs::write(root.join(&entry), artifact).expect("bundle artifact");
+                manifest
+            })
+            .collect::<Vec<_>>();
         fs::write(
             root.join(BUNDLED_CATALOG_FILE),
-            catalog_with(manifests.to_vec()),
+            catalog_with(manifests.clone()),
         )
         .expect("bundle catalog");
-        for (entry, artifact) in artifacts {
-            fs::write(root.join(entry), artifact).expect("bundle artifact");
-        }
+        manifests
     }
 
     fn options(root: &Path, signing_key: &SigningKey) -> PluginManagerOptions {
@@ -1707,30 +1784,13 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[21_u8; 32]);
         let postgresql_artifact = b"postgresql-connector".as_slice();
         let sqlite_artifact = b"sqlite-connector".as_slice();
-        let postgresql = signed_manifest_for(
-            &signing_key,
-            postgresql_artifact,
-            "1.0.0",
-            "postgresql",
-            "ordadb-connector-postgresql.exe",
-            ConnectorDialect::PostgreSql,
-            vec![ConnectorPermission::Network],
-        );
-        let sqlite = signed_manifest_for(
-            &signing_key,
-            sqlite_artifact,
-            "1.0.0",
-            "sqlite",
-            "ordadb-connector-sqlite.exe",
-            ConnectorDialect::Sqlite,
-            vec![ConnectorPermission::LocalDatabaseFile],
-        );
-        write_bundle(
+        let manifests = write_official_bundle(
             bundled.path(),
-            &[postgresql.clone(), sqlite.clone()],
+            &signing_key,
+            "1.0.0",
             &[
-                (&postgresql.entry, postgresql_artifact),
-                (&sqlite.entry, sqlite_artifact),
+                ("postgresql", postgresql_artifact),
+                ("sqlite", sqlite_artifact),
             ],
         );
 
@@ -1747,9 +1807,18 @@ mod tests {
         );
         assert!(manager.active_entry("sqlite").expect("sqlite").is_file());
         let state = load_state(directory.path()).expect("state");
-        assert_eq!(state.plugins.len(), 2);
+        assert_eq!(state.plugins.len(), 9);
         assert_eq!(state.plugins["postgresql"].active_version, "1.0.0");
         assert_eq!(state.plugins["sqlite"].active_version, "1.0.0");
+        for descriptor in OFFICIAL_CONNECTOR_DESCRIPTORS {
+            assert!(
+                manager
+                    .active_entry(descriptor.id)
+                    .expect("official helper")
+                    .is_file()
+            );
+        }
+        assert_eq!(manifests.len(), OFFICIAL_CONNECTOR_DESCRIPTORS.len());
     }
 
     #[test]
@@ -1758,19 +1827,11 @@ mod tests {
         let bundled = tempdir().expect("bundled");
         let signing_key = SigningKey::from_bytes(&[22_u8; 32]);
         let first_artifact = b"connector-v1".as_slice();
-        let first = signed_manifest_for(
-            &signing_key,
-            first_artifact,
-            "1.0.0",
-            "postgresql",
-            "ordadb-connector-postgresql.exe",
-            ConnectorDialect::PostgreSql,
-            vec![ConnectorPermission::Network],
-        );
-        write_bundle(
+        write_official_bundle(
             bundled.path(),
-            std::slice::from_ref(&first),
-            &[(&first.entry, first_artifact)],
+            &signing_key,
+            "1.0.0",
+            &[("postgresql", first_artifact)],
         );
         let manager = PluginManager::open(
             bundled_options(directory.path(), bundled.path(), &signing_key),
@@ -1780,20 +1841,21 @@ mod tests {
         drop(manager);
 
         let second_artifact = b"connector-v2".as_slice();
-        let second = signed_manifest_for(
-            &signing_key,
-            second_artifact,
-            "2.0.0",
-            "postgresql",
-            "ordadb-connector-postgresql.exe",
-            ConnectorDialect::PostgreSql,
-            vec![ConnectorPermission::Network],
-        );
-        write_bundle(
+        let second = write_official_bundle(
             bundled.path(),
-            std::slice::from_ref(&second),
-            &[(&second.entry, b"tampered-v2")],
+            &signing_key,
+            "2.0.0",
+            &[("postgresql", second_artifact)],
         );
+        let second_postgresql = second
+            .iter()
+            .find(|manifest| manifest.id == "postgresql")
+            .expect("postgresql manifest");
+        fs::write(
+            bundled.path().join(&second_postgresql.entry),
+            b"tampered-v2",
+        )
+        .expect("tamper bundle");
         let error = PluginManager::open(
             bundled_options(directory.path(), bundled.path(), &signing_key),
             Arc::new(FakeTransport::new(Vec::new(), Vec::new())),

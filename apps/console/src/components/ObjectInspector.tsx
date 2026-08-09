@@ -187,7 +187,9 @@ function InspectorContent({
   return (
     <dl className="property-list">
       <PropertyRow label="名称" value={object.name} />
+      <PropertyRow label="Catalog ID" value={object.id ?? "—"} />
       <PropertyRow label="Schema" value={object.schema || "—"} />
+      <PropertyRow label="Namespace" value={object.namespace ?? "—"} />
       <PropertyRow label="类型" value={kindLabels[object.kind] ?? object.kind} />
       <PropertyRow label="父对象" value={object.parent ?? "—"} />
       {typeof details.owner === "string" && (

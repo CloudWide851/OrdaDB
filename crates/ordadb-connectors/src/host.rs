@@ -10,15 +10,15 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use ordadb_connector_sdk::{
-    CONNECTOR_PROTOCOL_V2, CONNECTOR_PROTOCOL_V3, ConnectorCapabilitiesV3,
+    CONNECTOR_PROTOCOL_V2, CONNECTOR_PROTOCOL_V3, ConnectorCapabilitiesV2, ConnectorCapabilitiesV3,
     ConnectorCatalogNodeKindV3, ConnectorCatalogObjectKindV2, ConnectorCommandV3,
     ConnectorCredentialV2, ConnectorEndpointV2, ConnectorKindV3, ConnectorLogicalTypeV2,
     ConnectorParameterV2, ConnectorQueryEventV2, ConnectorRequestV2, ConnectorRequestV3,
     ConnectorResponseV2, ConnectorResponseV3, ConnectorResultBatchV3, ConnectorResultEventV3,
     ConnectorResultStreamValidatorV3, ConnectorTlsModeV2, ConnectorTypeV2, ConnectorValueV2,
     ProtocolHelloV2, ProtocolHelloV3, read_connector_frame as read_connector_frame_v2,
-    read_connector_frame_v3, validate_catalog_page_v3, validate_catalog_request_v3,
-    validate_command_v3, validate_endpoint, validate_error_v3,
+    read_connector_frame_v3, validate_capability_subset_v3, validate_catalog_page_v3,
+    validate_catalog_request_v3, validate_command_v3, validate_endpoint, validate_error_v3,
     validate_protocol_ready as validate_protocol_ready_v2, validate_protocol_ready_v3,
     write_connector_frame as write_connector_frame_v2, write_connector_frame_v3,
 };
@@ -119,6 +119,10 @@ impl ConnectorHost {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        if plugin_id == "oracle" {
+            let client = ordadb_windows::discover_amd64_oracle_client(entry.parent())?;
+            command.env("PATH", client.directory());
+        }
         configure_hidden_process(&mut command);
         let mut child = command
             .spawn()
@@ -190,6 +194,52 @@ impl ConnectorHost {
         }
     }
 
+    pub fn structured_endpoint(
+        &self,
+        endpoint: &str,
+        database: Option<String>,
+    ) -> Result<ConnectorEndpointV2> {
+        structured_endpoint(&self.plugin_id, endpoint, database)
+    }
+
+    pub async fn connect_v2(
+        &mut self,
+        connection_id: impl Into<String>,
+        endpoint: ConnectorEndpointV2,
+        tls_mode: ConnectorTlsModeV2,
+        credential: Option<ConnectorCredentialV2>,
+    ) -> Result<ConnectorCapabilitiesV2> {
+        if self.protocol_version() != CONNECTOR_PROTOCOL_V2 {
+            return Err(DbError::unsupported("connector protocol v2 connection"));
+        }
+        let connection_id = connection_id.into();
+        write_connector_frame_v2(
+            &mut self.pipe,
+            &ConnectorRequestV2::Connect {
+                connection_id: connection_id.clone(),
+                endpoint,
+                tls_mode,
+                credential,
+            },
+        )
+        .await?;
+        let response = tokio::select! {
+            response = read_connector_frame_v2(&mut self.pipe) => response,
+            status = self.child.wait() => return Err(helper_exit_error(status)),
+        }?;
+        match response {
+            ConnectorResponseV2::Connected {
+                connection_id: actual,
+                capabilities,
+            } if actual == connection_id => Ok(capabilities),
+            ConnectorResponseV2::Error { error, .. } => Err(error.into_db_error()),
+            _ => Err(DbError::new(
+                "08P01",
+                "connector returned an unexpected v2 connect response",
+            )),
+        }
+    }
+
     #[must_use]
     pub const fn protocol_version(&self) -> u32 {
         match &self.protocol {
@@ -226,7 +276,10 @@ impl ConnectorHost {
             ConnectorResponseV3::Connected {
                 connection_id: actual,
                 capabilities,
-            } if actual == connection_id => Ok(capabilities),
+            } if actual == connection_id => {
+                self.protocol = NegotiatedProtocol::V3(capabilities.clone());
+                Ok(capabilities)
+            }
             ConnectorResponseV3::Error { error, .. } => Err(error.into_db_error()),
             _ => Err(DbError::new(
                 "08P01",
@@ -800,10 +853,7 @@ fn validate_v3_response(
         ConnectorResponseV3::Connected {
             capabilities: actual,
             ..
-        } if actual != capabilities => Err(DbError::new(
-            "08P01",
-            "connector session capabilities differ from the handshake",
-        )),
+        } => validate_capability_subset_v3(capabilities, actual),
         ConnectorResponseV3::CatalogPage { request_id, page } => {
             let Some(PendingV3Request::Catalog { maximum_nodes }) =
                 pending.get(request_id).copied()
@@ -862,9 +912,7 @@ fn validate_v3_response(
             }
             Ok(())
         }
-        ConnectorResponseV3::Connected { .. }
-        | ConnectorResponseV3::Disconnected { .. }
-        | ConnectorResponseV3::Shutdown => Ok(()),
+        ConnectorResponseV3::Disconnected { .. } | ConnectorResponseV3::Shutdown => Ok(()),
     }
 }
 
@@ -1165,7 +1213,11 @@ fn structured_endpoint(
         });
     }
     let default_port = match plugin_id {
-        "mysql" | "ordadb-mysql" => 3306,
+        "mongodb" => 27017,
+        "redis" => 6379,
+        "mysql" | "ordadb-mysql" | "mariadb" => 3306,
+        "clickhouse" => 8123,
+        "oracle" => 1521,
         "sql-server" | "ordadb-sql-server" => 1433,
         _ => 5432,
     };
@@ -2023,6 +2075,19 @@ mod tests {
         let endpoint =
             structured_endpoint("sqlite", "C:\\data\\app.db", None).expect("file endpoint");
         assert!(matches!(endpoint, ConnectorEndpointV2::File { .. }));
+        for (plugin_id, expected_port) in [
+            ("mongodb", 27017),
+            ("redis", 6379),
+            ("mariadb", 3306),
+            ("clickhouse", 8123),
+            ("oracle", 1521),
+        ] {
+            assert!(matches!(
+                structured_endpoint(plugin_id, "db.example", None)
+                    .expect("v3 network endpoint"),
+                ConnectorEndpointV2::Network { port, .. } if port == expected_port
+            ));
+        }
 
         let error = ConnectorErrorV2 {
             sql_state: "40001".into(),

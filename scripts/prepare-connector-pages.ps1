@@ -20,6 +20,18 @@ param(
 $ErrorActionPreference = "Stop"
 $maximumArtifactBytes = 256MB
 $maximumHistoryVersions = 128
+$legacyConnectorIds = @("postgresql", "mysql", "sqlite", "sql-server")
+$officialConnectorIds = @(
+    "postgresql",
+    "mysql",
+    "sqlite",
+    "sql-server",
+    "mongodb",
+    "redis",
+    "mariadb",
+    "clickhouse",
+    "oracle"
+)
 $baseUri = [Uri]::new($BaseUrl)
 if ($baseUri.Scheme -ne "https" -or -not $baseUri.AbsolutePath.EndsWith("/")) {
     throw "Connector Pages base URL must be an absolute HTTPS directory"
@@ -63,6 +75,27 @@ try {
         throw "Failed to generate the signed connector Pages tree"
     }
 
+    $generatedCatalog = Get-Content -Raw -LiteralPath (Join-Path $siteOutput "catalog-v1.json") |
+        ConvertFrom-Json
+    $generatedIds = @($generatedCatalog.plugins | ForEach-Object { $_.id } | Sort-Object -Unique)
+    if ($generatedCatalog.schemaVersion -ne 1 -or
+        $generatedCatalog.plugins.Count -ne $officialConnectorIds.Count -or
+        (Compare-Object ($officialConnectorIds | Sort-Object) $generatedIds)) {
+        throw "The current connector catalog must contain exactly the nine official helpers"
+    }
+
+    $generatedHistory = Get-Content -Raw -LiteralPath (Join-Path $siteOutput "history-v1.json") |
+        ConvertFrom-Json
+    $currentHistory = @($generatedHistory.versions | Where-Object { $_.version -eq $Version })
+    $currentHistoryIds = if ($currentHistory.Count -eq 1) {
+        @($currentHistory[0].plugins | ForEach-Object { $_.id } | Sort-Object -Unique)
+    }
+    if ($currentHistory.Count -ne 1 -or
+        $currentHistory[0].plugins.Count -ne $officialConnectorIds.Count -or
+        (Compare-Object ($officialConnectorIds | Sort-Object) $currentHistoryIds)) {
+        throw "The current connector history entry must contain exactly nine artifacts"
+    }
+
     if (Test-Path -LiteralPath $historyPath -PathType Leaf) {
         $history = Get-Content -Raw -LiteralPath $historyPath | ConvertFrom-Json
         if ($history.schemaVersion -ne 1 -or $history.versions.Count -gt $maximumHistoryVersions) {
@@ -72,8 +105,13 @@ try {
             if ($publishedVersion.version -eq $Version) {
                 continue
             }
-            if ($publishedVersion.plugins.Count -ne 4) {
-                throw "Every published connector version must contain exactly four artifacts"
+            $publishedIds = @($publishedVersion.plugins | ForEach-Object { $_.id } | Sort-Object -Unique)
+            $isLegacySet = $publishedVersion.plugins.Count -eq $legacyConnectorIds.Count -and
+                -not (Compare-Object ($legacyConnectorIds | Sort-Object) $publishedIds)
+            $isOfficialSet = $publishedVersion.plugins.Count -eq $officialConnectorIds.Count -and
+                -not (Compare-Object ($officialConnectorIds | Sort-Object) $publishedIds)
+            if (-not $isLegacySet -and -not $isOfficialSet) {
+                throw "Published connector history must contain an immutable four-helper legacy set or nine-helper official set"
             }
             foreach ($plugin in $publishedVersion.plugins) {
                 $downloadUri = [Uri]::new($plugin.downloadUrl)

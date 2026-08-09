@@ -1,6 +1,11 @@
 import ordadbLogoUrl from "../../../../logo.svg?url";
 import mysqlLogoUrl from "../assets/connectors/mysql.svg?url";
+import clickhouseLogoUrl from "../assets/connectors/clickhouse.svg?url";
+import mariadbLogoUrl from "../assets/connectors/mariadb.svg?url";
+import mongodbLogoUrl from "../assets/connectors/mongodb.svg?url";
+import oracleLogoUrl from "../assets/connectors/oracle.svg?url";
 import postgresqlLogoUrl from "../assets/connectors/postgresql.svg?url";
+import redisLogoUrl from "../assets/connectors/redis.svg?url";
 import sqliteLogoUrl from "../assets/connectors/sqlite.svg?url";
 import sqlServerLogoUrl from "../assets/connectors/sql-server.svg?url";
 import type {
@@ -13,7 +18,12 @@ export type ConnectorManifestDialect =
   | "postgreSql"
   | "mySql"
   | "sqlite"
-  | "sqlServer";
+  | "sqlServer"
+  | "mongoDb"
+  | "redis"
+  | "mariaDb"
+  | "clickHouse"
+  | "oracle";
 export type ConnectorPermission = "network" | "localDatabaseFile";
 export type RegistryAvailability = "configured" | "notConfigured";
 export type PluginLifecycle =
@@ -97,8 +107,11 @@ export interface ConnectorDefinition {
   defaultAdminEndpoint?: string;
   defaultDatabase?: string;
   defaultTlsMode: ConnectorDescriptor["defaultTlsMode"];
+  connectorKind: ConnectorDescriptor["connectorKind"];
+  commandLanguage: string;
+  editorMode: ConnectorDescriptor["editorMode"];
   dialect: ConnectorManifestDialect;
-  sqlDialect: SqlDialect;
+  sqlDialect?: SqlDialect;
   publisher: string;
   permissions: ConnectorPermission[];
   size: number;
@@ -107,7 +120,7 @@ export interface ConnectorDefinition {
 export interface ConnectorViewModel
   extends Omit<PluginCatalogItem, "lifecycle"> {
   shortName: string;
-  sqlDialect: SqlDialect;
+  sqlDialect?: SqlDialect;
   logoUrl: string;
   lifecycle: ConnectorViewLifecycle;
 }
@@ -123,6 +136,9 @@ export const connectorDefinitions: ConnectorDefinition[] = [
     defaultAdminEndpoint: "http://127.0.0.1:9080",
     defaultDatabase: "ordadb",
     defaultTlsMode: "disable",
+    connectorKind: "sql",
+    commandLanguage: "postgresql-sql",
+    editorMode: "sql",
     dialect: "postgreSql",
     sqlDialect: "postgresql",
     publisher: "OrdaDB",
@@ -138,6 +154,9 @@ export const connectorDefinitions: ConnectorDefinition[] = [
     defaultEndpoint: "127.0.0.1:5432",
     defaultDatabase: "postgres",
     defaultTlsMode: "prefer",
+    connectorKind: "sql",
+    commandLanguage: "postgresql-sql",
+    editorMode: "sql",
     dialect: "postgreSql",
     sqlDialect: "postgresql",
     publisher: "OrdaDB",
@@ -152,6 +171,9 @@ export const connectorDefinitions: ConnectorDefinition[] = [
     logoUrl: mysqlLogoUrl,
     defaultEndpoint: "127.0.0.1:3306",
     defaultTlsMode: "prefer",
+    connectorKind: "sql",
+    commandLanguage: "mysql-sql",
+    editorMode: "sql",
     dialect: "mySql",
     sqlDialect: "mysql",
     publisher: "OrdaDB",
@@ -166,6 +188,9 @@ export const connectorDefinitions: ConnectorDefinition[] = [
     logoUrl: sqliteLogoUrl,
     defaultEndpoint: "",
     defaultTlsMode: "disable",
+    connectorKind: "sql",
+    commandLanguage: "sqlite-sql",
+    editorMode: "sql",
     dialect: "sqlite",
     sqlDialect: "sqlite",
     publisher: "OrdaDB",
@@ -180,11 +205,101 @@ export const connectorDefinitions: ConnectorDefinition[] = [
     logoUrl: sqlServerLogoUrl,
     defaultEndpoint: "127.0.0.1:1433",
     defaultTlsMode: "require",
+    connectorKind: "sql",
+    commandLanguage: "sql-server-sql",
+    editorMode: "sql",
     dialect: "sqlServer",
     sqlDialect: "sqlServer",
     publisher: "OrdaDB",
     permissions: ["network"],
     size: 9_437_184,
+  },
+  {
+    id: "mongodb",
+    dataSourceKind: "mongodb",
+    displayName: "MongoDB",
+    shortName: "MongoDB",
+    logoUrl: mongodbLogoUrl,
+    defaultEndpoint: "127.0.0.1:27017",
+    defaultDatabase: "admin",
+    defaultTlsMode: "prefer",
+    connectorKind: "document",
+    commandLanguage: "mongodb-json",
+    editorMode: "json",
+    dialect: "mongoDb",
+    publisher: "OrdaDB",
+    permissions: ["network"],
+    size: 10_485_760,
+  },
+  {
+    id: "redis",
+    dataSourceKind: "redis",
+    displayName: "Redis",
+    shortName: "Redis",
+    logoUrl: redisLogoUrl,
+    defaultEndpoint: "127.0.0.1:6379",
+    defaultDatabase: "0",
+    defaultTlsMode: "disable",
+    connectorKind: "keyValue",
+    commandLanguage: "redis-resp3",
+    editorMode: "plaintext",
+    dialect: "redis",
+    publisher: "OrdaDB",
+    permissions: ["network"],
+    size: 6_291_456,
+  },
+  {
+    id: "mariadb",
+    dataSourceKind: "mariadb",
+    displayName: "MariaDB",
+    shortName: "MariaDB",
+    logoUrl: mariadbLogoUrl,
+    defaultEndpoint: "127.0.0.1:3306",
+    defaultTlsMode: "require",
+    connectorKind: "sql",
+    commandLanguage: "mariadb-sql",
+    editorMode: "sql",
+    dialect: "mariaDb",
+    sqlDialect: "mariadb",
+    publisher: "OrdaDB",
+    permissions: ["network"],
+    size: 7_340_032,
+  },
+  {
+    id: "clickhouse",
+    dataSourceKind: "clickhouse",
+    displayName: "ClickHouse",
+    shortName: "ClickHouse",
+    logoUrl: clickhouseLogoUrl,
+    defaultEndpoint: "127.0.0.1:8123",
+    defaultDatabase: "default",
+    defaultTlsMode: "disable",
+    connectorKind: "sql",
+    commandLanguage: "clickhouse-sql",
+    editorMode: "sql",
+    dialect: "clickHouse",
+    sqlDialect: "clickhouse",
+    publisher: "OrdaDB",
+    permissions: ["network"],
+    size: 7_340_032,
+  },
+  {
+    id: "oracle",
+    dataSourceKind: "oracle",
+    displayName: "Oracle",
+    shortName: "Oracle",
+    logoUrl: oracleLogoUrl,
+    defaultEndpoint: "127.0.0.1:1521",
+    defaultDatabase: "ORCLPDB1",
+    defaultTlsMode: "disable",
+    connectorKind: "sql",
+    commandLanguage: "oracle-sql",
+    editorMode: "sql",
+    dialect: "oracle",
+    sqlDialect: "oracle",
+    publisher: "OrdaDB",
+    permissions: ["network"],
+    size: 8_388_608,
   },
 ];
 

@@ -9,10 +9,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{SecondsFormat, Utc};
 use ed25519_dalek::{Signer, SigningKey};
-use ordadb_connector_sdk::CONNECTOR_PROTOCOL_V2;
 use ordadb_connectors::{
-    CONNECTOR_MANIFEST_VERSION, ConnectorArchitecture, ConnectorDialect, ConnectorPermission,
-    CredentialVault, PluginManifestV1, RegistryCatalogV1, manifest_signing_payload,
+    CONNECTOR_MANIFEST_VERSION, ConnectorArchitecture, CredentialVault,
+    OFFICIAL_CONNECTOR_DESCRIPTORS, PluginManifestV1, RegistryCatalogV1, manifest_signing_payload,
 };
 use rand::RngCore as _;
 use rand::rngs::OsRng;
@@ -79,53 +78,6 @@ struct ConnectorHistoryPluginV1 {
     download_url: String,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ConnectorDescriptor {
-    id: &'static str,
-    display_name: &'static str,
-    package: &'static str,
-    dialect: ConnectorDialect,
-    permissions: &'static [ConnectorPermission],
-    api_version: u32,
-}
-
-const NETWORK: &[ConnectorPermission] = &[ConnectorPermission::Network];
-const LOCAL_FILE: &[ConnectorPermission] = &[ConnectorPermission::LocalDatabaseFile];
-const CONNECTORS: &[ConnectorDescriptor] = &[
-    ConnectorDescriptor {
-        id: "postgresql",
-        display_name: "PostgreSQL",
-        package: "ordadb-connector-postgresql",
-        dialect: ConnectorDialect::PostgreSql,
-        permissions: NETWORK,
-        api_version: CONNECTOR_PROTOCOL_V2,
-    },
-    ConnectorDescriptor {
-        id: "mysql",
-        display_name: "MySQL",
-        package: "ordadb-connector-mysql",
-        dialect: ConnectorDialect::MySql,
-        permissions: NETWORK,
-        api_version: CONNECTOR_PROTOCOL_V2,
-    },
-    ConnectorDescriptor {
-        id: "sqlite",
-        display_name: "SQLite",
-        package: "ordadb-connector-sqlite",
-        dialect: ConnectorDialect::Sqlite,
-        permissions: LOCAL_FILE,
-        api_version: CONNECTOR_PROTOCOL_V2,
-    },
-    ConnectorDescriptor {
-        id: "sql-server",
-        display_name: "SQL Server",
-        package: "ordadb-connector-sql-server",
-        dialect: ConnectorDialect::SqlServer,
-        permissions: NETWORK,
-        api_version: CONNECTOR_PROTOCOL_V2,
-    },
-];
-
 fn main() {
     if let Err(error) = run() {
         eprintln!("connector publisher failed: {error}");
@@ -175,9 +127,9 @@ fn sign_bundle(options: SignOptions) -> AppResult<()> {
     let signing_key = load_signing_key(&options.credential_id)?;
     verify_expected_public_key(&options.public_key, &signing_key)?;
     let base_url = normalized_base_url(&options.base_url)?;
-    let mut manifests = Vec::with_capacity(CONNECTORS.len());
+    let mut manifests = Vec::with_capacity(OFFICIAL_CONNECTOR_DESCRIPTORS.len());
     let mut artifact_sources = BTreeMap::new();
-    for descriptor in CONNECTORS {
+    for descriptor in OFFICIAL_CONNECTOR_DESCRIPTORS {
         let entry = format!("{}.exe", descriptor.package);
         let source = options.artifacts.join(&entry);
         let (size, sha256) = hash_file(&source)?;
@@ -239,7 +191,7 @@ fn sign_bundle(options: SignOptions) -> AppResult<()> {
             Ok(())
         })?;
     }
-    println!("Signed and staged four Windows x64 connector helpers.");
+    println!("Signed and staged nine Windows x64 connector helpers.");
     Ok(())
 }
 
@@ -596,20 +548,27 @@ mod tests {
     }
 
     #[test]
-    fn descriptors_cover_four_unique_external_connectors() {
-        assert_eq!(CONNECTORS.len(), 4);
+    fn descriptors_cover_nine_unique_external_connectors() {
+        assert_eq!(OFFICIAL_CONNECTOR_DESCRIPTORS.len(), 9);
         assert_eq!(
-            CONNECTORS
+            OFFICIAL_CONNECTOR_DESCRIPTORS
                 .iter()
                 .map(|descriptor| descriptor.id)
                 .collect::<BTreeSet<_>>()
                 .len(),
-            4
+            9
         );
         assert!(
-            CONNECTORS
+            OFFICIAL_CONNECTOR_DESCRIPTORS
                 .iter()
-                .all(|descriptor| descriptor.api_version == CONNECTOR_PROTOCOL_V2)
+                .take(4)
+                .all(|descriptor| descriptor.api_version == 2)
+        );
+        assert!(
+            OFFICIAL_CONNECTOR_DESCRIPTORS
+                .iter()
+                .skip(4)
+                .all(|descriptor| descriptor.api_version == 3)
         );
     }
 

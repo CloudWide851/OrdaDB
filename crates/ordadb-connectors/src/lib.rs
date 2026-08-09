@@ -12,7 +12,8 @@ pub use manager::{
     PluginProgressPhase, RegistryAvailability, RegistryStatus, RegistryTransport,
 };
 pub use manifest::{
-    ConnectorArchitecture, ConnectorDialect, ConnectorPermission, ManifestPolicy, PluginManifestV1,
+    ConnectorArchitecture, ConnectorDialect, ConnectorPermission, ManifestPolicy,
+    OFFICIAL_CONNECTOR_DESCRIPTORS, OfficialConnectorDescriptor, PluginManifestV1,
     RegistryCatalogV1, decode_public_key, manifest_signing_payload, validate_manifest,
 };
 #[cfg(windows)]

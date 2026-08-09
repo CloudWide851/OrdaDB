@@ -9,7 +9,7 @@ import {
 } from "./connectors";
 
 describe("connector catalog projection", () => {
-  it("keeps the four approved connection types when the registry is absent", () => {
+  it("keeps the nine approved connection types when the registry is absent", () => {
     const snapshot: PluginCatalogSnapshot = {
       registry: {
         availability: "notConfigured",
@@ -29,20 +29,44 @@ describe("connector catalog projection", () => {
     );
   });
 
-  it("keeps native OrdaDB separate from the four signed helpers", () => {
+  it("keeps native OrdaDB separate from the nine signed helpers", () => {
     expect(connectorDefinitions.map((connector) => connector.id)).toEqual([
       "ordadb-native",
       "postgresql",
       "mysql",
       "sqlite",
       "sql-server",
+      "mongodb",
+      "redis",
+      "mariadb",
+      "clickhouse",
+      "oracle",
     ]);
-    expect(pluginConnectorDefinitions).toHaveLength(4);
+    expect(pluginConnectorDefinitions).toHaveLength(9);
     expect(
       pluginConnectorDefinitions.some(
         (connector) => connector.id === "ordadb-native",
       ),
     ).toBe(false);
+    expect(new Set(connectorDefinitions.map((connector) => connector.id)).size).toBe(
+      10,
+    );
+    expect(
+      connectorDefinitions.map((connector) => [
+        connector.id,
+        connector.connectorKind,
+        connector.commandLanguage,
+        connector.sqlDialect ?? null,
+      ]),
+    ).toEqual(
+      expect.arrayContaining([
+        ["mongodb", "document", "mongodb-json", null],
+        ["redis", "keyValue", "redis-resp3", null],
+        ["mariadb", "sql", "mariadb-sql", "mariadb"],
+        ["clickhouse", "sql", "clickhouse-sql", "clickhouse"],
+        ["oracle", "sql", "oracle-sql", "oracle"],
+      ]),
+    );
   });
 
   it("formats sizes and compares semantic versions numerically", () => {

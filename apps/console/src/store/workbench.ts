@@ -5,7 +5,7 @@ import {
   defaultConnectorDescriptors,
   defaultConsoleSettings,
   getConsoleClient,
-  type ConnectionProfileV2,
+  type ConnectionProfileV3,
   type ConnectorDescriptor,
   type ConsoleClient,
   type ConsoleSettingsV2,
@@ -22,9 +22,11 @@ import {
   type ConnectionProbe,
   type DbmsCatalogObject,
   type DbmsClient,
+  type DbmsCommand,
   type DbmsConnectionRequest,
   type DbmsConnectionSnapshot,
   type DbmsError,
+  type DbmsKeyValue,
   type DbmsMonitorSnapshot,
   type DbmsOperationRecord,
   type DbmsQueryColumn,
@@ -58,7 +60,6 @@ export type QuickOpenMode = "recent" | "files" | "global";
 
 export interface DataSourceValues extends DbmsConnectionRequest {
   username: string;
-  tlsMode: ConnectionProfileV2["tlsMode"];
 }
 
 interface RunQueryOptions {
@@ -76,7 +77,7 @@ export interface WorkbenchState {
   activeDocumentPath: string | null;
   recovery: WorkspaceSessionV1 | null;
   recentFiles: RecentFileEntry[];
-  connectionProfiles: ConnectionProfileV2[];
+  connectionProfiles: ConnectionProfileV3[];
   connectorDescriptors: ConnectorDescriptor[];
   connectionProbe: ConnectionProbe | null;
   dialect: SqlDialect;
@@ -97,6 +98,10 @@ export interface WorkbenchState {
   queryState: QueryState;
   columns: DbmsQueryColumn[];
   resultBuffer: ResultBuffer;
+  documentResults: unknown[];
+  keyValueResults: DbmsKeyValue[];
+  structuredResultBytes: number;
+  droppedStructuredItems: number;
   logs: string[];
   error: DbmsError | null;
   errorMessage: string | null;
@@ -210,6 +215,10 @@ export function createWorkbenchStore(
   queryState: "idle",
   columns: [],
   resultBuffer: emptyResultBuffer(),
+  documentResults: [],
+  keyValueResults: [],
+  structuredResultBytes: 0,
+  droppedStructuredItems: 0,
   logs: [],
   error: null,
   errorMessage: null,
@@ -562,6 +571,8 @@ export function createWorkbenchStore(
       document,
       get().settings,
       get().dialect,
+      get().connection?.connectorKind !== "document" &&
+        get().connection?.connectorKind !== "keyValue",
     );
     try {
       const saved = await consoleClient.saveDocumentAs({
@@ -597,6 +608,8 @@ export function createWorkbenchStore(
         document,
         get().settings,
         get().dialect,
+        get().connection?.connectorKind !== "document" &&
+          get().connection?.connectorKind !== "keyValue",
       );
       try {
         const saved =
@@ -656,6 +669,13 @@ export function createWorkbenchStore(
   formatActiveDocument: () => {
     const state = get();
     if (!state.activeDocumentPath) return;
+    if (
+      state.connection?.connectorKind === "document" ||
+      state.connection?.connectorKind === "keyValue"
+    ) {
+      set({ notice: "当前命令语言不使用 SQL 格式化器" });
+      return;
+    }
     const dialect = getSqlDialect(state.dialect);
     state.setSql(formatSqlForDialect(state.sql, dialect));
     set({ notice: `格式化 SQL · ${dialect.label}` });
@@ -760,12 +780,16 @@ export function createWorkbenchStore(
     set((state) => ({ inspectorVisible: !state.inspectorVisible })),
   setActiveResultTab: (activeResultTab) => set({ activeResultTab }),
   setActiveInspectorTab: (activeInspectorTab) => set({ activeInspectorTab }),
-  setSelectedObject: (selectedObject) =>
+  setSelectedObject: (identifier) => {
+    const selected =
+      get().catalog.find((object) => object.id === identifier) ??
+      get().catalog.find((object) => object.name === identifier) ??
+      null;
     set({
-      selectedObject,
-      selectedCatalogObject:
-        get().catalog.find((object) => object.name === selectedObject) ?? null,
-    }),
+      selectedObject: selected ? catalogObjectIdentity(selected) : "",
+      selectedCatalogObject: selected,
+    });
+  },
   setCommandPaletteOpen: (commandPaletteOpen) => set({ commandPaletteOpen }),
   setPluginManagerOpen: (pluginManagerOpen) => set({ pluginManagerOpen }),
   setDataSourceOpen: (dataSourceOpen) => set({ dataSourceOpen }),
@@ -938,6 +962,10 @@ export function createWorkbenchStore(
       set({ dataSourceOpen: true, notice: "请先连接数据源" });
       return;
     }
+    if (!connection.capabilities.catalog) {
+      set({ catalog: [], notice: "当前数据源不提供 Catalog" });
+      return;
+    }
     try {
       const catalog = await dbms.catalog(connection.connectionId);
       setCatalog(set, get, catalog.objects);
@@ -951,6 +979,10 @@ export function createWorkbenchStore(
   refreshMonitor: async () => {
     const connection = get().connection;
     if (!connection) return;
+    if (!supportsMonitor(connection)) {
+      set({ monitor: null });
+      return;
+    }
     try {
       const monitor = await dbms.monitor(connection.connectionId);
       set({ monitor });
@@ -1024,10 +1056,10 @@ export function createWorkbenchStore(
   },
 
   runQuery: async (options = {}) => {
-    const sql = (options.sql ?? get().sql).trim();
+    const input = (options.sql ?? get().sql).trim();
     const connection = get().connection;
-    if (!sql) {
-      const error = localError("42601", "SQL 不能为空");
+    if (!input) {
+      const error = localError("42601", "命令不能为空");
       setQueryError(set, error);
       return;
     }
@@ -1040,7 +1072,8 @@ export function createWorkbenchStore(
     }
     if (
       get().settings.connections.confirmDangerousWrites &&
-      requiresDangerousWriteConfirmation(sql) &&
+      connection.connectorKind === "sql" &&
+      requiresDangerousWriteConfirmation(input) &&
       (typeof window === "undefined" ||
         !window.confirm("该语句可能修改数据库。确认继续执行吗？"))
     ) {
@@ -1050,10 +1083,21 @@ export function createWorkbenchStore(
     const queryTimeoutMs = get().settings.results.queryTimeoutMs;
     const queryDeadline = Date.now() + queryTimeoutMs;
     const resultLimits = resultBufferLimits(get().settings);
+    let command: DbmsCommand;
+    try {
+      command = buildDbmsCommand(connection, input);
+    } catch (error) {
+      setQueryError(set, normalizeDbmsError(error));
+      return;
+    }
     set({
       queryState: "running",
       columns: [],
       resultBuffer: emptyResultBuffer(),
+      documentResults: [],
+      keyValueResults: [],
+      structuredResultBytes: 0,
+      droppedStructuredItems: 0,
       logs: [],
       error: null,
       errorMessage: null,
@@ -1062,11 +1106,11 @@ export function createWorkbenchStore(
       activeRequestId: null,
       activeResultTab: options.resultTab ?? "data",
       notice:
-        connection.mode === "preview" ? "正在运行 Preview 查询" : "正在运行查询",
+        connection.mode === "preview" ? "正在运行 Preview 命令" : "正在运行命令",
     });
     try {
       const operation = await withTimeout(
-        dbms.execute(connection.connectionId, sql),
+        dbms.execute(connection.connectionId, command),
         queryTimeoutMs,
         () => queryTimeoutError(queryTimeoutMs),
       );
@@ -1105,6 +1149,38 @@ export function createWorkbenchStore(
               ),
             }));
             break;
+          case "documents":
+            set((state) => {
+              const appended = appendStructuredValues(
+                state.documentResults,
+                event.documents,
+                state.structuredResultBytes,
+                state.droppedStructuredItems,
+                state.settings,
+              );
+              return {
+                documentResults: appended.items,
+                structuredResultBytes: appended.bytes,
+                droppedStructuredItems: appended.droppedItems,
+              };
+            });
+            break;
+          case "keyValues":
+            set((state) => {
+              const appended = appendStructuredValues(
+                state.keyValueResults,
+                event.entries,
+                state.structuredResultBytes,
+                state.droppedStructuredItems,
+                state.settings,
+              );
+              return {
+                keyValueResults: appended.items,
+                structuredResultBytes: appended.bytes,
+                droppedStructuredItems: appended.droppedItems,
+              };
+            });
+            break;
           case "progress":
             set({ rowsProcessed: event.rowsProcessed });
             break;
@@ -1118,7 +1194,7 @@ export function createWorkbenchStore(
               durationMs: event.durationMs,
               activeRequestId: null,
               logs: [...state.logs, event.commandTag],
-              notice: `${event.commandTag} · ${state.resultBuffer.totalRows} 行`,
+              notice: `${event.commandTag} · ${resultItemCount(state)} 项`,
             }));
             break;
           case "error":
@@ -1139,6 +1215,11 @@ export function createWorkbenchStore(
   },
 
   runExplain: async () => {
+    const connection = get().connection;
+    if (connection && !connection.capabilities.explain) {
+      setQueryError(set, localError("0A000", "当前数据源不支持执行计划"));
+      return;
+    }
     const sql = get().sql.trim();
     if (!sql) {
       setQueryError(set, localError("42601", "SQL 不能为空"));
@@ -1206,13 +1287,14 @@ function setCatalog(
 ) {
   const current = get().selectedObject;
   const selected =
+    catalog.find((object) => catalogObjectIdentity(object) === current) ??
     catalog.find((object) => object.name === current) ??
     catalog.find((object) => object.kind === "table") ??
     catalog[0] ??
     null;
   set({
     catalog,
-    selectedObject: selected?.name ?? "",
+    selectedObject: selected ? catalogObjectIdentity(selected) : "",
     selectedCatalogObject: selected,
   });
 }
@@ -1224,7 +1306,7 @@ function setQueryError(set: StoreSet, error: DbmsError) {
     errorMessage: error.message,
     activeRequestId: null,
     activeResultTab: "logs",
-    notice: `查询失败 · ${error.sqlState}`,
+    notice: `命令失败 · ${error.sqlState}`,
   });
 }
 
@@ -1237,6 +1319,13 @@ async function runTransaction(
   const connection = get().connection;
   if (!connection) {
     set({ dataSourceOpen: true, notice: "请先连接数据源" });
+    return;
+  }
+  if (!connection.capabilities.transactions) {
+    set({
+      connectionError: localError("0A000", "当前数据源不支持事务"),
+      notice: "当前数据源不支持事务",
+    });
     return;
   }
   try {
@@ -1296,7 +1385,7 @@ function runConnectionStep<T>(
 function queryTimeoutError(timeoutMs: number) {
   return localError(
     "57014",
-    `查询超过 ${Math.ceil(timeoutMs / 1_000)} 秒，已请求取消`,
+    `命令超过 ${Math.ceil(timeoutMs / 1_000)} 秒，已请求取消`,
   );
 }
 
@@ -1306,6 +1395,182 @@ function resultBufferLimits(settings: ConsoleSettingsV2): ResultBufferLimits {
     maxRows: settings.results.residentRowLimit,
     maxBytes: settings.results.residentMemoryBytes,
   };
+}
+
+function catalogObjectIdentity(object: DbmsCatalogObject) {
+  return object.id ?? `${object.kind}:${object.schema}:${object.name}`;
+}
+
+const MAX_CONNECTOR_TEXT_BYTES = 1024 * 1024;
+const MAX_CONNECTOR_COMMAND_ARGUMENTS = 4096;
+
+function buildDbmsCommand(
+  connection: DbmsConnectionSnapshot,
+  input: string,
+): DbmsCommand {
+  if (new TextEncoder().encode(input).byteLength > MAX_CONNECTOR_TEXT_BYTES) {
+    throw localError("54000", "命令超过 1 MiB 上限");
+  }
+  switch (connection.connectorKind) {
+    case "sql":
+      return {
+        kind: "text",
+        languageId: connection.commandLanguage,
+        text: input,
+        params: [],
+      };
+    case "document": {
+      let document: unknown;
+      try {
+        document = JSON.parse(input) as unknown;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "无效 JSON";
+        throw localError("22023", `MongoDB 命令必须是有效 JSON：${message}`);
+      }
+      if (!document || typeof document !== "object" || Array.isArray(document)) {
+        throw localError("22023", "MongoDB 命令必须是 JSON 对象");
+      }
+      return {
+        kind: "document",
+        languageId: connection.commandLanguage,
+        document,
+      };
+    }
+    case "keyValue":
+      return {
+        kind: "arguments",
+        languageId: connection.commandLanguage,
+        arguments: parseRedisArguments(input),
+      };
+  }
+}
+
+function parseRedisArguments(input: string): string[] {
+  const arguments_: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  let tokenStarted = false;
+  for (const character of input) {
+    if (escaped) {
+      current +=
+        character === "n"
+          ? "\n"
+          : character === "r"
+            ? "\r"
+            : character === "t"
+              ? "\t"
+              : character;
+      escaped = false;
+      tokenStarted = true;
+      continue;
+    }
+    if (character === "\\") {
+      escaped = true;
+      tokenStarted = true;
+      continue;
+    }
+    if (quote) {
+      if (character === quote) quote = null;
+      else current += character;
+      tokenStarted = true;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      tokenStarted = true;
+      continue;
+    }
+    if (/\s/u.test(character)) {
+      if (tokenStarted) {
+        arguments_.push(current);
+        current = "";
+        tokenStarted = false;
+      }
+      continue;
+    }
+    current += character;
+    tokenStarted = true;
+  }
+  if (escaped || quote) {
+    throw localError("22023", "Redis 命令包含未结束的转义或引号");
+  }
+  if (tokenStarted) arguments_.push(current);
+  if (arguments_.length === 0) {
+    throw localError("22023", "Redis 命令至少需要一个参数");
+  }
+  if (arguments_.length > MAX_CONNECTOR_COMMAND_ARGUMENTS) {
+    throw localError("54000", "Redis 命令参数超过 4096 个上限");
+  }
+  return arguments_;
+}
+
+function appendStructuredValues<T>(
+  current: T[],
+  incoming: T[],
+  currentBytes: number,
+  currentDroppedItems: number,
+  settings: ConsoleSettingsV2,
+) {
+  const items = [...current];
+  let bytes = currentBytes;
+  let accepted = 0;
+  for (const item of incoming) {
+    const itemBytes = estimateJsonBytes(item);
+    if (
+      items.length >= settings.results.residentRowLimit ||
+      bytes + itemBytes > settings.results.residentMemoryBytes
+    ) {
+      break;
+    }
+    items.push(item);
+    bytes += itemBytes;
+    accepted += 1;
+  }
+  return {
+    items,
+    bytes,
+    droppedItems: currentDroppedItems + incoming.length - accepted,
+  };
+}
+
+function estimateJsonBytes(value: unknown) {
+  try {
+    return new TextEncoder().encode(JSON.stringify(value) ?? "null").byteLength;
+  } catch {
+    return MAX_CONNECTOR_TEXT_BYTES;
+  }
+}
+
+function resultItemCount(state: WorkbenchState) {
+  return (
+    state.resultBuffer.totalRows +
+    state.documentResults.length +
+    state.keyValueResults.length +
+    state.droppedStructuredItems
+  );
+}
+
+function supportsMonitor(connection: DbmsConnectionSnapshot) {
+  const capabilities = connection.capabilities;
+  return (
+    capabilities.sessions ||
+    capabilities.locks ||
+    capabilities.metrics ||
+    capabilities.wal
+  );
+}
+
+function loadCatalog(dbms: DbmsClient, connection: DbmsConnectionSnapshot) {
+  return connection.capabilities.catalog
+    ? dbms.catalog(connection.connectionId)
+    : Promise.resolve({ connectionId: connection.connectionId, objects: [] });
+}
+
+function loadMonitor(dbms: DbmsClient, connection: DbmsConnectionSnapshot) {
+  return supportsMonitor(connection)
+    ? dbms.monitor(connection.connectionId)
+    : Promise.resolve(null);
 }
 
 const READ_ONLY_SQL_KEYWORDS = new Set([
@@ -1390,8 +1655,9 @@ function prepareDocumentForSave(
   document: OpenSqlDocument,
   settings: ConsoleSettingsV2,
   dialect: SqlDialect,
+  allowFormatting: boolean,
 ) {
-  if (!settings.editor.formatOnSave) return document;
+  if (!settings.editor.formatOnSave || !allowFormatting) return document;
   const content = formatSqlForDialect(document.content, getSqlDialect(dialect));
   return content === document.content ? document : { ...document, content };
 }
@@ -1457,6 +1723,8 @@ async function saveNamedDocument(
     document,
     get().settings,
     get().dialect,
+    get().connection?.connectorKind !== "document" &&
+      get().connection?.connectorKind !== "keyValue",
   );
   try {
     const saved = await saveOpenDocument(consoleClient, prepared, force);
@@ -1687,7 +1955,7 @@ function replacePathPrefix(path: string, before: string, after: string) {
 }
 
 async function connectProfile(
-  profile: ConnectionProfileV2,
+  profile: ConnectionProfileV3,
   dbms: DbmsClient,
   _consoleClient: ConsoleClient,
   set: StoreSet,
@@ -1720,13 +1988,13 @@ async function connectProfile(
       get,
     );
     let catalog: Awaited<ReturnType<DbmsClient["catalog"]>>;
-    let monitor: Awaited<ReturnType<DbmsClient["monitor"]>>;
+    let monitor: Awaited<ReturnType<DbmsClient["monitor"]>> | null;
     try {
       [catalog, monitor] = await runConnectionStep(
         "自动重连元数据加载",
         Promise.all([
-          dbms.catalog(connection.connectionId),
-          dbms.monitor(connection.connectionId),
+          loadCatalog(dbms, connection),
+          loadMonitor(dbms, connection),
         ]),
         get,
       );
@@ -1737,7 +2005,7 @@ async function connectProfile(
     set({
       connection,
       monitor,
-      dialect: connection.dialect,
+      dialect: connection.dialect ?? get().dialect,
       connectionState: "connected",
       connectionError: null,
       notice: `${connection.database} · 已自动重连`,
@@ -1758,21 +2026,27 @@ function toConnectionRequest(
   values:
     | DataSourceValues
     | Pick<
-        ConnectionProfileV2,
+        ConnectionProfileV3,
         | "connectorId"
+        | "connectorKind"
+        | "commandLanguage"
         | "dialect"
         | "endpoint"
         | "adminEndpoint"
         | "database"
+        | "tlsMode"
         | "credentialId"
       >,
 ): DbmsConnectionRequest {
   return {
     connectorId: values.connectorId,
+    connectorKind: values.connectorKind,
+    commandLanguage: values.commandLanguage,
     dialect: values.dialect,
     endpoint: values.endpoint,
     adminEndpoint: values.adminEndpoint,
     database: values.database,
+    tlsMode: values.tlsMode,
     credentialId: values.credentialId,
   };
 }
@@ -1820,13 +2094,13 @@ async function establishDataSourceConnection(
     get,
   );
   let catalog: Awaited<ReturnType<DbmsClient["catalog"]>>;
-  let monitor: Awaited<ReturnType<DbmsClient["monitor"]>>;
+  let monitor: Awaited<ReturnType<DbmsClient["monitor"]>> | null;
   try {
     [catalog, monitor] = await runConnectionStep(
       "加载数据库元数据",
       Promise.all([
-        dbms.catalog(connection.connectionId),
-        dbms.monitor(connection.connectionId),
+        loadCatalog(dbms, connection),
+        loadMonitor(dbms, connection),
       ]),
       get,
     );
@@ -1835,11 +2109,13 @@ async function establishDataSourceConnection(
     throw error;
   }
   const profiles = await consoleClient.saveConnectionProfile({
-    formatVersion: 2,
+    formatVersion: 3,
     profileId: values.credentialId,
     label: values.database || values.endpoint,
     dataSourceKind: descriptor.dataSourceKind,
     connectorId: values.connectorId,
+    connectorKind: descriptor.connectorKind,
+    commandLanguage: descriptor.commandLanguage,
     dialect: values.dialect,
     endpoint: values.endpoint,
     adminEndpoint: values.adminEndpoint,
@@ -1855,7 +2131,7 @@ async function establishDataSourceConnection(
     monitor,
     operations: [],
     serviceStatus: null,
-    dialect: connection.dialect,
+    dialect: connection.dialect ?? get().dialect,
     dataSourceOpen: false,
     connectionState: "connected",
     connectionError: null,

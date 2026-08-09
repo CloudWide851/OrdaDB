@@ -77,6 +77,8 @@ const initialWorkbenchState = useWorkbenchStore.getState();
 async function seedPreviewWorkspace() {
   await useWorkbenchStore.getState().connectDataSource({
     connectorId: "ordadb-native",
+    connectorKind: "sql",
+    commandLanguage: "postgresql-sql",
     dialect: "postgresql",
     endpoint: "preview",
     database: "ordadb_preview",
@@ -186,7 +188,7 @@ describe("OrdaDB workbench", () => {
     await waitFor(() => {
       expect(screen.getByText("WAL checkpoint overview")).toBeVisible();
     });
-    expect(screen.getByText("5 行 · 36 ms")).toBeVisible();
+    expect(screen.getByText("5 项 · 36 ms")).toBeVisible();
   });
 
   it("renders the configured NULL value without changing result data", () => {
@@ -318,7 +320,7 @@ describe("OrdaDB workbench", () => {
 
     await user.keyboard("{Control>}{Enter}{/Control}");
     await waitFor(() => {
-      expect(screen.getByText("5 行 · 36 ms")).toBeVisible();
+      expect(screen.getByText("5 项 · 36 ms")).toBeVisible();
     });
   });
 
@@ -400,7 +402,7 @@ describe("OrdaDB workbench", () => {
     const connectorLogos = dataSource.querySelectorAll(
       ".data-source-choice img",
     );
-    expect(connectorLogos).toHaveLength(5);
+    expect(connectorLogos).toHaveLength(10);
     for (const image of connectorLogos) {
       expect(image.getAttribute("src")).toMatch(
         /^(?:data:image\/svg\+xml|\/src\/assets\/connectors\/)/,
@@ -546,7 +548,7 @@ describe("OrdaDB workbench", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("manages the four signed connector fixtures with accessible lifecycle actions", async () => {
+  it("manages the nine signed connector fixtures with accessible lifecycle actions", async () => {
     const user = userEvent.setup();
     renderApp();
 
@@ -558,6 +560,11 @@ describe("OrdaDB workbench", () => {
       "MySQL",
       "SQLite",
       "SQL Server",
+      "MongoDB",
+      "Redis",
+      "MariaDB",
+      "ClickHouse",
+      "Oracle",
     ]) {
       expect(pluginView.getByText(connector)).toBeVisible();
     }

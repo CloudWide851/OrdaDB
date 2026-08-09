@@ -18,6 +18,7 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+ordadb-connector-sdk = { path = "../../../crates/ordadb-connector-sdk" }
 ordadb-connectors = { path = "../../../crates/ordadb-connectors" }
 ordadb-protocol = { path = "../../../crates/ordadb-protocol" }
 ordadb-server = { path = "../../../crates/ordadb-server" }

@@ -1,10 +1,18 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
+use ordadb_connector_sdk::{
+    CONNECTOR_PROTOCOL_V2, CONNECTOR_PROTOCOL_V3, ConnectorCapabilitiesV2, ConnectorCapabilitiesV3,
+    ConnectorCatalogNodeKindV3, ConnectorCatalogNodeV3, ConnectorCommandV3, ConnectorCredentialV2,
+    ConnectorKindV3, ConnectorParameterV2, ConnectorRequestV3, ConnectorResponseV3,
+    ConnectorResultBatchV3, ConnectorResultEventV3, ConnectorTlsModeV2,
+    ConnectorTransactionStateV2, ConnectorValueV2, MAX_CONNECTOR_CATALOG_PAGE_NODES,
+    MAX_CONNECTOR_COMMAND_ARGUMENTS, MAX_CONNECTOR_TEXT_BYTES,
+};
 use ordadb_connectors::{
     CatalogEntry, ConnectorHost, ConnectorRequestV1, ConnectorResponseV1, CredentialPayload,
     PluginManager,
@@ -32,12 +40,18 @@ const MAX_ADMIN_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const BOOTSTRAP_TICKET_TTL: Duration = Duration::from_secs(120);
 const MAX_BOOTSTRAP_TICKETS: usize = 32;
-const VALID_CONNECTOR_IDS: [&str; 5] = [
+const MAX_DESKTOP_CATALOG_NODES: usize = 10_000;
+const VALID_CONNECTOR_IDS: [&str; 10] = [
     NATIVE_CONNECTOR_ID,
     "postgresql",
     "mysql",
     "sqlite",
     "sql-server",
+    "mongodb",
+    "redis",
+    "mariadb",
+    "clickhouse",
+    "oracle",
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,10 +73,13 @@ pub struct PromptCredentialRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConnectRequest {
     connector_id: String,
-    dialect: String,
+    connector_kind: String,
+    command_language: String,
+    dialect: Option<String>,
     endpoint: String,
     admin_endpoint: Option<String>,
     database: Option<String>,
+    tls_mode: ConnectorTlsModeV2,
     credential_id: String,
 }
 
@@ -227,6 +244,40 @@ impl DbmsCapabilities {
             service_control: false,
         }
     }
+
+    fn plugin_v2(capabilities: &ConnectorCapabilitiesV2) -> Self {
+        Self {
+            catalog: capabilities.catalog,
+            transactions: capabilities.transactions,
+            cancel: capabilities.cancellation,
+            explain: true,
+            sessions: false,
+            locks: false,
+            metrics: false,
+            wal: false,
+            checkpoint: false,
+            backup: false,
+            import_export: false,
+            service_control: false,
+        }
+    }
+
+    fn plugin_v3(capabilities: &ConnectorCapabilitiesV3) -> Self {
+        Self {
+            catalog: capabilities.catalog,
+            transactions: capabilities.transactions,
+            cancel: capabilities.cancellation,
+            explain: capabilities.kind == ConnectorKindV3::Sql,
+            sessions: false,
+            locks: false,
+            metrics: false,
+            wal: false,
+            checkpoint: false,
+            backup: false,
+            import_export: false,
+            service_control: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -234,7 +285,9 @@ impl DbmsCapabilities {
 pub struct ConnectionSnapshot {
     connection_id: String,
     connector_id: String,
-    dialect: String,
+    connector_kind: String,
+    command_language: String,
+    dialect: Option<String>,
     endpoint: String,
     database: String,
     mode: &'static str,
@@ -244,8 +297,10 @@ pub struct ConnectionSnapshot {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogObject {
+    id: Option<String>,
     kind: String,
     schema: String,
+    namespace: Option<String>,
     name: String,
     parent: Option<String>,
     details: JsonValue,
@@ -262,9 +317,31 @@ pub struct CatalogSnapshot {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExecuteRequest {
     connection_id: String,
-    sql: String,
-    #[serde(default)]
-    params: Vec<Option<String>>,
+    command: DesktopCommand,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum DesktopCommand {
+    Text {
+        language_id: String,
+        text: String,
+        #[serde(default)]
+        params: Vec<Option<String>>,
+    },
+    Document {
+        language_id: String,
+        document: JsonValue,
+    },
+    Arguments {
+        language_id: String,
+        arguments: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -325,6 +402,12 @@ pub enum DbmsQueryEvent {
     Batch {
         rows: Vec<Vec<Option<String>>>,
     },
+    Documents {
+        documents: Vec<JsonValue>,
+    },
+    KeyValues {
+        entries: Vec<DbmsKeyValue>,
+    },
     Progress {
         rows_processed: u64,
     },
@@ -340,6 +423,13 @@ pub enum DbmsQueryEvent {
     Error {
         error: DbmsError,
     },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DbmsKeyValue {
+    key: JsonValue,
+    value: JsonValue,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -533,6 +623,8 @@ pub struct AdministrationServiceStatus {
 
 #[derive(Debug)]
 struct ConnectionHandle {
+    connector_kind: String,
+    command_language: String,
     transport: ConnectionTransport,
 }
 
@@ -562,6 +654,7 @@ impl std::fmt::Debug for NativeConnection {
 #[derive(Debug)]
 struct PluginConnection {
     host: AsyncMutex<Option<ConnectorHost>>,
+    capabilities_v3: Option<ConnectorCapabilitiesV3>,
 }
 
 struct AdminSession {
@@ -680,10 +773,13 @@ impl DbmsRuntime {
         validate_connect_request(&request)?;
         let stored = self.credentials.load(&request.credential_id)?;
         let connection_id = Uuid::new_v4().to_string();
-        let database = request
-            .database
-            .clone()
-            .unwrap_or_else(|| "ordadb".to_owned());
+        let database = request.database.clone().unwrap_or_else(|| {
+            if request.connector_id == NATIVE_CONNECTOR_ID {
+                "ordadb".to_owned()
+            } else {
+                String::new()
+            }
+        });
 
         let (transport, mode, capabilities) = if request.connector_id == NATIVE_CONNECTOR_ID {
             let address: SocketAddr = request.endpoint.parse().map_err(|_| {
@@ -751,32 +847,82 @@ impl DbmsRuntime {
         } else {
             let mut host =
                 ConnectorHost::launch(&self.plugin_manager, &request.connector_id).await?;
-            host.connect(
-                connection_id.clone(),
-                request.endpoint.clone(),
-                request.database.clone(),
-                CredentialPayload::new(stored.username, stored.password.to_string()),
-            )
-            .await?;
+            let protocol_version = host.protocol_version();
+            let username = stored.username;
+            let secret = stored.password.to_string();
+            let (capabilities_v3, capabilities) = match protocol_version {
+                CONNECTOR_PROTOCOL_V3 => {
+                    let endpoint =
+                        host.structured_endpoint(&request.endpoint, request.database.clone())?;
+                    let negotiated = host
+                        .connect_v3(
+                            connection_id.clone(),
+                            endpoint,
+                            request.tls_mode,
+                            Some(ConnectorCredentialV2::new(Some(username), secret)),
+                        )
+                        .await?;
+                    validate_negotiated_v3(&request, &negotiated)?;
+                    let desktop = DbmsCapabilities::plugin_v3(&negotiated);
+                    (Some(negotiated), desktop)
+                }
+                CONNECTOR_PROTOCOL_V2 => {
+                    let endpoint =
+                        host.structured_endpoint(&request.endpoint, request.database.clone())?;
+                    let negotiated = host
+                        .connect_v2(
+                            connection_id.clone(),
+                            endpoint,
+                            request.tls_mode,
+                            Some(ConnectorCredentialV2::new(Some(username), secret)),
+                        )
+                        .await?;
+                    (None, DbmsCapabilities::plugin_v2(&negotiated))
+                }
+                _ => {
+                    if request.connector_kind != "sql" {
+                        return Err(DbError::unsupported(
+                            "non-SQL connectors require connector protocol v3",
+                        ));
+                    }
+                    host.connect(
+                        connection_id.clone(),
+                        request.endpoint.clone(),
+                        request.database.clone(),
+                        CredentialPayload::new(username, secret),
+                    )
+                    .await?;
+                    (None, DbmsCapabilities::plugin())
+                }
+            };
             (
                 ConnectionTransport::Plugin(Box::new(PluginConnection {
                     host: AsyncMutex::new(Some(host)),
+                    capabilities_v3,
                 })),
                 "plugin",
-                DbmsCapabilities::plugin(),
+                capabilities,
             )
         };
 
+        let connector_kind = request.connector_kind.clone();
+        let command_language = request.command_language.clone();
         let snapshot = ConnectionSnapshot {
             connection_id: connection_id.clone(),
             connector_id: request.connector_id,
+            connector_kind: connector_kind.clone(),
+            command_language: command_language.clone(),
             dialect: request.dialect,
             endpoint: request.endpoint,
             database,
             mode,
             capabilities,
         };
-        let handle = Arc::new(ConnectionHandle { transport });
+        let handle = Arc::new(ConnectionHandle {
+            connector_kind,
+            command_language,
+            transport,
+        });
         write_lock(&self.connections)?.insert(connection_id, handle);
         Ok(snapshot)
     }
@@ -1173,27 +1319,34 @@ impl DbmsRuntime {
                 flatten_catalog(&projection)?
             }
             ConnectionTransport::Plugin(plugin) => {
-                let request_id = Uuid::new_v4().to_string();
+                let capabilities_v3 = plugin.capabilities_v3.clone();
                 let mut host = plugin.host.lock().await;
                 let host = host
                     .as_mut()
                     .ok_or_else(|| DbError::new("08003", "connector host is closed"))?;
-                host.send(&ConnectorRequestV1::Catalog {
-                    request_id: request_id.clone(),
-                    connection_id: connection_id.to_owned(),
-                })
-                .await?;
-                match host.receive().await? {
-                    ConnectorResponseV1::Catalog {
-                        request_id: actual,
-                        entries,
-                    } if actual == request_id => entries.into_iter().map(catalog_entry).collect(),
-                    ConnectorResponseV1::Error { error, .. } => return Err(error),
-                    _ => {
-                        return Err(DbError::new(
-                            "08P01",
-                            "connector returned an unexpected catalog response",
-                        ));
+                if let Some(capabilities) = capabilities_v3 {
+                    connector_catalog_v3(host, connection_id, &capabilities).await?
+                } else {
+                    let request_id = Uuid::new_v4().to_string();
+                    host.send(&ConnectorRequestV1::Catalog {
+                        request_id: request_id.clone(),
+                        connection_id: connection_id.to_owned(),
+                    })
+                    .await?;
+                    match host.receive().await? {
+                        ConnectorResponseV1::Catalog {
+                            request_id: actual,
+                            entries,
+                        } if actual == request_id => {
+                            entries.into_iter().map(catalog_entry).collect()
+                        }
+                        ConnectorResponseV1::Error { error, .. } => return Err(error),
+                        _ => {
+                            return Err(DbError::new(
+                                "08P01",
+                                "connector returned an unexpected catalog response",
+                            ));
+                        }
                     }
                 }
             }
@@ -1211,6 +1364,11 @@ impl DbmsRuntime {
     ) -> Result<OperationStarted, DbError> {
         validate_execute_request(&request)?;
         let connection = self.connection(&request.connection_id)?;
+        validate_command_for_connection(
+            &request.command,
+            &connection.connector_kind,
+            &connection.command_language,
+        )?;
         let request_id = Uuid::new_v4().to_string();
         let cancellation = match &connection.transport {
             ConnectionTransport::Native(native) => {
@@ -1256,12 +1414,22 @@ impl DbmsRuntime {
         cancellation: RequestCancellation,
     ) -> Result<(), DbError> {
         let started = Instant::now();
+        let ExecuteRequest {
+            connection_id,
+            command,
+        } = request;
         match &connection.transport {
             ConnectionTransport::Native(native) => {
+                let DesktopCommand::Text {
+                    text: sql, params, ..
+                } = command
+                else {
+                    return Err(DbError::unsupported(
+                        "native OrdaDB accepts only SQL text commands",
+                    ));
+                };
                 let client = Arc::clone(&native.pg);
-                let sql = request.sql;
-                let params = request
-                    .params
+                let params = params
                     .into_iter()
                     .map(|value| value.map(String::into_bytes))
                     .collect::<Vec<_>>();
@@ -1312,12 +1480,32 @@ impl DbmsRuntime {
                 let host = host
                     .as_mut()
                     .ok_or_else(|| DbError::new("08003", "connector host is closed"))?;
+                if plugin.capabilities_v3.is_some() {
+                    run_connector_execute_v3(
+                        host,
+                        app,
+                        request_id,
+                        connection_id,
+                        desktop_command_v3(command),
+                        token,
+                        started,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let DesktopCommand::Text {
+                    text: sql, params, ..
+                } = command
+                else {
+                    return Err(DbError::unsupported(
+                        "connector protocols v1 and v2 accept only SQL text commands",
+                    ));
+                };
                 host.send(&ConnectorRequestV1::Execute {
                     request_id: request_id.to_owned(),
-                    connection_id: request.connection_id,
-                    sql: request.sql,
-                    params: request
-                        .params
+                    connection_id,
+                    sql,
+                    params: params
                         .into_iter()
                         .map(|value| value.map_or(Value::Null, Value::Text))
                         .collect(),
@@ -1407,11 +1595,36 @@ impl DbmsRuntime {
             }
             ConnectionTransport::Plugin(plugin) => {
                 let request_id = Uuid::new_v4().to_string();
-                let request = action.connector_request(&request_id, connection_id);
                 let mut host = plugin.host.lock().await;
                 let host = host
                     .as_mut()
                     .ok_or_else(|| DbError::new("08003", "connector host is closed"))?;
+                if plugin.capabilities_v3.is_some() {
+                    host.send_v3(&action.connector_request_v3(&request_id, connection_id))
+                        .await?;
+                    return match host.receive_v3().await? {
+                        ConnectorResponseV3::Transaction {
+                            request_id: actual,
+                            state,
+                        } if actual == request_id => {
+                            validate_transaction_state(action, state)?;
+                            Ok(CommandResult {
+                                command_tag: action.label().to_owned(),
+                            })
+                        }
+                        ConnectorResponseV3::Error {
+                            request_id: actual,
+                            error,
+                        } if actual.as_deref().is_none_or(|actual| actual == request_id) => {
+                            Err(error.into_db_error())
+                        }
+                        _ => Err(DbError::new(
+                            "08P01",
+                            "connector returned an unexpected v3 transaction response",
+                        )),
+                    };
+                }
+                let request = action.connector_request(&request_id, connection_id);
                 host.send(&request).await?;
                 loop {
                     match host.receive().await? {
@@ -1680,6 +1893,53 @@ impl TransactionAction {
             },
         }
     }
+
+    fn connector_request_v3(self, request_id: &str, connection_id: &str) -> ConnectorRequestV3 {
+        match self {
+            Self::Begin => ConnectorRequestV3::Begin {
+                request_id: request_id.to_owned(),
+                connection_id: connection_id.to_owned(),
+                isolation: None,
+            },
+            Self::Commit => ConnectorRequestV3::Commit {
+                request_id: request_id.to_owned(),
+                connection_id: connection_id.to_owned(),
+            },
+            Self::Rollback => ConnectorRequestV3::Rollback {
+                request_id: request_id.to_owned(),
+                connection_id: connection_id.to_owned(),
+            },
+        }
+    }
+}
+
+fn validate_transaction_state(
+    action: TransactionAction,
+    state: ConnectorTransactionStateV2,
+) -> Result<(), DbError> {
+    let valid = matches!(
+        (action, state),
+        (
+            TransactionAction::Begin,
+            ConnectorTransactionStateV2::Active
+        ) | (
+            TransactionAction::Commit | TransactionAction::Rollback,
+            ConnectorTransactionStateV2::Idle
+        )
+    );
+    if valid {
+        Ok(())
+    } else if state == ConnectorTransactionStateV2::Failed {
+        Err(DbError::new(
+            "25P02",
+            "connector transaction entered the failed state",
+        ))
+    } else {
+        Err(DbError::new(
+            "08P01",
+            "connector returned an unexpected transaction state",
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1912,25 +2172,132 @@ pub async fn dbms_service(
         .map_err(Into::into)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ConnectorContract {
+    kind: &'static str,
+    command_language: &'static str,
+    dialect: Option<&'static str>,
+}
+
+fn connector_contract(connector_id: &str) -> Option<ConnectorContract> {
+    let contract = match connector_id {
+        NATIVE_CONNECTOR_ID | "postgresql" => ConnectorContract {
+            kind: "sql",
+            command_language: "postgresql-sql",
+            dialect: Some("postgresql"),
+        },
+        "mysql" => ConnectorContract {
+            kind: "sql",
+            command_language: "mysql-sql",
+            dialect: Some("mysql"),
+        },
+        "sqlite" => ConnectorContract {
+            kind: "sql",
+            command_language: "sqlite-sql",
+            dialect: Some("sqlite"),
+        },
+        "sql-server" => ConnectorContract {
+            kind: "sql",
+            command_language: "sql-server-sql",
+            dialect: Some("sqlServer"),
+        },
+        "mongodb" => ConnectorContract {
+            kind: "document",
+            command_language: "mongodb-json",
+            dialect: None,
+        },
+        "redis" => ConnectorContract {
+            kind: "keyValue",
+            command_language: "redis-resp3",
+            dialect: None,
+        },
+        "mariadb" => ConnectorContract {
+            kind: "sql",
+            command_language: "mariadb-sql",
+            dialect: Some("mariadb"),
+        },
+        "clickhouse" => ConnectorContract {
+            kind: "sql",
+            command_language: "clickhouse-sql",
+            dialect: Some("clickhouse"),
+        },
+        "oracle" => ConnectorContract {
+            kind: "sql",
+            command_language: "oracle-sql",
+            dialect: Some("oracle"),
+        },
+        _ => return None,
+    };
+    Some(contract)
+}
+
 fn validate_connect_request(request: &ConnectRequest) -> Result<(), DbError> {
-    if !VALID_CONNECTOR_IDS.contains(&request.connector_id.as_str()) {
-        return Err(DbError::new("22023", "unknown connector ID"));
-    }
-    if !matches!(
-        request.dialect.as_str(),
-        "postgresql" | "mysql" | "sqlite" | "sqlServer"
-    ) {
-        return Err(DbError::new("22023", "unknown SQL dialect"));
+    let contract = connector_contract(&request.connector_id)
+        .ok_or_else(|| DbError::new("22023", "unknown connector ID"))?;
+    if request.connector_kind != contract.kind
+        || request.command_language != contract.command_language
+        || request.dialect.as_deref() != contract.dialect
+    {
+        return Err(DbError::new(
+            "22023",
+            "connection metadata does not match the connector identity",
+        ));
     }
     validate_text(&request.endpoint, 1, 2_048, "connection endpoint")?;
+    validate_text(
+        &request.command_language,
+        1,
+        64,
+        "connector command language",
+    )?;
     validate_id(&request.credential_id, "credential ID")?;
     if let Some(database) = &request.database {
         validate_text(database, 1, 256, "database name")?;
     }
-    if request.connector_id == NATIVE_CONNECTOR_ID && request.dialect != "postgresql" {
+    if let Some(admin_endpoint) = &request.admin_endpoint {
+        validate_text(admin_endpoint, 1, 2_048, "administration endpoint")?;
+    }
+    if request.connector_id == NATIVE_CONNECTOR_ID
+        && (request.admin_endpoint.is_none() || request.tls_mode != ConnectorTlsModeV2::Disable)
+    {
         return Err(DbError::new(
             "22023",
-            "native OrdaDB connections use the PostgreSQL dialect",
+            "native OrdaDB requires its administration endpoint and local TLS mode",
+        ));
+    }
+    if request.connector_id != NATIVE_CONNECTOR_ID && request.admin_endpoint.is_some() {
+        return Err(DbError::new(
+            "22023",
+            "external connectors do not accept an OrdaDB administration endpoint",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_negotiated_v3(
+    request: &ConnectRequest,
+    capabilities: &ConnectorCapabilitiesV3,
+) -> Result<(), DbError> {
+    let expected_kind = match request.connector_kind.as_str() {
+        "sql" => ConnectorKindV3::Sql,
+        "document" => ConnectorKindV3::Document,
+        "keyValue" => ConnectorKindV3::KeyValue,
+        _ => return Err(DbError::new("22023", "unknown connector kind")),
+    };
+    if capabilities.kind != expected_kind {
+        return Err(DbError::new(
+            "08P01",
+            "connector negotiated a different data model than its profile",
+        ));
+    }
+    if !capabilities
+        .command_languages
+        .iter()
+        .any(|language| language.id == request.command_language)
+    {
+        return Err(DbError::new(
+            "08P01",
+            "connector did not negotiate the configured command language",
         ));
     }
     Ok(())
@@ -1991,9 +2358,74 @@ fn validate_operation_id(value: &str) -> Result<Uuid, DbError> {
 
 fn validate_execute_request(request: &ExecuteRequest) -> Result<(), DbError> {
     validate_id(&request.connection_id, "connection ID")?;
-    validate_text(&request.sql, 1, 4 * 1024 * 1024, "SQL text")?;
-    if request.params.len() > 65_535 {
-        return Err(DbError::new("54000", "parameter count exceeds 65,535"));
+    match &request.command {
+        DesktopCommand::Text {
+            language_id,
+            text,
+            params,
+        } => {
+            validate_text(language_id, 1, 64, "connector command language")?;
+            validate_text(text, 1, 4 * 1024 * 1024, "command text")?;
+            if params.len() > 65_535 {
+                return Err(DbError::new("54000", "parameter count exceeds 65,535"));
+            }
+        }
+        DesktopCommand::Document {
+            language_id,
+            document,
+        } => {
+            validate_text(language_id, 1, 64, "connector command language")?;
+            let encoded = serde_json::to_vec(document)
+                .map_err(|error| DbError::internal(error.to_string()))?;
+            if encoded.len() > MAX_CONNECTOR_TEXT_BYTES {
+                return Err(DbError::new(
+                    "54000",
+                    "document command exceeds the connector size limit",
+                ));
+            }
+        }
+        DesktopCommand::Arguments {
+            language_id,
+            arguments,
+        } => {
+            validate_text(language_id, 1, 64, "connector command language")?;
+            if arguments.is_empty() || arguments.len() > MAX_CONNECTOR_COMMAND_ARGUMENTS {
+                return Err(DbError::new(
+                    "54000",
+                    "argument command count is outside the connector limit",
+                ));
+            }
+            let total_bytes = arguments.iter().try_fold(0_usize, |total, argument| {
+                total
+                    .checked_add(argument.len())
+                    .ok_or_else(|| DbError::new("54000", "argument command size overflowed"))
+            })?;
+            if total_bytes > MAX_CONNECTOR_TEXT_BYTES {
+                return Err(DbError::new(
+                    "54000",
+                    "argument command exceeds the connector size limit",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_command_for_connection(
+    command: &DesktopCommand,
+    connector_kind: &str,
+    command_language: &str,
+) -> Result<(), DbError> {
+    let (actual_kind, actual_language) = match command {
+        DesktopCommand::Text { language_id, .. } => ("sql", language_id),
+        DesktopCommand::Document { language_id, .. } => ("document", language_id),
+        DesktopCommand::Arguments { language_id, .. } => ("keyValue", language_id),
+    };
+    if actual_kind != connector_kind || actual_language != command_language {
+        return Err(DbError::new(
+            "22023",
+            "command shape or language does not match the active connection",
+        ));
     }
     Ok(())
 }
@@ -2207,6 +2639,128 @@ fn validate_api_version(version: &str) -> Result<(), DbError> {
     }
 }
 
+async fn connector_catalog_v3(
+    host: &mut ConnectorHost,
+    connection_id: &str,
+    capabilities: &ConnectorCapabilitiesV3,
+) -> Result<Vec<CatalogObject>, DbError> {
+    if !capabilities.catalog {
+        return Err(DbError::unsupported("connector Catalog discovery"));
+    }
+    let page_size = capabilities
+        .maximum_catalog_page_size
+        .min(MAX_CONNECTOR_CATALOG_PAGE_NODES)
+        .min(1_024);
+    if page_size == 0 {
+        return Err(DbError::new(
+            "08P01",
+            "connector negotiated a zero Catalog page size",
+        ));
+    }
+    let mut pending_parents = VecDeque::from([None]);
+    let mut seen = BTreeSet::new();
+    let mut objects = Vec::new();
+    while let Some(parent_id) = pending_parents.pop_front() {
+        let mut cursor = None;
+        loop {
+            let request_id = Uuid::new_v4().to_string();
+            host.send_v3(&ConnectorRequestV3::Catalog {
+                request_id: request_id.clone(),
+                connection_id: connection_id.to_owned(),
+                parent_id: parent_id.clone(),
+                page_size,
+                cursor: cursor.take(),
+            })
+            .await?;
+            let page = match host.receive_v3().await? {
+                ConnectorResponseV3::CatalogPage {
+                    request_id: actual,
+                    page,
+                } if actual == request_id => page,
+                ConnectorResponseV3::Error {
+                    request_id: actual,
+                    error,
+                } if actual.as_deref().is_none_or(|actual| actual == request_id) => {
+                    return Err(error.into_db_error());
+                }
+                _ => {
+                    return Err(DbError::new(
+                        "08P01",
+                        "connector returned an unexpected v3 Catalog response",
+                    ));
+                }
+            };
+            cursor = page.next_cursor;
+            for node in page.nodes {
+                if node.parent_id != parent_id {
+                    return Err(DbError::new(
+                        "08P01",
+                        "connector Catalog node does not belong to the requested parent",
+                    ));
+                }
+                if !seen.insert(node.id.clone()) {
+                    return Err(DbError::new(
+                        "08P01",
+                        "connector Catalog contains a duplicate node ID",
+                    ));
+                }
+                if objects.len() >= MAX_DESKTOP_CATALOG_NODES {
+                    return Err(DbError::new(
+                        "54000",
+                        "connector Catalog exceeds the desktop node limit",
+                    ));
+                }
+                if node.has_children {
+                    pending_parents.push_back(Some(node.id.clone()));
+                }
+                objects.push(catalog_node_v3(node)?);
+            }
+            if cursor.is_none() {
+                break;
+            }
+        }
+    }
+    Ok(objects)
+}
+
+fn catalog_node_v3(node: ConnectorCatalogNodeV3) -> Result<CatalogObject, DbError> {
+    let details = serde_json::to_value(&node).map_err(|error| {
+        DbError::internal("failed to project connector Catalog node").with_detail(error.to_string())
+    })?;
+    Ok(CatalogObject {
+        id: Some(node.id),
+        kind: catalog_node_kind_v3(node.kind).into(),
+        schema: node.namespace.clone().unwrap_or_default(),
+        namespace: node.namespace,
+        name: node.name,
+        parent: node.parent_id,
+        details,
+    })
+}
+
+const fn catalog_node_kind_v3(kind: ConnectorCatalogNodeKindV3) -> &'static str {
+    match kind {
+        ConnectorCatalogNodeKindV3::Server => "server",
+        ConnectorCatalogNodeKindV3::Cluster => "cluster",
+        ConnectorCatalogNodeKindV3::Database => "database",
+        ConnectorCatalogNodeKindV3::Schema => "schema",
+        ConnectorCatalogNodeKindV3::Table => "table",
+        ConnectorCatalogNodeKindV3::View => "view",
+        ConnectorCatalogNodeKindV3::MaterializedView => "materializedView",
+        ConnectorCatalogNodeKindV3::Column => "column",
+        ConnectorCatalogNodeKindV3::Index => "index",
+        ConnectorCatalogNodeKindV3::Constraint => "constraint",
+        ConnectorCatalogNodeKindV3::Sequence => "sequence",
+        ConnectorCatalogNodeKindV3::Function => "function",
+        ConnectorCatalogNodeKindV3::Procedure => "procedure",
+        ConnectorCatalogNodeKindV3::Collection => "collection",
+        ConnectorCatalogNodeKindV3::Keyspace => "keyspace",
+        ConnectorCatalogNodeKindV3::Key => "key",
+        ConnectorCatalogNodeKindV3::Stream => "stream",
+        ConnectorCatalogNodeKindV3::Other => "other",
+    }
+}
+
 fn flatten_catalog(projection: &JsonValue) -> Result<Vec<CatalogObject>, DbError> {
     let database = projection
         .get("database")
@@ -2218,8 +2772,10 @@ fn flatten_catalog(projection: &JsonValue) -> Result<Vec<CatalogObject>, DbError
             .ok_or_else(|| DbError::new("08P01", "catalog database has no name"))?,
     )?;
     let mut objects = vec![CatalogObject {
+        id: None,
         kind: "database".into(),
         schema: String::new(),
+        namespace: None,
         name: database_name.clone(),
         parent: None,
         details: JsonValue::Object(database.clone()),
@@ -2234,8 +2790,10 @@ fn flatten_catalog(projection: &JsonValue) -> Result<Vec<CatalogObject>, DbError
                 .ok_or_else(|| DbError::new("08P01", "catalog schema has no name"))?,
         )?;
         objects.push(CatalogObject {
+            id: None,
             kind: "schema".into(),
             schema: schema_name.clone(),
+            namespace: Some(schema_name.clone()),
             name: schema_name.clone(),
             parent: Some(database_name.clone()),
             details: schema.clone(),
@@ -2302,8 +2860,10 @@ fn flatten_views(
                 .ok_or_else(|| DbError::new("08P01", "catalog view has no name"))?,
         )?;
         objects.push(CatalogObject {
+            id: None,
             kind: kind.into(),
             schema: schema.into(),
+            namespace: Some(schema.into()),
             name,
             parent: None,
             details: view.clone(),
@@ -2326,8 +2886,10 @@ fn flatten_named(
                 .ok_or_else(|| DbError::new("08P01", "catalog object has no name"))?,
         )?;
         objects.push(CatalogObject {
+            id: None,
             kind: kind.into(),
             schema: schema.into(),
+            namespace: Some(schema.into()),
             name,
             parent: parent.map(str::to_owned),
             details: entry.clone(),
@@ -2356,7 +2918,9 @@ fn identifier(value: &JsonValue) -> Result<String, DbError> {
 
 fn catalog_entry(entry: CatalogEntry) -> CatalogObject {
     CatalogObject {
+        id: None,
         kind: entry.kind,
+        namespace: (!entry.schema.is_empty()).then(|| entry.schema.clone()),
         schema: entry.schema,
         name: entry.name,
         parent: None,
@@ -2418,6 +2982,225 @@ fn emit_native_pg_event(
             },
         ),
     }
+}
+
+fn desktop_command_v3(command: DesktopCommand) -> ConnectorCommandV3 {
+    match command {
+        DesktopCommand::Text {
+            language_id,
+            text,
+            params,
+        } => ConnectorCommandV3::Text {
+            language_id,
+            text,
+            params: params
+                .into_iter()
+                .map(|value| ConnectorParameterV2 {
+                    data_type: None,
+                    value: value.map_or(ConnectorValueV2::Null, ConnectorValueV2::Text),
+                })
+                .collect(),
+        },
+        DesktopCommand::Document {
+            language_id,
+            document,
+        } => ConnectorCommandV3::Document {
+            language_id,
+            document,
+        },
+        DesktopCommand::Arguments {
+            language_id,
+            arguments,
+        } => ConnectorCommandV3::Arguments {
+            language_id,
+            arguments: arguments.into_iter().map(ConnectorValueV2::Text).collect(),
+        },
+    }
+}
+
+async fn run_connector_execute_v3(
+    host: &mut ConnectorHost,
+    app: &AppHandle,
+    request_id: &str,
+    connection_id: String,
+    command: ConnectorCommandV3,
+    cancellation: CancellationToken,
+    started: Instant,
+) -> Result<(), DbError> {
+    host.send_v3(&ConnectorRequestV3::Execute {
+        request_id: request_id.to_owned(),
+        connection_id,
+        command,
+        batch_size: QUERY_BATCH_ROWS as u32,
+    })
+    .await?;
+    let mut cancel_sent = false;
+    loop {
+        let response = if cancel_sent {
+            host.receive_v3().await?
+        } else {
+            tokio::select! {
+                response = host.receive_v3() => response?,
+                () = cancellation.cancelled() => {
+                    host.send_v3(&ConnectorRequestV3::Cancel {
+                        request_id: request_id.to_owned(),
+                    }).await?;
+                    cancel_sent = true;
+                    continue;
+                }
+            }
+        };
+        match response {
+            ConnectorResponseV3::ResultEvent {
+                request_id: actual,
+                event,
+            } if actual == request_id => {
+                let terminal = matches!(event, ConnectorResultEventV3::Complete { .. });
+                emit_query(
+                    app,
+                    request_id,
+                    map_connector_event_v3(event, started.elapsed())?,
+                );
+                if terminal {
+                    return Ok(());
+                }
+            }
+            ConnectorResponseV3::Cancelled { request_id: actual } if actual == request_id => {
+                return Err(DbError::new("57014", "connector command was cancelled"));
+            }
+            ConnectorResponseV3::Error {
+                request_id: actual,
+                error,
+            } if actual.as_deref().is_none_or(|actual| actual == request_id) => {
+                return Err(error.into_db_error());
+            }
+            _ => {
+                return Err(DbError::new(
+                    "08P01",
+                    "connector returned an unexpected v3 result response",
+                ));
+            }
+        }
+    }
+}
+
+fn map_connector_event_v3(
+    event: ConnectorResultEventV3,
+    elapsed: Duration,
+) -> Result<DbmsQueryEvent, DbError> {
+    match event {
+        ConnectorResultEventV3::Schema { columns } => Ok(DbmsQueryEvent::Schema {
+            columns: columns
+                .into_iter()
+                .map(|column| QueryColumn {
+                    name: column.name,
+                    data_type: column.data_type.vendor_name,
+                })
+                .collect(),
+        }),
+        ConnectorResultEventV3::Batch {
+            batch: ConnectorResultBatchV3::Rows { rows },
+        } => Ok(DbmsQueryEvent::Batch {
+            rows: rows
+                .into_iter()
+                .map(|row| row.into_iter().map(connector_value_text).collect())
+                .collect(),
+        }),
+        ConnectorResultEventV3::Batch {
+            batch: ConnectorResultBatchV3::Documents { documents },
+        } => Ok(DbmsQueryEvent::Documents { documents }),
+        ConnectorResultEventV3::Batch {
+            batch: ConnectorResultBatchV3::KeyValues { entries },
+        } => Ok(DbmsQueryEvent::KeyValues {
+            entries: entries
+                .into_iter()
+                .map(|entry| {
+                    Ok(DbmsKeyValue {
+                        key: connector_value_json(entry.key)?,
+                        value: connector_value_json(entry.value)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, DbError>>()?,
+        }),
+        ConnectorResultEventV3::Progress { items_processed } => Ok(DbmsQueryEvent::Progress {
+            rows_processed: items_processed,
+        }),
+        ConnectorResultEventV3::Notice { notice } => Ok(DbmsQueryEvent::Notice {
+            severity: notice.severity,
+            sql_state: notice.code.unwrap_or_default(),
+            message: notice.message,
+        }),
+        ConnectorResultEventV3::Complete { command_tag, .. } => Ok(DbmsQueryEvent::Complete {
+            command_tag,
+            duration_ms: elapsed_ms(elapsed),
+        }),
+    }
+}
+
+fn connector_value_text(value: ConnectorValueV2) -> Option<String> {
+    match value {
+        ConnectorValueV2::Null => None,
+        ConnectorValueV2::Boolean(value) => Some(value.to_string()),
+        ConnectorValueV2::SignedInteger(value) => Some(value.to_string()),
+        ConnectorValueV2::UnsignedInteger(value) => Some(value.to_string()),
+        ConnectorValueV2::FloatingPoint(value) => Some(value.to_string()),
+        ConnectorValueV2::Decimal(value)
+        | ConnectorValueV2::Text(value)
+        | ConnectorValueV2::Binary(value)
+        | ConnectorValueV2::Date(value)
+        | ConnectorValueV2::Time(value)
+        | ConnectorValueV2::Timestamp(value)
+        | ConnectorValueV2::TimestampWithTimeZone(value)
+        | ConnectorValueV2::Interval(value)
+        | ConnectorValueV2::Uuid(value) => Some(value),
+        ConnectorValueV2::Json(value) => Some(value.to_string()),
+        ConnectorValueV2::Array(values) => Some(
+            JsonValue::Array(
+                values
+                    .into_iter()
+                    .map(|value| {
+                        connector_value_text(value).map_or(JsonValue::Null, JsonValue::String)
+                    })
+                    .collect(),
+            )
+            .to_string(),
+        ),
+    }
+}
+
+fn connector_value_json(value: ConnectorValueV2) -> Result<JsonValue, DbError> {
+    let value = match value {
+        ConnectorValueV2::Null => JsonValue::Null,
+        ConnectorValueV2::Boolean(value) => JsonValue::Bool(value),
+        ConnectorValueV2::SignedInteger(value) => value.into(),
+        ConnectorValueV2::UnsignedInteger(value) => value.into(),
+        ConnectorValueV2::FloatingPoint(value) => serde_json::Number::from_f64(value)
+            .map(JsonValue::Number)
+            .ok_or_else(|| DbError::new("08P01", "connector returned a non-finite number"))?,
+        ConnectorValueV2::Decimal(value) => typed_connector_value("decimal", value),
+        ConnectorValueV2::Text(value) => JsonValue::String(value),
+        ConnectorValueV2::Binary(value) => typed_connector_value("binary", value),
+        ConnectorValueV2::Date(value) => typed_connector_value("date", value),
+        ConnectorValueV2::Time(value) => typed_connector_value("time", value),
+        ConnectorValueV2::Timestamp(value) => typed_connector_value("timestamp", value),
+        ConnectorValueV2::TimestampWithTimeZone(value) => {
+            typed_connector_value("timestampWithTimeZone", value)
+        }
+        ConnectorValueV2::Interval(value) => typed_connector_value("interval", value),
+        ConnectorValueV2::Uuid(value) => typed_connector_value("uuid", value),
+        ConnectorValueV2::Json(value) => value,
+        ConnectorValueV2::Array(values) => JsonValue::Array(
+            values
+                .into_iter()
+                .map(connector_value_json)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+    };
+    Ok(value)
+}
+
+fn typed_connector_value(kind: &'static str, value: String) -> JsonValue {
+    serde_json::json!({ "kind": kind, "value": value })
 }
 
 fn map_connector_event(event: QueryEvent, elapsed: Duration) -> DbmsQueryEvent {
@@ -2578,6 +3361,11 @@ async fn prompt_database_credential(
             "mysql" => "MySQL",
             "sqlite" => "SQLite",
             "sql-server" => "SQL Server",
+            "mongodb" => "MongoDB",
+            "redis" => "Redis",
+            "mariadb" => "MariaDB",
+            "clickhouse" => "ClickHouse",
+            "oracle" => "Oracle",
             _ => return Err(invalid("unknown connector ID")),
         };
         (
@@ -2724,10 +3512,13 @@ fn connection_fingerprint(request: &ConnectRequest) -> [u8; 32] {
     let mut hash = Sha256::new();
     for value in [
         Some(request.connector_id.as_str()),
-        Some(request.dialect.as_str()),
+        Some(request.connector_kind.as_str()),
+        Some(request.command_language.as_str()),
+        request.dialect.as_deref(),
         Some(request.endpoint.as_str()),
         request.admin_endpoint.as_deref(),
         request.database.as_deref(),
+        Some(connector_tls_mode_name(request.tls_mode)),
         Some(request.credential_id.as_str()),
     ] {
         match value {
@@ -2740,6 +3531,16 @@ fn connection_fingerprint(request: &ConnectRequest) -> [u8; 32] {
         }
     }
     hash.finalize().into()
+}
+
+const fn connector_tls_mode_name(mode: ConnectorTlsModeV2) -> &'static str {
+    match mode {
+        ConnectorTlsModeV2::Disable => "disable",
+        ConnectorTlsModeV2::Prefer => "prefer",
+        ConnectorTlsModeV2::Require => "require",
+        ConnectorTlsModeV2::VerifyCa => "verifyCa",
+        ConnectorTlsModeV2::VerifyFull => "verifyFull",
+    }
 }
 
 fn invalid(message: impl Into<String>) -> DbError {
@@ -3011,6 +3812,135 @@ mod tests {
     }
 
     #[test]
+    fn ten_connector_identities_validate_without_sql_aliases_for_non_sql_sources() {
+        let cases = [
+            (
+                NATIVE_CONNECTOR_ID,
+                "sql",
+                "postgresql-sql",
+                Some("postgresql"),
+            ),
+            ("postgresql", "sql", "postgresql-sql", Some("postgresql")),
+            ("mysql", "sql", "mysql-sql", Some("mysql")),
+            ("sqlite", "sql", "sqlite-sql", Some("sqlite")),
+            ("sql-server", "sql", "sql-server-sql", Some("sqlServer")),
+            ("mongodb", "document", "mongodb-json", None),
+            ("redis", "keyValue", "redis-resp3", None),
+            ("mariadb", "sql", "mariadb-sql", Some("mariadb")),
+            ("clickhouse", "sql", "clickhouse-sql", Some("clickhouse")),
+            ("oracle", "sql", "oracle-sql", Some("oracle")),
+        ];
+        for (connector_id, connector_kind, command_language, dialect) in cases {
+            let native = connector_id == NATIVE_CONNECTOR_ID;
+            let request = ConnectRequest {
+                connector_id: connector_id.into(),
+                connector_kind: connector_kind.into(),
+                command_language: command_language.into(),
+                dialect: dialect.map(str::to_owned),
+                endpoint: "127.0.0.1:15432".into(),
+                admin_endpoint: native.then(|| "http://127.0.0.1:9080".into()),
+                database: Some(if connector_id == "redis" { "0" } else { "test" }.into()),
+                tls_mode: if native {
+                    ConnectorTlsModeV2::Disable
+                } else {
+                    ConnectorTlsModeV2::Require
+                },
+                credential_id: format!("credential-{connector_id}"),
+            };
+            validate_connect_request(&request).expect(connector_id);
+
+            let mut mismatched = request;
+            mismatched.command_language = "postgresql-sql".into();
+            if command_language != "postgresql-sql" {
+                assert_eq!(
+                    validate_connect_request(&mismatched)
+                        .expect_err("identity mismatch")
+                        .sql_state,
+                    "22023"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn desktop_command_shapes_are_bound_to_the_negotiated_data_model() {
+        let mongodb = DesktopCommand::Document {
+            language_id: "mongodb-json".into(),
+            document: serde_json::json!({"operation": "find"}),
+        };
+        validate_command_for_connection(&mongodb, "document", "mongodb-json")
+            .expect("MongoDB document command");
+        assert_eq!(
+            validate_command_for_connection(&mongodb, "sql", "postgresql-sql")
+                .expect_err("document cannot become SQL")
+                .sql_state,
+            "22023"
+        );
+
+        let redis = DesktopCommand::Arguments {
+            language_id: "redis-resp3".into(),
+            arguments: vec!["GET".into(), "key".into()],
+        };
+        validate_command_for_connection(&redis, "keyValue", "redis-resp3")
+            .expect("Redis argument command");
+        assert!(matches!(
+            desktop_command_v3(redis),
+            ConnectorCommandV3::Arguments { .. }
+        ));
+    }
+
+    #[test]
+    fn v3_catalog_and_key_values_preserve_native_identity_and_types() {
+        let object = catalog_node_v3(ConnectorCatalogNodeV3 {
+            id: "collection:orders".into(),
+            parent_id: Some("database:shop".into()),
+            kind: ConnectorCatalogNodeKindV3::Collection,
+            name: "orders".into(),
+            namespace: Some("shop".into()),
+            has_children: true,
+            columns: Vec::new(),
+            attributes: BTreeMap::from([("capped".into(), "false".into())]),
+        })
+        .expect("Catalog projection");
+        assert_eq!(object.id.as_deref(), Some("collection:orders"));
+        assert_eq!(object.parent.as_deref(), Some("database:shop"));
+        assert_eq!(object.namespace.as_deref(), Some("shop"));
+        assert_eq!(object.details["attributes"]["capped"], "false");
+
+        assert_eq!(
+            connector_value_json(ConnectorValueV2::Decimal("123456789.0123".into()))
+                .expect("decimal"),
+            serde_json::json!({"kind": "decimal", "value": "123456789.0123"})
+        );
+        assert_eq!(
+            connector_value_json(ConnectorValueV2::Array(vec![
+                ConnectorValueV2::Text("value".into()),
+                ConnectorValueV2::Null,
+            ]))
+            .expect("array"),
+            serde_json::json!(["value", null])
+        );
+        assert_eq!(
+            connector_value_json(ConnectorValueV2::FloatingPoint(f64::NAN))
+                .expect_err("non-finite value")
+                .sql_state,
+            "08P01"
+        );
+    }
+
+    #[test]
+    fn bootstrap_fingerprint_covers_connector_model_language_and_tls() {
+        let request = native_connect_request();
+        let baseline = connection_fingerprint(&request);
+        let mut changed = request.clone();
+        changed.command_language = "other-sql".into();
+        assert_ne!(baseline, connection_fingerprint(&changed));
+        changed = request.clone();
+        changed.tls_mode = ConnectorTlsModeV2::Require;
+        assert_ne!(baseline, connection_fingerprint(&changed));
+    }
+
+    #[test]
     fn query_updates_serialize_event_fields_in_camel_case() {
         let progress = serde_json::to_value(QueryUpdate {
             request_id: "request-1".into(),
@@ -3159,10 +4089,13 @@ mod tests {
     fn native_connect_request() -> ConnectRequest {
         ConnectRequest {
             connector_id: NATIVE_CONNECTOR_ID.into(),
-            dialect: "postgresql".into(),
+            connector_kind: "sql".into(),
+            command_language: "postgresql-sql".into(),
+            dialect: Some("postgresql".into()),
             endpoint: "127.0.0.1:54329".into(),
             admin_endpoint: Some("http://127.0.0.1:9080".into()),
             database: Some("ordadb".into()),
+            tls_mode: ConnectorTlsModeV2::Disable,
             credential_id: "ordadb-local".into(),
         }
     }

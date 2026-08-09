@@ -17,7 +17,16 @@ export function StatusBar({ status, loading }: StatusBarProps) {
   const transactionActive = useWorkbenchStore(
     (state) => state.transactionActive,
   );
-  const dialectLabel = getSqlDialect(dialect).label;
+  const languageLabel =
+    connection?.connectorKind === "document"
+      ? "MongoDB JSON"
+      : connection?.connectorKind === "keyValue"
+        ? "Redis RESP3"
+        : `SQL · ${getSqlDialect(
+            connection?.mode === "preview"
+              ? dialect
+              : connection?.dialect ?? dialect,
+          ).label}`;
   const modeLabel = loading
     ? "状态检查中"
     : status?.mode === "desktop"
@@ -41,7 +50,7 @@ export function StatusBar({ status, loading }: StatusBarProps) {
           {transactionActive ? "事务进行中" : "自动提交"}
         </span>
         <span>UTF-8</span>
-        <span>SQL · {dialectLabel}</span>
+        <span>{languageLabel}</span>
         <span>{modeLabel}</span>
         <span>v{status?.version ?? "0.1.0"}</span>
       </div>

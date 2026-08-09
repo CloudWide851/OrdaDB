@@ -39,6 +39,30 @@ interface CatalogGroup {
 
 const catalogGroups: CatalogGroup[] = [
   { id: "tables", label: "表", icon: Table2, matches: (item) => item.kind === "table" },
+  {
+    id: "collections",
+    label: "集合",
+    icon: Layers3,
+    matches: (item) => item.kind === "collection",
+  },
+  {
+    id: "keyspaces",
+    label: "键空间",
+    icon: FolderTree,
+    matches: (item) => item.kind === "keyspace",
+  },
+  {
+    id: "keys",
+    label: "键",
+    icon: KeyRound,
+    matches: (item) => item.kind === "key",
+  },
+  {
+    id: "columns",
+    label: "列",
+    icon: ListOrdered,
+    matches: (item) => item.kind === "column",
+  },
   { id: "views", label: "视图", icon: Eye, matches: (item) => item.kind === "view" },
   {
     id: "materialized-views",
@@ -126,7 +150,8 @@ export function SchemaPane() {
             group.matches(object) &&
             (!normalized ||
               object.name.toLowerCase().includes(normalized) ||
-              object.schema.toLowerCase().includes(normalized)),
+              object.schema.toLowerCase().includes(normalized) ||
+              object.namespace?.toLowerCase().includes(normalized)),
         );
         return { ...group, objects };
       })
@@ -426,16 +451,22 @@ export function SchemaPane() {
                 group.objects.map((object) => (
                   <button
                     className={`tree-row tree-row--object ${
-                      selectedObject === object.name ? "tree-row--active" : ""
+                      selectedObject === catalogObjectIdentity(object)
+                        ? "tree-row--active"
+                        : ""
                     }`}
                     type="button"
                     aria-current={
-                      selectedObject === object.name ? "page" : undefined
+                      selectedObject === catalogObjectIdentity(object)
+                        ? "page"
+                        : undefined
                     }
-                    key={`${object.kind}:${object.schema}:${object.name}`}
+                    key={catalogObjectIdentity(object)}
                     onClick={() => {
-                      setSelectedObject(object.name);
-                      setNotice(`${object.schema}.${object.name} · 已选择`);
+                      setSelectedObject(catalogObjectIdentity(object));
+                      setNotice(
+                        `${(object.namespace ?? object.schema) || "Catalog"}.${object.name} · 已选择`,
+                      );
                     }}
                   >
                     <GroupIcon size={14} aria-hidden="true" />
@@ -485,4 +516,8 @@ export function SchemaPane() {
       )}
     </aside>
   );
+}
+
+function catalogObjectIdentity(object: DbmsCatalogObject) {
+  return object.id ?? `${object.kind}:${object.schema}:${object.name}`;
 }

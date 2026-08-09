@@ -14,8 +14,9 @@ use crate::{
     ConnectorErrorV3, ConnectorEventSinkV3, ConnectorIsolationLevelV2, ConnectorKindV3,
     ConnectorRequestV3, ConnectorResponseV3, ConnectorResultEventV3,
     ConnectorResultStreamValidatorV3, ConnectorSessionV3, ConnectorTransactionStateV2,
-    ProtocolReadyV3, read_connector_frame_v3, validate_capabilities_v3, validate_catalog_page_v3,
-    validate_catalog_request_v3, validate_command_v3, validate_endpoint, write_connector_frame_v3,
+    ProtocolReadyV3, read_connector_frame_v3, validate_capabilities_v3,
+    validate_capability_subset_v3, validate_catalog_page_v3, validate_catalog_request_v3,
+    validate_command_v3, validate_endpoint, write_connector_frame_v3,
 };
 
 const RESPONSE_CHANNEL_CAPACITY: usize = 64;
@@ -199,17 +200,10 @@ where
                 match driver.connect(endpoint, tls_mode, credential).await {
                     Ok(session) => {
                         let session_capabilities = session.capabilities().clone();
-                        validate_capabilities_v3(&session_capabilities)?;
-                        if session_capabilities != capabilities {
-                            send_error_v3(
-                                &responses,
-                                None,
-                                capabilities.kind,
-                                protocol_error(
-                                    "connector session capabilities differ from the handshake",
-                                ),
-                            )
-                            .await?;
+                        if let Err(error) =
+                            validate_capability_subset_v3(&capabilities, &session_capabilities)
+                        {
+                            send_error_v3(&responses, None, capabilities.kind, error).await?;
                             continue;
                         }
                         let (commands, command_rx) = mpsc::channel(SESSION_CHANNEL_CAPACITY);
@@ -218,13 +212,13 @@ where
                             command_rx,
                             responses.clone(),
                             Arc::clone(&active),
-                            capabilities.clone(),
+                            session_capabilities.clone(),
                         ));
                         sessions.insert(connection_id.clone(), commands);
                         responses
                             .send(ConnectorResponseV3::Connected {
                                 connection_id,
-                                capabilities: capabilities.clone(),
+                                capabilities: session_capabilities,
                             })
                             .await
                             .map_err(|_| connection_closed())?;

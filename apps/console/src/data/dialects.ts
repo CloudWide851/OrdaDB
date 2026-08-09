@@ -42,6 +42,30 @@ export const sqlDialects: readonly SqlDialectDescriptor[] = [
     paginationExample: "TOP 100",
     keywords: ["TOP", "NVARCHAR", "UNIQUEIDENTIFIER", "DATETIME", "ORDER BY"],
   },
+  {
+    id: "mariadb",
+    label: "MariaDB",
+    parameterExample: "?",
+    quoteExample: "`customer_id`",
+    paginationExample: "LIMIT 100",
+    keywords: ["RETURNING", "JSON", "UUID", "DATETIME", "LIMIT"],
+  },
+  {
+    id: "clickhouse",
+    label: "ClickHouse",
+    parameterExample: "{id:UInt64}",
+    quoteExample: "`customer_id`",
+    paginationExample: "LIMIT 100",
+    keywords: ["FINAL", "PREWHERE", "ARRAY JOIN", "FORMAT", "LIMIT"],
+  },
+  {
+    id: "oracle",
+    label: "Oracle",
+    parameterExample: ":1",
+    quoteExample: '"CUSTOMER_ID"',
+    paginationExample: "FETCH FIRST 100 ROWS ONLY",
+    keywords: ["ROWNUM", "VARCHAR2", "NUMBER", "MERGE", "FETCH"],
+  },
 ] as const;
 
 const descriptorById = new Map(

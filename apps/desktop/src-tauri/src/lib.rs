@@ -292,10 +292,10 @@ mod tests {
             bundled,
         ))
         .expect("activate production bundle");
-        for connector_id in ["postgresql", "mysql", "sqlite", "sql-server"] {
+        for descriptor in ordadb_connectors::OFFICIAL_CONNECTOR_DESCRIPTORS {
             assert!(
                 manager
-                    .active_entry(connector_id)
+                    .active_entry(descriptor.id)
                     .expect("active helper")
                     .is_file()
             );

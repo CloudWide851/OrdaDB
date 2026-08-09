@@ -129,11 +129,23 @@ export type DataSourceKind =
   | "postgresql"
   | "mysql"
   | "sqlite"
-  | "sqlServer";
+  | "sqlServer"
+  | "mongodb"
+  | "redis"
+  | "mariadb"
+  | "clickhouse"
+  | "oracle";
+
+export type ConnectorKind = "sql" | "document" | "keyValue";
+export type ConnectorEditorMode = "sql" | "json" | "plaintext";
 
 export interface ConnectorDescriptor {
   dataSourceKind: DataSourceKind;
   connectorId: string;
+  connectorKind: ConnectorKind;
+  commandLanguage: string;
+  editorMode: ConnectorEditorMode;
+  dialect?: SqlDialect;
   displayName: string;
   defaultEndpoint: string;
   defaultAdminEndpoint?: string;
@@ -144,16 +156,28 @@ export interface ConnectorDescriptor {
     | "require"
     | "verifyCa"
     | "verifyFull";
-  logoAsset: "ordadb" | "postgresql" | "mysql" | "sqlite" | "sql-server";
+  logoAsset:
+    | "ordadb"
+    | "postgresql"
+    | "mysql"
+    | "sqlite"
+    | "sql-server"
+    | "mongodb"
+    | "redis"
+    | "mariadb"
+    | "clickhouse"
+    | "oracle";
 }
 
-export interface ConnectionProfileV2 {
-  formatVersion: 2;
+export interface ConnectionProfileV3 {
+  formatVersion: 3;
   profileId: string;
   label: string;
   dataSourceKind: DataSourceKind;
   connectorId: string;
-  dialect: SqlDialect;
+  connectorKind: ConnectorKind;
+  commandLanguage: string;
+  dialect?: SqlDialect;
   endpoint: string;
   adminEndpoint?: string;
   database?: string;
@@ -166,7 +190,7 @@ export interface ConsoleBootstrap {
   settings: ConsoleSettingsV2;
   recovery: WorkspaceSessionV1 | null;
   recentFiles: RecentFileEntry[];
-  connectionProfiles: ConnectionProfileV2[];
+  connectionProfiles: ConnectionProfileV3[];
   connectorDescriptors: ConnectorDescriptor[];
 }
 
@@ -202,9 +226,9 @@ export interface ConsoleClient {
   trashEntry(rootPath: string, path: string): Promise<WorkspaceSnapshot>;
   saveSession(session: WorkspaceSessionV1): Promise<void>;
   saveConnectionProfile(
-    profile: ConnectionProfileV2,
-  ): Promise<ConnectionProfileV2[]>;
-  deleteConnectionProfile(profileId: string): Promise<ConnectionProfileV2[]>;
+    profile: ConnectionProfileV3,
+  ): Promise<ConnectionProfileV3[]>;
+  deleteConnectionProfile(profileId: string): Promise<ConnectionProfileV3[]>;
 }
 
 export const defaultConsoleSettings: ConsoleSettingsV2 = {
@@ -257,6 +281,10 @@ export const defaultConnectorDescriptors: ConnectorDescriptor[] = [
   {
     dataSourceKind: "ordadbNative",
     connectorId: "ordadb-native",
+    connectorKind: "sql",
+    commandLanguage: "postgresql-sql",
+    editorMode: "sql",
+    dialect: "postgresql",
     displayName: "OrdaDB",
     defaultEndpoint: "127.0.0.1:54329",
     defaultAdminEndpoint: "http://127.0.0.1:9080",
@@ -267,6 +295,10 @@ export const defaultConnectorDescriptors: ConnectorDescriptor[] = [
   {
     dataSourceKind: "postgresql",
     connectorId: "postgresql",
+    connectorKind: "sql",
+    commandLanguage: "postgresql-sql",
+    editorMode: "sql",
+    dialect: "postgresql",
     displayName: "PostgreSQL",
     defaultEndpoint: "127.0.0.1:5432",
     defaultDatabase: "postgres",
@@ -276,6 +308,10 @@ export const defaultConnectorDescriptors: ConnectorDescriptor[] = [
   {
     dataSourceKind: "mysql",
     connectorId: "mysql",
+    connectorKind: "sql",
+    commandLanguage: "mysql-sql",
+    editorMode: "sql",
+    dialect: "mysql",
     displayName: "MySQL",
     defaultEndpoint: "127.0.0.1:3306",
     defaultTlsMode: "prefer",
@@ -284,6 +320,10 @@ export const defaultConnectorDescriptors: ConnectorDescriptor[] = [
   {
     dataSourceKind: "sqlite",
     connectorId: "sqlite",
+    connectorKind: "sql",
+    commandLanguage: "sqlite-sql",
+    editorMode: "sql",
+    dialect: "sqlite",
     displayName: "SQLite",
     defaultEndpoint: "",
     defaultTlsMode: "disable",
@@ -292,10 +332,76 @@ export const defaultConnectorDescriptors: ConnectorDescriptor[] = [
   {
     dataSourceKind: "sqlServer",
     connectorId: "sql-server",
+    connectorKind: "sql",
+    commandLanguage: "sql-server-sql",
+    editorMode: "sql",
+    dialect: "sqlServer",
     displayName: "SQL Server",
     defaultEndpoint: "127.0.0.1:1433",
     defaultTlsMode: "require",
     logoAsset: "sql-server",
+  },
+  {
+    dataSourceKind: "mongodb",
+    connectorId: "mongodb",
+    connectorKind: "document",
+    commandLanguage: "mongodb-json",
+    editorMode: "json",
+    displayName: "MongoDB",
+    defaultEndpoint: "127.0.0.1:27017",
+    defaultDatabase: "admin",
+    defaultTlsMode: "prefer",
+    logoAsset: "mongodb",
+  },
+  {
+    dataSourceKind: "redis",
+    connectorId: "redis",
+    connectorKind: "keyValue",
+    commandLanguage: "redis-resp3",
+    editorMode: "plaintext",
+    displayName: "Redis",
+    defaultEndpoint: "127.0.0.1:6379",
+    defaultDatabase: "0",
+    defaultTlsMode: "disable",
+    logoAsset: "redis",
+  },
+  {
+    dataSourceKind: "mariadb",
+    connectorId: "mariadb",
+    connectorKind: "sql",
+    commandLanguage: "mariadb-sql",
+    editorMode: "sql",
+    dialect: "mariadb",
+    displayName: "MariaDB",
+    defaultEndpoint: "127.0.0.1:3306",
+    defaultTlsMode: "require",
+    logoAsset: "mariadb",
+  },
+  {
+    dataSourceKind: "clickhouse",
+    connectorId: "clickhouse",
+    connectorKind: "sql",
+    commandLanguage: "clickhouse-sql",
+    editorMode: "sql",
+    dialect: "clickhouse",
+    displayName: "ClickHouse",
+    defaultEndpoint: "127.0.0.1:8123",
+    defaultDatabase: "default",
+    defaultTlsMode: "disable",
+    logoAsset: "clickhouse",
+  },
+  {
+    dataSourceKind: "oracle",
+    connectorId: "oracle",
+    connectorKind: "sql",
+    commandLanguage: "oracle-sql",
+    editorMode: "sql",
+    dialect: "oracle",
+    displayName: "Oracle",
+    defaultEndpoint: "127.0.0.1:1521",
+    defaultDatabase: "ORCLPDB1",
+    defaultTlsMode: "disable",
+    logoAsset: "oracle",
   },
 ];
 
@@ -394,14 +500,14 @@ class TauriConsoleClient implements ConsoleClient {
     return invoke<void>("workspace_save_session", { session });
   }
 
-  saveConnectionProfile(profile: ConnectionProfileV2) {
-    return invoke<ConnectionProfileV2[]>("console_save_connection_profile", {
+  saveConnectionProfile(profile: ConnectionProfileV3) {
+    return invoke<ConnectionProfileV3[]>("console_save_connection_profile", {
       profile,
     });
   }
 
   deleteConnectionProfile(profileId: string) {
-    return invoke<ConnectionProfileV2[]>("console_delete_connection_profile", {
+    return invoke<ConnectionProfileV3[]>("console_delete_connection_profile", {
       profileId,
     });
   }
@@ -410,7 +516,7 @@ class TauriConsoleClient implements ConsoleClient {
 export class PreviewConsoleClient implements ConsoleClient {
   readonly mode = "preview";
   private settings = cloneConsoleSettings(defaultConsoleSettings);
-  private profiles: ConnectionProfileV2[] = [];
+  private profiles: ConnectionProfileV3[] = [];
   private session: WorkspaceSessionV1 = emptyPreviewSession();
   private revisionSequence = 3;
   private recentFiles: RecentFileEntry[] = [];
