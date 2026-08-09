@@ -111,7 +111,7 @@ class PreviewPluginManagerClient implements PluginManagerClient {
     return {
       registry: {
         availability: this.registryAvailability,
-        apiVersion: 2,
+        apiVersion: 3,
         message:
           this.registryAvailability === "configured"
             ? "Preview 插件目录 · 不执行网络或文件操作"

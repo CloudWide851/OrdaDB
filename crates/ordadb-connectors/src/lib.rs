@@ -27,7 +27,7 @@ use ordadb_types::DbError;
 
 pub const CONNECTOR_MANIFEST_VERSION: u32 = 1;
 pub const MIN_CONNECTOR_API_VERSION: u32 = 1;
-pub const CONNECTOR_API_VERSION: u32 = 2;
+pub const CONNECTOR_API_VERSION: u32 = 3;
 
 fn invalid(message: impl Into<String>) -> DbError {
     DbError::new("22023", message)
