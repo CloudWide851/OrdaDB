@@ -365,6 +365,116 @@
         "status": "not_captured",
         "gap": "No raw PostgreSQL 18 frontend/backend trace has been recorded for the pinned driver."
       }
+    },
+    {
+      "id": "plpgsql-routine-modes-001",
+      "category": "procedural_language",
+      "purpose": "Exercise IN, OUT, INOUT, top-level CALL output, nested exception handling, and structured RAISE behavior.",
+      "replayability": "engine_and_wire",
+      "source": {
+        "client": "psql, pgJDBC",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "PostgreSQL 18 PL/pgSQL routine and CALL result contract"
+      },
+      "steps": [
+        { "kind": "sql", "sql": "CREATE PROCEDURE public.ordadb_compat_mode_probe(IN input_value BIGINT, INOUT counter BIGINT, OUT doubled BIGINT) LANGUAGE plpgsql AS $$ BEGIN counter := counter + input_value; doubled := input_value * 2; EXCEPTION WHEN division_by_zero THEN RAISE EXCEPTION USING ERRCODE = '22012', MESSAGE = 'division by zero'; END $$" },
+        { "kind": "sql", "sql": "CALL public.ordadb_compat_mode_probe(3, 4)" },
+        { "kind": "sql", "sql": "DROP PROCEDURE public.ordadb_compat_mode_probe(BIGINT, BIGINT)" }
+      ],
+      "expected": {
+        "maxRows": 1,
+        "columnSets": [["counter", "doubled"]],
+        "rows": [["7", "6"]],
+        "commandTags": ["CREATE PROCEDURE", "CALL", "DROP PROCEDURE"]
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "PostgreSQL 18 CALL row description, nested handler behavior, and command tags have not been reference-captured."
+      }
+    },
+    {
+      "id": "trigger-statement-001",
+      "category": "triggers",
+      "purpose": "Prove a statement trigger fires once for both zero-row and non-zero-row updates.",
+      "replayability": "engine_and_wire",
+      "source": {
+        "client": "psql, pgJDBC",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "PostgreSQL 18 BEFORE/AFTER STATEMENT trigger contract"
+      },
+      "steps": [
+        { "kind": "sql", "sql": "CREATE TABLE public.ordadb_compat_trigger_target (id BIGINT PRIMARY KEY, payload TEXT NOT NULL)" },
+        { "kind": "sql", "sql": "CREATE TABLE public.ordadb_compat_trigger_audit (id BIGINT PRIMARY KEY, event_name TEXT NOT NULL)" },
+        { "kind": "sql", "sql": "CREATE FUNCTION public.ordadb_compat_statement_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO public.ordadb_compat_trigger_audit (id, event_name) VALUES (1, TG_OP); RETURN NULL; END $$" },
+        { "kind": "sql", "sql": "CREATE TRIGGER ordadb_compat_after_update AFTER UPDATE ON public.ordadb_compat_trigger_target FOR EACH STATEMENT EXECUTE FUNCTION public.ordadb_compat_statement_trigger()" },
+        { "kind": "sql", "sql": "UPDATE public.ordadb_compat_trigger_target SET payload = 'none' WHERE id = 999" },
+        { "kind": "sql", "sql": "SELECT count(*) AS fire_count FROM public.ordadb_compat_trigger_audit" },
+        { "kind": "sql", "sql": "DROP TABLE public.ordadb_compat_trigger_target CASCADE" },
+        { "kind": "sql", "sql": "DROP TABLE public.ordadb_compat_trigger_audit" },
+        { "kind": "sql", "sql": "DROP FUNCTION public.ordadb_compat_statement_trigger()" }
+      ],
+      "expected": {
+        "maxRows": 1,
+        "columnSets": [["fire_count"]],
+        "rows": [["1"]]
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "The zero-row statement-trigger firing sequence has not been captured from PostgreSQL 18."
+      }
+    },
+    {
+      "id": "reindex-maintenance-001",
+      "category": "maintenance",
+      "purpose": "Rebuild one synthetic index and verify the indexed relation remains queryable.",
+      "replayability": "engine_and_wire",
+      "source": {
+        "client": "psql, DataGrip",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "PostgreSQL 18 REINDEX INDEX command and error contract"
+      },
+      "steps": [
+        { "kind": "sql", "sql": "CREATE TABLE public.ordadb_compat_reindex_probe (id BIGINT PRIMARY KEY, payload TEXT NOT NULL)" },
+        { "kind": "sql", "sql": "CREATE INDEX ordadb_compat_reindex_payload ON public.ordadb_compat_reindex_probe (payload)" },
+        { "kind": "sql", "sql": "REINDEX INDEX public.ordadb_compat_reindex_payload" },
+        { "kind": "sql", "sql": "SELECT id FROM public.ordadb_compat_reindex_probe WHERE payload = 'missing' ORDER BY id" },
+        { "kind": "sql", "sql": "DROP TABLE public.ordadb_compat_reindex_probe" }
+      ],
+      "expected": {
+        "maxRows": 0,
+        "commandTags": ["CREATE TABLE", "CREATE INDEX", "REINDEX", "SELECT 0", "DROP TABLE"]
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "REINDEX locking, command tag, and post-rebuild plan evidence have not been captured from PostgreSQL 18."
+      }
+    },
+    {
+      "id": "listen-notify-001",
+      "category": "asynchronous_notifications",
+      "purpose": "Prove LISTEN and NOTIFY become visible at commit and preserve sender, channel, and payload.",
+      "replayability": "wire_and_client",
+      "source": {
+        "client": "psql, pgJDBC",
+        "captureStatus": "not_captured_from_live_client",
+        "basis": "PostgreSQL 18 transactional LISTEN/NOTIFY and NotificationResponse contract"
+      },
+      "steps": [
+        { "kind": "sql", "sql": "LISTEN ordadb_compat_channel" },
+        { "kind": "sql", "sql": "BEGIN" },
+        { "kind": "sql", "sql": "NOTIFY ordadb_compat_channel, 'committed-payload'" },
+        { "kind": "sql", "sql": "COMMIT" },
+        { "kind": "sql", "sql": "UNLISTEN ordadb_compat_channel" }
+      ],
+      "expected": {
+        "maxRows": 0,
+        "commandTags": ["LISTEN", "BEGIN", "NOTIFY", "COMMIT", "UNLISTEN"],
+        "notifications": [{ "channel": "ordadb_compat_channel", "payload": "committed-payload", "delivery": "after_commit" }]
+      },
+      "referenceResult": {
+        "status": "not_captured",
+        "gap": "No pinned PostgreSQL 18 NotificationResponse trace or OrdaDB multi-session execution has been captured."
+      }
     }
   ]
 }

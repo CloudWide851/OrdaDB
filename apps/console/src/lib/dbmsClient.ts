@@ -116,7 +116,12 @@ export type DbmsQueryEvent =
   | { kind: "schema"; columns: DbmsQueryColumn[] }
   | { kind: "batch"; rows: Array<Array<string | null>> }
   | { kind: "progress"; rowsProcessed: number }
-  | { kind: "notice"; message: string }
+  | {
+      kind: "notice";
+      severity: "INFO" | "NOTICE" | "WARNING";
+      sqlState: string;
+      message: string;
+    }
   | { kind: "complete"; commandTag: string; durationMs: number }
   | { kind: "error"; error: DbmsError };
 
@@ -719,6 +724,8 @@ async function* previewQueryEvents(
     };
     yield {
       kind: "notice",
+      severity: "NOTICE",
+      sqlState: "00000",
       message: "Preview 执行计划，不连接真实数据库",
     };
     yield { kind: "complete", commandTag: "EXPLAIN PREVIEW", durationMs: 12 };
@@ -747,6 +754,8 @@ async function* previewQueryEvents(
   yield { kind: "progress", rowsProcessed: 5 };
   yield {
     kind: "notice",
+    severity: "NOTICE",
+    sqlState: "00000",
     message: "Preview fixture · 不连接真实数据库",
   };
   yield { kind: "complete", commandTag: "SELECT 5 PREVIEW", durationMs: 36 };

@@ -129,6 +129,25 @@ fn alter_drop_and_views_publish_catalog_and_rows_together() {
         &engine,
         "ALTER VIEW app.item_names RENAME TO current_item_names",
     );
+    let catalog = engine
+        .catalog_snapshot()
+        .expect("catalog after view rename");
+    assert!(
+        catalog
+            .view(
+                &Identifier::unquoted("app"),
+                &Identifier::unquoted("current_item_names"),
+            )
+            .is_some()
+    );
+    assert!(
+        catalog
+            .view(
+                &Identifier::unquoted("app"),
+                &Identifier::unquoted("item_names"),
+            )
+            .is_none()
+    );
     execute(
         &engine,
         "CREATE VIEW app.nested_item_names AS SELECT * FROM app.current_item_names",
@@ -427,6 +446,25 @@ fn plpgsql_call_depth_and_cancellation_are_bounded_and_atomic() {
         .expect_err("routine depth limit");
     assert_eq!(depth.sql_state, "54001");
     assert!(rows(&engine, "SELECT * FROM app.audit").is_empty());
+
+    #[cfg(not(debug_assertions))]
+    {
+        let mut small_stack_session = engine.connect().expect("small-stack session");
+        let small_stack_state = std::thread::Builder::new()
+            .name("plpgsql-small-stack".into())
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                small_stack_session
+                    .execute("CALL app.recurse()", &[])
+                    .expect_err("small-stack routine depth limit")
+                    .sql_state
+            })
+            .expect("spawn small-stack worker")
+            .join()
+            .expect("join small-stack worker");
+        assert_eq!(small_stack_state, "54001");
+        assert!(rows(&engine, "SELECT * FROM app.audit").is_empty());
+    }
 
     execute(
         &engine,

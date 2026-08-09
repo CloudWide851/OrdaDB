@@ -487,6 +487,7 @@ fn query_event_v1(
             Ok(QueryEvent::Progress(QueryProgress { rows_processed }))
         }
         ConnectorQueryEventV2::Notice { notice } => Ok(QueryEvent::Notice(DbNotice {
+            severity: ordadb_types::DbNoticeSeverity::Notice,
             sql_state: notice.code.unwrap_or_else(|| "00000".into()),
             message: notice.message,
             detail: None,

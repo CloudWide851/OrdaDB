@@ -410,6 +410,19 @@ pub struct ViewDefinition {
     pub output: Schema,
     pub materialized_table_id: Option<TableId>,
     pub populated: bool,
+    #[serde(default)]
+    triggers: BTreeMap<Identifier, TriggerDefinition>,
+}
+
+impl ViewDefinition {
+    pub fn triggers(&self) -> impl Iterator<Item = &TriggerDefinition> {
+        self.triggers.values()
+    }
+
+    #[must_use]
+    pub fn trigger(&self, name: &Identifier) -> Option<&TriggerDefinition> {
+        self.triggers.get(name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -430,12 +443,36 @@ pub enum RoutineKind {
     Procedure,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutineArgumentMode {
+    #[default]
+    In,
+    Out,
+    InOut,
+    Variadic,
+}
+
+impl RoutineArgumentMode {
+    #[must_use]
+    pub const fn accepts_input(self) -> bool {
+        matches!(self, Self::In | Self::InOut | Self::Variadic)
+    }
+
+    #[must_use]
+    pub const fn produces_output(self) -> bool {
+        matches!(self, Self::Out | Self::InOut)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutineArgument {
     pub name: Option<Identifier>,
     pub data_type: ScalarType,
     #[serde(default)]
     pub declared_type: Option<TypeId>,
+    #[serde(default)]
+    pub mode: RoutineArgumentMode,
 }
 
 fn routine_arguments_have_same_type(left: &RoutineArgument, right: &RoutineArgument) -> bool {
@@ -443,6 +480,97 @@ fn routine_arguments_have_same_type(left: &RoutineArgument, right: &RoutineArgum
         (Some(left), Some(right)) => left == right,
         (None, None) => left.data_type == right.data_type,
         _ => false,
+    }
+}
+
+fn routine_input_signature_matches(left: &[RoutineArgument], right: &[RoutineArgument]) -> bool {
+    let mut left = left.iter().filter(|argument| argument.mode.accepts_input());
+    let mut right = right
+        .iter()
+        .filter(|argument| argument.mode.accepts_input());
+    loop {
+        match (left.next(), right.next()) {
+            (Some(left), Some(right)) if routine_arguments_have_same_type(left, right) => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn validate_routine_arguments(
+    kind: RoutineKind,
+    arguments: &[RoutineArgument],
+    return_type: Option<&ScalarType>,
+    returns_set: bool,
+) -> Result<()> {
+    const MAX_ROUTINE_ARGUMENTS: usize = 100;
+    if arguments.len() > MAX_ROUTINE_ARGUMENTS {
+        return Err(DbError::new(
+            "54000",
+            format!("routine argument count exceeds the maximum of {MAX_ROUTINE_ARGUMENTS}"),
+        ));
+    }
+
+    let mut names = BTreeSet::new();
+    for argument in arguments {
+        if let Some(name) = argument.name.as_ref()
+            && !names.insert(name.clone())
+        {
+            return Err(DbError::new(
+                "42P13",
+                format!("routine parameter name {name} is used more than once"),
+            ));
+        }
+    }
+
+    let variadic = arguments
+        .iter()
+        .enumerate()
+        .filter(|(_, argument)| argument.mode == RoutineArgumentMode::Variadic)
+        .collect::<Vec<_>>();
+    if variadic.len() > 1 {
+        return Err(DbError::new(
+            "42P13",
+            "a routine may declare at most one VARIADIC parameter",
+        ));
+    }
+    if let Some((index, argument)) = variadic.first().copied() {
+        if !matches!(argument.data_type, ScalarType::Array { .. }) {
+            return Err(DbError::new(
+                "42P13",
+                "VARIADIC parameter must have an array type",
+            ));
+        }
+        if arguments[index + 1..]
+            .iter()
+            .any(|argument| argument.mode.accepts_input())
+        {
+            return Err(DbError::new(
+                "42P13",
+                "VARIADIC parameter must be the last input parameter",
+            ));
+        }
+    }
+
+    let has_output_arguments = arguments
+        .iter()
+        .any(|argument| argument.mode.produces_output());
+    match kind {
+        RoutineKind::Function if has_output_arguments && return_type.is_some() => {
+            Err(DbError::new(
+                "42P13",
+                "function OUT parameters cannot be combined with an explicit return type",
+            ))
+        }
+        RoutineKind::Function if has_output_arguments && returns_set => Err(DbError::new(
+            "0A000",
+            "set-returning functions with OUT parameters are not supported yet",
+        )),
+        RoutineKind::Procedure if return_type.is_some() || returns_set => Err(DbError::new(
+            "42P13",
+            "procedures cannot declare a function return type",
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -459,6 +587,25 @@ pub struct RoutineDefinition {
     pub returns_set: bool,
     pub language: String,
     pub body: String,
+}
+
+impl RoutineDefinition {
+    pub fn input_arguments(&self) -> impl Iterator<Item = &RoutineArgument> {
+        self.arguments
+            .iter()
+            .filter(|argument| argument.mode.accepts_input())
+    }
+
+    pub fn output_arguments(&self) -> impl Iterator<Item = &RoutineArgument> {
+        self.arguments
+            .iter()
+            .filter(|argument| argument.mode.produces_output())
+    }
+
+    #[must_use]
+    pub fn input_arity(&self) -> usize {
+        self.input_arguments().count()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -480,6 +627,17 @@ pub struct NewRoutine {
 pub enum TriggerTiming {
     Before,
     After,
+    InsteadOf,
+    BeforeStatement,
+    AfterStatement,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerLevel {
+    #[default]
+    Row,
+    Statement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -490,15 +648,84 @@ pub enum TriggerEvent {
     Delete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum TriggerTarget {
+    Table(TableId),
+    View(ViewId),
+}
+
+impl TriggerTarget {
+    #[must_use]
+    pub const fn object_ref(self) -> CatalogObjectRef {
+        match self {
+            Self::Table(table_id) => CatalogObjectRef::Table(table_id),
+            Self::View(view_id) => CatalogObjectRef::View(view_id),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "TriggerDefinitionOwned")]
 pub struct TriggerDefinition {
     pub id: TriggerId,
-    pub table_id: TableId,
+    pub target: TriggerTarget,
     pub name: Identifier,
     pub timing: TriggerTiming,
+    #[serde(default)]
+    pub level: TriggerLevel,
     pub events: BTreeSet<TriggerEvent>,
     pub routine_id: RoutineId,
     pub enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct TriggerDefinitionOwned {
+    id: TriggerId,
+    #[serde(default)]
+    target: Option<TriggerTarget>,
+    #[serde(default)]
+    table_id: Option<TableId>,
+    name: Identifier,
+    timing: TriggerTiming,
+    #[serde(default)]
+    level: TriggerLevel,
+    events: BTreeSet<TriggerEvent>,
+    routine_id: RoutineId,
+    enabled: bool,
+}
+
+impl TryFrom<TriggerDefinitionOwned> for TriggerDefinition {
+    type Error = DbError;
+
+    fn try_from(encoded: TriggerDefinitionOwned) -> Result<Self> {
+        let target = match (encoded.target, encoded.table_id) {
+            (Some(target), None) => target,
+            (None, Some(table_id)) => TriggerTarget::Table(table_id),
+            (Some(_), Some(_)) => {
+                return Err(DbError::new(
+                    "XX001",
+                    "trigger catalog entry contains conflicting targets",
+                ));
+            }
+            (None, None) => {
+                return Err(DbError::new(
+                    "XX001",
+                    "trigger catalog entry is missing its target",
+                ));
+            }
+        };
+        Ok(Self {
+            id: encoded.id,
+            target,
+            name: encoded.name,
+            timing: encoded.timing,
+            level: encoded.level,
+            events: encoded.events,
+            routine_id: encoded.routine_id,
+            enabled: encoded.enabled,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1210,6 +1437,43 @@ impl TableDefinition {
         }
     }
 
+    pub fn expression_scope_for_schema(name: Identifier, schema: &Schema) -> Result<Self> {
+        let columns = schema
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let id = u64::try_from(index)
+                    .ok()
+                    .and_then(|index| index.checked_add(1))
+                    .map(ColumnId::new)
+                    .ok_or_else(|| {
+                        DbError::new("54000", "relation expression scope is too wide")
+                    })?;
+                Ok(ColumnDefinition {
+                    id,
+                    name: Identifier::unquoted(field.name.clone()),
+                    data_type: field.data_type.clone(),
+                    declared_type: None,
+                    nullable: field.nullable,
+                    primary_key: false,
+                    unique: false,
+                    default: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            id: TableId::new(1),
+            schema_id: SchemaId::new(1),
+            name,
+            columns,
+            indexes: BTreeMap::new(),
+            constraints: BTreeMap::new(),
+            triggers: BTreeMap::new(),
+            statistics: TableStatistics::default(),
+        })
+    }
+
     #[must_use]
     pub fn columns(&self) -> &[ColumnDefinition] {
         &self.columns
@@ -1573,6 +1837,12 @@ impl Catalog {
             objects.extend(schema.views().map(|view| PostgresOidObject::View(view.id)));
             objects.extend(
                 schema
+                    .views()
+                    .flat_map(ViewDefinition::triggers)
+                    .map(|trigger| PostgresOidObject::Trigger(trigger.id)),
+            );
+            objects.extend(
+                schema
                     .routines()
                     .map(|routine| PostgresOidObject::Routine(routine.id)),
             );
@@ -1724,6 +1994,12 @@ impl Catalog {
             objects.extend(schema.views().map(|view| CatalogObjectRef::View(view.id)));
             objects.extend(
                 schema
+                    .views()
+                    .flat_map(ViewDefinition::triggers)
+                    .map(|trigger| CatalogObjectRef::Trigger(trigger.id)),
+            );
+            objects.extend(
+                schema
                     .routines()
                     .map(|routine| CatalogObjectRef::Routine(routine.id)),
             );
@@ -1777,12 +2053,7 @@ impl Catalog {
             .iter()
             .find(|routine| {
                 routine.kind == kind
-                    && routine.arguments.len() == arguments.len()
-                    && routine
-                        .arguments
-                        .iter()
-                        .zip(arguments)
-                        .all(|(left, right)| routine_arguments_have_same_type(left, right))
+                    && routine_input_signature_matches(&routine.arguments, arguments)
             })
     }
 
@@ -3276,6 +3547,7 @@ impl Catalog {
                 output,
                 materialized_table_id,
                 populated,
+                triggers: BTreeMap::new(),
             },
         );
         self.next_view_id = next_view_id;
@@ -3302,6 +3574,7 @@ impl Catalog {
             replace,
             references,
         } = routine;
+        validate_routine_arguments(kind, &arguments, return_type.as_ref(), returns_set)?;
         let schema_id = self
             .schema(schema_name)
             .ok_or_else(|| DbError::new("3F000", format!("schema {schema_name} does not exist")))?
@@ -3347,12 +3620,7 @@ impl Catalog {
             .or_default();
         routines.retain(|routine| {
             !(routine.kind == kind
-                && routine.arguments.len() == arguments.len()
-                && routine
-                    .arguments
-                    .iter()
-                    .zip(&arguments)
-                    .all(|(left, right)| routine_arguments_have_same_type(left, right)))
+                && routine_input_signature_matches(&routine.arguments, &arguments))
         });
         routines.push(RoutineDefinition {
             id,
@@ -3387,17 +3655,95 @@ impl Catalog {
         events: BTreeSet<TriggerEvent>,
         routine_id: RoutineId,
     ) -> Result<TriggerId> {
-        self.ensure_writable_table_id(table_id)?;
+        self.create_trigger_on_target_with_level(
+            TriggerTarget::Table(table_id),
+            name,
+            timing,
+            TriggerLevel::Row,
+            events,
+            routine_id,
+        )
+    }
+
+    pub fn create_trigger_with_level(
+        &mut self,
+        table_id: TableId,
+        name: Identifier,
+        timing: TriggerTiming,
+        level: TriggerLevel,
+        events: BTreeSet<TriggerEvent>,
+        routine_id: RoutineId,
+    ) -> Result<TriggerId> {
+        self.create_trigger_on_target_with_level(
+            TriggerTarget::Table(table_id),
+            name,
+            timing,
+            level,
+            events,
+            routine_id,
+        )
+    }
+
+    pub fn create_trigger_on_target_with_level(
+        &mut self,
+        target: TriggerTarget,
+        name: Identifier,
+        timing: TriggerTiming,
+        level: TriggerLevel,
+        events: BTreeSet<TriggerEvent>,
+        routine_id: RoutineId,
+    ) -> Result<TriggerId> {
+        let activation_is_valid = match target {
+            TriggerTarget::Table(table_id) => {
+                self.ensure_writable_table_id(table_id)?;
+                if self.table_by_id(table_id).is_none() {
+                    return Err(DbError::new("42P01", "trigger owner table does not exist"));
+                }
+                matches!(
+                    (timing, level),
+                    (
+                        TriggerTiming::Before | TriggerTiming::After,
+                        TriggerLevel::Row
+                    ) | (
+                        TriggerTiming::BeforeStatement | TriggerTiming::AfterStatement,
+                        TriggerLevel::Statement
+                    )
+                )
+            }
+            TriggerTarget::View(view_id) => {
+                let view = self
+                    .view_by_id(view_id)
+                    .ok_or_else(|| DbError::new("42P01", "trigger owner view does not exist"))?;
+                if view.kind != ViewKind::Regular {
+                    return Err(DbError::new(
+                        "42809",
+                        "triggers cannot target materialized views",
+                    ));
+                }
+                timing == TriggerTiming::InsteadOf && level == TriggerLevel::Row
+            }
+        };
+        if !activation_is_valid {
+            return Err(DbError::new(
+                "0A000",
+                "trigger timing and level are not supported for this relation kind",
+            ));
+        }
         if events.is_empty() {
             return Err(DbError::new(
                 "42601",
                 "a trigger must contain at least one event",
             ));
         }
-        let table = self
-            .table_by_id(table_id)
-            .ok_or_else(|| DbError::new("42P01", "trigger owner table does not exist"))?;
-        if table.trigger(&name).is_some() {
+        let duplicate = match target {
+            TriggerTarget::Table(table_id) => self
+                .table_by_id(table_id)
+                .is_some_and(|table| table.trigger(&name).is_some()),
+            TriggerTarget::View(view_id) => self
+                .view_by_id(view_id)
+                .is_some_and(|view| view.trigger(&name).is_some()),
+        };
+        if duplicate {
             return Err(DbError::new(
                 "42710",
                 format!("trigger {name} already exists"),
@@ -3414,20 +3760,30 @@ impl Catalog {
             .ok_or_else(|| DbError::new("54000", "catalog trigger ID space is exhausted"))?;
         let object = CatalogObjectRef::Trigger(id);
         let mut dependencies = self.dependencies.clone();
-        dependencies.add(object, CatalogObjectRef::Table(table_id))?;
+        dependencies.add(object, target.object_ref())?;
         dependencies.add(object, CatalogObjectRef::Routine(routine_id))?;
-        self.table_by_id_mut(table_id)?.triggers.insert(
-            name.clone(),
-            TriggerDefinition {
-                id,
-                table_id,
-                name,
-                timing,
-                events,
-                routine_id,
-                enabled: true,
-            },
-        );
+        let definition = TriggerDefinition {
+            id,
+            target,
+            name: name.clone(),
+            timing,
+            level,
+            events,
+            routine_id,
+            enabled: true,
+        };
+        match target {
+            TriggerTarget::Table(table_id) => {
+                self.table_by_id_mut(table_id)?
+                    .triggers
+                    .insert(name, definition);
+            }
+            TriggerTarget::View(view_id) => {
+                self.view_by_id_mut(view_id)?
+                    .triggers
+                    .insert(name, definition);
+            }
+        }
         self.next_trigger_id = next_trigger_id;
         self.dependencies = dependencies;
         self.publish_postgres_oid_candidate(oid_registry)?;
@@ -3631,7 +3987,23 @@ impl Catalog {
         if self.view_by_id(view_id).is_none() {
             return Err(DbError::new("42P01", "view does not exist"));
         }
-        self.drop_catalog_object(CatalogObjectRef::View(view_id), behavior)
+        let root = CatalogObjectRef::View(view_id);
+        if behavior == DropBehavior::Restrict {
+            let external = self
+                .dependencies
+                .dependents(root)
+                .filter(|object| !self.object_is_owned_by_view(*object, view_id))
+                .collect::<Vec<_>>();
+            if !external.is_empty() {
+                return Err(DbError::new(
+                    "2BP01",
+                    "cannot drop view because other objects depend on it",
+                )
+                .with_detail(format!("dependents: {external:?}"))
+                .with_hint("Use DROP VIEW ... CASCADE to remove dependent objects."));
+            }
+        }
+        self.drop_catalog_object(root, DropBehavior::Cascade)
     }
 
     pub fn drop_routine(
@@ -3722,8 +4094,12 @@ impl Catalog {
     pub fn trigger_by_id(&self, trigger_id: TriggerId) -> Option<&TriggerDefinition> {
         self.database
             .schemas()
-            .flat_map(SchemaDefinition::tables)
-            .flat_map(TableDefinition::triggers)
+            .flat_map(|schema| {
+                schema
+                    .tables()
+                    .flat_map(TableDefinition::triggers)
+                    .chain(schema.views().flat_map(ViewDefinition::triggers))
+            })
             .find(|trigger| trigger.id == trigger_id)
     }
 
@@ -3819,13 +4195,25 @@ impl Catalog {
     }
 
     fn trigger_by_id_mut(&mut self, trigger_id: TriggerId) -> Result<&mut TriggerDefinition> {
-        self.database
-            .schemas
-            .values_mut()
-            .flat_map(|schema| schema.tables.values_mut())
-            .flat_map(|table| table.triggers.values_mut())
-            .find(|trigger| trigger.id == trigger_id)
-            .ok_or_else(|| DbError::new("42704", "trigger does not exist"))
+        for schema in self.database.schemas.values_mut() {
+            if let Some(trigger) = schema
+                .tables
+                .values_mut()
+                .flat_map(|table| table.triggers.values_mut())
+                .find(|trigger| trigger.id == trigger_id)
+            {
+                return Ok(trigger);
+            }
+            if let Some(trigger) = schema
+                .views
+                .values_mut()
+                .flat_map(|view| view.triggers.values_mut())
+                .find(|trigger| trigger.id == trigger_id)
+            {
+                return Ok(trigger);
+            }
+        }
+        Err(DbError::new("42704", "trigger does not exist"))
     }
 
     fn object_is_owned_by_table(&self, object: CatalogObjectRef, table_id: TableId) -> bool {
@@ -3839,9 +4227,15 @@ impl Catalog {
                 .is_some_and(|constraint| constraint.table_id == table_id),
             CatalogObjectRef::Trigger(trigger_id) => self
                 .trigger_by_id(trigger_id)
-                .is_some_and(|trigger| trigger.table_id == table_id),
+                .is_some_and(|trigger| trigger.target == TriggerTarget::Table(table_id)),
             _ => false,
         }
+    }
+
+    fn object_is_owned_by_view(&self, object: CatalogObjectRef, view_id: ViewId) -> bool {
+        matches!(object, CatalogObjectRef::Trigger(trigger_id) if self
+            .trigger_by_id(trigger_id)
+            .is_some_and(|trigger| trigger.target == TriggerTarget::View(view_id)))
     }
 
     fn drop_catalog_object(
@@ -4006,6 +4400,9 @@ impl Catalog {
                     for table in schema.tables.values_mut() {
                         table.triggers.retain(|_, trigger| trigger.id != trigger_id);
                     }
+                    for view in schema.views.values_mut() {
+                        view.triggers.retain(|_, trigger| trigger.id != trigger_id);
+                    }
                 }
             }
             CatalogObjectRef::Type(type_id) => {
@@ -4134,9 +4531,10 @@ mod tests {
         PG_CATALOG_SCHEMA_ID, PG_COLLATION_TABLE_ID, PG_DESCRIPTION_TABLE_ID,
         PG_NAMESPACE_TABLE_ID, POSTGRES_OID_EXHAUSTED, POSTGRES_OID_FIRST_USER,
         POSTGRES_OID_LAST_BUILTIN, PostgresOid, PostgresOidObject, ReferentialAction,
-        RoutineArgument, RoutineKind, SchemaDefinition, TableDefinition, TableStatistics,
-        TriggerEvent, TriggerTiming, UserDefinedTypeKind, VectorDistanceMetric, ViewKind,
-        system_relation, system_relations,
+        RoutineArgument, RoutineArgumentMode, RoutineKind, SchemaDefinition, TableDefinition,
+        TableStatistics, TriggerDefinition, TriggerEvent, TriggerLevel, TriggerTarget,
+        TriggerTiming, UserDefinedTypeKind, VectorDistanceMetric, ViewKind, system_relation,
+        system_relations,
     };
 
     struct OidFixture {
@@ -4659,6 +5057,7 @@ mod tests {
                         name: Some(Identifier::unquoted("value")),
                         data_type: ScalarType::Int64,
                         declared_type: None,
+                        mode: Default::default(),
                     }],
                     return_type: Some(ScalarType::Int64),
                     return_declared_type: None,
@@ -4945,6 +5344,7 @@ mod tests {
                         name: Some(Identifier::unquoted("value")),
                         data_type: enum_data_type,
                         declared_type: Some(enum_id),
+                        mode: Default::default(),
                     }],
                     return_type: Some(ScalarType::Int32),
                     return_declared_type: Some(domain_id),
@@ -5595,5 +5995,204 @@ mod tests {
             .expect_err("legacy system table rename");
         assert_eq!(table_error.sql_state, "42501");
         assert_eq!(catalog, before);
+    }
+
+    #[test]
+    fn routine_modes_use_input_signatures_and_legacy_defaults() {
+        let legacy: RoutineArgument = serde_json::from_value(serde_json::json!({
+            "name": null,
+            "data_type": "int64",
+            "declared_type": null
+        }))
+        .expect("legacy routine argument");
+        assert_eq!(legacy.mode, RoutineArgumentMode::In);
+
+        let mut catalog = Catalog::default();
+        let routine = |output_type| NewRoutine {
+            name: Identifier::unquoted("mode_probe"),
+            kind: RoutineKind::Procedure,
+            arguments: vec![
+                RoutineArgument {
+                    name: Some(Identifier::unquoted("input_value")),
+                    data_type: ScalarType::Int64,
+                    declared_type: None,
+                    mode: RoutineArgumentMode::In,
+                },
+                RoutineArgument {
+                    name: Some(Identifier::unquoted("output_value")),
+                    data_type: output_type,
+                    declared_type: None,
+                    mode: RoutineArgumentMode::Out,
+                },
+            ],
+            return_type: None,
+            return_declared_type: None,
+            returns_set: false,
+            language: "plpgsql".into(),
+            body: "BEGIN RETURN; END".into(),
+            replace: false,
+            references: Vec::new(),
+        };
+        catalog
+            .create_or_replace_routine(&Identifier::unquoted("public"), routine(ScalarType::Text))
+            .expect("first input signature");
+        let duplicate = catalog
+            .create_or_replace_routine(&Identifier::unquoted("public"), routine(ScalarType::Int32))
+            .expect_err("OUT type does not change the input signature");
+        assert_eq!(duplicate.sql_state, "42723");
+    }
+
+    #[test]
+    fn trigger_level_defaults_to_row_and_validates_activation() {
+        let legacy: TriggerDefinition = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "table_id": 1,
+            "name": "u:legacy_trigger",
+            "timing": "before",
+            "events": ["insert"],
+            "routine_id": 1,
+            "enabled": true
+        }))
+        .expect("legacy trigger definition");
+        assert_eq!(legacy.level, TriggerLevel::Row);
+        assert_eq!(legacy.target, TriggerTarget::Table(TableId::new(1)));
+
+        let mut catalog = Catalog::default();
+        let table_id = catalog
+            .create_table(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("trigger_level_probe"),
+                vec![NewColumn::new(
+                    Identifier::unquoted("id"),
+                    ScalarType::Int64,
+                )],
+            )
+            .expect("table");
+        let routine_id = catalog
+            .create_or_replace_routine(
+                &Identifier::unquoted("public"),
+                NewRoutine {
+                    name: Identifier::unquoted("trigger_level_fn"),
+                    kind: RoutineKind::Function,
+                    arguments: Vec::new(),
+                    return_type: None,
+                    return_declared_type: None,
+                    returns_set: false,
+                    language: "plpgsql".into(),
+                    body: "BEGIN RETURN; END".into(),
+                    replace: false,
+                    references: Vec::new(),
+                },
+            )
+            .expect("trigger routine");
+        let trigger_id = catalog
+            .create_trigger_with_level(
+                table_id,
+                Identifier::unquoted("statement_trigger"),
+                TriggerTiming::AfterStatement,
+                TriggerLevel::Statement,
+                BTreeSet::from([TriggerEvent::Insert]),
+                routine_id,
+            )
+            .expect("statement trigger");
+        assert_eq!(
+            catalog.trigger_by_id(trigger_id).expect("trigger").level,
+            TriggerLevel::Statement
+        );
+        let invalid = catalog
+            .create_trigger_with_level(
+                table_id,
+                Identifier::unquoted("invalid_trigger"),
+                TriggerTiming::After,
+                TriggerLevel::Statement,
+                BTreeSet::from([TriggerEvent::Insert]),
+                routine_id,
+            )
+            .expect_err("row timing cannot be statement level");
+        assert_eq!(invalid.sql_state, "0A000");
+    }
+
+    #[test]
+    fn regular_view_instead_of_triggers_round_trip_drop_with_owner_and_fail_closed() {
+        let mut catalog = Catalog::default();
+        let table_id = catalog
+            .create_table(
+                &Identifier::unquoted("public"),
+                Identifier::unquoted("view_trigger_rows"),
+                vec![NewColumn::new(
+                    Identifier::unquoted("id"),
+                    ScalarType::Int64,
+                )],
+            )
+            .expect("table");
+        let view_id = catalog
+            .create_view(
+                &Identifier::unquoted("public"),
+                NewView {
+                    name: Identifier::unquoted("view_trigger_target"),
+                    kind: ViewKind::Regular,
+                    query: "SELECT id FROM view_trigger_rows".into(),
+                    output: Schema::new(vec![ordadb_types::Field::new(
+                        "id",
+                        ScalarType::Int64,
+                        false,
+                    )]),
+                    materialized_table_id: None,
+                    populated: true,
+                    references: vec![CatalogObjectRef::Table(table_id)],
+                },
+            )
+            .expect("view");
+        let routine_id = catalog
+            .create_or_replace_routine(
+                &Identifier::unquoted("public"),
+                NewRoutine {
+                    name: Identifier::unquoted("view_trigger_fn"),
+                    kind: RoutineKind::Function,
+                    arguments: Vec::new(),
+                    return_type: None,
+                    return_declared_type: None,
+                    returns_set: false,
+                    language: "plpgsql".into(),
+                    body: "BEGIN RETURN NEW; END".into(),
+                    replace: false,
+                    references: Vec::new(),
+                },
+            )
+            .expect("routine");
+        let trigger_id = catalog
+            .create_trigger_on_target_with_level(
+                TriggerTarget::View(view_id),
+                Identifier::unquoted("view_trigger"),
+                TriggerTiming::InsteadOf,
+                TriggerLevel::Row,
+                BTreeSet::from([TriggerEvent::Insert]),
+                routine_id,
+            )
+            .expect("view trigger");
+        assert_eq!(
+            catalog.trigger_by_id(trigger_id).expect("trigger").target,
+            TriggerTarget::View(view_id)
+        );
+
+        let encoded = serde_json::to_value(&catalog).expect("serialize catalog");
+        let reopened: Catalog = serde_json::from_value(encoded.clone()).expect("reopen catalog");
+        assert_eq!(reopened, catalog);
+
+        let mut downgraded = encoded;
+        downgraded["database"]["schemas"]["u:public"]["views"]["u:view_trigger_target"]
+            .as_object_mut()
+            .expect("view object")
+            .remove("triggers");
+        let error = serde_json::from_value::<Catalog>(downgraded)
+            .expect_err("old projection must not silently discard a view trigger");
+        assert!(error.to_string().contains("OID registry"));
+
+        let removed = catalog
+            .drop_view(view_id, DropBehavior::Restrict)
+            .expect("owned view trigger drops with view");
+        assert!(removed.contains(&CatalogObjectRef::Trigger(trigger_id)));
+        assert!(catalog.trigger_by_id(trigger_id).is_none());
+        assert!(catalog.view_by_id(view_id).is_none());
     }
 }

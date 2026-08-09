@@ -230,6 +230,9 @@ static SYSTEM_RELATIONS: &[SystemRelationDescriptor] = &[
             column!(9, 6, "proretset", ScalarType::Boolean, false),
             column!(9, 7, "proargtypes", ScalarType::Text, false),
             column!(9, 8, "prolang", ScalarType::Text, false),
+            column!(9, 9, "proallargtypes", ScalarType::Text, true),
+            column!(9, 10, "proargmodes", ScalarType::Text, true),
+            column!(9, 11, "proargnames", ScalarType::Text, true),
         ],
     },
     SystemRelationDescriptor {
@@ -246,6 +249,7 @@ static SYSTEM_RELATIONS: &[SystemRelationDescriptor] = &[
             column!(10, 4, "tgenabled", ScalarType::InternalChar, false),
             column!(10, 5, "tgisinternal", ScalarType::Boolean, false),
             column!(10, 6, "tgfoid", ScalarType::Oid, false),
+            column!(10, 7, "tgtype", ScalarType::Int16, false),
         ],
     },
     SystemRelationDescriptor {

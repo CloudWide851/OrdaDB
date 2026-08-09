@@ -12,11 +12,12 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use ordadb_types::{DbError, Result};
+use ordadb_types::{DbError, DbNotice, DbNoticeSeverity, DbObjectIdentity, Result};
 
 use crate::codec::{CANCEL_REQUEST_CODE, PROTOCOL_VERSION_3, io_error, protocol};
 
 const CLIENT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const CLIENT_MAX_PENDING_NOTICES: usize = 1_024;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_CLIENT_BATCH_ROWS: usize = 1_024;
 
@@ -35,6 +36,7 @@ pub struct PgClient {
     process_id: u32,
     secret_key: u32,
     transaction_status: PgTransactionStatus,
+    pending_notices: Vec<DbNotice>,
 }
 
 #[derive(Clone)]
@@ -71,6 +73,8 @@ pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
     pub command_tags: Vec<String>,
+    pub notices: Vec<DbNotice>,
+    pub notifications: Vec<PgNotification>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -85,7 +89,16 @@ pub enum PgTransactionStatus {
 pub enum PgQueryEvent {
     Schema(Vec<String>),
     Batch(Vec<Vec<Option<String>>>),
+    Notice(DbNotice),
     Complete(String),
+    Notification(PgNotification),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgNotification {
+    pub sender_process_id: u32,
+    pub channel: String,
+    pub payload: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -116,6 +129,7 @@ impl PgClient {
 
         let mut process_id = 0;
         let mut secret_key = 0;
+        let mut pending_notices = Vec::new();
         let mut scram = ClientScram::new(&config.user, config.password.as_bytes());
         let transaction_status = loop {
             let message = read_backend(&mut stream)?;
@@ -132,7 +146,10 @@ impl PgClient {
                 }
                 b'E' => return Err(decode_error(&message.payload)),
                 b'Z' => break decode_ready_status(&message.payload)?,
-                b'S' | b'N' => {}
+                b'N' => {
+                    push_pending_notice(&mut pending_notices, decode_notice(&message.payload)?)?
+                }
+                b'S' => {}
                 other => {
                     return Err(protocol(format!(
                         "unexpected backend message 0x{other:02x} during startup"
@@ -149,12 +166,17 @@ impl PgClient {
             process_id,
             secret_key,
             transaction_status,
+            pending_notices,
         })
     }
 
     #[must_use]
     pub const fn transaction_status(&self) -> PgTransactionStatus {
         self.transaction_status
+    }
+
+    pub fn take_notices(&mut self) -> Vec<DbNotice> {
+        std::mem::take(&mut self.pending_notices)
     }
 
     pub fn query(&mut self, sql: &str) -> Result<QueryResult> {
@@ -200,6 +222,25 @@ impl PgClient {
             Ok(())
         })?;
         Ok(result)
+    }
+
+    pub fn read_notification(&mut self) -> Result<PgNotification> {
+        loop {
+            let message = read_backend(&mut self.stream)?;
+            match message.tag {
+                b'A' => return decode_notification(&message.payload),
+                b'E' => return Err(decode_error(&message.payload)),
+                b'N' => {
+                    let notice = decode_notice(&message.payload)?;
+                    push_pending_notice(&mut self.pending_notices, notice)?;
+                }
+                other => {
+                    return Err(protocol(format!(
+                        "unexpected backend message 0x{other:02x} while waiting for a notification"
+                    )));
+                }
+            }
+        }
     }
 
     pub fn query_prepared_batches(
@@ -266,7 +307,7 @@ impl PgClient {
 
     pub fn copy_to_stdout(&mut self, table: &str) -> Result<CopyOutResult> {
         validate_copy_table(table)?;
-        self.write_query(&format!("COPY {table} TO STDOUT"))?;
+        self.write_query(&format!("COPY {table} TO STDOUT WITH (FORMAT csv)"))?;
         let mut result = CopyOutResult::default();
         let mut pending_error = None;
         loop {
@@ -274,7 +315,14 @@ impl PgClient {
             match message.tag {
                 b'H' => result.columns = decode_copy_response(&message.payload)?,
                 b'd' => result.data.extend_from_slice(&message.payload),
-                b'c' | b'N' | b'I' => {}
+                b'A' => {
+                    let _ = decode_notification(&message.payload)?;
+                }
+                b'N' => {
+                    let notice = decode_notice(&message.payload)?;
+                    push_pending_notice(&mut self.pending_notices, notice)?;
+                }
+                b'c' | b'I' => {}
                 b'C' => {
                     result.command_tag = decode_only_cstring(&message.payload, "CommandComplete")?;
                 }
@@ -294,7 +342,7 @@ impl PgClient {
 
     pub fn copy_from_stdin(&mut self, table: &str, data: &[u8]) -> Result<String> {
         validate_copy_table(table)?;
-        self.write_query(&format!("COPY {table} FROM STDIN"))?;
+        self.write_query(&format!("COPY {table} FROM STDIN WITH (FORMAT csv)"))?;
         let mut pending_error = None;
         let mut copy_started = false;
         let mut command_tag = String::new();
@@ -313,7 +361,14 @@ impl PgClient {
                     command_tag = decode_only_cstring(&message.payload, "CommandComplete")?;
                 }
                 b'E' => pending_error = Some(decode_error(&message.payload)),
-                b'N' | b'I' => {}
+                b'A' => {
+                    let _ = decode_notification(&message.payload)?;
+                }
+                b'N' => {
+                    let notice = decode_notice(&message.payload)?;
+                    push_pending_notice(&mut self.pending_notices, notice)?;
+                }
+                b'I' => {}
                 b'Z' => {
                     self.transaction_status = decode_ready_status(&message.payload)?;
                     if let Some(error) = pending_error {
@@ -398,6 +453,23 @@ impl PgClient {
                     deliver_query_event(on_event, &mut callback_error, PgQueryEvent::Complete(tag));
                 }
                 b'E' => pending_error = Some(decode_error(&message.payload)),
+                b'A' => {
+                    let notification = decode_notification(&message.payload)?;
+                    deliver_query_event(
+                        on_event,
+                        &mut callback_error,
+                        PgQueryEvent::Notification(notification),
+                    );
+                }
+                b'N' => {
+                    flush_query_rows(on_event, &mut callback_error, &mut rows);
+                    let notice = decode_notice(&message.payload)?;
+                    deliver_query_event(
+                        on_event,
+                        &mut callback_error,
+                        PgQueryEvent::Notice(notice),
+                    );
+                }
                 b's' => suspended = true,
                 b'Z' => {
                     self.transaction_status = decode_ready_status(&message.payload)?;
@@ -407,7 +479,7 @@ impl PgClient {
                     }
                     return callback_error.map_or(Ok(suspended), Err);
                 }
-                b'1' | b'2' | b'3' | b'N' | b'I' | b'n' => {}
+                b'1' | b'2' | b'3' | b'I' | b'n' => {}
                 b'H' | b'G' | b'd' | b'c' => {
                     return Err(DbError::new(
                         "0A000",
@@ -465,7 +537,9 @@ fn collect_query_event(result: &mut QueryResult, event: PgQueryEvent) {
     match event {
         PgQueryEvent::Schema(columns) => result.columns = columns,
         PgQueryEvent::Batch(rows) => result.rows.extend(rows),
+        PgQueryEvent::Notice(notice) => result.notices.push(notice),
         PgQueryEvent::Complete(tag) => result.command_tags.push(tag),
+        PgQueryEvent::Notification(notification) => result.notifications.push(notification),
     }
 }
 
@@ -802,19 +876,35 @@ fn decode_data_row(payload: &[u8], expected: usize) -> Result<Vec<Option<String>
     Ok(row)
 }
 
-fn decode_error(payload: &[u8]) -> DbError {
-    let mut fields = std::collections::BTreeMap::new();
-    let mut offset = 0;
-    while offset < payload.len() && payload[offset] != 0 {
-        let tag = payload[offset];
-        offset += 1;
-        let Some(end) = payload[offset..].iter().position(|byte| *byte == 0) else {
-            return protocol("ErrorResponse field is not terminated");
-        };
-        let value = String::from_utf8_lossy(&payload[offset..offset + end]).into_owned();
-        fields.insert(tag, value);
-        offset += end + 1;
+fn push_pending_notice(notices: &mut Vec<DbNotice>, notice: DbNotice) -> Result<()> {
+    if notices.len() >= CLIENT_MAX_PENDING_NOTICES {
+        return Err(DbError::new(
+            "54000",
+            "PostgreSQL client pending-notice limit exceeded",
+        ));
     }
+    notices.push(notice);
+    Ok(())
+}
+
+fn decode_notification(payload: &[u8]) -> Result<PgNotification> {
+    let mut cursor = SliceCursor::new(payload);
+    let sender_process_id = cursor.u32()?;
+    let channel = cursor.cstring()?;
+    let payload = cursor.cstring()?;
+    cursor.finish()?;
+    Ok(PgNotification {
+        sender_process_id,
+        channel,
+        payload,
+    })
+}
+
+fn decode_error(payload: &[u8]) -> DbError {
+    let fields = match decode_response_fields(payload, "ErrorResponse") {
+        Ok(fields) => fields,
+        Err(error) => return error,
+    };
     let mut error = DbError::new(
         fields.get(&b'C').cloned().unwrap_or_else(|| "XX000".into()),
         fields
@@ -850,6 +940,84 @@ fn decode_error(payload: &[u8]) -> DbError {
         error = error.with_constraint_name(name.clone());
     }
     error
+}
+
+fn decode_notice(payload: &[u8]) -> Result<DbNotice> {
+    let fields = decode_response_fields(payload, "NoticeResponse")?;
+    let severity = match fields
+        .get(&b'V')
+        .or_else(|| fields.get(&b'S'))
+        .map(String::as_str)
+    {
+        Some("INFO") => DbNoticeSeverity::Info,
+        Some("NOTICE") | None => DbNoticeSeverity::Notice,
+        Some("WARNING") => DbNoticeSeverity::Warning,
+        Some(severity) => {
+            return Err(protocol(format!(
+                "NoticeResponse severity {severity} is not supported"
+            )));
+        }
+    };
+    let position = fields
+        .get(&b'P')
+        .map(|position| {
+            position
+                .parse::<usize>()
+                .map_err(|_| protocol("NoticeResponse position is invalid"))
+        })
+        .transpose()?;
+    let identity = DbObjectIdentity {
+        schema_name: fields.get(&b's').cloned().map(String::into_boxed_str),
+        table_name: fields.get(&b't').cloned().map(String::into_boxed_str),
+        column_name: fields.get(&b'c').cloned().map(String::into_boxed_str),
+        data_type_name: fields.get(&b'd').cloned().map(String::into_boxed_str),
+        constraint_name: fields.get(&b'n').cloned().map(String::into_boxed_str),
+    };
+    let object_identity = (identity.schema_name.is_some()
+        || identity.table_name.is_some()
+        || identity.column_name.is_some()
+        || identity.data_type_name.is_some()
+        || identity.constraint_name.is_some())
+    .then(|| Box::new(identity));
+    Ok(DbNotice {
+        severity,
+        sql_state: fields.get(&b'C').cloned().unwrap_or_else(|| "00000".into()),
+        message: fields
+            .get(&b'M')
+            .cloned()
+            .unwrap_or_else(|| "server notice".into()),
+        detail: fields.get(&b'D').cloned().map(String::into_boxed_str),
+        hint: fields.get(&b'H').cloned().map(String::into_boxed_str),
+        position,
+        object_identity,
+    })
+}
+
+fn decode_response_fields(
+    payload: &[u8],
+    context: &str,
+) -> Result<std::collections::BTreeMap<u8, String>> {
+    if payload.last() != Some(&0) {
+        return Err(protocol(format!("{context} is not terminated")));
+    }
+    let mut fields = std::collections::BTreeMap::new();
+    let mut offset = 0;
+    while payload.get(offset) != Some(&0) {
+        let tag = payload[offset];
+        offset += 1;
+        let Some(end) = payload[offset..].iter().position(|byte| *byte == 0) else {
+            return Err(protocol(format!("{context} field is not terminated")));
+        };
+        let value = std::str::from_utf8(&payload[offset..offset + end])
+            .map_err(|_| protocol(format!("{context} field is not UTF-8")))?
+            .to_owned();
+        fields.insert(tag, value);
+        offset += end + 1;
+    }
+    if offset + 1 != payload.len() {
+        return Err(protocol(format!("{context} contains trailing bytes")));
+    }
+    Ok(fields)
 }
 
 fn decode_only_cstring(payload: &[u8], context: &str) -> Result<String> {
@@ -907,6 +1075,12 @@ impl<'a> SliceCursor<'a> {
         ))
     }
 
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(
+            self.bytes(4)?.try_into().expect("checked"),
+        ))
+    }
+
     fn cstring(&mut self) -> Result<String> {
         let remaining = &self.bytes[self.offset..];
         let end = remaining
@@ -950,6 +1124,31 @@ mod tests {
     }
 
     #[test]
+    fn notice_response_preserves_typed_severity_and_structured_fields() {
+        let payload = b"SWARNING\0VWARNING\0C01000\0Mcareful\0Dcheck the statement\0Hreview the plan\0P7\0spublic\0titems\0\0";
+        let notice = decode_notice(payload).expect("notice");
+        assert_eq!(notice.severity, DbNoticeSeverity::Warning);
+        assert_eq!(notice.sql_state, "01000");
+        assert_eq!(notice.message, "careful");
+        assert_eq!(notice.detail.as_deref(), Some("check the statement"));
+        assert_eq!(notice.hint.as_deref(), Some("review the plan"));
+        assert_eq!(notice.position, Some(7));
+        let identity = notice.object_identity.as_deref().expect("object identity");
+        assert_eq!(identity.schema_name.as_deref(), Some("public"));
+        assert_eq!(identity.table_name.as_deref(), Some("items"));
+
+        let mut result = QueryResult::default();
+        collect_query_event(&mut result, PgQueryEvent::Notice(notice.clone()));
+        assert_eq!(result.notices, vec![notice]);
+        assert_eq!(
+            decode_notice(b"VDEBUG\0C00000\0Mdebug\0\0")
+                .expect_err("unsupported severity")
+                .sql_state,
+            "08P01"
+        );
+    }
+
+    #[test]
     fn data_row_decoder_checks_width_and_utf8() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&1_u16.to_be_bytes());
@@ -984,5 +1183,26 @@ mod tests {
         );
         assert!(decode_ready_status(b"").is_err());
         assert!(decode_ready_status(b"II").is_err());
+    }
+
+    #[test]
+    fn notification_response_is_typed_and_exact() {
+        let mut payload = 42_u32.to_be_bytes().to_vec();
+        payload.extend_from_slice(b"events\0ready\0");
+        assert_eq!(
+            decode_notification(&payload).expect("notification"),
+            PgNotification {
+                sender_process_id: 42,
+                channel: "events".into(),
+                payload: "ready".into(),
+            }
+        );
+        payload.push(0);
+        assert_eq!(
+            decode_notification(&payload)
+                .expect_err("trailing byte")
+                .sql_state,
+            "08P01"
+        );
     }
 }

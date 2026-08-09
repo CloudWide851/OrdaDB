@@ -3516,6 +3516,8 @@ name = "ordadb-plpgsql"
 version = "0.1.0"
 dependencies = [
  "ordadb-types",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

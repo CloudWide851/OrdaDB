@@ -8,3 +8,5 @@ authors.workspace = true
 
 [dependencies]
 ordadb-types = { path = "../ordadb-types" }
+serde_json.workspace = true
+tempfile.workspace = true

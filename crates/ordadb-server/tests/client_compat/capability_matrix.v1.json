@@ -245,6 +245,54 @@
       }
     },
     {
+      "id": "plpgsql-routine-modes-001",
+      "category": "procedural_language",
+      "corpusCaseId": "plpgsql-routine-modes-001",
+      "description": "PL/pgSQL IN/OUT/INOUT results, nested handlers, and structured RAISE behavior.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent." },
+        "pgjdbc": { "status": "not_run_dependency_gap", "reason": "Routine output execution and reference capture are not complete." },
+        "datagrip": { "status": "not_run_manual", "reason": "The procedural console smoke was not performed." },
+        "hibernate": { "status": "not_applicable", "reason": "Direct routine output verification belongs to psql and pgJDBC." }
+      }
+    },
+    {
+      "id": "trigger-statement-001",
+      "category": "triggers",
+      "corpusCaseId": "trigger-statement-001",
+      "description": "AFTER STATEMENT trigger firing once for a zero-row UPDATE.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent." },
+        "pgjdbc": { "status": "not_run_dependency_gap", "reason": "Statement-trigger execution is not complete." },
+        "datagrip": { "status": "not_run_manual", "reason": "The trigger inspection and execution smoke was not performed." },
+        "hibernate": { "status": "not_applicable", "reason": "Trigger timing is verified by direct SQL clients." }
+      }
+    },
+    {
+      "id": "reindex-maintenance-001",
+      "category": "maintenance",
+      "corpusCaseId": "reindex-maintenance-001",
+      "description": "Crash-safe REINDEX INDEX on an isolated synthetic relation.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent." },
+        "pgjdbc": { "status": "not_run_dependency_gap", "reason": "Typed REINDEX execution is not complete." },
+        "datagrip": { "status": "not_run_manual", "reason": "The maintenance action was not performed in DataGrip." },
+        "hibernate": { "status": "not_applicable", "reason": "REINDEX is outside the ORM smoke." }
+      }
+    },
+    {
+      "id": "listen-notify-001",
+      "category": "asynchronous_notifications",
+      "corpusCaseId": "listen-notify-001",
+      "description": "Transactional LISTEN/NOTIFY with idle NotificationResponse delivery.",
+      "statuses": {
+        "psql": { "status": "not_run_missing_client", "reason": "psql 18.0 is absent." },
+        "pgjdbc": { "status": "not_run_dependency_gap", "reason": "The notification broker and wire frame are not complete." },
+        "datagrip": { "status": "not_run_manual", "reason": "The notification console smoke was not performed." },
+        "hibernate": { "status": "not_applicable", "reason": "LISTEN/NOTIFY is outside the ORM smoke." }
+      }
+    },
+    {
       "id": "datagrip-ui-001",
       "category": "manual_ui",
       "corpusCaseId": null,
