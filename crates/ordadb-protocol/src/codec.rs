@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeSet,
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
 };
 
 use ordadb_types::{DbError, DbNotice, Result};
@@ -55,6 +55,112 @@ pub enum FrontendMessage {
     CopyData(Vec<u8>),
     CopyDone,
     CopyFail(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FrontendRead {
+    Message(FrontendMessage),
+    Pending,
+    Closed,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FrontendMessageReader {
+    header: [u8; 5],
+    header_read: usize,
+    payload: Option<Vec<u8>>,
+    payload_read: usize,
+}
+
+impl FrontendMessageReader {
+    pub(crate) fn poll<R: Read>(
+        &mut self,
+        reader: &mut R,
+        max_frame_bytes: usize,
+    ) -> Result<FrontendRead> {
+        if let Some(message) = self.take_complete(max_frame_bytes)? {
+            return Ok(FrontendRead::Message(message));
+        }
+
+        let read = if self.header_read < self.header.len() {
+            reader.read(&mut self.header[self.header_read..])
+        } else {
+            self.prepare_payload(max_frame_bytes)?;
+            let payload = self
+                .payload
+                .as_mut()
+                .ok_or_else(|| DbError::internal("frontend payload was not initialized"))?;
+            reader.read(&mut payload[self.payload_read..])
+        };
+        match read {
+            Ok(0) if self.header_read == 0 && self.payload.is_none() => {
+                return Ok(FrontendRead::Closed);
+            }
+            Ok(0) => {
+                return Err(protocol(
+                    "frontend connection closed during a message frame",
+                ));
+            }
+            Ok(count) if self.header_read < self.header.len() => {
+                self.header_read = self.header_read.saturating_add(count);
+            }
+            Ok(count) => {
+                self.payload_read = self.payload_read.saturating_add(count);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::TimedOut | ErrorKind::WouldBlock | ErrorKind::Interrupted
+                ) =>
+            {
+                return Ok(FrontendRead::Pending);
+            }
+            Err(error) => return Err(io_error("failed to read frontend message", error)),
+        }
+
+        self.take_complete(max_frame_bytes)
+            .map(|message| message.map_or(FrontendRead::Pending, FrontendRead::Message))
+    }
+
+    fn prepare_payload(&mut self, max_frame_bytes: usize) -> Result<()> {
+        if self.payload.is_some() || self.header_read < self.header.len() {
+            return Ok(());
+        }
+        let length = checked_frame_length(
+            u32::from_be_bytes(self.header[1..].try_into().expect("checked header")),
+            max_frame_bytes,
+        )?;
+        let payload_len = length - 4;
+        let mut payload = Vec::new();
+        payload.try_reserve_exact(payload_len).map_err(|error| {
+            DbError::new(
+                "53200",
+                "frontend message allocation exceeds available memory",
+            )
+            .with_detail(error.to_string())
+        })?;
+        payload.resize(payload_len, 0);
+        self.payload = Some(payload);
+        Ok(())
+    }
+
+    fn take_complete(&mut self, max_frame_bytes: usize) -> Result<Option<FrontendMessage>> {
+        self.prepare_payload(max_frame_bytes)?;
+        let Some(payload) = self.payload.as_ref() else {
+            return Ok(None);
+        };
+        if self.payload_read < payload.len() {
+            return Ok(None);
+        }
+        let tag = self.header[0];
+        let payload = self
+            .payload
+            .take()
+            .ok_or_else(|| DbError::internal("complete frontend payload is missing"))?;
+        self.header_read = 0;
+        self.payload_read = 0;
+        decode_frontend(tag, payload).map(Some)
+    }
 }
 
 pub fn read_startup<R: Read>(reader: &mut R, max_frame_bytes: usize) -> Result<StartupPacket> {
@@ -269,6 +375,19 @@ pub fn write_backend_key<W: Write>(writer: &mut W, process_id: u32, secret_key: 
     write_message(writer, b'K', &payload)
 }
 
+pub fn write_notification<W: Write>(
+    writer: &mut W,
+    sender_process_id: u32,
+    channel: &str,
+    payload_text: &str,
+) -> Result<()> {
+    let mut payload = Vec::with_capacity(4 + channel.len() + payload_text.len() + 2);
+    payload.extend_from_slice(&sender_process_id.to_be_bytes());
+    push_cstring(&mut payload, channel)?;
+    push_cstring(&mut payload, payload_text)?;
+    write_message(writer, b'A', &payload)
+}
+
 pub fn write_ready<W: Write>(writer: &mut W, status: u8) -> Result<()> {
     write_message(writer, b'Z', &[status])
 }
@@ -325,8 +444,8 @@ pub fn write_error<W: Write>(writer: &mut W, error: &DbError) -> Result<()> {
 
 pub fn write_notice<W: Write>(writer: &mut W, notice: &DbNotice) -> Result<()> {
     let mut payload = Vec::new();
-    push_error_field(&mut payload, b'S', "NOTICE")?;
-    push_error_field(&mut payload, b'V', "NOTICE")?;
+    push_error_field(&mut payload, b'S', notice.severity.as_str())?;
+    push_error_field(&mut payload, b'V', notice.severity.as_str())?;
     push_error_field(&mut payload, b'C', &notice.sql_state)?;
     push_error_field(&mut payload, b'M', &notice.message)?;
     push_optional_error_field(&mut payload, b'D', notice.detail.as_deref())?;
@@ -610,6 +729,31 @@ mod tests {
     }
 
     #[test]
+    fn incremental_frontend_reader_preserves_partial_frames() {
+        let query = frontend(b'Q', b"SELECT 1\0");
+        let mut input = query.as_slice();
+        let mut reader = FrontendMessageReader::default();
+        assert_eq!(
+            reader
+                .poll(&mut input, DEFAULT_MAX_FRAME_BYTES)
+                .expect("header"),
+            FrontendRead::Pending
+        );
+        assert_eq!(
+            reader
+                .poll(&mut input, DEFAULT_MAX_FRAME_BYTES)
+                .expect("payload"),
+            FrontendRead::Message(FrontendMessage::Query("SELECT 1".into()))
+        );
+        assert_eq!(
+            reader
+                .poll(&mut input, DEFAULT_MAX_FRAME_BYTES)
+                .expect("closed"),
+            FrontendRead::Closed
+        );
+    }
+
+    #[test]
     fn malformed_lengths_and_trailing_bytes_are_rejected() {
         let mut short = [0_u8, 0, 0, 3].as_slice();
         assert_eq!(
@@ -715,7 +859,8 @@ mod tests {
         assert_eq!(payload.last(), Some(&0));
 
         let notice = DbNotice {
-            sql_state: "00000".into(),
+            severity: ordadb_types::DbNoticeSeverity::Warning,
+            sql_state: "01000".into(),
             message: "maintenance complete".into(),
             detail: Some("one table".into()),
             hint: None,
@@ -731,11 +876,32 @@ mod tests {
         encoded.clear();
         write_notice(&mut encoded, &notice).expect("encode notice");
         assert_eq!(encoded[0], b'N');
-        assert!(
-            encoded[5..]
-                .windows(b"VNOTICE\0".len())
-                .any(|window| window == b"VNOTICE\0")
-        );
+        for field in [b"SWARNING\0".as_slice(), b"VWARNING\0".as_slice()] {
+            assert!(
+                encoded[5..]
+                    .windows(field.len())
+                    .any(|window| window == field)
+            );
+        }
         assert_eq!(encoded.last(), Some(&0));
+    }
+
+    #[test]
+    fn notification_response_encodes_pid_channel_and_payload() {
+        let mut encoded = Vec::new();
+        write_notification(&mut encoded, 12_345, "events", "ready").expect("encode notification");
+        assert_eq!(encoded[0], b'A');
+        assert_eq!(
+            u32::from_be_bytes(encoded[1..5].try_into().expect("length")),
+            21
+        );
+        assert_eq!(&encoded[5..9], &12_345_u32.to_be_bytes());
+        assert_eq!(&encoded[9..], b"events\0ready\0");
+        assert_eq!(
+            write_notification(&mut Vec::new(), 1, "bad\0channel", "")
+                .expect_err("embedded NUL")
+                .sql_state,
+            "08P01"
+        );
     }
 }

@@ -526,6 +526,11 @@ impl PgArray {
     pub fn values(&self) -> &[Value] {
         &self.values
     }
+
+    #[must_use]
+    pub fn into_values(self) -> Vec<Value> {
+        self.values
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -666,8 +671,30 @@ pub struct DbObjectIdentity {
     pub constraint_name: Option<Box<str>>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DbNoticeSeverity {
+    Info,
+    #[default]
+    Notice,
+    Warning,
+}
+
+impl DbNoticeSeverity {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "INFO",
+            Self::Notice => "NOTICE",
+            Self::Warning => "WARNING",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DbNotice {
+    #[serde(default)]
+    pub severity: DbNoticeSeverity,
     pub sql_state: String,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -810,8 +837,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ArrayDimension, DbError, Identifier, MAX_POSTGRES_NAME_BYTES, PgArray, PgInterval,
-        ScalarType, Value,
+        ArrayDimension, DbError, DbNotice, DbNoticeSeverity, Identifier, MAX_POSTGRES_NAME_BYTES,
+        PgArray, PgInterval, ScalarType, Value,
     };
 
     #[test]
@@ -837,6 +864,30 @@ mod tests {
         let decoded: DbError = serde_json::from_value(legacy).expect("legacy error");
         assert_eq!(decoded.sql_state, "42P01");
         assert!(decoded.object_identity.is_none());
+    }
+
+    #[test]
+    fn notices_round_trip_typed_severity_and_default_legacy_payloads() {
+        let warning = DbNotice {
+            severity: DbNoticeSeverity::Warning,
+            sql_state: "01000".into(),
+            message: "careful".into(),
+            detail: None,
+            hint: Some("review the statement".into()),
+            position: Some(7),
+            object_identity: None,
+        };
+        let encoded = serde_json::to_value(&warning).expect("serialize notice");
+        assert_eq!(encoded["severity"], "WARNING");
+        let decoded: DbNotice = serde_json::from_value(encoded).expect("deserialize notice");
+        assert_eq!(decoded, warning);
+
+        let legacy = serde_json::json!({
+            "sql_state": "00000",
+            "message": "legacy notice"
+        });
+        let decoded: DbNotice = serde_json::from_value(legacy).expect("legacy notice");
+        assert_eq!(decoded.severity, DbNoticeSeverity::Notice);
     }
 
     #[test]

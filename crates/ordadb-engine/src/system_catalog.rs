@@ -10,8 +10,9 @@ use ordadb_catalog::{
     PG_ATTRIBUTE_TABLE_ID, PG_CLASS_TABLE_ID, PG_COLLATION_TABLE_ID, PG_CONSTRAINT_TABLE_ID,
     PG_DATABASE_TABLE_ID, PG_DEPEND_TABLE_ID, PG_ENUM_TABLE_ID, PG_INDEX_TABLE_ID,
     PG_NAMESPACE_TABLE_ID, PG_PROC_TABLE_ID, PG_ROLES_TABLE_ID, PG_SETTINGS_TABLE_ID,
-    PG_TRIGGER_TABLE_ID, PG_TYPE_TABLE_ID, PG_USER_TABLE_ID, PostgresOidObject, RoutineKind,
-    SystemRelationDescriptor, UserDefinedTypeKind, ViewKind, system_relations,
+    PG_TRIGGER_TABLE_ID, PG_TYPE_TABLE_ID, PG_USER_TABLE_ID, PostgresOidObject,
+    RoutineArgumentMode, RoutineKind, SystemRelationDescriptor, TriggerDefinition, TriggerEvent,
+    TriggerLevel, TriggerTarget, TriggerTiming, UserDefinedTypeKind, ViewKind, system_relations,
 };
 use ordadb_execution::{SnapshotTableProvider, TableProvider, TableScan, estimated_row_bytes};
 use ordadb_types::{DbError, Row, ScalarType, TableId, TypeId, Value};
@@ -298,11 +299,22 @@ fn object_visible_by_privilege(
                 }
             }
             CatalogObjectRef::Trigger(trigger_id) => {
-                if let Some(table) = schema
-                    .tables()
-                    .find(|table| table.triggers().any(|trigger| trigger.id == trigger_id))
-                {
-                    return authorization.can_discover(schema_name, Some(table.name.as_str()));
+                if let Some(trigger) = catalog.trigger_by_id(trigger_id) {
+                    match trigger.target {
+                        TriggerTarget::Table(table_id) => {
+                            if let Some(table) = schema.tables().find(|table| table.id == table_id)
+                            {
+                                return authorization
+                                    .can_discover(schema_name, Some(table.name.as_str()));
+                            }
+                        }
+                        TriggerTarget::View(view_id) => {
+                            if let Some(view) = schema.views().find(|view| view.id == view_id) {
+                                return authorization
+                                    .can_discover(schema_name, Some(view.name.as_str()));
+                            }
+                        }
+                    }
                 }
             }
             CatalogObjectRef::Type(type_id) => {
@@ -1125,6 +1137,9 @@ fn build_pg_proc(
                 Value::Boolean(false),
                 Value::Text(String::new()),
                 Value::Text("internal".to_owned()),
+                Value::Null,
+                Value::Null,
+                Value::Null,
             ]),
         )?;
     }
@@ -1138,21 +1153,63 @@ fn build_pg_proc(
             ) {
                 continue;
             }
-            let return_oid = routine
-                .return_type
-                .as_ref()
-                .map_or(Ok(2_278_i64), |data_type| {
-                    scalar_type_oid(catalog, data_type, routine.return_declared_type)
-                })?;
+            let output_arguments = routine.output_arguments().collect::<Vec<_>>();
+            let return_oid = match output_arguments.as_slice() {
+                [] => routine
+                    .return_type
+                    .as_ref()
+                    .map_or(Ok(2_278_i64), |data_type| {
+                        scalar_type_oid(catalog, data_type, routine.return_declared_type)
+                    })?,
+                [argument] => {
+                    scalar_type_oid(catalog, &argument.data_type, argument.declared_type)?
+                }
+                _ => 2_249,
+            };
             let argument_oids = routine
-                .arguments
-                .iter()
+                .input_arguments()
                 .map(|argument| {
                     scalar_type_oid(catalog, &argument.data_type, argument.declared_type)
                         .map(|oid| oid.to_string())
                 })
                 .collect::<ordadb_types::Result<Vec<_>>>()?
                 .join(" ");
+            let all_argument_oids = output_arguments.first().map(|_| {
+                routine
+                    .arguments
+                    .iter()
+                    .map(|argument| {
+                        scalar_type_oid(catalog, &argument.data_type, argument.declared_type)
+                            .map(|oid| oid.to_string())
+                    })
+                    .collect::<ordadb_types::Result<Vec<_>>>()
+                    .map(|oids| oids.join(" "))
+            });
+            let argument_modes = output_arguments.first().map(|_| {
+                routine
+                    .arguments
+                    .iter()
+                    .map(|argument| match argument.mode {
+                        RoutineArgumentMode::In => "i",
+                        RoutineArgumentMode::Out => "o",
+                        RoutineArgumentMode::InOut => "b",
+                        RoutineArgumentMode::Variadic => "v",
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
+            let argument_names = routine
+                .arguments
+                .iter()
+                .any(|argument| argument.name.is_some())
+                .then(|| {
+                    routine
+                        .arguments
+                        .iter()
+                        .map(|argument| argument.name.as_ref().map_or("", |name| name.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                });
             push_row(
                 rows,
                 Row::new(vec![
@@ -1170,6 +1227,11 @@ fn build_pg_proc(
                     Value::Boolean(routine.returns_set),
                     Value::Text(argument_oids),
                     Value::Text(routine.language.clone()),
+                    all_argument_oids
+                        .transpose()?
+                        .map_or(Value::Null, Value::Text),
+                    argument_modes.map_or(Value::Null, Value::Text),
+                    argument_names.map_or(Value::Null, Value::Text),
                 ]),
             )?;
         }
@@ -1187,26 +1249,84 @@ fn build_pg_trigger(
             if !object_visible(catalog, CatalogObjectRef::Table(table.id), authorization) {
                 continue;
             }
-            let table_oid = object_oid(catalog, PostgresOidObject::Table(table.id))?;
-            for trigger in table.triggers() {
-                push_row(
-                    rows,
-                    Row::new(vec![
-                        Value::Int64(object_oid(catalog, PostgresOidObject::Trigger(trigger.id))?),
-                        Value::Text(trigger.name.as_str().to_owned()),
-                        Value::Int64(table_oid),
-                        Value::Text(if trigger.enabled { "O" } else { "D" }.to_owned()),
-                        Value::Boolean(false),
-                        Value::Int64(object_oid(
-                            catalog,
-                            PostgresOidObject::Routine(trigger.routine_id),
-                        )?),
-                    ]),
-                )?;
+            push_pg_trigger_rows(
+                catalog,
+                object_oid(catalog, PostgresOidObject::Table(table.id))?,
+                table.triggers(),
+                rows,
+            )?;
+        }
+        for view in schema.views() {
+            if !object_visible(catalog, CatalogObjectRef::View(view.id), authorization) {
+                continue;
             }
+            push_pg_trigger_rows(
+                catalog,
+                object_oid(catalog, PostgresOidObject::View(view.id))?,
+                view.triggers(),
+                rows,
+            )?;
         }
     }
     Ok(())
+}
+
+fn push_pg_trigger_rows<'a>(
+    catalog: &Catalog,
+    relation_oid: i64,
+    triggers: impl Iterator<Item = &'a TriggerDefinition>,
+    rows: &mut SystemRelationRows,
+) -> ordadb_types::Result<()> {
+    for trigger in triggers {
+        push_row(
+            rows,
+            Row::new(vec![
+                Value::Int64(object_oid(catalog, PostgresOidObject::Trigger(trigger.id))?),
+                Value::Text(trigger.name.as_str().to_owned()),
+                Value::Int64(relation_oid),
+                Value::Text(if trigger.enabled { "O" } else { "D" }.to_owned()),
+                Value::Boolean(false),
+                Value::Int64(object_oid(
+                    catalog,
+                    PostgresOidObject::Routine(trigger.routine_id),
+                )?),
+                Value::Int16(pg_trigger_type(
+                    trigger.timing,
+                    trigger.level,
+                    &trigger.events,
+                )),
+            ]),
+        )?;
+    }
+    Ok(())
+}
+
+fn pg_trigger_type(
+    timing: TriggerTiming,
+    level: TriggerLevel,
+    events: &BTreeSet<TriggerEvent>,
+) -> i16 {
+    let mut value = 0_i16;
+    if level == TriggerLevel::Row {
+        value |= 1;
+    }
+    if matches!(
+        timing,
+        TriggerTiming::Before | TriggerTiming::BeforeStatement
+    ) {
+        value |= 2;
+    }
+    if timing == TriggerTiming::InsteadOf {
+        value |= 64;
+    }
+    for event in events {
+        value |= match event {
+            TriggerEvent::Insert => 4,
+            TriggerEvent::Delete => 8,
+            TriggerEvent::Update => 16,
+        };
+    }
+    value
 }
 
 fn build_pg_roles(
@@ -1897,6 +2017,11 @@ fn build_information_schema_routines(
                     routine
                         .return_type
                         .as_ref()
+                        .or_else(|| {
+                            let mut outputs = routine.output_arguments();
+                            let first = outputs.next()?;
+                            outputs.next().is_none().then_some(&first.data_type)
+                        })
                         .map_or(Value::Null, |data_type| {
                             Value::Text(information_schema_type_name(data_type).to_owned())
                         }),
@@ -1964,7 +2089,11 @@ fn build_information_schema_parameters(
                         schema: schema.name.as_str(),
                         specific_name: &specific_name,
                         ordinal,
-                        mode: Some("IN"),
+                        mode: Some(match argument.mode {
+                            RoutineArgumentMode::In | RoutineArgumentMode::Variadic => "IN",
+                            RoutineArgumentMode::Out => "OUT",
+                            RoutineArgumentMode::InOut => "INOUT",
+                        }),
                         name: argument.name.as_ref().map(|name| name.as_str()),
                         data_type: &argument.data_type,
                         declared_type: argument.declared_type,

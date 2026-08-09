@@ -14,9 +14,10 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use ordadb_catalog::{
     Catalog, CatalogExpression, CatalogObjectRef, ConstraintKind, DomainConstraint, DropBehavior,
     EnumValuePosition, FullTextAnalyzer, IndexMethod, IndexOptions, NewColumn, NewConstraint,
-    NewConstraintKind, NewIndex, NewSequence, ReferentialAction, RoutineArgument, RoutineKind,
-    TableDefinition, TriggerEvent as CatalogTriggerEvent, TriggerTiming, TypeDefinition,
-    VectorDistanceMetric, ViewDefinition, ViewKind, indexable_type, text_search_type,
+    NewConstraintKind, NewIndex, NewSequence, ReferentialAction, RoutineArgument,
+    RoutineArgumentMode, RoutineKind, TableDefinition, TriggerEvent as CatalogTriggerEvent,
+    TriggerLevel, TriggerTarget, TriggerTiming, TypeDefinition, VectorDistanceMetric,
+    ViewDefinition, ViewKind, indexable_type, text_search_type,
 };
 use ordadb_transaction::{IsolationLevel, TransactionAccessMode, TransactionCharacteristics};
 use ordadb_types::{
@@ -34,17 +35,17 @@ use sqlparser::ast::{
     BeginTransactionKind, BinaryOperator as SqlBinaryOperator, CastKind, CharacterLength,
     ColumnDef, ColumnOption, ConflictTarget as SqlConflictTarget,
     CreateFunction as SqlCreateFunction, CreateFunctionBody, CreateTable, CreateTableOptions,
-    CreateTrigger as SqlCreateTrigger, CreateView, DataType, Distinct as SqlDistinct,
-    DropBehavior as SqlDropBehavior, DuplicateTreatment, ExactNumberInfo, Expr as SqlExpr,
-    FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, FunctionReturnType,
-    FunctionSecurity, GroupByExpr, Ident, IndexType, JoinConstraint, JoinOperator, LimitClause,
-    Merge as SqlMerge, MergeAction as SqlMergeAction, MergeClauseKind as SqlMergeClauseKind,
-    MergeInsertKind as SqlMergeInsertKind, NamedWindowExpr, ObjectName, ObjectNamePart, ObjectType,
-    OnConflictAction as SqlOnConflictAction, OnInsert as SqlOnInsert, OrderByKind,
-    OutputClause as SqlOutputClause, Query, ReferentialAction as SqlReferentialAction,
-    RenameTableNameKind, SchemaName, Select, SelectItem, SequenceOptions, SetExpr,
-    SetOperator as SqlSetOperator, SetQuantifier as SqlSetQuantifier, Spanned,
-    Statement as SqlStatement, TableAlias, TableConstraint, TableFactor, TableObject,
+    CreateTrigger as SqlCreateTrigger, CreateView, DataType, DiscardObject,
+    Distinct as SqlDistinct, DropBehavior as SqlDropBehavior, DuplicateTreatment, ExactNumberInfo,
+    Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    FunctionReturnType, FunctionSecurity, GroupByExpr, Ident, IndexType, JoinConstraint,
+    JoinOperator, LimitClause, Merge as SqlMerge, MergeAction as SqlMergeAction,
+    MergeClauseKind as SqlMergeClauseKind, MergeInsertKind as SqlMergeInsertKind, NamedWindowExpr,
+    ObjectName, ObjectNamePart, ObjectType, OnConflictAction as SqlOnConflictAction,
+    OnInsert as SqlOnInsert, OrderByKind, OutputClause as SqlOutputClause, Query,
+    ReferentialAction as SqlReferentialAction, RenameTableNameKind, SchemaName, Select, SelectItem,
+    SequenceOptions, SetExpr, SetOperator as SqlSetOperator, SetQuantifier as SqlSetQuantifier,
+    Spanned, Statement as SqlStatement, TableAlias, TableConstraint, TableFactor, TableObject,
     TableWithJoins, TimezoneInfo, TopQuantity, TransactionAccessMode as SqlTransactionAccessMode,
     TransactionIsolationLevel as SqlTransactionIsolationLevel, TransactionMode,
     TriggerEvent as SqlTriggerEvent, TriggerExecBodyType, TriggerObject, TriggerObjectKind,
@@ -411,6 +412,7 @@ pub struct ParsedRoutineArgument {
     pub name: Option<Identifier>,
     pub data_type: ScalarType,
     pub declared_type: Option<ParsedObjectName>,
+    pub mode: RoutineArgumentMode,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -701,6 +703,24 @@ pub enum ParsedStatement {
         table: Option<ParsedObjectName>,
         analyze: bool,
     },
+    Reindex {
+        target: ParsedReindexTarget,
+    },
+    Listen {
+        channel: ParsedIdentifier,
+    },
+    Unlisten {
+        channel: Option<ParsedIdentifier>,
+    },
+    Notify {
+        channel: ParsedIdentifier,
+        payload: String,
+    },
+    Do {
+        body: String,
+    },
+    DiscardAll,
+    DeallocateAll,
     CreateSchema {
         name: ParsedIdentifier,
         if_not_exists: bool,
@@ -825,6 +845,11 @@ pub enum ParsedStatement {
         arguments: Vec<ParsedExpr>,
         alias: Option<ParsedIdentifier>,
     },
+    PgNotify {
+        channel: ParsedExpr,
+        payload: ParsedExpr,
+        alias: Option<ParsedIdentifier>,
+    },
     SequenceValue {
         name: ParsedObjectName,
         operation: ParsedSequenceOperation,
@@ -834,6 +859,7 @@ pub enum ParsedStatement {
         name: ParsedIdentifier,
         table: ParsedObjectName,
         timing: TriggerTiming,
+        level: TriggerLevel,
         events: Vec<CatalogTriggerEvent>,
         routine: ParsedObjectName,
     },
@@ -899,6 +925,14 @@ pub enum ParsedStatement {
         filter: Option<ParsedExpr>,
         returning: Vec<ParsedProjection>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParsedReindexTarget {
+    Index(ParsedObjectName),
+    Table(ParsedObjectName),
+    Schema(ParsedIdentifier),
+    Database(ParsedIdentifier),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1196,6 +1230,24 @@ pub enum BoundStatement {
         table_id: Option<TableId>,
         analyze: bool,
     },
+    Reindex {
+        target: BoundReindexTarget,
+    },
+    Listen {
+        channel: Identifier,
+    },
+    Unlisten {
+        channel: Option<Identifier>,
+    },
+    Notify {
+        channel: Identifier,
+        payload: String,
+    },
+    Do {
+        body: String,
+    },
+    DiscardAll,
+    DeallocateAll,
     CreateSchema {
         name: Identifier,
         if_not_exists: bool,
@@ -1318,6 +1370,7 @@ pub enum BoundStatement {
     Call {
         routine_id: RoutineId,
         arguments: Vec<BoundExpr>,
+        schema: Schema,
     },
     ScalarSelect {
         projection: Vec<BoundProjection>,
@@ -1329,15 +1382,21 @@ pub enum BoundStatement {
         schema: Schema,
         returns_set: bool,
     },
+    PgNotify {
+        channel: BoundExpr,
+        payload: BoundExpr,
+        schema: Schema,
+    },
     SequenceValue {
         sequence_id: SequenceId,
         operation: BoundSequenceOperation,
         schema: Schema,
     },
     CreateTrigger {
-        table_id: TableId,
+        target: TriggerTarget,
         name: Identifier,
         timing: TriggerTiming,
+        level: TriggerLevel,
         events: Vec<CatalogTriggerEvent>,
         routine_id: RoutineId,
     },
@@ -1356,6 +1415,13 @@ pub enum BoundStatement {
         column_indexes: Vec<usize>,
         rows: Vec<Vec<BoundExpr>>,
         on_conflict: Option<BoundOnConflict>,
+        returning: Option<BoundReturning>,
+    },
+    ViewInsert {
+        view_id: ViewId,
+        source: Box<BoundStatement>,
+        column_indexes: Vec<usize>,
+        rows: Vec<Vec<BoundExpr>>,
         returning: Option<BoundReturning>,
     },
     Merge(BoundMerge),
@@ -1409,11 +1475,32 @@ pub enum BoundStatement {
         filter: Option<BoundExpr>,
         returning: Option<BoundReturning>,
     },
+    ViewUpdate {
+        view_id: ViewId,
+        source: Box<BoundStatement>,
+        assignments: Vec<(usize, BoundExpr)>,
+        filter: Option<BoundExpr>,
+        returning: Option<BoundReturning>,
+    },
     Delete {
         table_id: TableId,
         filter: Option<BoundExpr>,
         returning: Option<BoundReturning>,
     },
+    ViewDelete {
+        view_id: ViewId,
+        source: Box<BoundStatement>,
+        filter: Option<BoundExpr>,
+        returning: Option<BoundReturning>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundReindexTarget {
+    Index(IndexId),
+    Table(TableId),
+    Schema(SchemaId),
+    Database,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1440,6 +1527,9 @@ pub fn parse(sql: &str) -> Result<ParsedStatement> {
 /// into OrdaDB's PostgreSQL-compatible syntax tree.
 pub fn parse_with_dialect(sql: &str, dialect: SqlDialect) -> Result<ParsedStatement> {
     if dialect == SqlDialect::PostgreSql {
+        if let Some(statement) = parse_postgres_session_or_maintenance(sql)? {
+            return Ok(statement);
+        }
         if let Some(statement) = parse_vacuum_analyze(sql)? {
             return Ok(statement);
         }
@@ -1810,6 +1900,161 @@ fn parse_create_procedure(sql: &str) -> Result<Option<ParsedStatement>> {
     }))
 }
 
+fn parse_postgres_session_or_maintenance(sql: &str) -> Result<Option<ParsedStatement>> {
+    const MAX_NOTIFICATION_PAYLOAD_BYTES: usize = 7_999;
+    const MAX_DO_BODY_BYTES: usize = 1024 * 1024;
+
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    let tokens = significant_tokens(trimmed);
+    let Some(first) = tokens.first() else {
+        return Ok(None);
+    };
+
+    if is_unquoted_word(first, "REINDEX") {
+        if tokens.iter().any(|token| matches!(token, Token::LParen)) {
+            return unsupported("REINDEX parameter clauses are not supported");
+        }
+        if tokens
+            .iter()
+            .any(|token| is_unquoted_word(token, "CONCURRENTLY"))
+        {
+            return unsupported("REINDEX CONCURRENTLY is not supported");
+        }
+        let mut cursor = 1;
+        if tokens
+            .get(cursor)
+            .is_some_and(|token| is_unquoted_word(token, "SYSTEM"))
+        {
+            return unsupported("REINDEX SYSTEM is not supported");
+        }
+        let target = if tokens
+            .get(cursor)
+            .is_some_and(|token| is_unquoted_word(token, "INDEX"))
+        {
+            cursor += 1;
+            ParsedReindexTarget::Index(parse_token_object_name(&tokens, &mut cursor, 2)?)
+        } else if tokens
+            .get(cursor)
+            .is_some_and(|token| is_unquoted_word(token, "TABLE"))
+        {
+            cursor += 1;
+            ParsedReindexTarget::Table(parse_token_object_name(&tokens, &mut cursor, 2)?)
+        } else if tokens
+            .get(cursor)
+            .is_some_and(|token| is_unquoted_word(token, "SCHEMA"))
+        {
+            cursor += 1;
+            ParsedReindexTarget::Schema(parse_token_identifier(&tokens, &mut cursor)?)
+        } else if tokens
+            .get(cursor)
+            .is_some_and(|token| is_unquoted_word(token, "DATABASE"))
+        {
+            cursor += 1;
+            ParsedReindexTarget::Database(parse_token_identifier(&tokens, &mut cursor)?)
+        } else {
+            return unsupported("REINDEX requires INDEX, TABLE, SCHEMA, or DATABASE");
+        };
+        ensure_token_end(&tokens, cursor)?;
+        return Ok(Some(ParsedStatement::Reindex { target }));
+    }
+
+    if is_unquoted_word(first, "LISTEN") {
+        let mut cursor = 1;
+        let channel = parse_token_identifier(&tokens, &mut cursor)?;
+        validate_notification_channel(&channel.name)?;
+        ensure_token_end(&tokens, cursor)?;
+        return Ok(Some(ParsedStatement::Listen { channel }));
+    }
+
+    if is_unquoted_word(first, "UNLISTEN") {
+        let mut cursor = 1;
+        let channel = if tokens.get(cursor) == Some(&Token::Mul) {
+            cursor += 1;
+            None
+        } else {
+            let channel = parse_token_identifier(&tokens, &mut cursor)?;
+            validate_notification_channel(&channel.name)?;
+            Some(channel)
+        };
+        ensure_token_end(&tokens, cursor)?;
+        return Ok(Some(ParsedStatement::Unlisten { channel }));
+    }
+
+    if is_unquoted_word(first, "NOTIFY") {
+        let mut cursor = 1;
+        let channel = parse_token_identifier(&tokens, &mut cursor)?;
+        validate_notification_channel(&channel.name)?;
+        let payload = if tokens.get(cursor) == Some(&Token::Comma) {
+            cursor += 1;
+            let Token::SingleQuotedString(payload) = tokens
+                .get(cursor)
+                .ok_or_else(|| DbError::new(SYNTAX_ERROR, "NOTIFY payload expected"))?
+            else {
+                return Err(DbError::new(
+                    SYNTAX_ERROR,
+                    "NOTIFY payload must be a string literal",
+                ));
+            };
+            cursor += 1;
+            payload.clone()
+        } else {
+            String::new()
+        };
+        if payload.contains('\0') {
+            return Err(DbError::new("22021", "NOTIFY payload cannot contain NUL"));
+        }
+        if payload.len() > MAX_NOTIFICATION_PAYLOAD_BYTES {
+            return Err(DbError::new("22023", "NOTIFY payload is too long"));
+        }
+        ensure_token_end(&tokens, cursor)?;
+        return Ok(Some(ParsedStatement::Notify { channel, payload }));
+    }
+
+    if is_unquoted_word(first, "DO") {
+        let mut cursor = 1;
+        if tokens
+            .get(cursor)
+            .is_some_and(|token| is_unquoted_word(token, "LANGUAGE"))
+        {
+            cursor += 1;
+            let language = parse_token_identifier(&tokens, &mut cursor)?;
+            if !language.name.as_str().eq_ignore_ascii_case("plpgsql") {
+                return unsupported("only LANGUAGE plpgsql DO blocks are supported");
+            }
+        }
+        let body = match tokens.get(cursor) {
+            Some(Token::DollarQuotedString(body)) => body.value.clone(),
+            Some(Token::SingleQuotedString(body)) => body.clone(),
+            _ => return Err(DbError::new(SYNTAX_ERROR, "DO requires a quoted body")),
+        };
+        cursor += 1;
+        if body.len() > MAX_DO_BODY_BYTES {
+            return Err(DbError::new("54000", "DO body exceeds the source limit"));
+        }
+        ensure_token_end(&tokens, cursor)?;
+        return Ok(Some(ParsedStatement::Do { body }));
+    }
+
+    Ok(None)
+}
+
+fn validate_notification_channel(channel: &Identifier) -> Result<()> {
+    if channel.as_str().is_empty() || channel.as_str().len() > ordadb_types::MAX_POSTGRES_NAME_BYTES
+    {
+        return Err(DbError::new(
+            "42622",
+            "notification channel name is empty or too long",
+        ));
+    }
+    if channel.as_str().contains('\0') {
+        return Err(DbError::new(
+            "22021",
+            "notification channel cannot contain NUL",
+        ));
+    }
+    Ok(())
+}
+
 fn keyword_span(value: &str, keyword: &str) -> Option<(usize, usize)> {
     let mut start = None;
     for (position, character) in value.char_indices() {
@@ -2048,9 +2293,28 @@ fn parse_procedure_arguments(value: &str) -> Result<Vec<ParsedRoutineArgument>> 
     value
         .split(',')
         .map(|argument| {
-            let parts = argument.split_whitespace().collect::<Vec<_>>();
+            let mut parts = argument.split_whitespace().collect::<Vec<_>>();
+            if parts
+                .iter()
+                .any(|part| part.eq_ignore_ascii_case("DEFAULT") || part.contains('='))
+            {
+                return unsupported("defaulted procedure arguments are not supported yet");
+            }
+            let mode = parts
+                .first()
+                .and_then(|part| parse_routine_argument_mode(part))
+                .unwrap_or_default();
+            if parse_routine_argument_mode(parts.first().copied().unwrap_or_default()).is_some() {
+                parts.remove(0);
+            }
             let (name, data_type) = match parts.as_slice() {
                 [data_type] => (None, *data_type),
+                [first, second]
+                    if first.eq_ignore_ascii_case("DOUBLE")
+                        && second.eq_ignore_ascii_case("PRECISION") =>
+                {
+                    (None, "DOUBLE PRECISION")
+                }
                 [name, data_type] => (Some(Identifier::unquoted(*name)), *data_type),
                 [name, first, second] if first.eq_ignore_ascii_case("DOUBLE") => (
                     Some(Identifier::unquoted(*name)),
@@ -2067,9 +2331,24 @@ fn parse_procedure_arguments(value: &str) -> Result<Vec<ParsedRoutineArgument>> 
                 name,
                 data_type,
                 declared_type,
+                mode,
             })
         })
         .collect()
+}
+
+fn parse_routine_argument_mode(value: &str) -> Option<RoutineArgumentMode> {
+    if value.eq_ignore_ascii_case("IN") {
+        Some(RoutineArgumentMode::In)
+    } else if value.eq_ignore_ascii_case("OUT") {
+        Some(RoutineArgumentMode::Out)
+    } else if value.eq_ignore_ascii_case("INOUT") {
+        Some(RoutineArgumentMode::InOut)
+    } else if value.eq_ignore_ascii_case("VARIADIC") {
+        Some(RoutineArgumentMode::Variadic)
+    } else {
+        None
+    }
 }
 
 fn parse_procedure_data_type(value: &str) -> Result<(ScalarType, Option<ParsedObjectName>)> {
@@ -2699,8 +2978,7 @@ impl ParameterTypeSolver {
                 offset,
                 limit,
             } => {
-                let table = resolve_table(table, catalog)?;
-                let local_inputs = parameter_table_inputs(table, table.name.clone(), 0, false);
+                let local_inputs = parameter_relation_inputs(table, None, catalog, 0, false)?;
                 let inputs = inputs_with_outer(&local_inputs, outer_inputs)?;
                 if let Some(filter) = filter {
                     self.collect_expr(filter, &inputs, Some(&ScalarType::Boolean), catalog, depth)?;
@@ -2728,27 +3006,21 @@ impl ParameterTypeSolver {
                 limit,
                 ..
             } => {
-                let definition = resolve_table(&table.name, catalog)?;
-                let binding = table
-                    .alias
-                    .as_ref()
-                    .map_or_else(|| definition.name.clone(), |alias| alias.name.clone());
-                let mut local_inputs = parameter_table_inputs(definition, binding, 0, false);
+                let binding = table.alias.as_ref().map(|alias| alias.name.clone());
+                let mut local_inputs =
+                    parameter_relation_inputs(&table.name, binding, catalog, 0, false)?;
                 for join in joins {
                     match &join.source {
                         ParsedJoinSource::Table(table) => {
-                            let definition = resolve_table(&table.name, catalog)?;
-                            let binding = table.alias.as_ref().map_or_else(
-                                || definition.name.clone(),
-                                |alias| alias.name.clone(),
-                            );
+                            let binding = table.alias.as_ref().map(|alias| alias.name.clone());
                             let offset = local_inputs.len();
-                            local_inputs.extend(parameter_table_inputs(
-                                definition,
+                            local_inputs.extend(parameter_relation_inputs(
+                                &table.name,
                                 binding,
+                                catalog,
                                 offset,
                                 join.kind == JoinKind::Left,
-                            ));
+                            )?);
                         }
                         ParsedJoinSource::Derived {
                             lateral,
@@ -2893,7 +3165,8 @@ impl ParameterTypeSolver {
                 on_conflict,
                 returning,
             } => {
-                let table = resolve_table(table, catalog)?;
+                let relation = resolve_dml_relation(table, CatalogTriggerEvent::Insert, catalog)?;
+                let table = &relation.scope;
                 let column_indexes = parameter_target_columns(columns, table)?;
                 for row in rows {
                     for (expression, index) in row.iter().zip(&column_indexes) {
@@ -2907,6 +3180,9 @@ impl ParameterTypeSolver {
                     }
                 }
                 if let Some(on_conflict) = on_conflict {
+                    if matches!(relation.target, DmlTarget::View(_)) {
+                        return unsupported("ON CONFLICT is not supported for view DML");
+                    }
                     self.collect_on_conflict(on_conflict, table, catalog, depth)?;
                 }
                 let inputs = parameter_table_inputs(table, table.name.clone(), 0, false);
@@ -2918,7 +3194,8 @@ impl ParameterTypeSolver {
                 filter,
                 returning,
             } => {
-                let table = resolve_table(table, catalog)?;
+                let relation = resolve_dml_relation(table, CatalogTriggerEvent::Update, catalog)?;
+                let table = &relation.scope;
                 let inputs = parameter_table_inputs(table, table.name.clone(), 0, false);
                 for (column, expression) in assignments {
                     if let Some(index) = table.column_index(&column.name) {
@@ -2941,7 +3218,8 @@ impl ParameterTypeSolver {
                 filter,
                 returning,
             } => {
-                let table = resolve_table(table, catalog)?;
+                let relation = resolve_dml_relation(table, CatalogTriggerEvent::Delete, catalog)?;
+                let table = &relation.scope;
                 let inputs = parameter_table_inputs(table, table.name.clone(), 0, false);
                 if let Some(filter) = filter {
                     self.collect_expr(filter, &inputs, Some(&ScalarType::Boolean), catalog, depth)?;
@@ -3824,6 +4102,35 @@ fn parameter_table_inputs(
         .collect()
 }
 
+fn parameter_relation_inputs(
+    name: &ParsedObjectName,
+    binding: Option<Identifier>,
+    catalog: &Catalog,
+    offset: usize,
+    nullable: bool,
+) -> Result<Vec<InputColumn>> {
+    let (schema, relation, _) = split_table_name(name)?;
+    let binding = binding.unwrap_or_else(|| relation.clone());
+    if let Some(view) = catalog.view(&schema, &relation) {
+        return Ok(view
+            .output
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(column_offset, field)| InputColumn {
+                binding: binding.clone(),
+                name: Identifier::unquoted(&field.name),
+                index: offset + column_offset,
+                data_type: field.data_type.clone(),
+                nullable: nullable || field.nullable,
+                outer_depth: 0,
+            })
+            .collect());
+    }
+    let table = resolve_table(name, catalog)?;
+    Ok(parameter_table_inputs(table, binding, offset, nullable))
+}
+
 fn parameter_target_columns(
     columns: &[ParsedIdentifier],
     table: &TableDefinition,
@@ -3973,6 +4280,14 @@ fn resolve_statement_types(
             for argument in arguments {
                 resolve_expr_types(argument, parameter_types, catalog, depth + 1, session)?;
             }
+        }
+        ParsedStatement::PgNotify {
+            channel,
+            payload,
+            alias: _,
+        } => {
+            resolve_expr_types(channel, parameter_types, catalog, depth + 1, session)?;
+            resolve_expr_types(payload, parameter_types, catalog, depth + 1, session)?;
         }
         ParsedStatement::ScalarSelect { projection } => {
             resolve_projection_types(projection, parameter_types, catalog, depth + 1, session)?
@@ -4459,6 +4774,55 @@ fn bind_with_view_depth(
                 .transpose()?,
             analyze,
         }),
+        ParsedStatement::Reindex { target } => {
+            let target = match target {
+                ParsedReindexTarget::Index(name) => {
+                    let (schema, name, position) = split_table_name(&name)?;
+                    let index = catalog.index(&schema, &name).ok_or_else(|| {
+                        DbError::new("42704", format!("index {schema}.{name} does not exist"))
+                            .with_position_opt(position)
+                    })?;
+                    BoundReindexTarget::Index(index.id)
+                }
+                ParsedReindexTarget::Table(name) => {
+                    BoundReindexTarget::Table(resolve_table(&name, catalog)?.id)
+                }
+                ParsedReindexTarget::Schema(name) => {
+                    let schema = catalog.schema(&name.name).ok_or_else(|| {
+                        DbError::new(
+                            UNDEFINED_SCHEMA,
+                            format!("schema {} does not exist", name.name),
+                        )
+                        .with_position_opt(name.position)
+                    })?;
+                    BoundReindexTarget::Schema(schema.id)
+                }
+                ParsedReindexTarget::Database(name) => {
+                    if catalog.database().name != name.name {
+                        return Err(DbError::new(
+                            "3D000",
+                            format!("database {} does not exist", name.name),
+                        )
+                        .with_position_opt(name.position));
+                    }
+                    BoundReindexTarget::Database
+                }
+            };
+            Ok(BoundStatement::Reindex { target })
+        }
+        ParsedStatement::Listen { channel } => Ok(BoundStatement::Listen {
+            channel: channel.name,
+        }),
+        ParsedStatement::Unlisten { channel } => Ok(BoundStatement::Unlisten {
+            channel: channel.map(|channel| channel.name),
+        }),
+        ParsedStatement::Notify { channel, payload } => Ok(BoundStatement::Notify {
+            channel: channel.name,
+            payload,
+        }),
+        ParsedStatement::Do { body } => Ok(BoundStatement::Do { body }),
+        ParsedStatement::DiscardAll => Ok(BoundStatement::DiscardAll),
+        ParsedStatement::DeallocateAll => Ok(BoundStatement::DeallocateAll),
         ParsedStatement::CreateSchema {
             name,
             if_not_exists,
@@ -4949,6 +5313,7 @@ fn bind_with_view_depth(
                         name: argument.name,
                         data_type,
                         declared_type,
+                        mode: argument.mode,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -4994,9 +5359,9 @@ fn bind_with_view_depth(
             {
                 let signature_matches = match argument_types.as_ref() {
                     None => true,
-                    Some(argument_types) if routine.arguments.len() == argument_types.len() => {
+                    Some(argument_types) if routine.input_arity() == argument_types.len() => {
                         let mut matches = true;
-                        for (argument, expected) in routine.arguments.iter().zip(argument_types) {
+                        for (argument, expected) in routine.input_arguments().zip(argument_types) {
                             let expected_declared_type = expected
                                 .declared_type
                                 .as_ref()
@@ -5060,22 +5425,24 @@ fn bind_with_view_depth(
                 .iter()
                 .filter(|routine| {
                     routine.kind == RoutineKind::Procedure
-                        && routine.arguments.len() == arguments.len()
+                        && routine.input_arity() == arguments.len()
                 })
                 .collect::<Vec<_>>();
             let mut matches = Vec::new();
             for routine in candidates {
+                let input_arguments = routine.input_arguments().collect::<Vec<_>>();
                 if let Some((bound, exact_declared_matches)) =
-                    bind_routine_candidate(&arguments, &routine.arguments, catalog)?
+                    bind_routine_candidate(&arguments, &input_arguments, catalog)?
                 {
-                    matches.push((routine.id, bound, exact_declared_matches));
+                    matches.push((routine, bound, exact_declared_matches));
                 }
             }
             retain_best_routine_matches(&mut matches, |candidate| candidate.2);
             match matches.as_slice() {
-                [(routine_id, arguments, _)] => Ok(BoundStatement::Call {
-                    routine_id: *routine_id,
+                [(routine, arguments, _)] => Ok(BoundStatement::Call {
+                    routine_id: routine.id,
                     arguments: arguments.clone(),
+                    schema: routine_output_schema(routine),
                 }),
                 [] => Err(DbError::new(
                     "42883",
@@ -5104,14 +5471,16 @@ fn bind_with_view_depth(
                 .iter()
                 .filter(|routine| {
                     routine.kind == RoutineKind::Function
-                        && routine.return_type.is_some()
-                        && routine.arguments.len() == arguments.len()
+                        && (routine.return_type.is_some()
+                            || routine.output_arguments().next().is_some())
+                        && routine.input_arity() == arguments.len()
                 })
                 .collect::<Vec<_>>();
             let mut matches = Vec::new();
             for routine in candidates {
+                let input_arguments = routine.input_arguments().collect::<Vec<_>>();
                 if let Some((bound, exact_declared_matches)) =
-                    bind_routine_candidate(&arguments, &routine.arguments, catalog)?
+                    bind_routine_candidate(&arguments, &input_arguments, catalog)?
                 {
                     matches.push((routine, bound, exact_declared_matches));
                 }
@@ -5119,9 +5488,24 @@ fn bind_with_view_depth(
             retain_best_routine_matches(&mut matches, |candidate| candidate.2);
             match matches.as_slice() {
                 [(routine, arguments, _)] => {
-                    let return_type = routine.return_type.clone().ok_or_else(|| {
-                        DbError::internal("selected function lost its return type")
-                    })?;
+                    let output_arguments = routine.output_arguments().collect::<Vec<_>>();
+                    if output_arguments.len() > 1 {
+                        return Err(DbError::new(
+                            DATATYPE_MISMATCH,
+                            "a function with multiple OUT parameters cannot be used as a scalar expression",
+                        ));
+                    }
+                    let return_type = routine
+                        .return_type
+                        .clone()
+                        .or_else(|| {
+                            output_arguments
+                                .first()
+                                .map(|argument| argument.data_type.clone())
+                        })
+                        .ok_or_else(|| {
+                            DbError::internal("selected function lost its output type")
+                        })?;
                     Ok(BoundStatement::RoutineSelect {
                         routine_id: routine.id,
                         arguments: arguments.clone(),
@@ -5146,6 +5530,22 @@ fn bind_with_view_depth(
                 )
                 .with_position_opt(position)),
             }
+        }
+        ParsedStatement::PgNotify {
+            channel,
+            payload,
+            alias,
+        } => {
+            let text = ScalarType::Text;
+            Ok(BoundStatement::PgNotify {
+                channel: bind_expr(channel, None, Some(&text))?,
+                payload: bind_expr(payload, None, Some(&text))?,
+                schema: Schema::new(vec![Field::new(
+                    alias.map_or_else(|| "pg_notify".to_owned(), |alias| alias.name.to_string()),
+                    ScalarType::Text,
+                    true,
+                )]),
+            })
         }
         ParsedStatement::ScalarSelect { projection } => {
             let mut bound_projection = Vec::with_capacity(projection.len());
@@ -5216,10 +5616,11 @@ fn bind_with_view_depth(
             name,
             table,
             timing,
+            level,
             events,
             routine,
         } => {
-            let table = resolve_table(&table, catalog)?;
+            let target = resolve_trigger_target(&table, catalog)?;
             let (routine_schema, routine_name, routine_position) = split_table_name(&routine)?;
             let schema = catalog.schema(&routine_schema).ok_or_else(|| {
                 DbError::new(
@@ -5257,9 +5658,10 @@ fn bind_with_view_depth(
                 }
             };
             Ok(BoundStatement::CreateTrigger {
-                table_id: table.id,
+                target,
                 name: name.name,
                 timing,
+                level,
                 events,
                 routine_id,
             })
@@ -5270,8 +5672,16 @@ fn bind_with_view_depth(
             if_exists,
             behavior,
         } => {
-            let table = resolve_table(&table, catalog)?;
-            let Some(trigger) = table.trigger(&name.name) else {
+            let target = resolve_trigger_target(&table, catalog)?;
+            let trigger = match target {
+                TriggerTarget::Table(table_id) => catalog
+                    .table_by_id(table_id)
+                    .and_then(|table| table.trigger(&name.name)),
+                TriggerTarget::View(view_id) => catalog
+                    .view_by_id(view_id)
+                    .and_then(|view| view.trigger(&name.name)),
+            };
+            let Some(trigger) = trigger else {
                 if if_exists {
                     return Ok(BoundStatement::NoOp {
                         tag: "DROP TRIGGER".to_owned(),
@@ -5281,7 +5691,8 @@ fn bind_with_view_depth(
                     "42704",
                     format!(
                         "trigger {} for relation {} does not exist",
-                        name.name, table.name
+                        name.name,
+                        trigger_target_name(target, catalog)?
                     ),
                 )
                 .with_position_opt(name.position));
@@ -5297,7 +5708,15 @@ fn bind_with_view_depth(
             rows,
             on_conflict,
             returning,
-        } => bind_insert(table, columns, rows, on_conflict, returning, catalog),
+        } => bind_insert(
+            table,
+            columns,
+            rows,
+            on_conflict,
+            returning,
+            catalog,
+            view_depth,
+        ),
         ParsedStatement::Merge(merge) => bind_merge(merge, catalog),
         ParsedStatement::With {
             recursive,
@@ -5379,12 +5798,12 @@ fn bind_with_view_depth(
             assignments,
             filter,
             returning,
-        } => bind_update(table, assignments, filter, returning, catalog),
+        } => bind_update(table, assignments, filter, returning, catalog, view_depth),
         ParsedStatement::Delete {
             table,
             filter,
             returning,
-        } => bind_delete(table, filter, returning, catalog),
+        } => bind_delete(table, filter, returning, catalog, view_depth),
     }
 }
 
@@ -5880,6 +6299,18 @@ fn convert_statement(statement: SqlStatement, sql: &str) -> Result<ParsedStateme
                     .transpose()?,
                 returning,
             })
+        }
+        SqlStatement::Discard {
+            object_type: DiscardObject::ALL,
+        } => Ok(ParsedStatement::DiscardAll),
+        SqlStatement::Discard { .. } => unsupported("only DISCARD ALL is supported"),
+        SqlStatement::Deallocate { name, .. }
+            if name.quote_style.is_none() && name.value.eq_ignore_ascii_case("ALL") =>
+        {
+            Ok(ParsedStatement::DeallocateAll)
+        }
+        SqlStatement::Deallocate { .. } => {
+            unsupported("only DEALLOCATE ALL is supported at the SQL boundary")
         }
         SqlStatement::Explain {
             analyze,
@@ -6500,18 +6931,21 @@ fn convert_create_function(function: SqlCreateFunction, sql: &str) -> Result<Par
         .unwrap_or_default()
         .into_iter()
         .map(|argument| {
-            if !matches!(argument.mode, None | Some(ArgMode::In)) || argument.default_expr.is_some()
-            {
-                return unsupported("only non-defaulted IN routine arguments are supported");
+            if argument.default_expr.is_some() {
+                return unsupported("defaulted routine arguments are not supported yet");
             }
             let (data_type, declared_type) = convert_column_data_type(argument.data_type, sql)?;
             Ok(ParsedRoutineArgument {
                 name: argument.name.map(|name| convert_ident(name, sql).name),
                 data_type,
                 declared_type,
+                mode: convert_routine_argument_mode(argument.mode),
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let has_output_arguments = arguments
+        .iter()
+        .any(|argument| argument.mode.produces_output());
     let (return_type, return_declared_type, returns_set) = match function.return_type {
         Some(FunctionReturnType::DataType(data_type)) if is_trigger_type(&data_type) => {
             (None, None, false)
@@ -6524,7 +6958,8 @@ fn convert_create_function(function: SqlCreateFunction, sql: &str) -> Result<Par
             let (data_type, declared_type) = convert_column_data_type(data_type, sql)?;
             (Some(data_type), declared_type, true)
         }
-        None => return unsupported("CREATE FUNCTION requires a return type"),
+        None if has_output_arguments => (None, None, false),
+        None => return unsupported("CREATE FUNCTION requires a return type or OUT parameter"),
     };
     let body = match function.function_body {
         Some(CreateFunctionBody::AsBeforeOptions {
@@ -6568,12 +7003,8 @@ fn convert_drop_routine(
             arguments
                 .into_iter()
                 .map(|argument| {
-                    if !matches!(argument.mode, None | Some(ArgMode::In))
-                        || argument.default_expr.is_some()
-                    {
-                        return unsupported(
-                            "DROP routine signatures support only non-defaulted IN arguments",
-                        );
+                    if argument.default_expr.is_some() {
+                        return unsupported("DROP routine signatures cannot contain defaults");
                     }
                     let (data_type, declared_type) =
                         convert_column_data_type(argument.data_type, sql)?;
@@ -6581,11 +7012,18 @@ fn convert_drop_routine(
                         name: None,
                         data_type,
                         declared_type,
+                        mode: convert_routine_argument_mode(argument.mode),
                     })
                 })
                 .collect::<Result<Vec<_>>>()
         })
         .transpose()?;
+    let argument_types = argument_types.map(|arguments| {
+        arguments
+            .into_iter()
+            .filter(|argument| argument.mode.accepts_input())
+            .collect()
+    });
     Ok(ParsedStatement::DropRoutine {
         name: convert_object_name(routine.name, sql)?,
         kind,
@@ -6593,6 +7031,15 @@ fn convert_drop_routine(
         if_exists,
         behavior: convert_drop_behavior(behavior),
     })
+}
+
+fn convert_routine_argument_mode(mode: Option<ArgMode>) -> RoutineArgumentMode {
+    match mode {
+        None | Some(ArgMode::In) => RoutineArgumentMode::In,
+        Some(ArgMode::Out) => RoutineArgumentMode::Out,
+        Some(ArgMode::InOut) => RoutineArgumentMode::InOut,
+        Some(ArgMode::Variadic) => RoutineArgumentMode::Variadic,
+    }
 }
 
 fn convert_create_trigger(trigger: SqlCreateTrigger, sql: &str) -> Result<ParsedStatement> {
@@ -6610,17 +7057,23 @@ fn convert_create_trigger(trigger: SqlCreateTrigger, sql: &str) -> Result<Parsed
     {
         return unsupported("this CREATE TRIGGER option is not supported");
     }
-    if !matches!(
-        trigger.trigger_object,
+    let level = match trigger.trigger_object {
         Some(TriggerObjectKind::ForEach(TriggerObject::Row))
-            | Some(TriggerObjectKind::For(TriggerObject::Row))
-    ) {
-        return unsupported("only FOR EACH ROW triggers are supported");
-    }
-    let timing = match trigger.period {
-        Some(TriggerPeriod::Before) => TriggerTiming::Before,
-        Some(TriggerPeriod::After) => TriggerTiming::After,
-        _ => return unsupported("only BEFORE and AFTER triggers are supported"),
+        | Some(TriggerObjectKind::For(TriggerObject::Row)) => TriggerLevel::Row,
+        Some(TriggerObjectKind::ForEach(TriggerObject::Statement))
+        | Some(TriggerObjectKind::For(TriggerObject::Statement))
+        | None => TriggerLevel::Statement,
+    };
+    let timing = match (trigger.period, level) {
+        (Some(TriggerPeriod::Before), TriggerLevel::Row) => TriggerTiming::Before,
+        (Some(TriggerPeriod::After), TriggerLevel::Row) => TriggerTiming::After,
+        (Some(TriggerPeriod::InsteadOf), TriggerLevel::Row) => TriggerTiming::InsteadOf,
+        (Some(TriggerPeriod::Before), TriggerLevel::Statement) => TriggerTiming::BeforeStatement,
+        (Some(TriggerPeriod::After), TriggerLevel::Statement) => TriggerTiming::AfterStatement,
+        (Some(TriggerPeriod::InsteadOf), TriggerLevel::Statement) => {
+            return unsupported("INSTEAD OF triggers must use FOR EACH ROW");
+        }
+        _ => return unsupported("this trigger timing is not supported"),
     };
     let events = trigger
         .events
@@ -6654,6 +7107,7 @@ fn convert_create_trigger(trigger: SqlCreateTrigger, sql: &str) -> Result<Parsed
         name: name.clone(),
         table: convert_object_name(trigger.table_name, sql)?,
         timing,
+        level,
         events,
         routine: convert_object_name(body.func_desc.name, sql)?,
     })
@@ -7326,6 +7780,29 @@ fn convert_routine_select(
         };
         if let SqlExpr::Function(function) = &expression {
             let function_name = function.name.to_string().to_ascii_lowercase();
+            if matches!(function_name.as_str(), "pg_notify" | "pg_catalog.pg_notify") {
+                let (_, mut arguments) = convert_routine_invocation(function.clone(), sql)?;
+                if arguments.len() != 2 {
+                    return Err(DbError::new(
+                        "42883",
+                        format!(
+                            "function pg_notify does not accept {} arguments",
+                            arguments.len()
+                        ),
+                    ));
+                }
+                let payload = arguments
+                    .pop()
+                    .ok_or_else(|| DbError::internal("pg_notify payload argument is missing"))?;
+                let channel = arguments
+                    .pop()
+                    .ok_or_else(|| DbError::internal("pg_notify channel argument is missing"))?;
+                return Ok(ParsedStatement::PgNotify {
+                    channel,
+                    payload,
+                    alias,
+                });
+            }
             if scalar_function_from_name(&function_name).is_none() {
                 let (name, arguments) = convert_routine_invocation(function.clone(), sql)?;
                 if let Some(operation_name) = sequence_operation_name(&name) {
@@ -7719,7 +8196,7 @@ fn expr_has_aggregate(expr: &ParsedExpr) -> bool {
 
 fn bind_routine_candidate(
     arguments: &[ParsedExpr],
-    expected: &[RoutineArgument],
+    expected: &[&RoutineArgument],
     catalog: &Catalog,
 ) -> Result<Option<(Vec<BoundExpr>, usize)>> {
     let mut bound = Vec::with_capacity(arguments.len());
@@ -7741,6 +8218,22 @@ fn bind_routine_candidate(
         bound.push(argument);
     }
     Ok(Some((bound, exact_declared_matches)))
+}
+
+fn routine_output_schema(routine: &ordadb_catalog::RoutineDefinition) -> Schema {
+    Schema::new(
+        routine
+            .output_arguments()
+            .enumerate()
+            .map(|(index, argument)| {
+                let name = argument.name.as_ref().map_or_else(
+                    || format!("column{}", index + 1),
+                    |name| name.as_str().to_owned(),
+                );
+                Field::new(name, argument.data_type.clone(), true)
+            })
+            .collect(),
+    )
 }
 
 fn retain_best_routine_matches<T>(matches: &mut Vec<T>, score: impl Fn(&T) -> usize) {
@@ -9737,6 +10230,71 @@ fn validate_check_expression(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmlTarget {
+    Table(TableId),
+    View(ViewId),
+}
+
+struct DmlRelation {
+    target: DmlTarget,
+    scope: TableDefinition,
+}
+
+fn resolve_dml_relation(
+    name: &ParsedObjectName,
+    event: CatalogTriggerEvent,
+    catalog: &Catalog,
+) -> Result<DmlRelation> {
+    let (schema_name, relation_name, position) = split_table_name(name)?;
+    let schema = catalog.schema(&schema_name).ok_or_else(|| {
+        DbError::new(
+            UNDEFINED_SCHEMA,
+            format!("schema {schema_name} does not exist"),
+        )
+        .with_position_opt(position)
+    })?;
+    if let Some(table) = schema.table(&relation_name) {
+        return Ok(DmlRelation {
+            target: DmlTarget::Table(table.id),
+            scope: table.clone(),
+        });
+    }
+    let view = schema.view(&relation_name).ok_or_else(|| {
+        DbError::new(
+            UNDEFINED_TABLE,
+            format!("relation {schema_name}.{relation_name} does not exist"),
+        )
+        .with_position_opt(position)
+    })?;
+    if view.kind != ViewKind::Regular {
+        return Err(
+            DbError::new("42809", "cannot modify a materialized view").with_position_opt(position)
+        );
+    }
+    let has_instead_of_trigger = view.triggers().any(|trigger| {
+        trigger.enabled
+            && trigger.timing == TriggerTiming::InsteadOf
+            && trigger.level == TriggerLevel::Row
+            && trigger.events.contains(&event)
+    });
+    if !has_instead_of_trigger {
+        return Err(DbError::new(
+            "55000",
+            format!("cannot modify view {schema_name}.{relation_name}"),
+        )
+        .with_detail(format!(
+            "no enabled INSTEAD OF ROW trigger handles {event:?}"
+        ))
+        .with_hint("Create a matching INSTEAD OF trigger on the view.")
+        .with_position_opt(position));
+    }
+    Ok(DmlRelation {
+        target: DmlTarget::View(view.id),
+        scope: TableDefinition::expression_scope_for_schema(view.name.clone(), &view.output)?,
+    })
+}
+
 fn bind_insert(
     table_name: ParsedObjectName,
     columns: Vec<ParsedIdentifier>,
@@ -9744,8 +10302,10 @@ fn bind_insert(
     on_conflict: Option<ParsedOnConflict>,
     returning: Vec<ParsedProjection>,
     catalog: &Catalog,
+    view_depth: usize,
 ) -> Result<BoundStatement> {
-    let table = resolve_table(&table_name, catalog)?.clone();
+    let relation = resolve_dml_relation(&table_name, CatalogTriggerEvent::Insert, catalog)?;
+    let table = relation.scope;
     let column_indexes = if columns.is_empty() {
         (0..table.columns().len()).collect::<Vec<_>>()
     } else {
@@ -9794,17 +10354,34 @@ fn bind_insert(
                 .collect()
         })
         .collect::<Result<Vec<_>>>()?;
+    if matches!(relation.target, DmlTarget::View(_)) && on_conflict.is_some() {
+        return unsupported("ON CONFLICT is not supported for view DML");
+    }
     let on_conflict = on_conflict
         .map(|on_conflict| bind_on_conflict(on_conflict, &table))
         .transpose()?;
     let returning = bind_returning(returning, &table)?;
-    Ok(BoundStatement::Insert {
-        table_id: table.id,
-        column_indexes,
-        rows,
-        on_conflict,
-        returning,
-    })
+    match relation.target {
+        DmlTarget::Table(table_id) => Ok(BoundStatement::Insert {
+            table_id,
+            column_indexes,
+            rows,
+            on_conflict,
+            returning,
+        }),
+        DmlTarget::View(view_id) => {
+            let view = catalog
+                .view_by_id(view_id)
+                .ok_or_else(|| DbError::internal("bound view target disappeared"))?;
+            Ok(BoundStatement::ViewInsert {
+                view_id,
+                source: Box::new(bind_view_source(view, catalog, view_depth)?),
+                column_indexes,
+                rows,
+                returning,
+            })
+        }
+    }
 }
 
 fn bind_merge(merge: ParsedMerge, catalog: &Catalog) -> Result<BoundStatement> {
@@ -14365,46 +14942,7 @@ fn bind_view_select(
             "WHERE, ORDER BY, OFFSET, and LIMIT on views are not supported in this milestone",
         );
     }
-    let source = match view.kind {
-        ViewKind::Regular => {
-            bind_with_view_depth(parse(&view.query)?, catalog, view_depth.saturating_add(1))?
-        }
-        ViewKind::Materialized => {
-            if !view.populated {
-                return Err(DbError::new(
-                    "55000",
-                    format!("materialized view {} has not been populated", view.name),
-                )
-                .with_hint("run REFRESH MATERIALIZED VIEW before querying it"));
-            }
-            let table_id = view.materialized_table_id.ok_or_else(|| {
-                DbError::internal("materialized view is missing its backing table")
-            })?;
-            let projection = view
-                .output
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(index, field)| BoundProjection {
-                    expr: BoundExpr {
-                        kind: BoundExprKind::Column { index },
-                        data_type: field.data_type.clone(),
-                        nullable: field.nullable,
-                    },
-                    field: field.clone(),
-                })
-                .collect();
-            BoundStatement::Select {
-                table_id,
-                schema: view.output.clone(),
-                projection,
-                filter: None,
-                order_by: Vec::new(),
-                offset: None,
-                limit: None,
-            }
-        }
-    };
+    let source = bind_view_source(view, catalog, view_depth)?;
     let source_schema = bound_query_schema(&source)?;
     if source_schema.fields.len() != view.output.fields.len() {
         return Err(DbError::new(
@@ -14464,14 +15002,77 @@ fn bind_view_select(
     })
 }
 
+fn bind_view_source(
+    view: &ViewDefinition,
+    catalog: &Catalog,
+    view_depth: usize,
+) -> Result<BoundStatement> {
+    let source = match view.kind {
+        ViewKind::Regular => {
+            bind_with_view_depth(parse(&view.query)?, catalog, view_depth.saturating_add(1))?
+        }
+        ViewKind::Materialized => {
+            if !view.populated {
+                return Err(DbError::new(
+                    "55000",
+                    format!("materialized view {} has not been populated", view.name),
+                )
+                .with_hint("run REFRESH MATERIALIZED VIEW before querying it"));
+            }
+            let table_id = view.materialized_table_id.ok_or_else(|| {
+                DbError::internal("materialized view is missing its backing table")
+            })?;
+            let projection = view
+                .output
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| BoundProjection {
+                    expr: BoundExpr {
+                        kind: BoundExprKind::Column { index },
+                        data_type: field.data_type.clone(),
+                        nullable: field.nullable,
+                    },
+                    field: field.clone(),
+                })
+                .collect();
+            BoundStatement::Select {
+                table_id,
+                schema: view.output.clone(),
+                projection,
+                filter: None,
+                order_by: Vec::new(),
+                offset: None,
+                limit: None,
+            }
+        }
+    };
+    let source_schema = bound_query_schema(&source)?;
+    if source_schema.fields.len() != view.output.fields.len()
+        || source_schema
+            .fields
+            .iter()
+            .zip(&view.output.fields)
+            .any(|(source, target)| source.data_type != target.data_type)
+    {
+        return Err(DbError::new(
+            "42P16",
+            "stored view query output no longer matches its catalog definition",
+        ));
+    }
+    Ok(source)
+}
+
 fn bind_update(
     table_name: ParsedObjectName,
     assignments: Vec<(ParsedIdentifier, ParsedExpr)>,
     filter: Option<ParsedExpr>,
     returning: Vec<ParsedProjection>,
     catalog: &Catalog,
+    view_depth: usize,
 ) -> Result<BoundStatement> {
-    let table = resolve_table(&table_name, catalog)?.clone();
+    let relation = resolve_dml_relation(&table_name, CatalogTriggerEvent::Update, catalog)?;
+    let table = relation.scope;
     let mut seen = BTreeSet::new();
     let assignments = assignments
         .into_iter()
@@ -14497,14 +15098,29 @@ fn bind_update(
         })
         .collect::<Result<Vec<_>>>()?;
     let returning = bind_returning(returning, &table)?;
-    Ok(BoundStatement::Update {
-        table_id: table.id,
-        assignments,
-        filter: filter
-            .map(|expr| bind_boolean_expr(expr, &table))
-            .transpose()?,
-        returning,
-    })
+    let filter = filter
+        .map(|expr| bind_boolean_expr(expr, &table))
+        .transpose()?;
+    match relation.target {
+        DmlTarget::Table(table_id) => Ok(BoundStatement::Update {
+            table_id,
+            assignments,
+            filter,
+            returning,
+        }),
+        DmlTarget::View(view_id) => {
+            let view = catalog
+                .view_by_id(view_id)
+                .ok_or_else(|| DbError::internal("bound view target disappeared"))?;
+            Ok(BoundStatement::ViewUpdate {
+                view_id,
+                source: Box::new(bind_view_source(view, catalog, view_depth)?),
+                assignments,
+                filter,
+                returning,
+            })
+        }
+    }
 }
 
 fn bind_delete(
@@ -14512,16 +15128,32 @@ fn bind_delete(
     filter: Option<ParsedExpr>,
     returning: Vec<ParsedProjection>,
     catalog: &Catalog,
+    view_depth: usize,
 ) -> Result<BoundStatement> {
-    let table = resolve_table(&table_name, catalog)?.clone();
+    let relation = resolve_dml_relation(&table_name, CatalogTriggerEvent::Delete, catalog)?;
+    let table = relation.scope;
     let returning = bind_returning(returning, &table)?;
-    Ok(BoundStatement::Delete {
-        table_id: table.id,
-        filter: filter
-            .map(|expr| bind_boolean_expr(expr, &table))
-            .transpose()?,
-        returning,
-    })
+    let filter = filter
+        .map(|expr| bind_boolean_expr(expr, &table))
+        .transpose()?;
+    match relation.target {
+        DmlTarget::Table(table_id) => Ok(BoundStatement::Delete {
+            table_id,
+            filter,
+            returning,
+        }),
+        DmlTarget::View(view_id) => {
+            let view = catalog
+                .view_by_id(view_id)
+                .ok_or_else(|| DbError::internal("bound view target disappeared"))?;
+            Ok(BoundStatement::ViewDelete {
+                view_id,
+                source: Box::new(bind_view_source(view, catalog, view_depth)?),
+                filter,
+                returning,
+            })
+        }
+    }
 }
 
 fn bind_returning(
@@ -15213,6 +15845,41 @@ fn resolve_table<'a>(name: &ParsedObjectName, catalog: &'a Catalog) -> Result<&'
         )
         .with_position_opt(position)
     })
+}
+
+fn resolve_trigger_target(name: &ParsedObjectName, catalog: &Catalog) -> Result<TriggerTarget> {
+    let (schema_name, relation_name, position) = split_table_name(name)?;
+    let schema = catalog.schema(&schema_name).ok_or_else(|| {
+        DbError::new(
+            UNDEFINED_SCHEMA,
+            format!("schema {schema_name} does not exist"),
+        )
+        .with_position_opt(position)
+    })?;
+    if let Some(table) = schema.table(&relation_name) {
+        return Ok(TriggerTarget::Table(table.id));
+    }
+    if let Some(view) = schema.view(&relation_name) {
+        return Ok(TriggerTarget::View(view.id));
+    }
+    Err(DbError::new(
+        UNDEFINED_TABLE,
+        format!("relation {schema_name}.{relation_name} does not exist"),
+    )
+    .with_position_opt(position))
+}
+
+fn trigger_target_name(target: TriggerTarget, catalog: &Catalog) -> Result<&Identifier> {
+    match target {
+        TriggerTarget::Table(table_id) => catalog
+            .table_by_id(table_id)
+            .map(|table| &table.name)
+            .ok_or_else(|| DbError::internal("bound trigger table disappeared")),
+        TriggerTarget::View(view_id) => catalog
+            .view_by_id(view_id)
+            .map(|view| &view.name)
+            .ok_or_else(|| DbError::internal("bound trigger view disappeared")),
+    }
 }
 
 fn split_table_name(name: &ParsedObjectName) -> Result<(Identifier, Identifier, Option<usize>)> {
@@ -17643,6 +18310,238 @@ mod tests {
     }
 
     #[test]
+    fn parses_routine_argument_modes_and_trigger_activation() {
+        let procedure = parse(
+            "CREATE PROCEDURE public.mode_probe(\
+             IN input_value BIGINT, OUT output_value TEXT, \
+             INOUT counter INTEGER, VARIADIC rest BIGINT[]) \
+             LANGUAGE plpgsql AS $$ BEGIN RETURN; END $$",
+        )
+        .expect("parse procedure modes");
+        let ParsedStatement::CreateRoutine { arguments, .. } = procedure else {
+            panic!("expected procedure");
+        };
+        assert_eq!(
+            arguments
+                .iter()
+                .map(|argument| argument.mode)
+                .collect::<Vec<_>>(),
+            vec![
+                RoutineArgumentMode::In,
+                RoutineArgumentMode::Out,
+                RoutineArgumentMode::InOut,
+                RoutineArgumentMode::Variadic,
+            ]
+        );
+
+        let function = parse(
+            "CREATE FUNCTION public.output_probe(IN value BIGINT, OUT doubled BIGINT) \
+             LANGUAGE plpgsql AS $$ BEGIN doubled := value * 2; RETURN; END $$",
+        )
+        .expect("parse function OUT mode");
+        assert!(matches!(
+            function,
+            ParsedStatement::CreateRoutine {
+                return_type: None,
+                ref arguments,
+                ..
+            } if arguments[1].mode == RoutineArgumentMode::Out
+        ));
+
+        let statement_trigger = parse(
+            "CREATE TRIGGER documents_audit AFTER UPDATE ON documents \
+             FOR EACH STATEMENT EXECUTE FUNCTION public.audit_documents()",
+        )
+        .expect("parse statement trigger");
+        assert!(matches!(
+            statement_trigger,
+            ParsedStatement::CreateTrigger {
+                timing: TriggerTiming::AfterStatement,
+                level: TriggerLevel::Statement,
+                ..
+            }
+        ));
+
+        let instead_of = parse(
+            "CREATE TRIGGER documents_view_insert INSTEAD OF INSERT ON documents_view \
+             FOR EACH ROW EXECUTE FUNCTION public.insert_documents_view()",
+        )
+        .expect("parse INSTEAD OF trigger");
+        assert!(matches!(
+            instead_of,
+            ParsedStatement::CreateTrigger {
+                timing: TriggerTiming::InsteadOf,
+                level: TriggerLevel::Row,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn binds_regular_view_instead_of_trigger_targets_and_view_dml() {
+        let mut catalog = catalog_with_documents();
+        let documents = catalog
+            .table(
+                &Identifier::unquoted("public"),
+                &Identifier::unquoted("documents"),
+            )
+            .expect("documents")
+            .id;
+        let view_id = catalog
+            .create_view(
+                &Identifier::unquoted("public"),
+                ordadb_catalog::NewView {
+                    name: Identifier::unquoted("document_view"),
+                    kind: ViewKind::Regular,
+                    query: "SELECT id, title FROM documents".into(),
+                    output: Schema::new(vec![
+                        Field::new("id", ScalarType::Int64, false),
+                        Field::new("title", ScalarType::Text, false),
+                    ]),
+                    materialized_table_id: None,
+                    populated: true,
+                    references: vec![CatalogObjectRef::Table(documents)],
+                },
+            )
+            .expect("view");
+        let routine_id = catalog
+            .create_or_replace_routine(
+                &Identifier::unquoted("public"),
+                ordadb_catalog::NewRoutine {
+                    name: Identifier::unquoted("document_view_insert"),
+                    kind: RoutineKind::Function,
+                    arguments: Vec::new(),
+                    return_type: None,
+                    return_declared_type: None,
+                    returns_set: false,
+                    language: "plpgsql".into(),
+                    body: "BEGIN RETURN NEW; END".into(),
+                    replace: false,
+                    references: Vec::new(),
+                },
+            )
+            .expect("routine");
+        let unavailable = bind(
+            parse("INSERT INTO document_view VALUES (1, 'one')").expect("parse view insert"),
+            &catalog,
+        )
+        .expect_err("view DML requires a trigger");
+        assert_eq!(unavailable.sql_state, "55000");
+
+        let create = bind(
+            parse(
+                "CREATE TRIGGER document_view_insert_trigger INSTEAD OF INSERT ON document_view \
+                 FOR EACH ROW EXECUTE FUNCTION document_view_insert()",
+            )
+            .expect("parse view trigger"),
+            &catalog,
+        )
+        .expect("bind view trigger");
+        assert!(matches!(
+            create,
+            BoundStatement::CreateTrigger {
+                target: TriggerTarget::View(id),
+                ..
+            } if id == view_id
+        ));
+        catalog
+            .create_trigger_on_target_with_level(
+                TriggerTarget::View(view_id),
+                Identifier::unquoted("document_view_insert_trigger"),
+                TriggerTiming::InsteadOf,
+                TriggerLevel::Row,
+                BTreeSet::from([CatalogTriggerEvent::Insert]),
+                routine_id,
+            )
+            .expect("catalog view trigger");
+        assert!(matches!(
+            bind(
+                parse("INSERT INTO document_view VALUES ($1, $2) RETURNING *")
+                    .expect("parse parameterized view insert"),
+                &catalog,
+            )
+            .expect("bind parameterized view insert"),
+            BoundStatement::ViewInsert { view_id: id, .. } if id == view_id
+        ));
+    }
+
+    #[test]
+    fn parses_and_binds_remaining_core_session_and_maintenance_commands() {
+        let catalog = catalog_with_documents();
+        assert!(matches!(
+            bind(
+                parse("REINDEX TABLE public.documents").expect("parse reindex table"),
+                &catalog,
+            )
+            .expect("bind reindex table"),
+            BoundStatement::Reindex {
+                target: BoundReindexTarget::Table(_)
+            }
+        ));
+        assert_eq!(
+            parse("REINDEX (VERBOSE true) TABLE public.documents")
+                .expect_err("reindex parameters are explicit unsupported")
+                .sql_state,
+            FEATURE_NOT_SUPPORTED
+        );
+        assert_eq!(
+            parse("REINDEX TABLE CONCURRENTLY public.documents")
+                .expect_err("concurrent reindex is explicit unsupported")
+                .sql_state,
+            FEATURE_NOT_SUPPORTED
+        );
+
+        assert!(matches!(
+            bind(parse("LISTEN events").expect("parse listen"), &catalog)
+                .expect("bind listen"),
+            BoundStatement::Listen { ref channel } if channel.as_str() == "events"
+        ));
+        assert!(matches!(
+            bind(
+                parse("NOTIFY events, 'ready'").expect("parse notify"),
+                &catalog,
+            )
+            .expect("bind notify"),
+            BoundStatement::Notify { ref channel, ref payload }
+                if channel.as_str() == "events" && payload == "ready"
+        ));
+        assert!(matches!(
+            bind(
+                parse("SELECT pg_catalog.pg_notify('events', 'from-function')")
+                    .expect("parse pg_notify"),
+                &catalog,
+            )
+            .expect("bind pg_notify"),
+            BoundStatement::PgNotify { ref schema, .. }
+                if schema.fields.len() == 1 && schema.fields[0].name == "pg_notify"
+        ));
+        assert!(matches!(
+            bind(parse("UNLISTEN *").expect("parse unlisten"), &catalog).expect("bind unlisten"),
+            BoundStatement::Unlisten { channel: None }
+        ));
+        assert!(matches!(
+            bind(
+                parse("DO LANGUAGE plpgsql $$ BEGIN NULL; END $$").expect("parse do"),
+                &catalog,
+            )
+            .expect("bind do"),
+            BoundStatement::Do { ref body } if body.contains("BEGIN")
+        ));
+        assert!(matches!(
+            bind(parse("DISCARD ALL").expect("parse discard"), &catalog).expect("bind discard"),
+            BoundStatement::DiscardAll
+        ));
+        assert!(matches!(
+            bind(
+                parse("DEALLOCATE PREPARE ALL").expect("parse deallocate"),
+                &catalog,
+            )
+            .expect("bind deallocate"),
+            BoundStatement::DeallocateAll
+        ));
+    }
+
+    #[test]
     fn parses_and_binds_alter_drop_and_if_exists_forms() {
         let catalog = catalog_with_documents();
         let alter = bind(
@@ -18934,6 +19833,7 @@ mod tests {
                 name: Some(Identifier::unquoted("value")),
                 data_type: ScalarType::Int32,
                 declared_type: Some(type_id),
+                mode: RoutineArgumentMode::In,
             }],
             return_type: Some(ScalarType::Int32),
             return_declared_type: None,

@@ -229,6 +229,7 @@ impl CatalogProjection {
                                     kind: view.kind,
                                     output: view.output.clone(),
                                     populated: view.populated,
+                                    triggers: view.triggers().cloned().collect(),
                                     indexes: view
                                         .materialized_table_id
                                         .and_then(|table_id| catalog.table_by_id(table_id))
@@ -294,6 +295,7 @@ struct ViewProjection {
     kind: ViewKind,
     output: Schema,
     populated: bool,
+    triggers: Vec<TriggerDefinition>,
     indexes: Vec<IndexDefinition>,
 }
 

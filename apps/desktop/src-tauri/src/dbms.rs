@@ -329,6 +329,8 @@ pub enum DbmsQueryEvent {
         rows_processed: u64,
     },
     Notice {
+        severity: String,
+        sql_state: String,
         message: String,
     },
     Complete {
@@ -2393,7 +2395,28 @@ fn emit_native_pg_event(
                 },
             );
         }
+        PgQueryEvent::Notice(notice) => emit_query(
+            app,
+            request_id,
+            DbmsQueryEvent::Notice {
+                severity: notice.severity.as_str().into(),
+                sql_state: notice.sql_state,
+                message: notice.message,
+            },
+        ),
         PgQueryEvent::Complete(_) => {}
+        PgQueryEvent::Notification(notification) => emit_query(
+            app,
+            request_id,
+            DbmsQueryEvent::Notice {
+                severity: "NOTICE".into(),
+                sql_state: "00000".into(),
+                message: format!(
+                    "notification {} from backend {}: {}",
+                    notification.channel, notification.sender_process_id, notification.payload
+                ),
+            },
+        ),
     }
 }
 
@@ -2420,7 +2443,9 @@ fn map_connector_event(event: QueryEvent, elapsed: Duration) -> DbmsQueryEvent {
             rows_processed: progress.rows_processed,
         },
         QueryEvent::Notice(notice) => DbmsQueryEvent::Notice {
-            message: format!("{} · {}", notice.sql_state, notice.message),
+            severity: notice.severity.as_str().into(),
+            sql_state: notice.sql_state,
+            message: notice.message,
         },
         QueryEvent::Complete(complete) => DbmsQueryEvent::Complete {
             command_tag: complete.tag,
@@ -2999,6 +3024,28 @@ mod tests {
                 "event": {
                     "kind": "progress",
                     "rowsProcessed": 7
+                }
+            })
+        );
+
+        let notice = serde_json::to_value(QueryUpdate {
+            request_id: "request-notice".into(),
+            event: DbmsQueryEvent::Notice {
+                severity: "WARNING".into(),
+                sql_state: "01000".into(),
+                message: "careful".into(),
+            },
+        })
+        .expect("serialize notice");
+        assert_eq!(
+            notice,
+            serde_json::json!({
+                "requestId": "request-notice",
+                "event": {
+                    "kind": "notice",
+                    "severity": "WARNING",
+                    "sqlState": "01000",
+                    "message": "careful"
                 }
             })
         );

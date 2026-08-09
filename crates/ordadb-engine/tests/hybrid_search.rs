@@ -57,6 +57,15 @@ fn search_indexes_rebuild_across_mutation_rollback_reopen_and_drop() {
         &[],
     )
     .expect("HNSW index");
+    for statement in [
+        "REINDEX INDEX public.documents_fts",
+        "REINDEX INDEX public.documents_hnsw",
+        "REINDEX TABLE public.documents",
+        "REINDEX SCHEMA public",
+        "REINDEX DATABASE ordadb",
+    ] {
+        execute(&mut session, statement, &[]).expect(statement);
+    }
 
     let catalog = engine.catalog_snapshot().expect("catalog");
     let full_text_id = catalog

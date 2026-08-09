@@ -24,17 +24,18 @@ use ordadb_engine::{
     CatalogRoleMetadata, CatalogVisibility, CatalogVisibilityScope, Engine, Session,
     SessionAuthorization, SessionRuntimeMetadata, StatementDescription, TransactionStatus,
 };
+use ordadb_sql::{ParsedStatement, parse};
 use ordadb_types::{
     Batch, CommandComplete, DbError, Field, Identifier, QueryEvent, QueryProgress, Result, Row,
     ScalarType, Schema, Value,
 };
 
 use crate::codec::{
-    DEFAULT_MAX_FRAME_BYTES, FrontendMessage, StartupPacket, io_error, protocol, read_frontend,
-    read_startup, write_backend_key, write_bind_complete, write_close_complete,
+    DEFAULT_MAX_FRAME_BYTES, FrontendMessage, FrontendMessageReader, FrontendRead, StartupPacket,
+    io_error, protocol, read_startup, write_backend_key, write_bind_complete, write_close_complete,
     write_command_complete, write_empty_query, write_error, write_message, write_no_data,
-    write_notice, write_parameter_description, write_parameter_status, write_parse_complete,
-    write_portal_suspended, write_ready,
+    write_notice, write_notification, write_parameter_description, write_parameter_status,
+    write_parse_complete, write_portal_suspended, write_ready,
 };
 use crate::scram::authenticate;
 use crate::security::{
@@ -48,6 +49,8 @@ use crate::value::{
 const DEFAULT_MAX_PREPARED: usize = 1024;
 const DEFAULT_MAX_PORTALS: usize = 1024;
 const DEFAULT_MAX_COPY_BYTES: usize = 64 * 1024 * 1024;
+const COPY_INSERT_BATCH_ROWS: usize = 128;
+const COPY_INSERT_BATCH_PARAMETERS: usize = 4_096;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(300);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -203,7 +206,11 @@ fn serve_tcp_connection_inner(
         .set_write_timeout(Some(socket_timeout))
         .map_err(|error| io_error("failed to configure PostgreSQL write timeout", error))?;
 
-    let stream = InterruptibleTcpStream { stream, shutdown };
+    let stream = InterruptibleTcpStream {
+        stream,
+        shutdown,
+        frontend_polling: false,
+    };
     let connection_shutdown = stream.shutdown.clone();
     let (mut stream, startup) = negotiate_startup(stream, tls, config.max_frame_bytes)?;
     let parameters = match startup {
@@ -272,8 +279,10 @@ fn serve_tcp_connection_inner(
     write_startup_responses(&mut stream, &settings, &handle)?;
 
     let mut session = connect_postgresql_session(&engine, &principal, bypass_ownership)?;
+    session.set_backend_process_id(handle.process_id())?;
     session.set_runtime_metadata(session_runtime_metadata(&settings, &database, &principal)?);
     refresh_system_catalog_metadata(&mut session, &auth, &settings, &principal, &database)?;
+    stream.enable_frontend_polling()?;
     let mut connection = Connection {
         stream,
         session,
@@ -287,6 +296,7 @@ fn serve_tcp_connection_inner(
         settings,
         prepared: BTreeMap::new(),
         portals: BTreeMap::new(),
+        frontend_reader: FrontendMessageReader::default(),
         extended_state: ExtendedQueryState::Ready,
         shutdown: connection_shutdown,
     };
@@ -410,14 +420,25 @@ enum ConnectionStream {
     Tls(Box<StreamOwned<ServerConnection, InterruptibleTcpStream>>),
 }
 
+impl ConnectionStream {
+    fn enable_frontend_polling(&mut self) -> Result<()> {
+        match self {
+            Self::Plain(stream) => stream.enable_frontend_polling(),
+            Self::Tls(stream) => stream.sock.enable_frontend_polling(),
+        }
+    }
+}
+
 struct InterruptibleTcpStream {
     stream: TcpStream,
     shutdown: Option<CancellationToken>,
+    frontend_polling: bool,
 }
 
 impl InterruptibleTcpStream {
-    fn should_retry(&self, error: &std::io::Error) -> bool {
-        self.shutdown.is_some()
+    fn should_retry_read(&self, error: &std::io::Error) -> bool {
+        !self.frontend_polling
+            && self.shutdown.is_some()
             && matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
             && !self
                 .shutdown
@@ -430,13 +451,21 @@ impl InterruptibleTcpStream {
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
     }
+
+    fn enable_frontend_polling(&mut self) -> Result<()> {
+        self.stream
+            .set_read_timeout(Some(SOCKET_POLL_INTERVAL))
+            .map_err(|error| io_error("failed to configure notification polling", error))?;
+        self.frontend_polling = true;
+        Ok(())
+    }
 }
 
 impl Read for InterruptibleTcpStream {
     fn read(&mut self, target: &mut [u8]) -> std::io::Result<usize> {
         loop {
             match self.stream.read(target) {
-                Err(error) if self.should_retry(&error) => {}
+                Err(error) if self.should_retry_read(&error) => {}
                 Err(error)
                     if self.is_shutdown()
                         && matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
@@ -453,7 +482,10 @@ impl Write for InterruptibleTcpStream {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         loop {
             match self.stream.write(bytes) {
-                Err(error) if self.should_retry(&error) => {}
+                Err(error)
+                    if self.shutdown.is_some()
+                        && matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
+                        && !self.is_shutdown() => {}
                 Err(error)
                     if self.is_shutdown()
                         && matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
@@ -614,6 +646,28 @@ enum ExtendedQueryState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolSessionReset {
+    DeallocateAll,
+    DiscardAll,
+}
+
+fn protocol_session_reset(sql: &str) -> Result<Option<ProtocolSessionReset>> {
+    let first_word = sql
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .map_or_else(|| sql.trim(), |(word, _)| word);
+    if !first_word.eq_ignore_ascii_case("DISCARD") && !first_word.eq_ignore_ascii_case("DEALLOCATE")
+    {
+        return Ok(None);
+    }
+    match parse(sql)? {
+        ParsedStatement::DiscardAll => Ok(Some(ProtocolSessionReset::DiscardAll)),
+        ParsedStatement::DeallocateAll => Ok(Some(ProtocolSessionReset::DeallocateAll)),
+        _ => Ok(None),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailedMessageAction {
     Synchronize,
     Terminate,
@@ -688,6 +742,7 @@ struct Connection {
     settings: PgSessionSettings,
     prepared: BTreeMap<String, PreparedStatement>,
     portals: BTreeMap<String, Portal>,
+    frontend_reader: FrontendMessageReader,
     extended_state: ExtendedQueryState,
     shutdown: Option<CancellationToken>,
 }
@@ -695,8 +750,8 @@ struct Connection {
 impl Connection {
     fn run(&mut self) -> Result<()> {
         loop {
-            let Some(message) = read_frontend(&mut self.stream, self.config.max_frame_bytes)?
-            else {
+            self.deliver_pending_notifications()?;
+            let Some(message) = self.next_frontend_message()? else {
                 return Ok(());
             };
             if self.extended_state == ExtendedQueryState::FailedUntilSync {
@@ -725,6 +780,42 @@ impl Connection {
                 }
             }
         }
+    }
+
+    fn next_frontend_message(&mut self) -> Result<Option<FrontendMessage>> {
+        loop {
+            match self
+                .frontend_reader
+                .poll(&mut self.stream, self.config.max_frame_bytes)?
+            {
+                FrontendRead::Message(message) => return Ok(Some(message)),
+                FrontendRead::Closed => return Ok(None),
+                FrontendRead::Pending => self.deliver_pending_notifications()?,
+            }
+        }
+    }
+
+    fn deliver_pending_notifications(&mut self) -> Result<()> {
+        let notifications = match self.session.drain_notifications() {
+            Ok(notifications) => notifications,
+            Err(error) => {
+                write_error(&mut self.stream, &error)?;
+                self.flush()?;
+                return Err(error);
+            }
+        };
+        if notifications.is_empty() {
+            return Ok(());
+        }
+        for notification in notifications {
+            write_notification(
+                &mut self.stream,
+                notification.sender_process_id,
+                &notification.channel,
+                &notification.payload,
+            )?;
+        }
+        self.flush()
     }
 
     fn handle_message(&mut self, message: FrontendMessage) -> Result<()> {
@@ -799,6 +890,7 @@ impl Connection {
             redacted_security_sql(sql),
         )?;
         let result = (|| {
+            let protocol_reset = protocol_session_reset(sql)?;
             let stream = self.statement_stream(sql, &[])?;
             let mut schema = Schema::empty();
             for event in stream {
@@ -824,6 +916,9 @@ impl Connection {
                         write_notice(&mut self.stream, &notice)?;
                     }
                     QueryEvent::Complete(complete) => {
+                        if let Some(reset) = protocol_reset {
+                            self.apply_protocol_session_reset(reset)?;
+                        }
                         write_command_complete(&mut self.stream, &command_tag(&complete))?;
                     }
                 }
@@ -932,12 +1027,20 @@ impl Connection {
             .portals
             .remove(name)
             .ok_or_else(|| DbError::new("34000", "portal does not exist"))?;
-        let result = self.execute_portal_inner(&mut portal, max_rows);
-        self.portals.insert(name.to_owned(), portal);
+        let protocol_reset = protocol_session_reset(&portal.sql)?;
+        let result = self.execute_portal_inner(&mut portal, max_rows, protocol_reset);
+        if !(portal.completed && protocol_reset.is_some()) {
+            self.portals.insert(name.to_owned(), portal);
+        }
         result
     }
 
-    fn execute_portal_inner(&mut self, portal: &mut Portal, max_rows: u32) -> Result<()> {
+    fn execute_portal_inner(
+        &mut self,
+        portal: &mut Portal,
+        max_rows: u32,
+        protocol_reset: Option<ProtocolSessionReset>,
+    ) -> Result<()> {
         if portal.completed {
             return write_command_complete(&mut self.stream, "SELECT 0");
         }
@@ -1008,13 +1111,16 @@ impl Connection {
                     write_notice(&mut self.stream, &notice)?;
                 }
                 Ok(QueryEvent::Complete(complete)) => {
-                    write_command_complete(&mut self.stream, &command_tag(&complete))?;
                     if let Some(query_id) = &portal.query_id {
                         self.registry
                             .finish_query(query_id, QueryOutcome::Complete)?;
                     }
                     portal.completed = true;
                     portal.stream = None;
+                    if let Some(reset) = protocol_reset {
+                        self.apply_protocol_session_reset(reset)?;
+                    }
+                    write_command_complete(&mut self.stream, &command_tag(&complete))?;
                     return Ok(());
                 }
                 Err(error) => {
@@ -1064,6 +1170,19 @@ impl Connection {
             if let Some(portal) = self.portals.remove(&name) {
                 retire_portal(&self.registry, portal, QueryOutcome::Cancelled)?;
             }
+        }
+        Ok(())
+    }
+
+    fn apply_protocol_session_reset(&mut self, reset: ProtocolSessionReset) -> Result<()> {
+        self.prepared.clear();
+        let portals = std::mem::take(&mut self.portals);
+        for (_, portal) in portals {
+            retire_portal(&self.registry, portal, QueryOutcome::Cancelled)?;
+        }
+        if reset == ProtocolSessionReset::DiscardAll {
+            self.settings.reset_all();
+            self.refresh_runtime_metadata()?;
         }
         Ok(())
     }
@@ -1239,14 +1358,12 @@ impl Connection {
     fn copy_from_stdin(&mut self, copy: &CopyCommand) -> Result<()> {
         self.authorize(&format!("COPY {} FROM STDIN", copy.table))?;
         let columns = copy_columns(&self.engine, &copy.table, &copy.columns)?;
-        let insert = insert_statement(&copy.table, &columns);
         let owns_transaction = begin_copy_transaction(&mut self.session)?;
         write_copy_response(&mut self.stream, b'G', columns.len())?;
         self.flush()?;
         let mut bytes = Vec::new();
         let receive = loop {
-            let Some(message) = read_frontend(&mut self.stream, self.config.max_frame_bytes)?
-            else {
+            let Some(message) = self.next_frontend_message()? else {
                 break Err(DbError::new("08006", "connection closed during COPY IN"));
             };
             match message {
@@ -1275,7 +1392,13 @@ impl Connection {
             abort_copy_transaction(&mut self.session, owns_transaction);
             return Err(error);
         }
-        let rows = match import_copy(&mut self.session, &insert, &columns, &copy.options, &bytes) {
+        let rows = match import_copy(
+            &mut self.session,
+            &copy.table,
+            &columns,
+            &copy.options,
+            &bytes,
+        ) {
             Ok(rows) => rows,
             Err(error) => {
                 abort_copy_transaction(&mut self.session, owns_transaction);
@@ -2371,36 +2494,114 @@ fn copy_columns(
         .collect()
 }
 
-fn insert_statement(table: &str, columns: &[ColumnDefinition]) -> String {
+fn insert_statement(table: &str, columns: &[ColumnDefinition], rows: usize) -> Result<String> {
+    if columns.is_empty() || rows == 0 {
+        return Err(DbError::new(
+            "XX000",
+            "COPY insert batches require at least one row and column",
+        ));
+    }
     let names = columns
         .iter()
         .map(|column| column.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let parameters = (1..=columns.len())
-        .map(|index| format!("${index}"))
+    let parameter_count = rows
+        .checked_mul(columns.len())
+        .ok_or_else(|| DbError::new("54000", "COPY parameter count overflowed"))?;
+    let parameters = (0..rows)
+        .map(|row| {
+            let first = row * columns.len() + 1;
+            let values = (first..first + columns.len())
+                .map(|index| format!("${index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({values})")
+        })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("INSERT INTO {table} ({names}) VALUES ({parameters})")
+    debug_assert_eq!(parameter_count, rows * columns.len());
+    Ok(format!("INSERT INTO {table} ({names}) VALUES {parameters}"))
 }
 
 fn import_copy(
     session: &mut Session,
-    insert: &str,
+    table: &str,
     columns: &[ColumnDefinition],
     options: &CopyOptions,
     bytes: &[u8],
 ) -> Result<u64> {
+    let plan = CopyInsertPlan::new(table, columns)?;
     match options.format {
-        CopyFormat::Text => import_text(session, insert, columns, options, bytes),
-        CopyFormat::Csv => import_csv(session, insert, columns, options, bytes),
+        CopyFormat::Text => import_text(session, &plan, options, bytes),
+        CopyFormat::Csv => import_csv(session, &plan, options, bytes),
+    }
+}
+
+struct CopyInsertPlan<'a> {
+    table: &'a str,
+    columns: &'a [ColumnDefinition],
+    data_types: Vec<ScalarType>,
+    oids: Vec<u32>,
+    batch_rows: usize,
+}
+
+impl<'a> CopyInsertPlan<'a> {
+    fn new(table: &'a str, columns: &'a [ColumnDefinition]) -> Result<Self> {
+        if columns.is_empty() {
+            return Err(DbError::new("XX000", "COPY target has no columns"));
+        }
+        let data_types = columns
+            .iter()
+            .map(|column| column.data_type.clone())
+            .collect::<Vec<_>>();
+        let oids = data_types.iter().map(type_oid).collect::<Vec<_>>();
+        let batch_rows =
+            (COPY_INSERT_BATCH_PARAMETERS / columns.len()).clamp(1, COPY_INSERT_BATCH_ROWS);
+        Ok(Self {
+            table,
+            columns,
+            data_types,
+            oids,
+            batch_rows,
+        })
+    }
+
+    fn insert_rows(&self, session: &mut Session, raw_rows: &[Vec<Option<Vec<u8>>>]) -> Result<()> {
+        if raw_rows.is_empty() {
+            return Ok(());
+        }
+        let parameter_count = raw_rows
+            .len()
+            .checked_mul(self.columns.len())
+            .ok_or_else(|| DbError::new("54000", "COPY parameter count overflowed"))?;
+        let mut values = Vec::with_capacity(parameter_count);
+        for raw in raw_rows {
+            if raw.len() != self.columns.len() {
+                return Err(DbError::new(
+                    "22P04",
+                    format!(
+                        "COPY row has {} fields but target has {} columns",
+                        raw.len(),
+                        self.columns.len()
+                    ),
+                ));
+            }
+            values.extend(decode_parameters_as(
+                &self.oids,
+                &self.data_types,
+                &[],
+                raw,
+            )?);
+        }
+        let insert = insert_statement(self.table, self.columns, raw_rows.len())?;
+        drain(session.execute_stream(&insert, &values)?)
     }
 }
 
 fn import_csv(
     session: &mut Session,
-    insert: &str,
-    columns: &[ColumnDefinition],
+    plan: &CopyInsertPlan<'_>,
     options: &CopyOptions,
     bytes: &[u8],
 ) -> Result<u64> {
@@ -2410,7 +2611,8 @@ fn import_csv(
         let header = records
             .next()
             .ok_or_else(|| DbError::new("22P04", "COPY CSV header is missing"))?;
-        let expected = columns
+        let expected = plan
+            .columns
             .iter()
             .map(|column| column.name.as_str())
             .collect::<Vec<_>>();
@@ -2430,6 +2632,7 @@ fn import_csv(
         }
     }
     let mut rows = 0_u64;
+    let mut batch = Vec::with_capacity(plan.batch_rows);
     for record in records {
         let raw = record
             .into_iter()
@@ -2441,9 +2644,14 @@ fn import_csv(
                 }
             })
             .collect::<Vec<_>>();
-        insert_copy_row(session, insert, columns, raw)?;
+        batch.push(raw);
         rows = checked_copy_row_count(rows)?;
+        if batch.len() == plan.batch_rows {
+            plan.insert_rows(session, &batch)?;
+            batch.clear();
+        }
     }
+    plan.insert_rows(session, &batch)?;
     Ok(rows)
 }
 
@@ -2563,12 +2771,12 @@ fn skip_csv_record_end(bytes: &[u8], index: usize) -> usize {
 
 fn import_text(
     session: &mut Session,
-    insert: &str,
-    columns: &[ColumnDefinition],
+    plan: &CopyInsertPlan<'_>,
     options: &CopyOptions,
     bytes: &[u8],
 ) -> Result<u64> {
     let mut rows = 0_u64;
+    let mut batch = Vec::with_capacity(plan.batch_rows);
     let mut start = 0;
     for end in (0..=bytes.len()).filter(|index| *index == bytes.len() || bytes[*index] == b'\n') {
         if end == bytes.len() && start == end {
@@ -2579,10 +2787,15 @@ fn import_text(
             record = &record[..record.len() - 1];
         }
         let raw = decode_text_record(record, options)?;
-        insert_copy_row(session, insert, columns, raw)?;
+        batch.push(raw);
         rows = checked_copy_row_count(rows)?;
+        if batch.len() == plan.batch_rows {
+            plan.insert_rows(session, &batch)?;
+            batch.clear();
+        }
         start = end.saturating_add(1);
     }
+    plan.insert_rows(session, &batch)?;
     Ok(rows)
 }
 
@@ -2643,31 +2856,6 @@ fn decode_text_field(field: &[u8], options: &CopyOptions) -> Result<Option<Vec<u
     Ok(Some(decoded))
 }
 
-fn insert_copy_row(
-    session: &mut Session,
-    insert: &str,
-    columns: &[ColumnDefinition],
-    raw: Vec<Option<Vec<u8>>>,
-) -> Result<()> {
-    if raw.len() != columns.len() {
-        return Err(DbError::new(
-            "22P04",
-            format!(
-                "COPY row has {} fields but target has {} columns",
-                raw.len(),
-                columns.len()
-            ),
-        ));
-    }
-    let data_types = columns
-        .iter()
-        .map(|column| column.data_type.clone())
-        .collect::<Vec<_>>();
-    let oids = data_types.iter().map(type_oid).collect::<Vec<_>>();
-    let values = decode_parameters_as(&oids, &data_types, &[], &raw)?;
-    drain(session.execute_stream(insert, &values)?)
-}
-
 fn checked_copy_row_count(rows: u64) -> Result<u64> {
     rows.checked_add(1)
         .ok_or_else(|| DbError::new("54000", "COPY row count overflowed"))
@@ -2682,6 +2870,25 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn protocol_session_reset_classifier_is_exact() {
+        assert_eq!(
+            protocol_session_reset("DISCARD ALL").expect("discard"),
+            Some(ProtocolSessionReset::DiscardAll)
+        );
+        assert_eq!(
+            protocol_session_reset("deallocate all").expect("deallocate"),
+            Some(ProtocolSessionReset::DeallocateAll)
+        );
+        assert_eq!(protocol_session_reset("SELECT 1").expect("select"), None);
+        assert_eq!(
+            protocol_session_reset("DEALLOCATE named")
+                .expect_err("named deallocate remains unsupported")
+                .sql_state,
+            "0A000"
+        );
+    }
 
     #[test]
     fn prepared_parameter_oids_fill_unknowns_and_reject_conflicts() {
@@ -3038,14 +3245,13 @@ mod tests {
         )
         .expect("drain create table");
         let columns = copy_columns(&engine, "copy_tx", &[]).expect("COPY columns");
-        let insert = insert_statement("copy_tx", &columns);
         let options = default_copy_options(CopyFormat::Text);
 
         drain(session.execute_stream("BEGIN", &[]).expect("begin")).expect("drain begin");
         let owns_transaction = begin_copy_transaction(&mut session).expect("reuse transaction");
         assert!(!owns_transaction);
         assert_eq!(
-            import_copy(&mut session, &insert, &columns, &options, b"1\touter\n",)
+            import_copy(&mut session, "copy_tx", &columns, &options, b"1\touter\n",)
                 .expect("import COPY row"),
             1
         );
@@ -3072,7 +3278,7 @@ mod tests {
         let owns_transaction = begin_copy_transaction(&mut session).expect("reuse transaction");
         let error = import_copy(
             &mut session,
-            &insert,
+            "copy_tx",
             &columns,
             &options,
             b"2\tvalid\n3\ttoo\tmany\n",
@@ -3134,7 +3340,6 @@ mod tests {
         .expect("drain create table");
         let requested = vec!["id".to_owned(), "title".to_owned()];
         let columns = copy_columns(&engine, "items", &requested).expect("COPY columns");
-        let insert = insert_statement("items", &columns);
         let mut csv = default_copy_options(CopyFormat::Csv);
         csv.header = true;
         csv.delimiter = b';';
@@ -3143,7 +3348,7 @@ mod tests {
         assert_eq!(
             import_copy(
                 &mut session,
-                &insert,
+                "items",
                 &columns,
                 &csv,
                 b"id;title\n1;first\n2;second\n",
@@ -3162,7 +3367,7 @@ mod tests {
             .expect("drain begin failure");
         let error = import_copy(
             &mut session,
-            &insert,
+            "items",
             &columns,
             &default_copy_options(CopyFormat::Text),
             b"3\tthird\nnot-an-id\tbroken\n",

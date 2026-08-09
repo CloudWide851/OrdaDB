@@ -16,8 +16,9 @@ use std::time::Duration;
 use ordadb_catalog::{
     Catalog, CatalogExpression, CatalogObjectRef, CatalogOwner, ColumnDefinition, ColumnStatistics,
     ConstraintKind, DomainBaseType, DropBehavior, IndexMethod, NewColumn, NewRoutine, NewView,
-    ReferentialAction, SequenceAlteration, TableDefinition, TableStatistics, TriggerEvent,
-    TriggerTiming, UserDefinedTypeKind, ViewKind, indexable_type,
+    PostgresOidObject, ReferentialAction, RoutineDefinition, SequenceAlteration, TableDefinition,
+    TableStatistics, TriggerDefinition, TriggerEvent, TriggerLevel, TriggerTarget, TriggerTiming,
+    UserDefinedTypeKind, ViewKind, indexable_type,
 };
 use ordadb_execution::{
     AdvancedExecutionCursor, AdvancedExecutionPlan, ApplyExecutionKind, ApplyExecutionPlan,
@@ -33,7 +34,9 @@ use ordadb_optimizer::{
     JoinStrategy, choose_join_strategy, explain as explain_plan, optimize_select,
 };
 use ordadb_plpgsql::{
-    PlpgsqlHost, compile_with_arguments as compile_plpgsql, execute as execute_plpgsql,
+    PlpgsqlHost, VmMachine, VmMemoryGrant, VmMemoryHold, VmMemoryReservation, VmOutput, VmRunState,
+    VmSqlStream, compile_with_arguments as compile_plpgsql,
+    execute_with_memory_grant as execute_plpgsql_with_memory,
 };
 pub use ordadb_search::{
     AllowedRows, HybridSearchRequest, SearchRowId, TextSearchRequest, VectorSearchRequest,
@@ -43,11 +46,12 @@ use ordadb_sql::{
     BinaryOperator, BoundAlterDomainOperation, BoundAlterTableOperation, BoundApply,
     BoundApplyKind, BoundConflictAction, BoundCte, BoundExpr, BoundExprKind, BoundJoin,
     BoundJoinSource, BoundMerge, BoundMergeAction, BoundMergeClauseKind, BoundOnConflict,
-    BoundOrder, BoundProjection, BoundReturning, BoundSequenceOperation, BoundStatement,
-    BoundTable, BoundWindow, BoundWindowFrameBound, DdlObjectKind, JoinKind, ParsedStatement,
-    QuerySetOperator, SessionBindValues, SqlDialect, SubqueryQuantifier, TransactionChain, bind,
-    bind_catalog_expression_with_catalog, bind_catalog_expression_with_parameter_types_and_catalog,
-    bind_with_session, parse, parse_with_dialect,
+    BoundOrder, BoundProjection, BoundReindexTarget, BoundReturning, BoundSequenceOperation,
+    BoundStatement, BoundTable, BoundWindow, BoundWindowFrameBound, DdlObjectKind, JoinKind,
+    ParsedStatement, QuerySetOperator, SessionBindValues, SqlDialect, SubqueryQuantifier,
+    TransactionChain, bind, bind_catalog_expression_with_catalog,
+    bind_catalog_expression_with_parameter_types_and_catalog, bind_with_session, parse,
+    parse_with_dialect,
 };
 use ordadb_storage::{
     ApplyPoint, DataFormat, DatabaseStore, DurabilityBarrier, FROZEN_TRANSACTION_ID,
@@ -62,7 +66,7 @@ use ordadb_transaction::{
     TransactionStatusStore, WalManager, WriterCoordinator, WriterLease, tuple_visible,
 };
 use ordadb_types::{
-    Batch, CommandComplete, DbError, Field, Identifier, IndexId, PgArray, QueryEvent,
+    Batch, CommandComplete, DbError, DbNotice, Field, Identifier, IndexId, PgArray, QueryEvent,
     QueryProgress, Result, Row, ScalarType, Schema, SequenceId, TableId, TypeId, Value, ViewId,
 };
 
@@ -79,7 +83,15 @@ const MAX_SYSTEM_CATALOG_SETTINGS: usize = 256;
 const MAX_SYSTEM_CATALOG_TEXT_BYTES: usize = 1_024;
 const MAX_SESSION_RUNTIME_TEXT_BYTES: usize = 1_024;
 const MAX_SESSION_RUNTIME_SETTINGS: usize = 256;
-const PLPGSQL_EXECUTION_STACK_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ROUTINE_FRAMES: usize = 64;
+// Trigger-issued DML still re-enters the statement executor synchronously. Keep
+// this guard below the verified 128 KiB Windows release-stack boundary until
+// trigger statement continuations are fully heap-resident alongside routine
+// VM frames. Exceeding it is a structured implementation limit, never a stack
+// overflow.
+const MAX_TRIGGER_FRAMES: usize = 1;
+const MAX_PLPGSQL_NOTICES: usize = 1_024;
+const MAX_PLPGSQL_NOTICE_BYTES: usize = 64 * 1024;
 pub const LOGICAL_SNAPSHOT_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -618,6 +630,186 @@ impl Drop for StorageWriteLease {
     }
 }
 
+const MAX_NOTIFICATION_QUEUE_ENTRIES: usize = 1_024;
+const MAX_NOTIFICATION_QUEUE_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseNotification {
+    pub sender_process_id: u32,
+    pub channel: String,
+    pub payload: String,
+}
+
+#[derive(Debug, Clone)]
+enum NotificationListenerAction {
+    Listen(Identifier),
+    Unlisten(Identifier),
+    UnlistenAll,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NotificationTransactionState {
+    listener_actions: Vec<NotificationListenerAction>,
+    notifications: Vec<(Identifier, String)>,
+    coalesced: BTreeSet<(Identifier, String)>,
+}
+
+impl NotificationTransactionState {
+    fn listen(&mut self, channel: Identifier) {
+        self.listener_actions
+            .push(NotificationListenerAction::Listen(channel));
+    }
+
+    fn unlisten(&mut self, channel: Option<Identifier>) {
+        self.listener_actions.push(channel.map_or(
+            NotificationListenerAction::UnlistenAll,
+            NotificationListenerAction::Unlisten,
+        ));
+    }
+
+    fn notify(&mut self, channel: Identifier, payload: String) {
+        if self.coalesced.insert((channel.clone(), payload.clone())) {
+            self.notifications.push((channel, payload));
+        }
+    }
+
+    fn append(&mut self, pending: Self) {
+        self.listener_actions.extend(pending.listener_actions);
+        for (channel, payload) in pending.notifications {
+            self.notify(channel, payload);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NotificationSessionQueue {
+    process_id: u32,
+    channels: BTreeSet<Identifier>,
+    queue: VecDeque<DatabaseNotification>,
+    queued_bytes: usize,
+    overflowed: bool,
+}
+
+#[derive(Debug, Default)]
+struct NotificationBrokerState {
+    next_session_id: u64,
+    sessions: BTreeMap<u64, NotificationSessionQueue>,
+}
+
+#[derive(Debug, Default)]
+struct NotificationBroker {
+    state: Mutex<NotificationBrokerState>,
+}
+
+impl NotificationBroker {
+    fn register(&self) -> u64 {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.next_session_id = state.next_session_id.saturating_add(1).max(1);
+        let session_id = state.next_session_id;
+        let process_id = u32::try_from(session_id).unwrap_or(u32::MAX).max(1);
+        state.sessions.insert(
+            session_id,
+            NotificationSessionQueue {
+                process_id,
+                channels: BTreeSet::new(),
+                queue: VecDeque::new(),
+                queued_bytes: 0,
+                overflowed: false,
+            },
+        );
+        session_id
+    }
+
+    fn set_process_id(&self, session_id: u64, process_id: u32) -> Result<()> {
+        if process_id == 0 {
+            return Err(DbError::new("22023", "backend process ID must be non-zero"));
+        }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let session = state
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| DbError::new("08003", "notification session is not registered"))?;
+        session.process_id = process_id;
+        Ok(())
+    }
+
+    fn unregister(&self, session_id: u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .sessions
+            .remove(&session_id);
+    }
+
+    fn commit(&self, session_id: u64, pending: NotificationTransactionState) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let sender_process_id = state
+            .sessions
+            .get(&session_id)
+            .map_or(0, |session| session.process_id);
+        if let Some(session) = state.sessions.get_mut(&session_id) {
+            for action in pending.listener_actions {
+                match action {
+                    NotificationListenerAction::Listen(channel) => {
+                        session.channels.insert(channel);
+                    }
+                    NotificationListenerAction::Unlisten(channel) => {
+                        session.channels.remove(&channel);
+                    }
+                    NotificationListenerAction::UnlistenAll => session.channels.clear(),
+                }
+            }
+        }
+        for (channel, payload) in pending.notifications {
+            let notification_bytes = channel
+                .as_str()
+                .len()
+                .saturating_add(payload.len())
+                .saturating_add(std::mem::size_of::<DatabaseNotification>());
+            for session in state.sessions.values_mut() {
+                if !session.channels.contains(&channel) || session.overflowed {
+                    continue;
+                }
+                if session.queue.len() >= MAX_NOTIFICATION_QUEUE_ENTRIES
+                    || session.queued_bytes.saturating_add(notification_bytes)
+                        > MAX_NOTIFICATION_QUEUE_BYTES
+                {
+                    session.overflowed = true;
+                    continue;
+                }
+                session.queue.push_back(DatabaseNotification {
+                    sender_process_id,
+                    channel: channel.as_str().to_owned(),
+                    payload: payload.clone(),
+                });
+                session.queued_bytes = session.queued_bytes.saturating_add(notification_bytes);
+            }
+        }
+    }
+
+    fn drain(&self, session_id: u64) -> Result<Vec<DatabaseNotification>> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let session = state
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| DbError::new("08003", "notification session is not registered"))?;
+        if session.overflowed {
+            session.queue.clear();
+            session.queued_bytes = 0;
+            return Err(DbError::new(
+                "54000",
+                "asynchronous notification queue limit exceeded",
+            )
+            .with_detail(format!(
+                "the session queue is limited to {MAX_NOTIFICATION_QUEUE_ENTRIES} messages and {MAX_NOTIFICATION_QUEUE_BYTES} bytes"
+            ))
+            .with_hint("consume notifications promptly and reconnect this session"));
+        }
+        session.queued_bytes = 0;
+        Ok(session.queue.drain(..).collect())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Engine {
     config: Arc<EngineConfig>,
@@ -631,6 +823,7 @@ pub struct Engine {
     ssi: Arc<SsiManager>,
     writer: Arc<WriterCoordinator>,
     commits_since_checkpoint: Arc<AtomicU64>,
+    notifications: Arc<NotificationBroker>,
 }
 
 impl Engine {
@@ -702,6 +895,7 @@ impl Engine {
             ssi,
             writer,
             commits_since_checkpoint: Arc::new(AtomicU64::new(0)),
+            notifications: Arc::new(NotificationBroker::default()),
         })
     }
 
@@ -739,6 +933,7 @@ impl Engine {
             session_user,
             session_user,
         )?;
+        let notification_session_id = self.notifications.register();
         Ok(Session {
             state: Arc::clone(&self.state),
             store: Arc::clone(&self.store),
@@ -750,6 +945,8 @@ impl Engine {
             ssi: Arc::clone(&self.ssi),
             writer: Arc::clone(&self.writer),
             commits_since_checkpoint: Arc::clone(&self.commits_since_checkpoint),
+            notifications: Arc::clone(&self.notifications),
+            notification_session_id,
             sql_transaction: SqlTransactionState::Idle,
             sequence_currvals: BTreeMap::new(),
             options,
@@ -932,6 +1129,8 @@ pub struct Session {
     ssi: Arc<SsiManager>,
     writer: Arc<WriterCoordinator>,
     commits_since_checkpoint: Arc<AtomicU64>,
+    notifications: Arc<NotificationBroker>,
+    notification_session_id: u64,
     sql_transaction: SqlTransactionState,
     sequence_currvals: BTreeMap<SequenceId, i64>,
     options: SessionOptions,
@@ -966,6 +1165,7 @@ struct ActiveSqlTransaction {
     savepoint_states: BTreeMap<SavepointId, SqlSavepointState>,
     failed: bool,
     stream_failed: Arc<AtomicBool>,
+    notification_state: NotificationTransactionState,
 }
 
 #[derive(Debug, Clone)]
@@ -976,6 +1176,7 @@ struct SqlSavepointState {
     lock_len: usize,
     dml_only: bool,
     ssi: Option<SsiSavepoint>,
+    notification_state: NotificationTransactionState,
 }
 
 #[derive(Debug)]
@@ -1052,7 +1253,219 @@ impl Drop for SsiTransactionGuard {
     }
 }
 
+struct ProcedureTransactionCoordinator {
+    state: Arc<RwLock<DatabaseState>>,
+    store: Arc<Mutex<DatabaseStore>>,
+    storage_access: Arc<StorageAccessGate>,
+    wal: Arc<WalManager>,
+    transaction_status: Arc<TransactionStatusStore>,
+    transactions: Arc<TransactionManager>,
+    locks: Arc<LockManager>,
+    writer: Arc<WriterCoordinator>,
+    commits_since_checkpoint: Arc<AtomicU64>,
+    notifications: Arc<NotificationBroker>,
+    notification_session_id: u64,
+    authorization: Option<SessionAuthorization>,
+    cancellation: Option<Arc<AtomicBool>>,
+    base: DatabaseState,
+    transaction: Option<DurableTransaction>,
+    locks_held: Vec<LockGuard>,
+    lease: Option<WriterLease>,
+    notices: Vec<DbNotice>,
+    sequence_currvals: BTreeMap<SequenceId, i64>,
+}
+
+impl ProcedureTransactionCoordinator {
+    fn new(session: &Session, base: DatabaseState) -> Result<Self> {
+        let mut coordinator = Self {
+            state: Arc::clone(&session.state),
+            store: Arc::clone(&session.store),
+            storage_access: Arc::clone(&session.storage_access),
+            wal: Arc::clone(&session.wal),
+            transaction_status: Arc::clone(&session.transaction_status),
+            transactions: Arc::clone(&session.transactions),
+            locks: Arc::clone(&session.locks),
+            writer: Arc::clone(&session.writer),
+            commits_since_checkpoint: Arc::clone(&session.commits_since_checkpoint),
+            notifications: Arc::clone(&session.notifications),
+            notification_session_id: session.notification_session_id,
+            authorization: session.authorization.clone(),
+            cancellation: base.cancellation.clone(),
+            base,
+            transaction: None,
+            locks_held: Vec::new(),
+            lease: None,
+            notices: Vec::new(),
+            sequence_currvals: session.sequence_currvals.clone(),
+        };
+        coordinator.start_segment(TransactionCharacteristics::default())?;
+        let committed = committed_snapshot(&coordinator.state)?;
+        coordinator.base = coordinator.prepare_candidate(committed);
+        Ok(coordinator)
+    }
+
+    fn prepare_candidate(&self, mut candidate: DatabaseState) -> DatabaseState {
+        candidate.triggers_fired = 0;
+        candidate.routine_frames.clear();
+        candidate.pending_notices.clear();
+        candidate.pending_notifications = NotificationTransactionState::default();
+        candidate.cancellation = self.cancellation.clone();
+        candidate.authorization = self.authorization.clone();
+        candidate.sequence_currvals = self.sequence_currvals.clone();
+        candidate
+    }
+
+    fn start_segment(&mut self, characteristics: TransactionCharacteristics) -> Result<()> {
+        let transaction = DurableTransaction::begin(
+            &self.transactions,
+            Arc::clone(&self.transaction_status),
+            Arc::clone(&self.wal),
+            characteristics,
+        )?;
+        let lease = self.writer.try_acquire(transaction.transaction_id())?;
+        let lock = acquire_compatibility_write_lock(
+            &self.locks,
+            &transaction,
+            self.cancellation.as_deref(),
+        )?;
+        self.transaction = Some(transaction);
+        self.lease = Some(lease);
+        self.locks_held.push(lock);
+        Ok(())
+    }
+
+    fn boundary(
+        &mut self,
+        boundary: ProcedureBoundary,
+        candidate: &mut DatabaseState,
+        dirty: bool,
+    ) -> Result<()> {
+        let characteristics = self
+            .transaction
+            .as_ref()
+            .and_then(DurableTransaction::characteristics)
+            .ok_or_else(|| no_active_transaction_error("end a procedure transaction"))?;
+        match boundary {
+            ProcedureBoundary::Commit(_) => self.finish_segment(candidate, dirty, true)?,
+            ProcedureBoundary::Rollback(_) => self.finish_segment(candidate, dirty, false)?,
+        }
+        let next_characteristics = match boundary {
+            ProcedureBoundary::Commit(TransactionChain::Chain)
+            | ProcedureBoundary::Rollback(TransactionChain::Chain) => characteristics,
+            ProcedureBoundary::Commit(TransactionChain::NoChain)
+            | ProcedureBoundary::Commit(TransactionChain::Default)
+            | ProcedureBoundary::Rollback(TransactionChain::NoChain)
+            | ProcedureBoundary::Rollback(TransactionChain::Default) => {
+                TransactionCharacteristics::default()
+            }
+        };
+        let runtime_frames = candidate.routine_frames.clone();
+        let committed = committed_snapshot(&self.state)?;
+        self.base = self.prepare_candidate(committed);
+        *candidate = self.base.clone();
+        candidate.routine_frames = runtime_frames;
+        self.start_segment(next_characteristics)
+    }
+
+    fn finish_final(&mut self, candidate: &mut DatabaseState, dirty: bool) -> Result<()> {
+        self.finish_segment(candidate, dirty, true)
+    }
+
+    fn abort(&mut self) {
+        self.notices
+            .append(&mut mem::take(&mut self.base.pending_notices));
+        if let Some(transaction) = self.transaction.take() {
+            let _ = transaction.abort();
+        }
+        self.locks_held.clear();
+        self.lease.take();
+    }
+
+    fn runtime_sequence_currvals(&self) -> BTreeMap<SequenceId, i64> {
+        self.sequence_currvals.clone()
+    }
+
+    fn finish_segment(
+        &mut self,
+        candidate: &mut DatabaseState,
+        dirty: bool,
+        commit: bool,
+    ) -> Result<()> {
+        self.notices
+            .append(&mut mem::take(&mut candidate.pending_notices));
+        let pending_notifications = mem::take(&mut candidate.pending_notifications);
+        let mut transaction = self
+            .transaction
+            .take()
+            .ok_or_else(|| no_active_transaction_error("end a procedure transaction"))?;
+        if commit {
+            if dirty {
+                reconcile_version_changes(
+                    &self.base,
+                    candidate,
+                    version_mutation_context(&transaction)?,
+                )?;
+                let mut durable_candidate = candidate.clone();
+                durable_candidate.routine_frames.clear();
+                durable_candidate.pending_notices.clear();
+                durable_candidate.pending_notifications = NotificationTransactionState::default();
+                durable_candidate.cancellation = None;
+                durable_candidate.authorization = None;
+                let mut state = self
+                    .state
+                    .write()
+                    .map_err(|_| internal_error("engine state lock is poisoned"))?;
+                persist_candidate(
+                    &mut state,
+                    &self.store,
+                    &self.storage_access,
+                    &self.wal,
+                    &mut transaction,
+                    durable_candidate,
+                )?;
+                drop(state);
+            } else {
+                transaction.commit_empty()?;
+            }
+            self.sequence_currvals = candidate.sequence_currvals.clone();
+        } else {
+            transaction.abort()?;
+        }
+        self.locks_held.clear();
+        self.lease.take();
+        if commit {
+            self.notifications
+                .commit(self.notification_session_id, pending_notifications);
+            if dirty {
+                record_commit_and_maybe_checkpoint(
+                    &self.state,
+                    &self.store,
+                    &self.wal,
+                    &self.transactions,
+                    &self.commits_since_checkpoint,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.notifications.unregister(self.notification_session_id);
+    }
+}
+
 impl Session {
+    pub fn set_backend_process_id(&mut self, process_id: u32) -> Result<()> {
+        self.notifications
+            .set_process_id(self.notification_session_id, process_id)
+    }
+
+    pub fn drain_notifications(&mut self) -> Result<Vec<DatabaseNotification>> {
+        self.notifications.drain(self.notification_session_id)
+    }
+
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryStream> {
         match self
             .execute_stream(sql, params)?
@@ -1168,6 +1581,7 @@ impl Session {
         }
         let mut snapshot = self.statement_snapshot()?;
         snapshot.cancellation = cancellation;
+        snapshot.sequence_currvals = self.sequence_currvals.clone();
         let statement = match bind_with_session(
             parsed,
             &snapshot.catalog,
@@ -1503,6 +1917,7 @@ impl Session {
             savepoint_states: BTreeMap::new(),
             failed: false,
             stream_failed: Arc::new(AtomicBool::new(false)),
+            notification_state: NotificationTransactionState::default(),
         }))
     }
 
@@ -1533,6 +1948,7 @@ impl Session {
             lease,
             dml_only,
             mut ssi,
+            notification_state,
             ..
         } = *transaction;
         if let Some(ssi) = &mut ssi
@@ -1605,6 +2021,8 @@ impl Session {
                 ssi.finish();
             }
         }
+        self.notifications
+            .commit(self.notification_session_id, notification_state);
         self.start_chained_sql_transaction(chain, characteristics)?;
         Ok(TryQueryStream::new(transaction_events("COMMIT")))
     }
@@ -1693,6 +2111,7 @@ impl Session {
                 lock_len: transaction.locks.len(),
                 dml_only: transaction.dml_only,
                 ssi,
+                notification_state: transaction.notification_state.clone(),
             },
         );
         if let Err(error) = transaction.transaction.finish_statement() {
@@ -1748,6 +2167,7 @@ impl Session {
         transaction.working = saved.working;
         transaction.locks.truncate(saved.lock_len);
         transaction.dml_only = saved.dml_only;
+        transaction.notification_state = saved.notification_state;
         if transaction.working.is_none() {
             transaction.lease = None;
         }
@@ -1817,6 +2237,27 @@ impl Session {
         snapshot: DatabaseState,
         statement: BoundStatement,
     ) -> Result<TryQueryStream> {
+        let procedure = match &statement {
+            BoundStatement::Call {
+                routine_id,
+                arguments,
+                schema,
+            } if snapshot
+                .catalog
+                .routine_by_id(*routine_id)
+                .is_some_and(|routine| routine.kind == ordadb_catalog::RoutineKind::Procedure) =>
+            {
+                Some((*routine_id, arguments.clone(), schema.clone()))
+            }
+            _ => None,
+        };
+        if let Some((routine_id, arguments, schema)) = procedure {
+            return self
+                .execute_auto_commit_procedure(snapshot, routine_id, &arguments, schema, params);
+        }
+        if let Some(stream) = self.execute_auto_commit_session_command(&statement, params)? {
+            return Ok(stream);
+        }
         let table_provider = StorageTableProviderV2::new(
             Arc::clone(&self.store),
             Arc::clone(&self.storage_access),
@@ -1835,7 +2276,7 @@ impl Session {
         let write_scope = statement_write_scope(&statement);
         let maintenance =
             maintenance_context(self.transactions.as_ref(), self.transaction_status.as_ref())?;
-        let (_, events, dirty) = execute_bound_candidate(
+        let (mut preview, events, dirty) = execute_bound_candidate(
             &snapshot,
             statement,
             params,
@@ -1844,6 +2285,9 @@ impl Session {
             maintenance,
         )?;
         if !dirty {
+            let pending = mem::take(&mut preview.pending_notifications);
+            self.notifications
+                .commit(self.notification_session_id, pending);
             return TryQueryStream::buffered(events);
         }
 
@@ -1900,7 +2344,8 @@ impl Session {
             .map_err(|_| internal_error("engine state lock is poisoned"))?;
         let mut committed = state.clone();
         committed.cancellation = snapshot.cancellation.clone();
-        let (candidate, events, dirty) = execute_candidate(
+        committed.sequence_currvals = self.sequence_currvals.clone();
+        let (mut candidate, events, dirty) = execute_candidate(
             &committed,
             sql,
             params,
@@ -1912,6 +2357,8 @@ impl Session {
             Some(version_mutation_context(&transaction)?),
             maintenance,
         )?;
+        let pending_notifications = mem::take(&mut candidate.pending_notifications);
+        let runtime_sequence_currvals = candidate.sequence_currvals.clone();
         let stream = TryQueryStream::buffered(events)?;
         if dirty {
             let sequence_value = sequence_id
@@ -1925,6 +2372,7 @@ impl Session {
                 &mut transaction,
                 candidate,
             )?;
+            self.sequence_currvals = runtime_sequence_currvals;
             drop(state);
             drop(write_locks);
             drop(lease.take());
@@ -1944,7 +2392,55 @@ impl Session {
                 self.sequence_currvals.insert(sequence_id, value);
             }
         }
+        self.notifications
+            .commit(self.notification_session_id, pending_notifications);
         Ok(stream)
+    }
+
+    fn execute_auto_commit_procedure(
+        &mut self,
+        snapshot: DatabaseState,
+        routine_id: ordadb_types::RoutineId,
+        arguments: &[BoundExpr],
+        schema: Schema,
+        params: &[Value],
+    ) -> Result<TryQueryStream> {
+        let mut coordinator = ProcedureTransactionCoordinator::new(self, snapshot)?;
+        let mut candidate = coordinator.base.clone();
+        let execution = {
+            let mut boundary = |boundary, candidate: &mut DatabaseState, dirty| {
+                coordinator.boundary(boundary, candidate, dirty)
+            };
+            execute_routine_program_with_boundaries(
+                &mut candidate,
+                routine_id,
+                arguments,
+                params,
+                Some(&mut boundary),
+            )
+        };
+        let (output, dirty) = match execution {
+            Ok(output) => output,
+            Err(error) => {
+                coordinator.abort();
+                self.sequence_currvals = coordinator.runtime_sequence_currvals();
+                return Err(error);
+            }
+        };
+        if let Err(error) = coordinator.finish_final(&mut candidate, dirty) {
+            coordinator.abort();
+            self.sequence_currvals = coordinator.runtime_sequence_currvals();
+            return Err(error);
+        }
+        self.sequence_currvals = coordinator.runtime_sequence_currvals();
+        let row_count = u64::from(!schema.fields.is_empty());
+        let batch = (!schema.fields.is_empty()).then(|| Batch {
+            schema: schema.clone(),
+            rows: vec![Row::new(output.output_parameters)],
+        });
+        let mut events = command_events(schema, "CALL", row_count, batch);
+        insert_pending_notices(&mut events, mem::take(&mut coordinator.notices));
+        TryQueryStream::buffered(events)
     }
 
     fn execute_in_sql_transaction(
@@ -1960,6 +2456,10 @@ impl Session {
                 "25001",
                 "VACUUM cannot run inside a transaction block",
             ));
+        }
+        if let Some(stream) = execute_transaction_session_command(transaction, &statement, params)?
+        {
+            return Ok(stream);
         }
         if let Some(ssi) = &transaction.ssi {
             for predicate in statement_read_predicates(&statement) {
@@ -1997,6 +2497,9 @@ impl Session {
             maintenance,
         )?;
         if !dirty {
+            transaction
+                .notification_state
+                .append(mem::take(&mut candidate.pending_notifications));
             return TryQueryStream::buffered(events);
         }
         if transaction
@@ -2026,7 +2529,7 @@ impl Session {
                 if recheck_conflict_after_locks {
                     let mut completed = false;
                     for _ in 0..MAX_DML_LOCK_RECHECKS {
-                        let recheck_base = read_committed_statement_state(
+                        let mut recheck_base = read_committed_statement_state(
                             &self.state,
                             self.transaction_status.as_ref(),
                             &mut transaction.transaction,
@@ -2034,6 +2537,7 @@ impl Session {
                             transaction.working.as_ref(),
                             snapshot.cancellation.clone(),
                         )?;
+                        recheck_base.sequence_currvals = self.sequence_currvals.clone();
                         let (rechecked, rechecked_events, rechecked_dirty) = execute_candidate(
                             &recheck_base,
                             sql,
@@ -2115,7 +2619,7 @@ impl Session {
                     let working = transaction.working.as_ref().ok_or_else(|| {
                         internal_error("DML transaction is missing its working state")
                     })?;
-                    let (upgraded_base, upgraded_working, lease, lock) =
+                    let (upgraded_base, mut upgraded_working, lease, lock) =
                         upgrade_dml_candidate_to_exclusive(
                             DmlUpgradeAuthorities {
                                 state: &self.state,
@@ -2128,7 +2632,8 @@ impl Session {
                             working,
                             snapshot.cancellation.clone(),
                         )?;
-                    let (candidate, events, dirty) = execute_candidate(
+                    upgraded_working.sequence_currvals = self.sequence_currvals.clone();
+                    let (mut candidate, events, dirty) = execute_candidate(
                         &upgraded_working,
                         sql,
                         params,
@@ -2152,6 +2657,10 @@ impl Session {
                             candidate_sequence_value(&candidate, sequence_id)?,
                         );
                     }
+                    self.sequence_currvals = candidate.sequence_currvals.clone();
+                    transaction
+                        .notification_state
+                        .append(mem::take(&mut candidate.pending_notifications));
                     transaction.base = Some(upgraded_base);
                     transaction.working = Some(candidate);
                     transaction.lease = Some(lease);
@@ -2189,13 +2698,18 @@ impl Session {
                     candidate_sequence_value(&candidate, sequence_id)?,
                 );
             }
+            self.sequence_currvals = candidate.sequence_currvals.clone();
+            transaction
+                .notification_state
+                .append(mem::take(&mut candidate.pending_notifications));
             transaction.working = Some(candidate);
             return Ok(stream);
         }
 
         let mut committed = committed_snapshot(&self.state)?;
         committed.cancellation = snapshot.cancellation.clone();
-        let (candidate, events, dirty) = execute_candidate(
+        committed.sequence_currvals = self.sequence_currvals.clone();
+        let (mut candidate, events, dirty) = execute_candidate(
             &committed,
             sql,
             params,
@@ -2208,6 +2722,9 @@ impl Session {
             maintenance,
         )?;
         let stream = TryQueryStream::buffered(events)?;
+        transaction
+            .notification_state
+            .append(mem::take(&mut candidate.pending_notifications));
         if dirty {
             if let Some(sequence_id) = sequence_id {
                 self.sequence_currvals.insert(
@@ -2215,9 +2732,54 @@ impl Session {
                     candidate_sequence_value(&candidate, sequence_id)?,
                 );
             }
+            self.sequence_currvals = candidate.sequence_currvals.clone();
             transaction.working = Some(candidate);
         }
         Ok(stream)
+    }
+
+    fn execute_auto_commit_session_command(
+        &mut self,
+        statement: &BoundStatement,
+        params: &[Value],
+    ) -> Result<Option<TryQueryStream>> {
+        let mut pending = NotificationTransactionState::default();
+        if let BoundStatement::PgNotify {
+            channel,
+            payload,
+            schema,
+        } = statement
+        {
+            let (channel, payload) = evaluate_pg_notify(channel, payload, params)?;
+            pending.notify(channel, payload);
+            self.notifications
+                .commit(self.notification_session_id, pending);
+            return Ok(Some(TryQueryStream::new(pg_notify_events(schema.clone()))));
+        }
+        let tag = match statement {
+            BoundStatement::Listen { channel } => {
+                pending.listen(channel.clone());
+                "LISTEN"
+            }
+            BoundStatement::Unlisten { channel } => {
+                pending.unlisten(channel.clone());
+                "UNLISTEN"
+            }
+            BoundStatement::Notify { channel, payload } => {
+                pending.notify(channel.clone(), payload.clone());
+                "NOTIFY"
+            }
+            BoundStatement::DiscardAll => {
+                pending.unlisten(None);
+                self.sequence_currvals.clear();
+                "DISCARD ALL"
+            }
+            BoundStatement::DeallocateAll => "DEALLOCATE ALL",
+            _ => return Ok(None),
+        };
+        self.notifications
+            .commit(self.notification_session_id, pending);
+        Ok(Some(TryQueryStream::new(transaction_events(tag))))
     }
 
     fn fail_sql_transaction(&mut self) {
@@ -2282,9 +2844,15 @@ fn bound_statement_schema(statement: &BoundStatement) -> Schema {
         | BoundStatement::With { schema, .. }
         | BoundStatement::ViewSelect { schema, .. }
         | BoundStatement::ScalarSelect { schema, .. }
+        | BoundStatement::Call { schema, .. }
         | BoundStatement::RoutineSelect { schema, .. }
+        | BoundStatement::PgNotify { schema, .. }
         | BoundStatement::SequenceValue { schema, .. } => schema.clone(),
         BoundStatement::Insert {
+            returning: Some(returning),
+            ..
+        }
+        | BoundStatement::ViewInsert {
             returning: Some(returning),
             ..
         }
@@ -2292,7 +2860,15 @@ fn bound_statement_schema(statement: &BoundStatement) -> Schema {
             returning: Some(returning),
             ..
         }
+        | BoundStatement::ViewUpdate {
+            returning: Some(returning),
+            ..
+        }
         | BoundStatement::Delete {
+            returning: Some(returning),
+            ..
+        }
+        | BoundStatement::ViewDelete {
             returning: Some(returning),
             ..
         }
@@ -2311,6 +2887,13 @@ fn bound_statement_schema(statement: &BoundStatement) -> Schema {
         | BoundStatement::ReleaseSavepoint { .. }
         | BoundStatement::Analyze { .. }
         | BoundStatement::Vacuum { .. }
+        | BoundStatement::Reindex { .. }
+        | BoundStatement::Listen { .. }
+        | BoundStatement::Unlisten { .. }
+        | BoundStatement::Notify { .. }
+        | BoundStatement::Do { .. }
+        | BoundStatement::DiscardAll
+        | BoundStatement::DeallocateAll
         | BoundStatement::NoOp { .. }
         | BoundStatement::CreateSchema { .. }
         | BoundStatement::CreateEnumType { .. }
@@ -2332,15 +2915,17 @@ fn bound_statement_schema(statement: &BoundStatement) -> Schema {
         | BoundStatement::RefreshMaterializedView { .. }
         | BoundStatement::CreateRoutine { .. }
         | BoundStatement::DropRoutine { .. }
-        | BoundStatement::Call { .. }
         | BoundStatement::CreateTrigger { .. }
         | BoundStatement::DropTrigger { .. }
         | BoundStatement::Insert { .. }
+        | BoundStatement::ViewInsert { .. }
         | BoundStatement::Merge(BoundMerge {
             returning: None, ..
         })
         | BoundStatement::Update { .. }
-        | BoundStatement::Delete { .. } => Schema::empty(),
+        | BoundStatement::ViewUpdate { .. }
+        | BoundStatement::Delete { .. }
+        | BoundStatement::ViewDelete { .. } => Schema::empty(),
     }
 }
 
@@ -2363,6 +2948,12 @@ fn bound_statement_parameter_types(statement: &BoundStatement) -> Result<Vec<Sca
             }
             BoundStatement::ScalarSelect { projection, .. } => {
                 expressions.extend(projection.iter().map(|projection| &projection.expr));
+            }
+            BoundStatement::PgNotify {
+                channel, payload, ..
+            } => {
+                expressions.push(channel);
+                expressions.push(payload);
             }
             BoundStatement::SequenceValue { operation, .. } => {
                 if let BoundSequenceOperation::SetValue { value, .. } = operation {
@@ -2388,6 +2979,16 @@ fn bound_statement_parameter_types(statement: &BoundStatement) -> Result<Vec<Sca
                     expressions.extend(assignments.iter().map(|(_, expression)| expression));
                     expressions.extend(filter.iter());
                 }
+                push_returning_expressions(&mut expressions, returning.as_ref());
+            }
+            BoundStatement::ViewInsert {
+                source,
+                rows,
+                returning,
+                ..
+            } => {
+                statements.push(source);
+                expressions.extend(rows.iter().flatten());
                 push_returning_expressions(&mut expressions, returning.as_ref());
             }
             BoundStatement::Merge(merge) => {
@@ -2497,9 +3098,31 @@ fn bound_statement_parameter_types(statement: &BoundStatement) -> Result<Vec<Sca
                 expressions.extend(filter.iter());
                 push_returning_expressions(&mut expressions, returning.as_ref());
             }
+            BoundStatement::ViewUpdate {
+                source,
+                assignments,
+                filter,
+                returning,
+                ..
+            } => {
+                statements.push(source);
+                expressions.extend(assignments.iter().map(|(_, expression)| expression));
+                expressions.extend(filter.iter());
+                push_returning_expressions(&mut expressions, returning.as_ref());
+            }
             BoundStatement::Delete {
                 filter, returning, ..
             } => {
+                expressions.extend(filter.iter());
+                push_returning_expressions(&mut expressions, returning.as_ref());
+            }
+            BoundStatement::ViewDelete {
+                source,
+                filter,
+                returning,
+                ..
+            } => {
+                statements.push(source);
                 expressions.extend(filter.iter());
                 push_returning_expressions(&mut expressions, returning.as_ref());
             }
@@ -2512,6 +3135,13 @@ fn bound_statement_parameter_types(statement: &BoundStatement) -> Result<Vec<Sca
             | BoundStatement::ReleaseSavepoint { .. }
             | BoundStatement::Analyze { .. }
             | BoundStatement::Vacuum { .. }
+            | BoundStatement::Reindex { .. }
+            | BoundStatement::Listen { .. }
+            | BoundStatement::Unlisten { .. }
+            | BoundStatement::Notify { .. }
+            | BoundStatement::Do { .. }
+            | BoundStatement::DiscardAll
+            | BoundStatement::DeallocateAll
             | BoundStatement::CreateSchema { .. }
             | BoundStatement::CreateEnumType { .. }
             | BoundStatement::CreateDomain { .. }
@@ -2739,7 +3369,7 @@ impl Transaction<'_> {
     }
 
     fn execute_inner(&mut self, sql: &str, params: &[Value]) -> Result<QueryStream> {
-        let snapshot = match &self.working {
+        let mut snapshot = match &self.working {
             Some(working) => working.clone(),
             None => {
                 let committed = committed_snapshot(self.state)?;
@@ -2755,6 +3385,7 @@ impl Transaction<'_> {
                 )?
             }
         };
+        snapshot.sequence_currvals = self.sequence_currvals.clone();
         let statement = resolve_sequence_currval(
             bind_with_session(
                 parse_with_dialect(sql, self.dialect)?,
@@ -2826,7 +3457,7 @@ impl Transaction<'_> {
                     let working = self.working.as_ref().ok_or_else(|| {
                         internal_error("DML transaction is missing its working state")
                     })?;
-                    let (upgraded_base, upgraded_working, lease, lock) =
+                    let (upgraded_base, mut upgraded_working, lease, lock) =
                         upgrade_dml_candidate_to_exclusive(
                             DmlUpgradeAuthorities {
                                 state: self.state,
@@ -2839,6 +3470,7 @@ impl Transaction<'_> {
                             working,
                             None,
                         )?;
+                    upgraded_working.sequence_currvals = self.sequence_currvals.clone();
                     let (candidate, events, dirty) = execute_candidate(
                         &upgraded_working,
                         sql,
@@ -2862,6 +3494,7 @@ impl Transaction<'_> {
                             candidate_sequence_value(&candidate, sequence_id)?,
                         );
                     }
+                    *self.sequence_currvals = candidate.sequence_currvals.clone();
                     self.base = Some(upgraded_base);
                     self.working = Some(candidate);
                     self.lease = Some(lease);
@@ -2895,11 +3528,13 @@ impl Transaction<'_> {
                     candidate_sequence_value(&candidate, sequence_id)?,
                 );
             }
+            *self.sequence_currvals = candidate.sequence_currvals.clone();
             self.working = Some(candidate);
             return Ok(QueryStream::new(events));
         }
 
-        let committed = committed_snapshot(self.state)?;
+        let mut committed = committed_snapshot(self.state)?;
+        committed.sequence_currvals = self.sequence_currvals.clone();
         let (candidate, events, dirty) = execute_candidate(
             &committed,
             sql,
@@ -2919,6 +3554,7 @@ impl Transaction<'_> {
                     candidate_sequence_value(&candidate, sequence_id)?,
                 );
             }
+            *self.sequence_currvals = candidate.sequence_currvals.clone();
             self.working = Some(candidate);
         }
         Ok(QueryStream::new(events))
@@ -3180,6 +3816,137 @@ impl Iterator for QueryStream {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoutineFrameId(usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutineFrameKind {
+    Routine(ordadb_types::RoutineId),
+    Trigger(ordadb_types::TriggerId),
+}
+
+#[derive(Debug, Clone)]
+struct RoutineFrame {
+    kind: RoutineFrameKind,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RoutineFrameStack {
+    arena: Vec<Option<RoutineFrame>>,
+    free: Vec<usize>,
+    active: Vec<RoutineFrameId>,
+}
+
+impl RoutineFrameStack {
+    fn push_routine(&mut self, routine_id: ordadb_types::RoutineId) -> Result<RoutineFrameId> {
+        self.push(RoutineFrameKind::Routine(routine_id))
+    }
+
+    fn push_trigger(&mut self, trigger_id: ordadb_types::TriggerId) -> Result<RoutineFrameId> {
+        self.push(RoutineFrameKind::Trigger(trigger_id))
+    }
+
+    fn push(&mut self, kind: RoutineFrameKind) -> Result<RoutineFrameId> {
+        let (current, maximum, label) = match kind {
+            RoutineFrameKind::Routine(_) => (
+                self.active_kind_count(|kind| matches!(kind, RoutineFrameKind::Routine(_))),
+                MAX_ROUTINE_FRAMES,
+                "routine-call",
+            ),
+            RoutineFrameKind::Trigger(_) => (
+                self.active_kind_count(|kind| matches!(kind, RoutineFrameKind::Trigger(_))),
+                MAX_TRIGGER_FRAMES,
+                "trigger",
+            ),
+        };
+        if current >= maximum {
+            return Err(DbError::new(
+                "54001",
+                format!("PL/pgSQL {label} depth exceeds the maximum of {maximum}"),
+            ));
+        }
+        let frame = RoutineFrame { kind };
+        let index = if let Some(index) = self.free.pop() {
+            self.arena[index] = Some(frame);
+            index
+        } else {
+            let index = self.arena.len();
+            self.arena.push(Some(frame));
+            index
+        };
+        let id = RoutineFrameId(index);
+        self.active.push(id);
+        Ok(id)
+    }
+
+    fn pop(&mut self, id: RoutineFrameId) -> Result<()> {
+        if self.active.last().copied() != Some(id) {
+            return Err(internal_error("PL/pgSQL routine frame stack is not LIFO"));
+        }
+        self.active.pop();
+        let frame = self
+            .arena
+            .get_mut(id.0)
+            .and_then(Option::take)
+            .ok_or_else(|| internal_error("PL/pgSQL routine frame is missing"))?;
+        let _ = frame.kind;
+        self.free.push(id.0);
+        Ok(())
+    }
+
+    fn active_kind_count(&self, matches: impl Fn(RoutineFrameKind) -> bool) -> usize {
+        self.active
+            .iter()
+            .filter_map(|id| self.arena.get(id.0).and_then(Option::as_ref))
+            .filter(|frame| matches(frame.kind))
+            .count()
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+enum RoutineCompletion {
+    Root,
+    Call { schema: Schema },
+    Select { schema: Schema, returns_set: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcedureBoundary {
+    Commit(TransactionChain),
+    Rollback(TransactionChain),
+}
+
+type ProcedureBoundaryHandler<'a> =
+    dyn FnMut(ProcedureBoundary, &mut DatabaseState, bool) -> Result<()> + 'a;
+
+struct RoutineVmFrame {
+    id: RoutineFrameId,
+    routine: RoutineDefinition,
+    machine: VmMachine,
+    response: Option<Result<VmSqlStream>>,
+    completion: RoutineCompletion,
+    exception_states: Vec<DatabaseState>,
+    exception_triggers: Vec<Option<TriggerRowSavepoint>>,
+    exception_charges: Vec<usize>,
+    exception_memory: VmMemoryReservation,
+}
+
+struct RoutineCompletionStream {
+    events: std::vec::IntoIter<QueryEvent>,
+    _memory: Option<VmMemoryHold>,
+}
+
+impl Iterator for RoutineCompletionStream {
+    type Item = Result<QueryEvent>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.events.next().map(Ok)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct DatabaseState {
     catalog: Arc<Catalog>,
@@ -3190,11 +3957,13 @@ struct DatabaseState {
     indexes: BTreeMap<IndexId, Arc<BPlusTree>>,
     searches: Arc<SearchCatalog>,
     generation: u64,
-    trigger_depth: usize,
     triggers_fired: usize,
-    routine_depth: usize,
+    routine_frames: RoutineFrameStack,
+    pending_notices: Vec<DbNotice>,
+    pending_notifications: NotificationTransactionState,
     cancellation: Option<Arc<AtomicBool>>,
     authorization: Option<SessionAuthorization>,
+    sequence_currvals: BTreeMap<SequenceId, i64>,
 }
 
 struct SelectExecution {
@@ -3404,11 +4173,13 @@ impl DatabaseState {
                 indexes: BTreeMap::new(),
                 searches: Arc::new(SearchCatalog::default()),
                 generation,
-                trigger_depth: 0,
                 triggers_fired: 0,
-                routine_depth: 0,
+                routine_frames: RoutineFrameStack::default(),
+                pending_notices: Vec::new(),
+                pending_notifications: NotificationTransactionState::default(),
                 cancellation: None,
                 authorization: None,
+                sequence_currvals: BTreeMap::new(),
             };
             validate_database_rows(&state)?;
             for table_id in catalog_table_ids {
@@ -3441,11 +4212,13 @@ impl DatabaseState {
             indexes,
             searches: Arc::new(searches),
             generation,
-            trigger_depth: 0,
             triggers_fired: 0,
-            routine_depth: 0,
+            routine_frames: RoutineFrameStack::default(),
+            pending_notices: Vec::new(),
+            pending_notifications: NotificationTransactionState::default(),
             cancellation: None,
             authorization: None,
+            sequence_currvals: BTreeMap::new(),
         })
     }
 
@@ -3499,11 +4272,13 @@ impl DatabaseState {
             indexes: BTreeMap::new(),
             searches: Arc::new(SearchCatalog::default()),
             generation: snapshot.source_generation,
-            trigger_depth: 0,
             triggers_fired: 0,
-            routine_depth: 0,
+            routine_frames: RoutineFrameStack::default(),
+            pending_notices: Vec::new(),
+            pending_notifications: NotificationTransactionState::default(),
             cancellation: None,
             authorization: None,
+            sequence_currvals: BTreeMap::new(),
         };
         (state.versions, state.visible_versions) = frozen_version_state(&state.rows)?;
         validate_database_rows(&state)?;
@@ -3865,9 +4640,12 @@ enum StatementWriteScope {
 fn statement_write_scope(statement: &BoundStatement) -> StatementWriteScope {
     match statement {
         BoundStatement::Insert { .. }
+        | BoundStatement::ViewInsert { .. }
         | BoundStatement::Merge(_)
         | BoundStatement::Update { .. }
-        | BoundStatement::Delete { .. } => StatementWriteScope::Dml,
+        | BoundStatement::ViewUpdate { .. }
+        | BoundStatement::Delete { .. }
+        | BoundStatement::ViewDelete { .. } => StatementWriteScope::Dml,
         BoundStatement::Select { .. }
         | BoundStatement::AdvancedSelect { .. }
         | BoundStatement::SetOperation { .. }
@@ -3957,6 +4735,9 @@ fn statement_read_table_ids(statement: &BoundStatement) -> BTreeSet<TableId> {
                 table_ids.insert(merge.source.table_id);
             }
             BoundStatement::ViewSelect { source, .. }
+            | BoundStatement::ViewInsert { source, .. }
+            | BoundStatement::ViewUpdate { source, .. }
+            | BoundStatement::ViewDelete { source, .. }
             | BoundStatement::Explain { statement: source } => {
                 pending.push(source);
             }
@@ -4122,15 +4903,17 @@ fn execute_bound_candidate(
     maintenance: MaintenanceContext<'_>,
 ) -> Result<(DatabaseState, Vec<QueryEvent>, bool)> {
     let mut candidate = state.clone();
-    candidate.trigger_depth = 0;
     candidate.triggers_fired = 0;
-    candidate.routine_depth = 0;
+    candidate.routine_frames.clear();
+    candidate.pending_notices.clear();
+    candidate.pending_notifications = NotificationTransactionState::default();
     candidate.authorization = authorization.cloned();
     let reconciles_versions = !matches!(
         &statement,
         BoundStatement::Analyze { .. } | BoundStatement::Vacuum { .. }
     );
-    let (events, dirty) = execute_root_bound(&mut candidate, statement, params, maintenance)?;
+    let (mut events, dirty) = execute_root_bound(&mut candidate, statement, params, maintenance)?;
+    insert_pending_notices(&mut events, mem::take(&mut candidate.pending_notices));
     if dirty
         && reconciles_versions
         && let Some(version_context) = version_context
@@ -4157,15 +4940,17 @@ fn execute_candidate(
         context.runtime_metadata.bind_values(),
     )?;
     let mut candidate = state.clone();
-    candidate.trigger_depth = 0;
     candidate.triggers_fired = 0;
-    candidate.routine_depth = 0;
+    candidate.routine_frames.clear();
+    candidate.pending_notices.clear();
+    candidate.pending_notifications = NotificationTransactionState::default();
     candidate.authorization = context.authorization.cloned();
     let reconciles_versions = !matches!(
         &statement,
         BoundStatement::Analyze { .. } | BoundStatement::Vacuum { .. }
     );
-    let (events, dirty) = execute_root_bound(&mut candidate, statement, params, maintenance)?;
+    let (mut events, dirty) = execute_root_bound(&mut candidate, statement, params, maintenance)?;
+    insert_pending_notices(&mut events, mem::take(&mut candidate.pending_notices));
     if dirty
         && reconciles_versions
         && let Some(version_context) = version_context
@@ -4175,6 +4960,17 @@ fn execute_candidate(
     candidate.cancellation = None;
     candidate.authorization = None;
     Ok((candidate, events, dirty))
+}
+
+fn insert_pending_notices(events: &mut Vec<QueryEvent>, notices: Vec<DbNotice>) {
+    if notices.is_empty() {
+        return;
+    }
+    let position = usize::from(matches!(events.first(), Some(QueryEvent::Schema(_))));
+    events.splice(
+        position..position,
+        notices.into_iter().map(QueryEvent::Notice),
+    );
 }
 
 fn reconcile_version_changes(
@@ -4617,6 +5413,7 @@ fn persist_candidate(
     transaction: &mut DurableTransaction,
     mut candidate: DatabaseState,
 ) -> Result<()> {
+    candidate.sequence_currvals.clear();
     candidate.generation = state.generation.checked_add(1).ok_or_else(|| {
         DbError::new("54000", "database generation space is exhausted")
             .with_hint("create a logical backup before retrying on a fresh database")
@@ -4697,8 +5494,99 @@ fn record_commit_and_maybe_checkpoint(
     Ok(())
 }
 
+fn execute_transaction_session_command(
+    transaction: &mut ActiveSqlTransaction,
+    statement: &BoundStatement,
+    params: &[Value],
+) -> Result<Option<TryQueryStream>> {
+    if let BoundStatement::PgNotify {
+        channel,
+        payload,
+        schema,
+    } = statement
+    {
+        let (channel, payload) = evaluate_pg_notify(channel, payload, params)?;
+        transaction.notification_state.notify(channel, payload);
+        return Ok(Some(TryQueryStream::new(pg_notify_events(schema.clone()))));
+    }
+    let tag = match statement {
+        BoundStatement::Listen { channel } => {
+            transaction.notification_state.listen(channel.clone());
+            "LISTEN"
+        }
+        BoundStatement::Unlisten { channel } => {
+            transaction.notification_state.unlisten(channel.clone());
+            "UNLISTEN"
+        }
+        BoundStatement::Notify { channel, payload } => {
+            transaction
+                .notification_state
+                .notify(channel.clone(), payload.clone());
+            "NOTIFY"
+        }
+        BoundStatement::DeallocateAll => "DEALLOCATE ALL",
+        BoundStatement::DiscardAll => {
+            return Err(DbError::new(
+                "25001",
+                "DISCARD ALL cannot run inside a transaction block",
+            ));
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(TryQueryStream::new(transaction_events(tag))))
+}
+
 fn transaction_events(tag: &str) -> Vec<QueryEvent> {
     command_events(Schema::empty(), tag, 0, None)
+}
+
+fn evaluate_pg_notify(
+    channel: &BoundExpr,
+    payload: &BoundExpr,
+    params: &[Value],
+) -> Result<(Identifier, String)> {
+    let Value::Text(channel) = evaluate_scalar(channel, &[], params)? else {
+        return Err(DbError::new("22004", "pg_notify channel must not be NULL"));
+    };
+    let Value::Text(payload) = evaluate_scalar(payload, &[], params)? else {
+        return Err(DbError::new("22004", "pg_notify payload must not be NULL"));
+    };
+    if channel.is_empty() || channel.len() > ordadb_types::MAX_POSTGRES_NAME_BYTES {
+        return Err(DbError::new(
+            "42622",
+            "notification channel name is empty or too long",
+        ));
+    }
+    if channel.contains('\0') || payload.contains('\0') {
+        return Err(DbError::new(
+            "22021",
+            "notification channel and payload cannot contain NUL",
+        ));
+    }
+    if payload.len() > 7_999 {
+        return Err(DbError::new("22023", "NOTIFY payload is too long"));
+    }
+    let identifier = if channel
+        .chars()
+        .all(|character| !character.is_ascii_uppercase())
+    {
+        Identifier::unquoted(channel)
+    } else {
+        Identifier::quoted(channel)
+    };
+    Ok((identifier, payload))
+}
+
+fn pg_notify_events(schema: Schema) -> Vec<QueryEvent> {
+    command_events(
+        schema.clone(),
+        "SELECT 1",
+        1,
+        Some(Batch {
+            schema,
+            rows: vec![Row::new(vec![Value::Null])],
+        }),
+    )
 }
 
 fn no_active_transaction_error(action: &str) -> DbError {
@@ -4738,6 +5626,14 @@ fn execute_root_bound(
                 state.authorization.as_ref(),
             )?;
             execute_vacuum(state, table_id, analyze, maintenance)
+        }
+        BoundStatement::Reindex { target } => {
+            authorize_statement_ownership(
+                &state.catalog,
+                &BoundStatement::Reindex { target },
+                state.authorization.as_ref(),
+            )?;
+            execute_reindex(state, target)
         }
         statement => execute_bound_with_ownership(state, statement, params),
     }
@@ -4825,14 +5721,33 @@ fn authorize_statement_ownership(
             table_id: Some(table_id),
             ..
         } => objects.push(CatalogObjectRef::Table(*table_id)),
+        BoundStatement::Reindex { target } => match target {
+            BoundReindexTarget::Index(index_id) => {
+                objects.push(CatalogObjectRef::Index(*index_id));
+            }
+            BoundReindexTarget::Table(table_id) => {
+                objects.push(CatalogObjectRef::Table(*table_id));
+            }
+            BoundReindexTarget::Schema(schema_id) => {
+                objects.push(CatalogObjectRef::Schema(*schema_id));
+            }
+            BoundReindexTarget::Database => {
+                objects.extend(
+                    catalog
+                        .database()
+                        .schemas()
+                        .map(|schema| CatalogObjectRef::Schema(schema.id)),
+                );
+            }
+        },
         BoundStatement::DropObjects {
             objects: dropped, ..
         } => objects.extend(dropped.iter().copied()),
         BoundStatement::AlterTable { table_id, .. }
-        | BoundStatement::CreateIndex { table_id, .. }
-        | BoundStatement::CreateTrigger { table_id, .. } => {
+        | BoundStatement::CreateIndex { table_id, .. } => {
             objects.push(CatalogObjectRef::Table(*table_id));
         }
+        BoundStatement::CreateTrigger { target, .. } => objects.push(target.object_ref()),
         BoundStatement::AlterIndexRename { index_id, .. } => {
             objects.push(CatalogObjectRef::Index(*index_id));
         }
@@ -4901,6 +5816,42 @@ fn execute_analyze(
         ),
         true,
     ))
+}
+
+fn execute_reindex(
+    state: &mut DatabaseState,
+    target: BoundReindexTarget,
+) -> Result<(Vec<QueryEvent>, bool)> {
+    let table_ids = match target {
+        BoundReindexTarget::Index(index_id) => {
+            ensure_statement_not_cancelled(state)?;
+            rebuild_index_derived(state, index_id)?;
+            Vec::new()
+        }
+        BoundReindexTarget::Table(table_id) => {
+            table_definition(state, table_id)?;
+            vec![table_id]
+        }
+        BoundReindexTarget::Schema(schema_id) => state
+            .catalog
+            .schema_by_id(schema_id)
+            .ok_or_else(|| DbError::new("3F000", "schema does not exist"))?
+            .tables()
+            .map(|table| table.id)
+            .collect(),
+        BoundReindexTarget::Database => state
+            .catalog
+            .database()
+            .schemas()
+            .flat_map(|schema| schema.tables())
+            .map(|table| table.id)
+            .collect(),
+    };
+    for table_id in table_ids {
+        ensure_statement_not_cancelled(state)?;
+        rebuild_table_indexes(state, table_id)?;
+    }
+    Ok((command_events(Schema::empty(), "REINDEX", 0, None), true))
 }
 
 fn execute_vacuum(
@@ -5086,6 +6037,33 @@ fn execute_bound(
 ) -> Result<(Vec<QueryEvent>, bool)> {
     match statement {
         BoundStatement::NoOp { tag } => Ok((command_events(Schema::empty(), tag, 0, None), false)),
+        BoundStatement::Do { body } => {
+            let program = compile_plpgsql(&body, &[])?;
+            let limits = ordadb_plpgsql::ResourceLimits::default();
+            let memory = VmMemoryGrant::new(limits.max_cursor_bytes)?;
+            let output = {
+                let mut host = EnginePlpgsqlHost {
+                    state,
+                    trigger: None,
+                    exception_states: Vec::new(),
+                    exception_triggers: Vec::new(),
+                    exception_charges: Vec::new(),
+                    exception_memory: memory.try_reserve(0)?,
+                    sql_dirty: false,
+                };
+                execute_plpgsql_with_memory(&program, &mut host, &[], limits, memory)?
+            };
+            if output.return_value.is_some()
+                || !output.returned_rows.is_empty()
+                || output.return_parameter.is_some()
+            {
+                return Err(DbError::new(
+                    "42601",
+                    "DO blocks cannot return a value or result row",
+                ));
+            }
+            Ok((command_events(Schema::empty(), "DO", 0, None), true))
+        }
         BoundStatement::CreateSchema {
             name,
             if_not_exists,
@@ -5402,12 +6380,14 @@ fn execute_bound(
             replace,
         } => {
             let argument_names = routine_argument_names(&arguments);
-            let compile_names =
-                if kind == ordadb_catalog::RoutineKind::Function && return_type.is_none() {
-                    vec!["old".to_owned(), "new".to_owned()]
-                } else {
-                    argument_names
-                };
+            let compile_names = if kind == ordadb_catalog::RoutineKind::Function
+                && return_type.is_none()
+                && arguments.is_empty()
+            {
+                vec!["old".to_owned(), "new".to_owned()]
+            } else {
+                argument_names
+            };
             compile_plpgsql(&body, &compile_names)?;
             let tag = match kind {
                 ordadb_catalog::RoutineKind::Function => "CREATE FUNCTION",
@@ -5458,9 +6438,15 @@ fn execute_bound(
         BoundStatement::Call {
             routine_id,
             arguments,
+            schema,
         } => {
-            execute_routine_program(state, routine_id, &arguments, params)?;
-            Ok((command_events(Schema::empty(), "CALL", 0, None), true))
+            let output = execute_routine_program(state, routine_id, &arguments, params)?;
+            let row_count = u64::from(!schema.fields.is_empty());
+            let batch = (!schema.fields.is_empty()).then(|| Batch {
+                schema: schema.clone(),
+                rows: vec![Row::new(output.output_parameters)],
+            });
+            Ok((command_events(schema, "CALL", row_count, batch), true))
         }
         BoundStatement::ScalarSelect { projection, schema } => {
             let values = projection
@@ -5548,6 +6534,9 @@ fn execute_bound(
                     (value, true)
                 }
             };
+            if dirty {
+                state.sequence_currvals.insert(sequence_id, value);
+            }
             Ok((
                 command_events(
                     schema.clone(),
@@ -5562,16 +6551,18 @@ fn execute_bound(
             ))
         }
         BoundStatement::CreateTrigger {
-            table_id,
+            target,
             name,
             timing,
+            level,
             events,
             routine_id,
         } => {
-            Arc::make_mut(&mut state.catalog).create_trigger(
-                table_id,
+            Arc::make_mut(&mut state.catalog).create_trigger_on_target_with_level(
+                target,
                 name,
                 timing,
+                level,
                 events.into_iter().collect(),
                 routine_id,
             )?;
@@ -5603,6 +6594,21 @@ fn execute_bound(
             column_indexes,
             rows,
             on_conflict,
+            returning,
+            params,
+        ),
+        BoundStatement::ViewInsert {
+            view_id,
+            source,
+            column_indexes,
+            rows,
+            returning,
+        } => execute_view_insert(
+            state,
+            view_id,
+            *source,
+            column_indexes,
+            rows,
             returning,
             params,
         ),
@@ -5705,13 +6711,44 @@ fn execute_bound(
             filter,
             returning,
         } => execute_update(state, table_id, assignments, filter, returning, params),
+        BoundStatement::ViewUpdate {
+            view_id,
+            source,
+            assignments,
+            filter,
+            returning,
+        } => execute_view_update(
+            state,
+            view_id,
+            *source,
+            assignments,
+            filter,
+            returning,
+            params,
+        ),
         BoundStatement::Delete {
             table_id,
             filter,
             returning,
         } => execute_delete(state, table_id, filter, returning, params),
-        BoundStatement::Analyze { .. } | BoundStatement::Vacuum { .. } => Err(internal_error(
+        BoundStatement::ViewDelete {
+            view_id,
+            source,
+            filter,
+            returning,
+        } => execute_view_delete(state, view_id, *source, filter, returning, params),
+        BoundStatement::Analyze { .. }
+        | BoundStatement::Vacuum { .. }
+        | BoundStatement::Reindex { .. } => Err(internal_error(
             "maintenance statement was not routed through the root executor",
+        )),
+        BoundStatement::Listen { .. }
+        | BoundStatement::Unlisten { .. }
+        | BoundStatement::Notify { .. }
+        | BoundStatement::PgNotify { .. }
+        | BoundStatement::DiscardAll
+        | BoundStatement::DeallocateAll => Err(internal_error(
+            "session command was not routed through the session executor",
         )),
         BoundStatement::Begin { .. }
         | BoundStatement::Commit { .. }
@@ -5745,60 +6782,315 @@ fn execute_routine_program(
     arguments: &[BoundExpr],
     params: &[Value],
 ) -> Result<ordadb_plpgsql::VmOutput> {
-    if state.routine_depth == 0 {
-        return std::thread::scope(|scope| {
-            let worker = std::thread::Builder::new()
-                .name("ordadb-plpgsql".to_owned())
-                .stack_size(PLPGSQL_EXECUTION_STACK_BYTES)
-                .spawn_scoped(scope, || {
-                    execute_routine_program_on_stack(state, routine_id, arguments, params)
-                })
-                .map_err(|error| {
-                    DbError::new("58030", "failed to start the PL/pgSQL execution worker")
-                        .with_detail(error.to_string())
-                })?;
-            worker
-                .join()
-                .map_err(|_| internal_error("PL/pgSQL execution worker terminated unexpectedly"))?
-        });
-    }
-    execute_routine_program_on_stack(state, routine_id, arguments, params)
+    execute_routine_program_with_boundaries(state, routine_id, arguments, params, None)
+        .map(|(output, _)| output)
 }
 
-fn execute_routine_program_on_stack(
+fn execute_routine_program_with_boundaries(
     state: &mut DatabaseState,
     routine_id: ordadb_types::RoutineId,
     arguments: &[BoundExpr],
     params: &[Value],
-) -> Result<ordadb_plpgsql::VmOutput> {
+    mut boundary_handler: Option<&mut ProcedureBoundaryHandler<'_>>,
+) -> Result<(ordadb_plpgsql::VmOutput, bool)> {
+    let routine_limits = ordadb_plpgsql::ResourceLimits::default();
+    let routine_memory = VmMemoryGrant::new(routine_limits.max_cursor_bytes)?;
+    let root = prepare_routine_vm_frame(
+        state,
+        routine_id,
+        arguments,
+        params,
+        RoutineCompletion::Root,
+        &routine_memory,
+    )?;
+    let mut frames = vec![root];
+    let mut segment_dirty = false;
+    loop {
+        let resumed = {
+            let frame = frames
+                .last_mut()
+                .ok_or_else(|| internal_error("PL/pgSQL VM frame stack is empty"))?;
+            let mut host = EnginePlpgsqlHost {
+                state,
+                trigger: None,
+                exception_states: mem::take(&mut frame.exception_states),
+                exception_triggers: mem::take(&mut frame.exception_triggers),
+                exception_charges: mem::take(&mut frame.exception_charges),
+                exception_memory: mem::replace(
+                    &mut frame.exception_memory,
+                    routine_memory.try_reserve(0)?,
+                ),
+                sql_dirty: false,
+            };
+            let resumed = frame.machine.resume(&mut host, frame.response.take());
+            frame.exception_states = host.exception_states;
+            frame.exception_triggers = host.exception_triggers;
+            frame.exception_charges = host.exception_charges;
+            frame.exception_memory = host.exception_memory;
+            resumed
+        };
+        let resumed = match resumed {
+            Ok(resumed) => resumed,
+            Err(error) => {
+                let failed = frames
+                    .pop()
+                    .ok_or_else(|| internal_error("PL/pgSQL failed frame is missing"))?;
+                state.routine_frames.pop(failed.id)?;
+                match failed.completion {
+                    RoutineCompletion::Root => return Err(error),
+                    RoutineCompletion::Call { .. } | RoutineCompletion::Select { .. } => {
+                        frames
+                            .last_mut()
+                            .ok_or_else(|| internal_error("PL/pgSQL parent frame is missing"))?
+                            .response = Some(Err(error));
+                        continue;
+                    }
+                }
+            }
+        };
+        match resumed {
+            VmRunState::Sql(request) => {
+                let statement =
+                    match parse(&request.sql).and_then(|parsed| bind(parsed, &state.catalog)) {
+                        Ok(statement) => statement,
+                        Err(error) => {
+                            frames
+                                .last_mut()
+                                .ok_or_else(|| internal_error("PL/pgSQL SQL frame is missing"))?
+                                .response = Some(Err(error));
+                            continue;
+                        }
+                    };
+                let boundary = match &statement {
+                    BoundStatement::Commit { chain } => Some(ProcedureBoundary::Commit(*chain)),
+                    BoundStatement::Rollback { chain } => Some(ProcedureBoundary::Rollback(*chain)),
+                    _ => None,
+                };
+                if let Some(boundary) = boundary {
+                    let response = if frames.len() != 1
+                        || !frames.first().is_some_and(|frame| {
+                            frame.routine.kind == ordadb_catalog::RoutineKind::Procedure
+                        }) {
+                        Err(DbError::new(
+                            "2D000",
+                            "invalid transaction termination inside this PL/pgSQL invocation",
+                        )
+                        .with_hint(
+                            "transaction termination is allowed only in an eligible top-level procedure CALL",
+                        ))
+                    } else if let Err(error) = frames
+                        .last()
+                        .ok_or_else(|| internal_error("PL/pgSQL SQL frame is missing"))?
+                        .machine
+                        .ensure_transaction_boundary_ready()
+                    {
+                        Err(error)
+                    } else if let Some(handler) = boundary_handler.as_deref_mut() {
+                        match handler(boundary, state, segment_dirty) {
+                            Ok(()) => {
+                                segment_dirty = false;
+                                let tag = match boundary {
+                                    ProcedureBoundary::Commit(_) => "COMMIT",
+                                    ProcedureBoundary::Rollback(_) => "ROLLBACK",
+                                };
+                                Ok(Box::new(transaction_events(tag).into_iter().map(Ok))
+                                    as VmSqlStream)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        Err(DbError::new(
+                            "2D000",
+                            "invalid transaction termination inside this PL/pgSQL invocation",
+                        )
+                        .with_hint(
+                            "transaction termination requires an eligible top-level procedure CALL in autocommit mode",
+                        ))
+                    };
+                    frames
+                        .last_mut()
+                        .ok_or_else(|| internal_error("PL/pgSQL SQL frame is missing"))?
+                        .response = Some(response);
+                    continue;
+                }
+                let child = match statement {
+                    BoundStatement::Call {
+                        routine_id,
+                        arguments,
+                        schema,
+                    } => Some(prepare_routine_vm_frame(
+                        state,
+                        routine_id,
+                        &arguments,
+                        &request.parameters,
+                        RoutineCompletion::Call { schema },
+                        &routine_memory,
+                    )),
+                    BoundStatement::RoutineSelect {
+                        routine_id,
+                        arguments,
+                        schema,
+                        returns_set,
+                    } => Some(prepare_routine_vm_frame(
+                        state,
+                        routine_id,
+                        &arguments,
+                        &request.parameters,
+                        RoutineCompletion::Select {
+                            schema,
+                            returns_set,
+                        },
+                        &routine_memory,
+                    )),
+                    _ => None,
+                };
+                if let Some(child) = child {
+                    match child {
+                        Ok(child) => frames.push(child),
+                        Err(error) => {
+                            frames
+                                .last_mut()
+                                .ok_or_else(|| internal_error("PL/pgSQL parent frame is missing"))?
+                                .response = Some(Err(error));
+                        }
+                    }
+                    continue;
+                }
+                let (response, dirty) = {
+                    let mut host = EnginePlpgsqlHost {
+                        state,
+                        trigger: None,
+                        exception_states: Vec::new(),
+                        exception_triggers: Vec::new(),
+                        exception_charges: Vec::new(),
+                        exception_memory: routine_memory.try_reserve(0)?,
+                        sql_dirty: false,
+                    };
+                    let response = host.execute_sql(&request.sql, &request.parameters);
+                    (response, host.sql_dirty)
+                };
+                segment_dirty |= dirty;
+                frames
+                    .last_mut()
+                    .ok_or_else(|| internal_error("PL/pgSQL SQL frame is missing"))?
+                    .response = Some(response);
+            }
+            VmRunState::Complete(output) => {
+                let completed = frames
+                    .pop()
+                    .ok_or_else(|| internal_error("PL/pgSQL completed frame is missing"))?;
+                state.routine_frames.pop(completed.id)?;
+                let output = match finish_routine_output(&completed.routine, output) {
+                    Ok(output) => output,
+                    Err(error) => match completed.completion {
+                        RoutineCompletion::Root => return Err(error),
+                        RoutineCompletion::Call { .. } | RoutineCompletion::Select { .. } => {
+                            frames
+                                .last_mut()
+                                .ok_or_else(|| internal_error("PL/pgSQL parent frame is missing"))?
+                                .response = Some(Err(error));
+                            continue;
+                        }
+                    },
+                };
+                match completed.completion {
+                    RoutineCompletion::Root => return Ok((output, segment_dirty)),
+                    completion => {
+                        let events = routine_completion_events(completion, output);
+                        frames
+                            .last_mut()
+                            .ok_or_else(|| internal_error("PL/pgSQL parent frame is missing"))?
+                            .response = Some(Ok(events));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn prepare_routine_vm_frame(
+    state: &mut DatabaseState,
+    routine_id: ordadb_types::RoutineId,
+    arguments: &[BoundExpr],
+    params: &[Value],
+    completion: RoutineCompletion,
+    memory: &VmMemoryGrant,
+) -> Result<RoutineVmFrame> {
     let routine = state
         .catalog
         .routine_by_id(routine_id)
         .cloned()
         .ok_or_else(|| DbError::new("42883", "routine does not exist"))?;
     let program = compile_plpgsql(&routine.body, &routine_argument_names(&routine.arguments))?;
-    let values = arguments
+    let mut input_arguments = arguments.iter();
+    let values = routine
+        .arguments
         .iter()
-        .map(|argument| evaluate_scalar(argument, &[], params))
+        .map(|argument| {
+            if argument.mode.accepts_input() {
+                input_arguments
+                    .next()
+                    .ok_or_else(|| internal_error("routine input argument is missing"))
+                    .and_then(|argument| evaluate_scalar(argument, &[], params))
+            } else {
+                Ok(Value::Null)
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
-    if state.routine_depth >= 64 {
-        return Err(DbError::new(
-            "54001",
-            "PL/pgSQL routine-call depth exceeds the maximum of 64",
-        ));
+    if input_arguments.next().is_some() {
+        return Err(internal_error("routine received too many input arguments"));
     }
-    state.routine_depth += 1;
-    let result = {
+    let machine = {
         let mut host = EnginePlpgsqlHost {
             state,
             trigger: None,
-            exception_state: None,
-            exception_trigger: None,
+            exception_states: Vec::new(),
+            exception_triggers: Vec::new(),
+            exception_charges: Vec::new(),
+            exception_memory: memory.try_reserve(0)?,
+            sql_dirty: false,
         };
-        execute_plpgsql(&program, &mut host, &values)
+        VmMachine::new_with_memory_grant(
+            &program,
+            &mut host,
+            &values,
+            ordadb_plpgsql::ResourceLimits::default(),
+            memory.clone(),
+        )?
     };
-    state.routine_depth = state.routine_depth.saturating_sub(1);
-    let mut output = result?;
+    let id = state.routine_frames.push_routine(routine_id)?;
+    Ok(RoutineVmFrame {
+        id,
+        routine,
+        machine,
+        response: None,
+        completion,
+        exception_states: Vec::new(),
+        exception_triggers: Vec::new(),
+        exception_charges: Vec::new(),
+        exception_memory: memory.try_reserve(0)?,
+    })
+}
+
+fn finish_routine_output(routine: &RoutineDefinition, mut output: VmOutput) -> Result<VmOutput> {
+    output.output_parameters = routine
+        .arguments
+        .iter()
+        .enumerate()
+        .filter(|(_, argument)| argument.mode.produces_output())
+        .map(|(index, _)| {
+            output
+                .final_locals
+                .get(index)
+                .cloned()
+                .ok_or_else(|| internal_error("routine output parameter local is missing"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if routine.return_type.is_none()
+        && let [value] = output.output_parameters.as_slice()
+    {
+        output.return_value = Some(value.clone());
+    }
     if let Some(return_type) = &routine.return_type {
         output.return_value = output
             .return_value
@@ -5810,12 +7102,66 @@ fn execute_routine_program_on_stack(
             .map(|value| coerce_execution_value(value, return_type))
             .collect::<Result<Vec<_>>>()?;
     }
+    output.refresh_retained_memory()?;
     Ok(output)
+}
+
+fn routine_completion_events(completion: RoutineCompletion, mut output: VmOutput) -> VmSqlStream {
+    let memory = output.take_memory_hold();
+    let events = match completion {
+        RoutineCompletion::Root => Vec::new(),
+        RoutineCompletion::Call { schema } => {
+            let row_count = u64::from(!schema.fields.is_empty());
+            let batch = (!schema.fields.is_empty()).then(|| Batch {
+                schema: schema.clone(),
+                rows: vec![Row::new(output.output_parameters)],
+            });
+            command_events(schema, "CALL", row_count, batch)
+        }
+        RoutineCompletion::Select {
+            schema,
+            returns_set,
+        } => {
+            let values = if returns_set {
+                output.returned_rows
+            } else {
+                vec![output.return_value.unwrap_or(Value::Null)]
+            };
+            let row_count = values.len() as u64;
+            vec![
+                QueryEvent::Schema(schema.clone()),
+                QueryEvent::Batch(Batch {
+                    schema,
+                    rows: values
+                        .into_iter()
+                        .map(|value| Row::new(vec![value]))
+                        .collect(),
+                }),
+                QueryEvent::Progress(QueryProgress {
+                    rows_processed: row_count,
+                }),
+                QueryEvent::Complete(CommandComplete {
+                    tag: format!("SELECT {row_count}"),
+                    rows_affected: row_count,
+                }),
+            ]
+        }
+    };
+    Box::new(RoutineCompletionStream {
+        events: events.into_iter(),
+        _memory: memory,
+    })
 }
 
 #[derive(Debug, Clone)]
 struct TriggerRowContext {
     table: TableDefinition,
+    old: Option<Row>,
+    new: Option<Row>,
+}
+
+#[derive(Debug, Clone)]
+struct TriggerRowSavepoint {
     old: Option<Row>,
     new: Option<Row>,
 }
@@ -5894,6 +7240,197 @@ enum RowTriggerOutcome {
     Suppress,
 }
 
+fn trigger_argument_names() -> Vec<String> {
+    [
+        "old",
+        "new",
+        "tg_op",
+        "tg_when",
+        "tg_level",
+        "tg_name",
+        "tg_relid",
+        "tg_table_schema",
+        "tg_table_name",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+#[derive(Debug, Clone)]
+struct TriggerRelation {
+    target: TriggerTarget,
+    schema_id: ordadb_types::SchemaId,
+    name: Identifier,
+    row_scope: TableDefinition,
+}
+
+fn trigger_relation(state: &DatabaseState, target: TriggerTarget) -> Result<TriggerRelation> {
+    match target {
+        TriggerTarget::Table(table_id) => {
+            let table = table_definition(state, table_id)?.clone();
+            Ok(TriggerRelation {
+                target,
+                schema_id: table.schema_id,
+                name: table.name.clone(),
+                row_scope: table,
+            })
+        }
+        TriggerTarget::View(view_id) => {
+            let view = state
+                .catalog
+                .view_by_id(view_id)
+                .cloned()
+                .ok_or_else(|| internal_error("trigger view does not exist"))?;
+            Ok(TriggerRelation {
+                target,
+                schema_id: view.schema_id,
+                name: view.name.clone(),
+                row_scope: TableDefinition::expression_scope_for_schema(
+                    view.name.clone(),
+                    &view.output,
+                )?,
+            })
+        }
+    }
+}
+
+fn trigger_argument_values(
+    state: &DatabaseState,
+    relation: &TriggerRelation,
+    trigger: &TriggerDefinition,
+    timing: TriggerTiming,
+    level: TriggerLevel,
+    event: TriggerEvent,
+) -> Result<Vec<Value>> {
+    let operation = match event {
+        TriggerEvent::Insert => "INSERT",
+        TriggerEvent::Update => "UPDATE",
+        TriggerEvent::Delete => "DELETE",
+    };
+    let when = match timing {
+        TriggerTiming::Before | TriggerTiming::BeforeStatement => "BEFORE",
+        TriggerTiming::After | TriggerTiming::AfterStatement => "AFTER",
+        TriggerTiming::InsteadOf => "INSTEAD OF",
+    };
+    let level = match level {
+        TriggerLevel::Row => "ROW",
+        TriggerLevel::Statement => "STATEMENT",
+    };
+    let schema = state
+        .catalog
+        .schema_by_id(relation.schema_id)
+        .ok_or_else(|| internal_error("trigger relation schema does not exist"))?;
+    let relation_oid = state.catalog.postgres_oid(match relation.target {
+        TriggerTarget::Table(table_id) => PostgresOidObject::Table(table_id),
+        TriggerTarget::View(view_id) => PostgresOidObject::View(view_id),
+    })?;
+    Ok(vec![
+        Value::Null,
+        Value::Null,
+        Value::Text(operation.to_owned()),
+        Value::Text(when.to_owned()),
+        Value::Text(level.to_owned()),
+        Value::Text(trigger.name.as_str().to_owned()),
+        Value::Int64(i64::from(relation_oid.get())),
+        Value::Text(schema.name.as_str().to_owned()),
+        Value::Text(relation.name.as_str().to_owned()),
+    ])
+}
+
+struct TriggerInvocation<'a> {
+    timing: TriggerTiming,
+    level: TriggerLevel,
+    event: TriggerEvent,
+    old: Option<&'a Row>,
+    new: Option<&'a Row>,
+}
+
+fn execute_trigger(
+    state: &mut DatabaseState,
+    relation: &TriggerRelation,
+    trigger_definition: &TriggerDefinition,
+    invocation: TriggerInvocation<'_>,
+) -> Result<(VmOutput, TriggerRowContext)> {
+    if state.triggers_fired >= 16_384 {
+        return Err(DbError::new("54001", "fired-trigger limit exceeded"));
+    }
+    let routine = state
+        .catalog
+        .routine_by_id(trigger_definition.routine_id)
+        .cloned()
+        .ok_or_else(|| DbError::new("42883", "trigger routine does not exist"))?;
+    let program = compile_plpgsql(&routine.body, &trigger_argument_names())?;
+    let parameters = trigger_argument_values(
+        state,
+        relation,
+        trigger_definition,
+        invocation.timing,
+        invocation.level,
+        invocation.event,
+    )?;
+    let frame = state.routine_frames.push_trigger(trigger_definition.id)?;
+    state.triggers_fired += 1;
+    let mut trigger = TriggerRowContext {
+        table: relation.row_scope.clone(),
+        old: invocation.old.cloned(),
+        new: invocation.new.cloned(),
+    };
+    let limits = ordadb_plpgsql::ResourceLimits::default();
+    let memory = VmMemoryGrant::new(limits.max_cursor_bytes)?;
+    let result = {
+        let mut host = EnginePlpgsqlHost {
+            state,
+            trigger: Some(&mut trigger),
+            exception_states: Vec::new(),
+            exception_triggers: Vec::new(),
+            exception_charges: Vec::new(),
+            exception_memory: memory.try_reserve(0)?,
+            sql_dirty: false,
+        };
+        execute_plpgsql_with_memory(&program, &mut host, &parameters, limits, memory)
+    };
+    state.routine_frames.pop(frame)?;
+    result.map(|output| (output, trigger))
+}
+
+fn fire_statement_triggers(
+    state: &mut DatabaseState,
+    table_id: TableId,
+    timing: TriggerTiming,
+    event: TriggerEvent,
+) -> Result<bool> {
+    let table = table_definition(state, table_id)?.clone();
+    let relation = trigger_relation(state, TriggerTarget::Table(table_id))?;
+    let mut triggers = table
+        .triggers()
+        .filter(|trigger| {
+            trigger.enabled
+                && trigger.level == TriggerLevel::Statement
+                && trigger.timing == timing
+                && trigger.events.contains(&event)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    triggers.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+    let fired = !triggers.is_empty();
+    for trigger in triggers {
+        let _ = execute_trigger(
+            state,
+            &relation,
+            &trigger,
+            TriggerInvocation {
+                timing,
+                level: TriggerLevel::Statement,
+                event,
+                old: None,
+                new: None,
+            },
+        )?;
+    }
+    Ok(fired)
+}
+
 fn fire_row_triggers_with_rows(
     state: &mut DatabaseState,
     table_id: TableId,
@@ -5902,67 +7439,102 @@ fn fire_row_triggers_with_rows(
     old: Option<&Row>,
     new: Option<&Row>,
 ) -> Result<RowTriggerOutcome> {
-    let table = table_definition(state, table_id)?.clone();
-    let triggers = table
-        .triggers()
-        .filter(|trigger| {
-            trigger.enabled && trigger.timing == timing && trigger.events.contains(&event)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    for trigger in triggers {
-        if state.trigger_depth >= 64 || state.triggers_fired >= 16_384 {
-            return Err(DbError::new(
-                "54001",
-                "trigger recursion or fired-trigger limit exceeded",
-            ));
-        }
-        let routine = state
+    fire_relation_row_triggers_with_rows(
+        state,
+        TriggerTarget::Table(table_id),
+        timing,
+        event,
+        old,
+        new,
+    )
+}
+
+fn fire_view_row_triggers_with_rows(
+    state: &mut DatabaseState,
+    view_id: ViewId,
+    event: TriggerEvent,
+    old: Option<&Row>,
+    new: Option<&Row>,
+) -> Result<RowTriggerOutcome> {
+    fire_relation_row_triggers_with_rows(
+        state,
+        TriggerTarget::View(view_id),
+        TriggerTiming::InsteadOf,
+        event,
+        old,
+        new,
+    )
+}
+
+fn fire_relation_row_triggers_with_rows(
+    state: &mut DatabaseState,
+    target: TriggerTarget,
+    timing: TriggerTiming,
+    event: TriggerEvent,
+    old: Option<&Row>,
+    new: Option<&Row>,
+) -> Result<RowTriggerOutcome> {
+    let relation = trigger_relation(state, target)?;
+    let mut current_old = old.cloned();
+    let mut current_new = new.cloned();
+    let triggers = match target {
+        TriggerTarget::Table(table_id) => state
             .catalog
-            .routine_by_id(trigger.routine_id)
-            .cloned()
-            .ok_or_else(|| DbError::new("42883", "trigger routine does not exist"))?;
-        let program = compile_plpgsql(&routine.body, &["old".into(), "new".into()])?;
-        state.trigger_depth += 1;
-        state.triggers_fired += 1;
-        let mut trigger = TriggerRowContext {
-            table: table.clone(),
-            old: old.cloned(),
-            new: new.cloned(),
-        };
-        let result = {
-            let mut host = EnginePlpgsqlHost {
-                state,
-                trigger: Some(&mut trigger),
-                exception_state: None,
-                exception_trigger: None,
-            };
-            execute_plpgsql(&program, &mut host, &[Value::Null, Value::Null])
-        };
-        state.trigger_depth = state.trigger_depth.saturating_sub(1);
-        let output = result?;
+            .table_by_id(table_id)
+            .map(|table| table.triggers().cloned().collect::<Vec<_>>())
+            .ok_or_else(|| internal_error("trigger table does not exist"))?,
+        TriggerTarget::View(view_id) => state
+            .catalog
+            .view_by_id(view_id)
+            .map(|view| view.triggers().cloned().collect::<Vec<_>>())
+            .ok_or_else(|| internal_error("trigger view does not exist"))?,
+    };
+    if triggers.iter().any(|trigger| trigger.target != target) {
+        return Err(DbError::new(
+            "XX001",
+            "trigger is stored under a different target relation",
+        ));
+    }
+    let mut triggers = triggers
+        .into_iter()
+        .filter(|trigger| {
+            trigger.enabled
+                && trigger.level == TriggerLevel::Row
+                && trigger.timing == timing
+                && trigger.events.contains(&event)
+        })
+        .collect::<Vec<_>>();
+    triggers.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+    for trigger in triggers {
+        let (output, trigger) = execute_trigger(
+            state,
+            &relation,
+            &trigger,
+            TriggerInvocation {
+                timing,
+                level: TriggerLevel::Row,
+                event,
+                old: current_old.as_ref(),
+                new: current_new.as_ref(),
+            },
+        )?;
         if timing == TriggerTiming::After {
             continue;
         }
         match output.return_parameter {
-            Some(0) => {
-                if event != TriggerEvent::Delete {
-                    return Ok(match trigger.old {
-                        Some(row) => RowTriggerOutcome::Proceed(Some(row)),
-                        None => RowTriggerOutcome::Suppress,
-                    });
-                }
-            }
-            Some(1) => {
-                if event == TriggerEvent::Delete {
-                    if trigger.new.is_none() {
-                        return Ok(RowTriggerOutcome::Suppress);
-                    }
+            Some(parameter @ 0..=1) => {
+                let returned = if parameter == 0 {
+                    trigger.old
                 } else {
-                    return Ok(match trigger.new {
-                        Some(row) => RowTriggerOutcome::Proceed(Some(row)),
-                        None => RowTriggerOutcome::Suppress,
-                    });
+                    trigger.new
+                };
+                let Some(returned) = returned else {
+                    return Ok(RowTriggerOutcome::Suppress);
+                };
+                if event == TriggerEvent::Delete {
+                    current_old = Some(returned);
+                } else {
+                    current_new = Some(returned);
                 }
             }
             Some(parameter) => {
@@ -5987,7 +7559,13 @@ fn fire_row_triggers_with_rows(
             }
         }
     }
-    Ok(RowTriggerOutcome::Proceed(new.cloned()))
+    Ok(RowTriggerOutcome::Proceed(
+        if event == TriggerEvent::Delete {
+            current_old
+        } else {
+            current_new
+        },
+    ))
 }
 
 fn execute_view_select(
@@ -6622,8 +8200,134 @@ fn materialize_statement_rows(
 struct EnginePlpgsqlHost<'a> {
     state: &'a mut DatabaseState,
     trigger: Option<&'a mut TriggerRowContext>,
-    exception_state: Option<DatabaseState>,
-    exception_trigger: Option<TriggerRowContext>,
+    exception_states: Vec<DatabaseState>,
+    exception_triggers: Vec<Option<TriggerRowSavepoint>>,
+    exception_charges: Vec<usize>,
+    exception_memory: VmMemoryReservation,
+    sql_dirty: bool,
+}
+
+fn estimated_btree_clone_bytes<K, V>(len: usize) -> usize {
+    len.saturating_mul(
+        std::mem::size_of::<(K, V)>().saturating_add(4 * std::mem::size_of::<usize>()),
+    )
+}
+
+fn estimated_database_state_snapshot_bytes(state: &DatabaseState) -> Result<usize> {
+    let routine_frames = state
+        .routine_frames
+        .arena
+        .capacity()
+        .saturating_mul(std::mem::size_of::<Option<RoutineFrame>>())
+        .saturating_add(
+            state
+                .routine_frames
+                .free
+                .capacity()
+                .saturating_mul(std::mem::size_of::<usize>()),
+        )
+        .saturating_add(
+            state
+                .routine_frames
+                .active
+                .capacity()
+                .saturating_mul(std::mem::size_of::<RoutineFrameId>()),
+        );
+    let notices = state
+        .pending_notices
+        .capacity()
+        .saturating_mul(std::mem::size_of::<DbNotice>())
+        .saturating_add(
+            state
+                .pending_notices
+                .iter()
+                .map(|notice| {
+                    notice
+                        .sql_state
+                        .capacity()
+                        .saturating_add(notice.message.capacity())
+                        .saturating_add(notice.detail.as_ref().map_or(0, |value| value.len()))
+                        .saturating_add(notice.hint.as_ref().map_or(0, |value| value.len()))
+                })
+                .sum::<usize>(),
+        );
+    let listener_actions = state
+        .pending_notifications
+        .listener_actions
+        .capacity()
+        .saturating_mul(std::mem::size_of::<NotificationListenerAction>())
+        .saturating_add(
+            state
+                .pending_notifications
+                .listener_actions
+                .iter()
+                .map(|action| match action {
+                    NotificationListenerAction::Listen(channel)
+                    | NotificationListenerAction::Unlisten(channel) => channel.as_str().len(),
+                    NotificationListenerAction::UnlistenAll => 0,
+                })
+                .sum::<usize>(),
+        );
+    let notifications = state
+        .pending_notifications
+        .notifications
+        .capacity()
+        .saturating_mul(std::mem::size_of::<(Identifier, String)>())
+        .saturating_add(
+            state
+                .pending_notifications
+                .notifications
+                .iter()
+                .map(|(channel, payload)| channel.as_str().len().saturating_add(payload.capacity()))
+                .sum::<usize>(),
+        );
+    let coalesced = state
+        .pending_notifications
+        .coalesced
+        .iter()
+        .map(|(channel, payload)| {
+            std::mem::size_of::<(Identifier, String)>()
+                .saturating_add(channel.as_str().len())
+                .saturating_add(payload.capacity())
+                .saturating_add(4 * std::mem::size_of::<usize>())
+        })
+        .sum::<usize>();
+    let total = std::mem::size_of::<DatabaseState>()
+        .saturating_add(estimated_btree_clone_bytes::<TableId, Arc<Vec<Row>>>(
+            state.rows.len(),
+        ))
+        .saturating_add(
+            estimated_btree_clone_bytes::<TableId, Arc<Vec<VersionedRow>>>(state.versions.len()),
+        )
+        .saturating_add(estimated_btree_clone_bytes::<TableId, Arc<Vec<u32>>>(
+            state.visible_versions.len(),
+        ))
+        .saturating_add(estimated_btree_clone_bytes::<IndexId, Arc<BPlusTree>>(
+            state.indexes.len(),
+        ))
+        .saturating_add(estimated_btree_clone_bytes::<SequenceId, i64>(
+            state.sequence_currvals.len(),
+        ))
+        .saturating_add(routine_frames)
+        .saturating_add(notices)
+        .saturating_add(listener_actions)
+        .saturating_add(notifications)
+        .saturating_add(coalesced);
+    if total == usize::MAX {
+        return Err(DbError::new(
+            "53200",
+            "PL/pgSQL exception savepoint memory accounting overflowed",
+        ));
+    }
+    Ok(total)
+}
+
+fn estimated_trigger_savepoint_bytes(trigger: Option<&TriggerRowContext>) -> usize {
+    trigger.map_or(0, |trigger| {
+        std::mem::size_of::<TriggerRowSavepoint>()
+            .saturating_add(trigger.old.as_ref().map_or(0, estimated_row_bytes))
+            .saturating_add(trigger.new.as_ref().map_or(0, estimated_row_bytes))
+    })
 }
 
 impl PlpgsqlHost for EnginePlpgsqlHost<'_> {
@@ -6631,25 +8335,61 @@ impl PlpgsqlHost for EnginePlpgsqlHost<'_> {
         &mut self,
         sql: &str,
         parameters: &[Value],
-    ) -> Result<Box<dyn Iterator<Item = Result<QueryEvent>> + '_>> {
+    ) -> Result<Box<dyn Iterator<Item = Result<QueryEvent>>>> {
         let (sql, parameters, _) =
             expand_trigger_record_fields(sql, parameters, self.trigger.as_deref())?;
-        let statement = bind(parse(&sql)?, &self.state.catalog)?;
+        let statement = resolve_sequence_currval(
+            bind(parse(&sql)?, &self.state.catalog)?,
+            &self.state.sequence_currvals,
+        )?;
+        if let BoundStatement::PgNotify {
+            channel,
+            payload,
+            schema,
+        } = &statement
+        {
+            let (channel, payload) = evaluate_pg_notify(channel, payload, &parameters)?;
+            self.state.pending_notifications.notify(channel, payload);
+            return Ok(Box::new(
+                pg_notify_events(schema.clone()).into_iter().map(Ok),
+            ));
+        }
+        if let BoundStatement::Notify { channel, payload } = &statement {
+            self.state
+                .pending_notifications
+                .notify(channel.clone(), payload.clone());
+            return Ok(Box::new(transaction_events("NOTIFY").into_iter().map(Ok)));
+        }
+        if matches!(
+            statement,
+            BoundStatement::Commit { .. } | BoundStatement::Rollback { .. }
+        ) {
+            return Err(DbError::new(
+                "2D000",
+                "invalid transaction termination inside this PL/pgSQL invocation",
+            )
+            .with_hint(
+                "transaction termination requires an eligible top-level procedure CALL in autocommit mode",
+            ));
+        }
         if matches!(
             statement,
             BoundStatement::Begin { .. }
-                | BoundStatement::Commit { .. }
-                | BoundStatement::Rollback { .. }
                 | BoundStatement::Savepoint { .. }
                 | BoundStatement::RollbackTo { .. }
                 | BoundStatement::ReleaseSavepoint { .. }
         ) {
             return Err(DbError::new(
                 "0A000",
-                "transaction control is not allowed inside PL/pgSQL routines",
+                "this transaction control command is not allowed inside PL/pgSQL",
             ));
         }
-        let (events, _) = execute_bound_with_ownership(self.state, statement, &parameters)?;
+        if let Some(stream) = prepare_read_stream(self.state, statement.clone(), &parameters, None)?
+        {
+            return Ok(Box::new(stream));
+        }
+        let (events, dirty) = execute_bound_with_ownership(self.state, statement, &parameters)?;
+        self.sql_dirty |= dirty;
         Ok(Box::new(events.into_iter().map(Ok)))
     }
 
@@ -6699,34 +8439,113 @@ impl PlpgsqlHost for EnginePlpgsqlHost<'_> {
             .assign(slot, field, value)
     }
 
+    fn resolve_row_type(&mut self, relation: &str) -> Result<Vec<String>> {
+        let statement = bind(
+            parse(&format!("SELECT * FROM {relation} LIMIT 0"))?,
+            &self.state.catalog,
+        )?;
+        let schema = match statement {
+            BoundStatement::Select { schema, .. }
+            | BoundStatement::AdvancedSelect { schema, .. }
+            | BoundStatement::ViewSelect { schema, .. } => schema,
+            _ => {
+                return Err(DbError::new(
+                    "42809",
+                    format!("relation {relation} does not expose a row type"),
+                ));
+            }
+        };
+        Ok(schema.fields.into_iter().map(|field| field.name).collect())
+    }
+
     fn begin_exception_block(&mut self) -> Result<()> {
-        if self.exception_state.is_some() {
-            return Err(internal_error(
-                "PL/pgSQL exception savepoint is already active",
+        if self.exception_states.len() >= 128 {
+            return Err(DbError::new(
+                "54001",
+                "PL/pgSQL exception block depth exceeds the maximum of 128",
             ));
         }
-        self.exception_state = Some(self.state.clone());
-        self.exception_trigger = self.trigger.as_deref().cloned();
+        let charge = estimated_database_state_snapshot_bytes(self.state)?
+            .saturating_add(estimated_trigger_savepoint_bytes(self.trigger.as_deref()))
+            .saturating_add(std::mem::size_of::<usize>());
+        let next = self
+            .exception_memory
+            .bytes()
+            .checked_add(charge)
+            .ok_or_else(|| {
+                DbError::new(
+                    "53200",
+                    "PL/pgSQL exception savepoint memory accounting overflowed",
+                )
+            })?;
+        self.exception_memory.resize(next)?;
+        self.exception_states.push(self.state.clone());
+        self.exception_triggers
+            .push(self.trigger.as_deref().map(|trigger| TriggerRowSavepoint {
+                old: trigger.old.clone(),
+                new: trigger.new.clone(),
+            }));
+        self.exception_charges.push(charge);
         Ok(())
     }
 
     fn commit_exception_block(&mut self) -> Result<()> {
-        self.exception_state = None;
-        self.exception_trigger = None;
+        self.exception_states
+            .pop()
+            .ok_or_else(|| internal_error("PL/pgSQL exception savepoint stack is empty"))?;
+        self.exception_triggers
+            .pop()
+            .ok_or_else(|| internal_error("PL/pgSQL trigger savepoint stack is empty"))?;
+        let charge = self
+            .exception_charges
+            .pop()
+            .ok_or_else(|| internal_error("PL/pgSQL exception memory stack is empty"))?;
+        self.exception_memory
+            .resize(self.exception_memory.bytes().saturating_sub(charge))?;
         Ok(())
     }
 
     fn rollback_exception_block(&mut self) -> Result<()> {
+        let pending_notices = mem::take(&mut self.state.pending_notices);
         let saved = self
-            .exception_state
-            .take()
+            .exception_states
+            .pop()
             .ok_or_else(|| internal_error("PL/pgSQL exception savepoint is not active"))?;
         *self.state = saved;
+        self.state.pending_notices = pending_notices;
+        let saved_trigger = self
+            .exception_triggers
+            .pop()
+            .ok_or_else(|| internal_error("PL/pgSQL trigger savepoint stack is empty"))?;
+        let charge = self
+            .exception_charges
+            .pop()
+            .ok_or_else(|| internal_error("PL/pgSQL exception memory stack is empty"))?;
+        self.exception_memory
+            .resize(self.exception_memory.bytes().saturating_sub(charge))?;
         if let Some(trigger) = self.trigger.as_deref_mut()
-            && let Some(saved) = self.exception_trigger.take()
+            && let Some(saved) = saved_trigger
         {
-            *trigger = saved;
+            trigger.old = saved.old;
+            trigger.new = saved.new;
         }
+        Ok(())
+    }
+
+    fn emit_notice(&mut self, notice: DbNotice) -> Result<()> {
+        if notice.message.len() > MAX_PLPGSQL_NOTICE_BYTES {
+            return Err(DbError::new(
+                "54000",
+                "PL/pgSQL notice message exceeds the configured byte limit",
+            ));
+        }
+        if self.state.pending_notices.len() >= MAX_PLPGSQL_NOTICES {
+            return Err(DbError::new(
+                "54001",
+                "PL/pgSQL notice count exceeds the configured limit",
+            ));
+        }
+        self.state.pending_notices.push(notice);
         Ok(())
     }
 
@@ -6865,6 +8684,24 @@ fn execute_merge(
         return Err(internal_error(
             "MERGE input column offsets are inconsistent",
         ));
+    }
+    let statement_events = clauses
+        .iter()
+        .filter_map(|clause| match clause.action {
+            BoundMergeAction::Insert { .. } => Some(TriggerEvent::Insert),
+            BoundMergeAction::Update { .. } => Some(TriggerEvent::Update),
+            BoundMergeAction::Delete => Some(TriggerEvent::Delete),
+            BoundMergeAction::DoNothing => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut statement_trigger_fired = false;
+    for event in &statement_events {
+        statement_trigger_fired |= fire_statement_triggers(
+            state,
+            target.table_id,
+            TriggerTiming::BeforeStatement,
+            *event,
+        )?;
     }
     let target_definition = table_definition(state, target.table_id)?.clone();
     table_definition(state, source.table_id)?;
@@ -7105,6 +8942,16 @@ fn execute_merge(
         affected = affected.saturating_add(1);
     }
 
+    for event in &statement_events {
+        statement_trigger_fired |= fire_statement_triggers(
+            state,
+            target.table_id,
+            TriggerTiming::AfterStatement,
+            *event,
+        )?;
+    }
+    validate_database_rows(state)?;
+
     Ok((
         dml_command_events(
             returning.as_ref(),
@@ -7112,7 +8959,7 @@ fn execute_merge(
             affected,
             returned_rows,
         ),
-        affected != 0,
+        affected != 0 || statement_trigger_fired,
     ))
 }
 
@@ -7375,6 +9222,24 @@ fn execute_insert(
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
     let table = table_definition(state, table_id)?.clone();
+    fire_statement_triggers(
+        state,
+        table_id,
+        TriggerTiming::BeforeStatement,
+        TriggerEvent::Insert,
+    )?;
+    let conflict_update = matches!(
+        on_conflict.as_ref().map(|conflict| &conflict.action),
+        Some(BoundConflictAction::DoUpdate { .. })
+    );
+    if conflict_update {
+        fire_statement_triggers(
+            state,
+            table_id,
+            TriggerTiming::BeforeStatement,
+            TriggerEvent::Update,
+        )?;
+    }
     let mut affected = 0u64;
     let mut returned_rows = Vec::new();
     let mut command_affected_rows = BTreeSet::new();
@@ -7473,15 +9338,27 @@ fn execute_insert(
         if let Some(returning) = &returning {
             returned_rows.push(evaluate_returning(returning, &inserted_row, params)?);
         }
-        if matches!(
-            on_conflict.as_ref().map(|conflict| &conflict.action),
-            Some(BoundConflictAction::DoUpdate { .. })
-        ) {
+        if conflict_update {
             conflict_reservation.grow(std::mem::size_of::<usize>() * 4)?;
             command_affected_rows.insert(inserted_position);
         }
         affected = affected.saturating_add(1);
     }
+    if conflict_update {
+        fire_statement_triggers(
+            state,
+            table_id,
+            TriggerTiming::AfterStatement,
+            TriggerEvent::Update,
+        )?;
+    }
+    fire_statement_triggers(
+        state,
+        table_id,
+        TriggerTiming::AfterStatement,
+        TriggerEvent::Insert,
+    )?;
+    validate_database_rows(state)?;
     Ok((
         dml_command_events(
             returning.as_ref(),
@@ -7491,6 +9368,92 @@ fn execute_insert(
         ),
         true,
     ))
+}
+
+fn execute_view_insert(
+    state: &mut DatabaseState,
+    view_id: ViewId,
+    _source: BoundStatement,
+    column_indexes: Vec<usize>,
+    expressions: Vec<Vec<BoundExpr>>,
+    returning: Option<BoundReturning>,
+    params: &[Value],
+) -> Result<(Vec<QueryEvent>, bool)> {
+    let view = state
+        .catalog
+        .view_by_id(view_id)
+        .cloned()
+        .ok_or_else(|| internal_error("view INSERT target disappeared"))?;
+    if view.kind != ViewKind::Regular {
+        return Err(DbError::new("42809", "cannot modify a materialized view"));
+    }
+    let mut affected = 0_u64;
+    let mut returned_rows = Vec::new();
+    for expressions in expressions {
+        ensure_statement_not_cancelled(state)?;
+        let mut values = vec![Value::Null; view.output.fields.len()];
+        for (expression, column_index) in expressions.into_iter().zip(&column_indexes) {
+            let target = values
+                .get_mut(*column_index)
+                .ok_or_else(|| internal_error("view INSERT column is out of bounds"))?;
+            *target = evaluate_scalar(&expression, &[], params)?;
+        }
+        let proposed = Row::new(values);
+        let returned = match fire_view_row_triggers_with_rows(
+            state,
+            view_id,
+            TriggerEvent::Insert,
+            None,
+            Some(&proposed),
+        )? {
+            RowTriggerOutcome::Proceed(Some(row)) => row,
+            RowTriggerOutcome::Proceed(None) | RowTriggerOutcome::Suppress => continue,
+        };
+        if let Some(returning) = &returning {
+            returned_rows.push(evaluate_returning(returning, &returned, params)?);
+        }
+        affected = affected.saturating_add(1);
+    }
+    validate_database_rows(state)?;
+    Ok((
+        dml_command_events(
+            returning.as_ref(),
+            format!("INSERT 0 {affected}"),
+            affected,
+            returned_rows,
+        ),
+        true,
+    ))
+}
+
+fn execute_view_source_rows(
+    state: &mut DatabaseState,
+    source: BoundStatement,
+    expected: &Schema,
+    params: &[Value],
+) -> Result<(Vec<Row>, Vec<DbNotice>)> {
+    let (events, dirty) = execute_bound(state, source, params)?;
+    if dirty {
+        return Err(internal_error(
+            "a stored view query attempted to mutate state",
+        ));
+    }
+    let mut rows = Vec::new();
+    let mut notices = Vec::new();
+    for event in events {
+        match event {
+            QueryEvent::Schema(schema) if schema != *expected => {
+                return Err(DbError::new(
+                    "42P16",
+                    "stored view query output no longer matches its catalog definition",
+                ));
+            }
+            QueryEvent::Schema(_) | QueryEvent::Progress(_) | QueryEvent::Complete(_) => {}
+            QueryEvent::Batch(batch) => rows.extend(batch.rows),
+            QueryEvent::Notice(notice) => notices.push(notice),
+        }
+    }
+    Ok((rows, notices))
 }
 
 fn conflicting_row_position(
@@ -9236,6 +11199,12 @@ fn execute_update(
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
     table_definition(state, table_id)?;
+    fire_statement_triggers(
+        state,
+        table_id,
+        TriggerTiming::BeforeStatement,
+        TriggerEvent::Update,
+    )?;
     let source_rows = state
         .rows
         .get(&table_id)
@@ -9320,6 +11289,13 @@ fn execute_update(
             updated = updated.saturating_add(1);
         }
     }
+    fire_statement_triggers(
+        state,
+        table_id,
+        TriggerTiming::AfterStatement,
+        TriggerEvent::Update,
+    )?;
+    validate_database_rows(state)?;
     Ok((
         dml_command_events(
             returning.as_ref(),
@@ -9331,6 +11307,71 @@ fn execute_update(
     ))
 }
 
+fn execute_view_update(
+    state: &mut DatabaseState,
+    view_id: ViewId,
+    source: BoundStatement,
+    assignments: Vec<(usize, BoundExpr)>,
+    filter: Option<BoundExpr>,
+    returning: Option<BoundReturning>,
+    params: &[Value],
+) -> Result<(Vec<QueryEvent>, bool)> {
+    let view = state
+        .catalog
+        .view_by_id(view_id)
+        .cloned()
+        .ok_or_else(|| internal_error("view UPDATE target disappeared"))?;
+    if view.kind != ViewKind::Regular {
+        return Err(DbError::new("42809", "cannot modify a materialized view"));
+    }
+    let (source_rows, notices) = execute_view_source_rows(state, source, &view.output, params)?;
+    let mut updated = 0_u64;
+    let mut returned_rows = Vec::new();
+    for old_row in source_rows {
+        ensure_statement_not_cancelled(state)?;
+        if !filter
+            .as_ref()
+            .map(|filter| execution_predicate_matches(filter, &old_row, params))
+            .transpose()?
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let mut proposed = old_row.clone();
+        for (column_index, expression) in &assignments {
+            let value = evaluate_scalar(expression, &old_row.values, params)?;
+            let target = proposed
+                .values
+                .get_mut(*column_index)
+                .ok_or_else(|| internal_error("view UPDATE column is out of bounds"))?;
+            *target = value;
+        }
+        let returned = match fire_view_row_triggers_with_rows(
+            state,
+            view_id,
+            TriggerEvent::Update,
+            Some(&old_row),
+            Some(&proposed),
+        )? {
+            RowTriggerOutcome::Proceed(Some(row)) => row,
+            RowTriggerOutcome::Proceed(None) | RowTriggerOutcome::Suppress => continue,
+        };
+        if let Some(returning) = &returning {
+            returned_rows.push(evaluate_returning(returning, &returned, params)?);
+        }
+        updated = updated.saturating_add(1);
+    }
+    validate_database_rows(state)?;
+    let mut events = dml_command_events(
+        returning.as_ref(),
+        format!("UPDATE {updated}"),
+        updated,
+        returned_rows,
+    );
+    insert_pending_notices(&mut events, notices);
+    Ok((events, true))
+}
+
 fn execute_delete(
     state: &mut DatabaseState,
     table_id: TableId,
@@ -9339,6 +11380,12 @@ fn execute_delete(
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
     table_definition(state, table_id)?;
+    fire_statement_triggers(
+        state,
+        table_id,
+        TriggerTiming::BeforeStatement,
+        TriggerEvent::Delete,
+    )?;
     let source_rows = state
         .rows
         .get(&table_id)
@@ -9410,6 +11457,13 @@ fn execute_delete(
         }
         deleted = deleted.saturating_add(1);
     }
+    fire_statement_triggers(
+        state,
+        table_id,
+        TriggerTiming::AfterStatement,
+        TriggerEvent::Delete,
+    )?;
+    validate_database_rows(state)?;
     Ok((
         dml_command_events(
             returning.as_ref(),
@@ -9419,6 +11473,61 @@ fn execute_delete(
         ),
         true,
     ))
+}
+
+fn execute_view_delete(
+    state: &mut DatabaseState,
+    view_id: ViewId,
+    source: BoundStatement,
+    filter: Option<BoundExpr>,
+    returning: Option<BoundReturning>,
+    params: &[Value],
+) -> Result<(Vec<QueryEvent>, bool)> {
+    let view = state
+        .catalog
+        .view_by_id(view_id)
+        .cloned()
+        .ok_or_else(|| internal_error("view DELETE target disappeared"))?;
+    if view.kind != ViewKind::Regular {
+        return Err(DbError::new("42809", "cannot modify a materialized view"));
+    }
+    let (source_rows, notices) = execute_view_source_rows(state, source, &view.output, params)?;
+    let mut deleted = 0_u64;
+    let mut returned_rows = Vec::new();
+    for old_row in source_rows {
+        ensure_statement_not_cancelled(state)?;
+        if !filter
+            .as_ref()
+            .map(|filter| execution_predicate_matches(filter, &old_row, params))
+            .transpose()?
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let returned = match fire_view_row_triggers_with_rows(
+            state,
+            view_id,
+            TriggerEvent::Delete,
+            Some(&old_row),
+            None,
+        )? {
+            RowTriggerOutcome::Proceed(Some(row)) => row,
+            RowTriggerOutcome::Proceed(None) | RowTriggerOutcome::Suppress => continue,
+        };
+        if let Some(returning) = &returning {
+            returned_rows.push(evaluate_returning(returning, &returned, params)?);
+        }
+        deleted = deleted.saturating_add(1);
+    }
+    validate_database_rows(state)?;
+    let mut events = dml_command_events(
+        returning.as_ref(),
+        format!("DELETE {deleted}"),
+        deleted,
+        returned_rows,
+    );
+    insert_pending_notices(&mut events, notices);
+    Ok((events, true))
 }
 
 fn evaluate_returning(returning: &BoundReturning, row: &Row, params: &[Value]) -> Result<Row> {
@@ -9924,69 +12033,109 @@ fn validate_database_rows(state: &DatabaseState) -> Result<()> {
     Ok(())
 }
 
-fn rebuild_table_derived(state: &mut DatabaseState, table_id: TableId) -> Result<()> {
-    let table = table_definition(state, table_id)?.clone();
-    let rows = state.rows.get(&table_id).cloned().unwrap_or_default();
-    let mut rebuilt = Vec::new();
-    for definition in table.indexes() {
-        if definition.method != IndexMethod::BTree {
-            continue;
-        }
-        let key_positions = definition
-            .key_columns
-            .iter()
-            .map(|column_id| {
-                table
-                    .column_index_by_id(*column_id)
-                    .ok_or_else(|| internal_error("index key column is absent from its table"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let key_types = key_positions
-            .iter()
-            .map(|position| table.columns()[*position].data_type.clone())
-            .collect::<Vec<_>>();
-        let include_positions = definition
-            .include_columns
-            .iter()
-            .map(|column_id| {
-                table
-                    .column_index_by_id(*column_id)
-                    .ok_or_else(|| internal_error("index include column is absent from its table"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let entries = rows
-            .iter()
-            .enumerate()
-            .map(|(row_index, row)| {
-                let row_id = u64::try_from(row_index)
-                    .map(RowId::new)
-                    .map_err(|_| DbError::new("54000", "table row count exceeds index limits"))?;
-                let key_values = key_positions
-                    .iter()
-                    .map(|position| row.values[*position].clone())
-                    .collect::<Vec<_>>();
-                let included = include_positions
-                    .iter()
-                    .map(|position| row.values[*position].clone())
-                    .collect();
-                IndexEntry::new_typed(&key_values, &key_types, row_id, included)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let tree = BPlusTree::from_entries(definition.unique, entries)?;
-        rebuilt.push((definition.id, tree));
+fn rebuild_btree_index(state: &mut DatabaseState, index_id: IndexId) -> Result<()> {
+    let definition = state
+        .catalog
+        .index_by_id(index_id)
+        .cloned()
+        .ok_or_else(|| DbError::new("42704", "index does not exist"))?;
+    if definition.method != IndexMethod::BTree {
+        return Err(internal_error(
+            "non-B-tree index reached the B-tree rebuild path",
+        ));
     }
+    let table = table_definition(state, definition.table_id)?.clone();
+    let rows = state
+        .rows
+        .get(&definition.table_id)
+        .cloned()
+        .unwrap_or_default();
+    let key_positions = definition
+        .key_columns
+        .iter()
+        .map(|column_id| {
+            table
+                .column_index_by_id(*column_id)
+                .ok_or_else(|| internal_error("index key column is absent from its table"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let key_types = key_positions
+        .iter()
+        .map(|position| table.columns()[*position].data_type.clone())
+        .collect::<Vec<_>>();
+    let include_positions = definition
+        .include_columns
+        .iter()
+        .map(|column_id| {
+            table
+                .column_index_by_id(*column_id)
+                .ok_or_else(|| internal_error("index include column is absent from its table"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let entries = rows
+        .iter()
+        .enumerate()
+        .map(|(row_index, row)| {
+            let row_id = u64::try_from(row_index)
+                .map(RowId::new)
+                .map_err(|_| DbError::new("54000", "table row count exceeds index limits"))?;
+            let key_values = key_positions
+                .iter()
+                .map(|position| row.values[*position].clone())
+                .collect::<Vec<_>>();
+            let included = include_positions
+                .iter()
+                .map(|position| row.values[*position].clone())
+                .collect();
+            IndexEntry::new_typed(&key_values, &key_types, row_id, included)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let tree = BPlusTree::from_entries(definition.unique, entries)?;
+    state.indexes.insert(index_id, Arc::new(tree));
+    Ok(())
+}
+
+fn rebuild_index_derived(state: &mut DatabaseState, index_id: IndexId) -> Result<()> {
+    let definition = state
+        .catalog
+        .index_by_id(index_id)
+        .cloned()
+        .ok_or_else(|| DbError::new("42704", "index does not exist"))?;
+    match definition.method {
+        IndexMethod::BTree => rebuild_btree_index(state, index_id),
+        IndexMethod::FullText | IndexMethod::Hnsw => {
+            rebuild_search_catalog_for_table(state, definition.table_id)
+        }
+    }
+}
+
+fn rebuild_table_indexes(state: &mut DatabaseState, table_id: TableId) -> Result<()> {
+    let table = table_definition(state, table_id)?.clone();
+    let index_methods = table
+        .indexes()
+        .map(|definition| (definition.id, definition.method))
+        .collect::<Vec<_>>();
     let catalog = Arc::clone(&state.catalog);
     state.indexes.retain(|index_id, _| {
         catalog
             .index_by_id(*index_id)
             .is_some_and(|definition| definition.method == IndexMethod::BTree)
     });
-    for (index_id, tree) in rebuilt {
-        state.indexes.insert(index_id, Arc::new(tree));
+    for (index_id, method) in &index_methods {
+        if *method == IndexMethod::BTree {
+            rebuild_btree_index(state, *index_id)?;
+        }
     }
+    rebuild_search_catalog_for_table(state, table_id)?;
+    Ok(())
+}
+
+fn rebuild_table_derived(state: &mut DatabaseState, table_id: TableId) -> Result<()> {
+    rebuild_table_indexes(state, table_id)?;
+    let table = table_definition(state, table_id)?.clone();
+    let rows = state.rows.get(&table_id).cloned().unwrap_or_default();
     Arc::make_mut(&mut state.catalog)
         .set_table_statistics(table_id, compute_statistics(&table, &rows)?)?;
-    rebuild_search_catalog_for_table(state, table_id)?;
     Ok(())
 }
 

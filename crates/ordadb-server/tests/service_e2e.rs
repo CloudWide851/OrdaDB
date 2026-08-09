@@ -51,6 +51,122 @@ async fn management_token(address: SocketAddr) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pgwire_notifications_are_transactional_idle_and_resettable() {
+    let directory = tempdir().expect("tempdir");
+    let mut config = ServerConfig::new(directory.path());
+    config.pg_bind = "127.0.0.1:0".parse().expect("PG bind");
+    config.admin_bind = "127.0.0.1:0".parse().expect("admin bind");
+
+    let server = start_server(config).await.expect("server");
+    let bootstrap_pipe = server.bootstrap_pipe.clone().expect("bootstrap pipe");
+    request_bootstrap(
+        &bootstrap_pipe,
+        ADMIN_USER.into(),
+        Zeroizing::new(ADMIN_PASSWORD.into()),
+    )
+    .await
+    .expect("bootstrap request");
+
+    let pg_address = server.pg_address;
+    tokio::task::spawn_blocking(move || {
+        let mut listener = client(pg_address, ADMIN_PASSWORD)?;
+        let mut sender = client(pg_address, ADMIN_PASSWORD)?;
+        listener.query("LISTEN events")?;
+
+        sender.query("BEGIN")?;
+        sender.query("NOTIFY events, 'committed'")?;
+        let before_commit = listener.query("SELECT 1")?;
+        assert!(before_commit.notifications.is_empty());
+        sender.query("COMMIT")?;
+        let committed = listener.read_notification()?;
+        assert_ne!(committed.sender_process_id, 0);
+        assert_eq!(committed.channel, "events");
+        assert_eq!(committed.payload, "committed");
+
+        sender.query("BEGIN")?;
+        sender.query("NOTIFY events, 'rolled-back'")?;
+        sender.query("ROLLBACK")?;
+        let after_rollback = listener.query("SELECT 2")?;
+        assert!(after_rollback.notifications.is_empty());
+
+        sender.query("BEGIN")?;
+        sender.query("NOTIFY events, 'once'")?;
+        sender.query("NOTIFY events, 'once'")?;
+        sender.query("COMMIT")?;
+        assert_eq!(listener.read_notification()?.payload, "once");
+        assert!(listener.query("SELECT 3")?.notifications.is_empty());
+
+        listener.query("DISCARD ALL")?;
+        sender.query("NOTIFY events, 'after-discard'")?;
+        assert!(listener.query("SELECT 4")?.notifications.is_empty());
+        assert_eq!(
+            listener.query("SHOW application_name")?.rows,
+            vec![vec![Some(String::new())]]
+        );
+        Ok::<(), ordadb_types::DbError>(())
+    })
+    .await
+    .expect("notification task")
+    .expect("notification checks");
+
+    tokio::time::timeout(Duration::from_secs(5), server.shutdown())
+        .await
+        .expect("shutdown timeout")
+        .expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pgwire_notification_overflow_is_structured_and_terminal() {
+    let directory = tempdir().expect("tempdir");
+    let mut config = ServerConfig::new(directory.path());
+    config.pg_bind = "127.0.0.1:0".parse().expect("PG bind");
+    config.admin_bind = "127.0.0.1:0".parse().expect("admin bind");
+
+    let server = start_server(config).await.expect("server");
+    let bootstrap_pipe = server.bootstrap_pipe.clone().expect("bootstrap pipe");
+    request_bootstrap(
+        &bootstrap_pipe,
+        ADMIN_USER.into(),
+        Zeroizing::new(ADMIN_PASSWORD.into()),
+    )
+    .await
+    .expect("bootstrap request");
+
+    let pg_address = server.pg_address;
+    tokio::task::spawn_blocking(move || {
+        let mut listener = client(pg_address, ADMIN_PASSWORD)?;
+        let mut sender = client(pg_address, ADMIN_PASSWORD)?;
+        listener.query("LISTEN overflow_events")?;
+
+        sender.query("BEGIN")?;
+        for index in 0..1_025 {
+            sender.query(&format!("NOTIFY overflow_events, 'overflow-{index}'"))?;
+        }
+        sender.query("COMMIT")?;
+
+        let overflow = listener
+            .read_notification()
+            .expect_err("overflow must terminate the listener");
+        assert_eq!(overflow.sql_state, "54000");
+        assert_eq!(
+            overflow.message,
+            "asynchronous notification queue limit exceeded"
+        );
+        assert!(overflow.detail.is_some());
+        assert!(overflow.hint.is_some());
+        Ok::<(), ordadb_types::DbError>(())
+    })
+    .await
+    .expect("notification overflow task")
+    .expect("notification overflow checks");
+
+    tokio::time::timeout(Duration::from_secs(5), server.shutdown())
+        .await
+        .expect("shutdown timeout")
+        .expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pgwire_management_copy_and_restart_are_end_to_end() {
     let directory = tempdir().expect("tempdir");
     let mut config = ServerConfig::new(directory.path());
@@ -598,13 +714,10 @@ async fn pgwire_security_ddl_is_autocommit_redacted_and_persistent() {
              WITH DATA",
         )?;
         let namespaces = admin.query("SELECT * FROM pg_catalog.pg_namespace")?;
-        assert_eq!(namespaces.columns, ["oid", "nspname"]);
-        assert!(
-            namespaces
-                .rows
-                .iter()
-                .any(|row| row.get(1) == Some(&Some("app".into())))
-        );
+        assert_eq!(namespaces.columns, ["oid", "nspname", "nspowner"]);
+        assert!(namespaces.rows.iter().any(|row| {
+            row.get(1) == Some(&Some("app".into())) && row.get(2).is_some_and(Option::is_some)
+        }));
         let classes = admin.query("SELECT * FROM pg_catalog.pg_class")?;
         assert!(classes.rows.iter().any(|row| {
             row.get(1) == Some(&Some("secure_items".into()))
