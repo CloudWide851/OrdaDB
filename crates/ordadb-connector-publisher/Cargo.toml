@@ -11,6 +11,7 @@ base64.workspace = true
 chrono.workspace = true
 ed25519-dalek.workspace = true
 ordadb-connectors = { path = "../ordadb-connectors" }
+ordadb-connector-sdk = { path = "../ordadb-connector-sdk" }
 ordadb-windows = { path = "../ordadb-windows" }
 rand.workspace = true
 semver.workspace = true

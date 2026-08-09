@@ -10,12 +10,17 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use ordadb_connector_sdk::{
-    CONNECTOR_PROTOCOL_V2, ConnectorCatalogObjectKindV2, ConnectorEndpointV2,
-    ConnectorLogicalTypeV2, ConnectorParameterV2, ConnectorQueryEventV2, ConnectorRequestV2,
-    ConnectorResponseV2, ConnectorTlsModeV2, ConnectorTypeV2, ConnectorValueV2, ProtocolHelloV2,
-    read_connector_frame as read_connector_frame_v2,
-    validate_protocol_ready as validate_protocol_ready_v2,
-    write_connector_frame as write_connector_frame_v2,
+    CONNECTOR_PROTOCOL_V2, CONNECTOR_PROTOCOL_V3, ConnectorCapabilitiesV3,
+    ConnectorCatalogNodeKindV3, ConnectorCatalogObjectKindV2, ConnectorCommandV3,
+    ConnectorCredentialV2, ConnectorEndpointV2, ConnectorKindV3, ConnectorLogicalTypeV2,
+    ConnectorParameterV2, ConnectorQueryEventV2, ConnectorRequestV2, ConnectorRequestV3,
+    ConnectorResponseV2, ConnectorResponseV3, ConnectorResultBatchV3, ConnectorResultEventV3,
+    ConnectorResultStreamValidatorV3, ConnectorTlsModeV2, ConnectorTypeV2, ConnectorValueV2,
+    ProtocolHelloV2, ProtocolHelloV3, read_connector_frame as read_connector_frame_v2,
+    read_connector_frame_v3, validate_catalog_page_v3, validate_catalog_request_v3,
+    validate_command_v3, validate_endpoint, validate_error_v3,
+    validate_protocol_ready as validate_protocol_ready_v2, validate_protocol_ready_v3,
+    write_connector_frame as write_connector_frame_v2, write_connector_frame_v3,
 };
 use ordadb_types::{
     Batch, CommandComplete, DbError, DbNotice, Field, QueryEvent, QueryProgress, Result, Row,
@@ -35,11 +40,20 @@ use crate::{
 const PIPE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_HOST_ACTIVE_V3_REQUESTS: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum NegotiatedProtocol {
     V1,
     V2,
+    V3(ConnectorCapabilitiesV3),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingV3Request {
+    Catalog { maximum_nodes: u32 },
+    Execute { maximum_batch_rows: u32 },
+    Transaction,
 }
 
 pub struct ConnectorHost {
@@ -49,6 +63,8 @@ pub struct ConnectorHost {
     plugin_version: String,
     protocol: NegotiatedProtocol,
     query_schemas: BTreeMap<String, Schema>,
+    v3_result_validators: BTreeMap<String, ConnectorResultStreamValidatorV3>,
+    v3_pending_requests: BTreeMap<String, PendingV3Request>,
     queued_responses: VecDeque<ConnectorResponseV1>,
 }
 
@@ -141,6 +157,8 @@ impl ConnectorHost {
             plugin_version: plugin_version.into(),
             protocol,
             query_schemas: BTreeMap::new(),
+            v3_result_validators: BTreeMap::new(),
+            v3_pending_requests: BTreeMap::new(),
             queued_responses: VecDeque::new(),
         })
     }
@@ -172,21 +190,56 @@ impl ConnectorHost {
         }
     }
 
-    pub async fn send(&mut self, request: &ConnectorRequestV1) -> Result<()> {
-        if self
-            .child
-            .try_wait()
-            .map_err(|error| io_error("failed to inspect connector helper process", error))?
-            .is_some()
-        {
-            return Err(network_error(
-                "connector helper process exited",
-                "process is no longer running",
-            ));
+    #[must_use]
+    pub const fn protocol_version(&self) -> u32 {
+        match &self.protocol {
+            NegotiatedProtocol::V1 => MIN_CONNECTOR_API_VERSION,
+            NegotiatedProtocol::V2 => CONNECTOR_PROTOCOL_V2,
+            NegotiatedProtocol::V3(_) => CONNECTOR_PROTOCOL_V3,
         }
-        match self.protocol {
-            NegotiatedProtocol::V1 => write_connector_frame(&mut self.pipe, request).await,
-            NegotiatedProtocol::V2 => {
+    }
+
+    #[must_use]
+    pub fn capabilities_v3(&self) -> Option<&ConnectorCapabilitiesV3> {
+        match &self.protocol {
+            NegotiatedProtocol::V3(capabilities) => Some(capabilities),
+            NegotiatedProtocol::V1 | NegotiatedProtocol::V2 => None,
+        }
+    }
+
+    pub async fn connect_v3(
+        &mut self,
+        connection_id: impl Into<String>,
+        endpoint: ConnectorEndpointV2,
+        tls_mode: ConnectorTlsModeV2,
+        credential: Option<ConnectorCredentialV2>,
+    ) -> Result<ConnectorCapabilitiesV3> {
+        let connection_id = connection_id.into();
+        self.send_v3(&ConnectorRequestV3::Connect {
+            connection_id: connection_id.clone(),
+            endpoint,
+            tls_mode,
+            credential,
+        })
+        .await?;
+        match self.receive_v3().await? {
+            ConnectorResponseV3::Connected {
+                connection_id: actual,
+                capabilities,
+            } if actual == connection_id => Ok(capabilities),
+            ConnectorResponseV3::Error { error, .. } => Err(error.into_db_error()),
+            _ => Err(DbError::new(
+                "08P01",
+                "connector returned an unexpected v3 connect response",
+            )),
+        }
+    }
+
+    pub async fn send(&mut self, request: &ConnectorRequestV1) -> Result<()> {
+        self.ensure_running()?;
+        match self.protocol_version() {
+            MIN_CONNECTOR_API_VERSION => write_connector_frame(&mut self.pipe, request).await,
+            CONNECTOR_PROTOCOL_V2 => {
                 let request_id = request_id(request).map(str::to_owned);
                 match translate_request_v2(request, &self.plugin_id)? {
                     Some(request) => write_connector_frame_v2(&mut self.pipe, &request).await,
@@ -199,32 +252,97 @@ impl ConnectorHost {
                     }
                 }
             }
+            CONNECTOR_PROTOCOL_V3 => {
+                let capabilities = self
+                    .capabilities_v3()
+                    .cloned()
+                    .ok_or_else(|| DbError::internal("connector v3 capabilities are missing"))?;
+                ensure_legacy_sql_v3(&capabilities)?;
+                let request_id = request_id(request).map(str::to_owned);
+                match translate_request_v3(request, &self.plugin_id, &capabilities)? {
+                    Some(request) => self.send_v3(&request).await,
+                    None => {
+                        self.queued_responses.push_back(ConnectorResponseV1::Error {
+                            request_id,
+                            error: DbError::unsupported("monitoring through connector protocol v3"),
+                        });
+                        Ok(())
+                    }
+                }
+            }
+            unsupported => Err(DbError::unsupported(format!(
+                "connector protocol version {unsupported}"
+            ))),
         }
+    }
+
+    pub async fn send_v3(&mut self, request: &ConnectorRequestV3) -> Result<()> {
+        self.ensure_running()?;
+        let capabilities = self
+            .capabilities_v3()
+            .cloned()
+            .ok_or_else(|| DbError::unsupported("native connector protocol v3"))?;
+        validate_request_v3(request, &capabilities)?;
+        let pending = prepare_v3_request(request, &self.v3_pending_requests)?;
+        write_connector_frame_v3(&mut self.pipe, request).await?;
+        if let Some((request_id, pending)) = pending {
+            self.v3_pending_requests.insert(request_id, pending);
+        }
+        Ok(())
     }
 
     pub async fn receive(&mut self) -> Result<ConnectorResponseV1> {
         if let Some(response) = self.queued_responses.pop_front() {
             return Ok(response);
         }
-        match self.protocol {
-            NegotiatedProtocol::V1 => tokio::select! {
+        match self.protocol_version() {
+            MIN_CONNECTOR_API_VERSION => tokio::select! {
                 response = read_connector_frame(&mut self.pipe) => response,
                 status = self.child.wait() => Err(helper_exit_error(status)),
             },
-            NegotiatedProtocol::V2 => {
+            CONNECTOR_PROTOCOL_V2 => {
                 let response = tokio::select! {
                     response = read_connector_frame_v2(&mut self.pipe) => response,
                     status = self.child.wait() => return Err(helper_exit_error(status)),
                 }?;
                 translate_response_v2(response, &mut self.query_schemas)
             }
+            CONNECTOR_PROTOCOL_V3 => {
+                let response = self.receive_v3().await?;
+                translate_response_v3(response, &mut self.query_schemas)
+            }
+            unsupported => Err(DbError::unsupported(format!(
+                "connector protocol version {unsupported}"
+            ))),
         }
     }
 
+    pub async fn receive_v3(&mut self) -> Result<ConnectorResponseV3> {
+        let capabilities = self
+            .capabilities_v3()
+            .cloned()
+            .ok_or_else(|| DbError::unsupported("native connector protocol v3"))?;
+        let response = tokio::select! {
+            response = read_connector_frame_v3(&mut self.pipe) => response,
+            status = self.child.wait() => return Err(helper_exit_error(status)),
+        }?;
+        validate_v3_response(
+            &response,
+            &capabilities,
+            &mut self.v3_pending_requests,
+            &mut self.v3_result_validators,
+        )?;
+        Ok(response)
+    }
+
     pub async fn shutdown(mut self) -> Result<()> {
-        let _ = self.send(&ConnectorRequestV1::Shutdown).await;
+        let send_result = if self.protocol_version() == CONNECTOR_PROTOCOL_V3 {
+            self.send_v3(&ConnectorRequestV3::Shutdown).await
+        } else {
+            self.send(&ConnectorRequestV1::Shutdown).await
+        };
         match tokio::time::timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await {
-            Ok(Ok(_)) => Ok(()),
+            Ok(Ok(_)) => send_result,
             Ok(Err(error)) => Err(io_error(
                 "failed to wait for connector helper shutdown",
                 error,
@@ -237,6 +355,21 @@ impl ConnectorHost {
                 Ok(())
             }
         }
+    }
+
+    fn ensure_running(&mut self) -> Result<()> {
+        if self
+            .child
+            .try_wait()
+            .map_err(|error| io_error("failed to inspect connector helper process", error))?
+            .is_some()
+        {
+            return Err(network_error(
+                "connector helper process exited",
+                "process is no longer running",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -297,6 +430,34 @@ async fn negotiate(
                     Ok(NegotiatedProtocol::V2)
                 }
                 ConnectorResponseV2::Error { error, .. } => Err(error.into_db_error()),
+                _ => Err(handshake_response_error()),
+            }
+        }
+        CONNECTOR_PROTOCOL_V3 => {
+            write_connector_frame_v3(
+                pipe,
+                &ConnectorRequestV3::Hello {
+                    hello: ProtocolHelloV3 {
+                        minimum_api_version: CONNECTOR_PROTOCOL_V3,
+                        maximum_api_version: CONNECTOR_PROTOCOL_V3,
+                        plugin_id: plugin_id.into(),
+                        plugin_version: plugin_version.into(),
+                    },
+                },
+            )
+            .await?;
+            let response = tokio::time::timeout(
+                HANDSHAKE_TIMEOUT,
+                read_connector_frame_v3::<_, ConnectorResponseV3>(pipe),
+            )
+            .await
+            .map_err(|_| handshake_timeout())??;
+            match response {
+                ConnectorResponseV3::Ready { ready } => {
+                    validate_protocol_ready_v3(&ready, plugin_id, plugin_version)?;
+                    Ok(NegotiatedProtocol::V3(ready.capabilities))
+                }
+                ConnectorResponseV3::Error { error, .. } => Err(error.into_db_error()),
                 _ => Err(handshake_response_error()),
             }
         }
@@ -381,6 +542,354 @@ fn translate_request_v2(
     Ok(Some(request))
 }
 
+fn translate_request_v3(
+    request: &ConnectorRequestV1,
+    plugin_id: &str,
+    capabilities: &ConnectorCapabilitiesV3,
+) -> Result<Option<ConnectorRequestV3>> {
+    let language_id = capabilities
+        .command_languages
+        .first()
+        .ok_or_else(|| DbError::new("08P01", "connector has no command language"))?
+        .id
+        .clone();
+    let request = match request {
+        ConnectorRequestV1::Hello { .. } => {
+            return Err(DbError::new(
+                "08P01",
+                "connector handshake cannot be repeated",
+            ));
+        }
+        ConnectorRequestV1::Connect {
+            connection_id,
+            endpoint,
+            database,
+            credential,
+        } => ConnectorRequestV3::Connect {
+            connection_id: connection_id.clone(),
+            endpoint: structured_endpoint(plugin_id, endpoint, database.clone())?,
+            tls_mode: default_tls_mode(plugin_id),
+            credential: Some(ConnectorCredentialV2::new(
+                Some(credential.username.clone()),
+                credential.password.to_string(),
+            )),
+        },
+        ConnectorRequestV1::Catalog {
+            request_id,
+            connection_id,
+        } => ConnectorRequestV3::Catalog {
+            request_id: request_id.clone(),
+            connection_id: connection_id.clone(),
+            parent_id: None,
+            page_size: capabilities.maximum_catalog_page_size.min(1024),
+            cursor: None,
+        },
+        ConnectorRequestV1::Execute {
+            request_id,
+            connection_id,
+            sql,
+            params,
+        } => ConnectorRequestV3::Execute {
+            request_id: request_id.clone(),
+            connection_id: connection_id.clone(),
+            command: ConnectorCommandV3::Text {
+                language_id,
+                text: sql.clone(),
+                params: params.iter().map(parameter_v2).collect(),
+            },
+            batch_size: 1024_u32.min(capabilities.maximum_batch_rows),
+        },
+        ConnectorRequestV1::Cancel { request_id } => ConnectorRequestV3::Cancel {
+            request_id: request_id.clone(),
+        },
+        ConnectorRequestV1::Begin {
+            request_id,
+            connection_id,
+        } => ConnectorRequestV3::Begin {
+            request_id: request_id.clone(),
+            connection_id: connection_id.clone(),
+            isolation: None,
+        },
+        ConnectorRequestV1::Commit {
+            request_id,
+            connection_id,
+        } => ConnectorRequestV3::Commit {
+            request_id: request_id.clone(),
+            connection_id: connection_id.clone(),
+        },
+        ConnectorRequestV1::Rollback {
+            request_id,
+            connection_id,
+        } => ConnectorRequestV3::Rollback {
+            request_id: request_id.clone(),
+            connection_id: connection_id.clone(),
+        },
+        ConnectorRequestV1::Monitor { .. } => return Ok(None),
+        ConnectorRequestV1::Shutdown => ConnectorRequestV3::Shutdown,
+    };
+    Ok(Some(request))
+}
+
+fn ensure_legacy_sql_v3(capabilities: &ConnectorCapabilitiesV3) -> Result<()> {
+    if capabilities.kind != ConnectorKindV3::Sql {
+        return Err(DbError::unsupported(
+            "legacy SQL execution for document or key/value connectors",
+        )
+        .with_hint("Use the native connector protocol v3 command API."));
+    }
+    Ok(())
+}
+
+fn validate_request_v3(
+    request: &ConnectorRequestV3,
+    capabilities: &ConnectorCapabilitiesV3,
+) -> Result<()> {
+    match request {
+        ConnectorRequestV3::Hello { .. } => Err(DbError::new(
+            "08P01",
+            "connector handshake cannot be repeated",
+        )),
+        ConnectorRequestV3::Connect {
+            connection_id,
+            endpoint,
+            tls_mode,
+            ..
+        } => {
+            validate_v3_id(connection_id, "connection ID")?;
+            validate_endpoint(endpoint)?;
+            if !capabilities.tls_modes.contains(tls_mode) {
+                return Err(DbError::unsupported("connector TLS mode"));
+            }
+            Ok(())
+        }
+        ConnectorRequestV3::Disconnect { connection_id } => {
+            validate_v3_id(connection_id, "connection ID")
+        }
+        ConnectorRequestV3::Catalog {
+            request_id,
+            connection_id,
+            parent_id,
+            page_size,
+            cursor,
+        } => {
+            validate_v3_id(request_id, "request ID")?;
+            validate_v3_id(connection_id, "connection ID")?;
+            validate_catalog_request_v3(
+                parent_id.as_deref(),
+                *page_size,
+                cursor.as_deref(),
+                capabilities,
+            )
+        }
+        ConnectorRequestV3::Execute {
+            request_id,
+            connection_id,
+            command,
+            batch_size,
+        } => {
+            validate_v3_id(request_id, "request ID")?;
+            validate_v3_id(connection_id, "connection ID")?;
+            if *batch_size == 0 || *batch_size > capabilities.maximum_batch_rows {
+                return Err(DbError::new(
+                    "22023",
+                    "connector batch size is outside its capability",
+                ));
+            }
+            validate_command_v3(command, capabilities)
+        }
+        ConnectorRequestV3::Cancel { request_id } => {
+            validate_v3_id(request_id, "request ID")?;
+            if !capabilities.cancellation {
+                return Err(DbError::unsupported("connector cancellation"));
+            }
+            Ok(())
+        }
+        ConnectorRequestV3::Begin {
+            request_id,
+            connection_id,
+            ..
+        }
+        | ConnectorRequestV3::Commit {
+            request_id,
+            connection_id,
+        }
+        | ConnectorRequestV3::Rollback {
+            request_id,
+            connection_id,
+        } => {
+            validate_v3_id(request_id, "request ID")?;
+            validate_v3_id(connection_id, "connection ID")?;
+            if !capabilities.transactions {
+                return Err(DbError::unsupported("connector transactions"));
+            }
+            Ok(())
+        }
+        ConnectorRequestV3::Shutdown => Ok(()),
+    }
+}
+
+fn prepare_v3_request(
+    request: &ConnectorRequestV3,
+    pending: &BTreeMap<String, PendingV3Request>,
+) -> Result<Option<(String, PendingV3Request)>> {
+    let prepared = match request {
+        ConnectorRequestV3::Catalog {
+            request_id,
+            page_size,
+            ..
+        } => Some((
+            request_id.clone(),
+            PendingV3Request::Catalog {
+                maximum_nodes: *page_size,
+            },
+        )),
+        ConnectorRequestV3::Execute {
+            request_id,
+            batch_size,
+            ..
+        } => Some((
+            request_id.clone(),
+            PendingV3Request::Execute {
+                maximum_batch_rows: *batch_size,
+            },
+        )),
+        ConnectorRequestV3::Begin { request_id, .. }
+        | ConnectorRequestV3::Commit { request_id, .. }
+        | ConnectorRequestV3::Rollback { request_id, .. } => {
+            Some((request_id.clone(), PendingV3Request::Transaction))
+        }
+        ConnectorRequestV3::Cancel { request_id } => {
+            if !matches!(
+                pending.get(request_id),
+                Some(PendingV3Request::Execute { .. })
+            ) {
+                return Err(DbError::new(
+                    "42704",
+                    "connector execution request does not exist",
+                ));
+            }
+            None
+        }
+        ConnectorRequestV3::Hello { .. }
+        | ConnectorRequestV3::Connect { .. }
+        | ConnectorRequestV3::Disconnect { .. }
+        | ConnectorRequestV3::Shutdown => None,
+    };
+    if let Some((request_id, _)) = &prepared {
+        if pending.contains_key(request_id) {
+            return Err(DbError::new("42P04", "connector request already exists"));
+        }
+        if pending.len() >= MAX_HOST_ACTIVE_V3_REQUESTS {
+            return Err(DbError::new(
+                "54000",
+                "connector has too many active v3 requests",
+            ));
+        }
+    }
+    Ok(prepared)
+}
+
+fn validate_v3_response(
+    response: &ConnectorResponseV3,
+    capabilities: &ConnectorCapabilitiesV3,
+    pending: &mut BTreeMap<String, PendingV3Request>,
+    validators: &mut BTreeMap<String, ConnectorResultStreamValidatorV3>,
+) -> Result<()> {
+    match response {
+        ConnectorResponseV3::Ready { .. } => Err(handshake_response_error()),
+        ConnectorResponseV3::Connected {
+            capabilities: actual,
+            ..
+        } if actual != capabilities => Err(DbError::new(
+            "08P01",
+            "connector session capabilities differ from the handshake",
+        )),
+        ConnectorResponseV3::CatalogPage { request_id, page } => {
+            let Some(PendingV3Request::Catalog { maximum_nodes }) =
+                pending.get(request_id).copied()
+            else {
+                return Err(unexpected_v3_request_id(request_id, "Catalog"));
+            };
+            validate_catalog_page_v3(page, maximum_nodes)?;
+            pending.remove(request_id);
+            Ok(())
+        }
+        ConnectorResponseV3::ResultEvent { request_id, event } => {
+            let Some(PendingV3Request::Execute { maximum_batch_rows }) =
+                pending.get(request_id).copied()
+            else {
+                return Err(unexpected_v3_request_id(request_id, "result"));
+            };
+            let terminal = matches!(event, ConnectorResultEventV3::Complete { .. });
+            validators
+                .entry(request_id.clone())
+                .or_insert_with(|| {
+                    ConnectorResultStreamValidatorV3::new(capabilities.kind, maximum_batch_rows)
+                })
+                .validate(event)?;
+            if terminal {
+                validators.remove(request_id);
+                pending.remove(request_id);
+            }
+            Ok(())
+        }
+        ConnectorResponseV3::Cancelled { request_id } => {
+            if !matches!(
+                pending.get(request_id),
+                Some(PendingV3Request::Execute { .. })
+            ) {
+                return Err(unexpected_v3_request_id(request_id, "cancellation"));
+            }
+            validators.remove(request_id);
+            pending.remove(request_id);
+            Ok(())
+        }
+        ConnectorResponseV3::Transaction { request_id, .. } => {
+            if pending.get(request_id) != Some(&PendingV3Request::Transaction) {
+                return Err(unexpected_v3_request_id(request_id, "transaction"));
+            }
+            pending.remove(request_id);
+            Ok(())
+        }
+        ConnectorResponseV3::Error { request_id, error } => {
+            validate_error_v3(error, capabilities.kind)?;
+            if let Some(request_id) = request_id {
+                if !pending.contains_key(request_id) {
+                    return Err(unexpected_v3_request_id(request_id, "error"));
+                }
+                validators.remove(request_id);
+                pending.remove(request_id);
+            }
+            Ok(())
+        }
+        ConnectorResponseV3::Connected { .. }
+        | ConnectorResponseV3::Disconnected { .. }
+        | ConnectorResponseV3::Shutdown => Ok(()),
+    }
+}
+
+fn unexpected_v3_request_id(request_id: &str, response_kind: &str) -> DbError {
+    DbError::new(
+        "08P01",
+        format!("connector returned {response_kind} for unknown v3 request {request_id}"),
+    )
+}
+
+fn validate_v3_id(value: &str, context: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.chars().any(|character| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_' | '.')
+        })
+    {
+        return Err(DbError::new(
+            "22023",
+            format!("connector {context} is invalid"),
+        ));
+    }
+    Ok(())
+}
+
 fn translate_response_v2(
     response: ConnectorResponseV2,
     query_schemas: &mut BTreeMap<String, Schema>,
@@ -433,6 +942,140 @@ fn translate_response_v2(
             error: error.into_db_error(),
         }),
         ConnectorResponseV2::Shutdown => Ok(ConnectorResponseV1::Shutdown),
+    }
+}
+
+fn translate_response_v3(
+    response: ConnectorResponseV3,
+    query_schemas: &mut BTreeMap<String, Schema>,
+) -> Result<ConnectorResponseV1> {
+    match response {
+        ConnectorResponseV3::Ready { .. } => Err(handshake_response_error()),
+        ConnectorResponseV3::Connected { connection_id, .. } => {
+            Ok(ConnectorResponseV1::Connected { connection_id })
+        }
+        ConnectorResponseV3::Disconnected { connection_id } => Ok(ConnectorResponseV1::Error {
+            request_id: None,
+            error: DbError::new(
+                "08003",
+                format!("connector connection {connection_id} was closed"),
+            ),
+        }),
+        ConnectorResponseV3::CatalogPage { request_id, page } => Ok(ConnectorResponseV1::Catalog {
+            request_id,
+            entries: page
+                .nodes
+                .into_iter()
+                .map(|node| CatalogEntry {
+                    kind: catalog_kind_v3(node.kind).into(),
+                    schema: node.namespace.unwrap_or_default(),
+                    name: node.name,
+                })
+                .collect(),
+        }),
+        ConnectorResponseV3::ResultEvent { request_id, event } => {
+            let event = query_event_v3(&request_id, event, query_schemas)?;
+            Ok(ConnectorResponseV1::QueryEvent { request_id, event })
+        }
+        ConnectorResponseV3::Cancelled { request_id } => Ok(ConnectorResponseV1::Error {
+            request_id: Some(request_id),
+            error: DbError::new("57014", "connector query was cancelled"),
+        }),
+        ConnectorResponseV3::Transaction { request_id, state } => {
+            Ok(ConnectorResponseV1::QueryEvent {
+                request_id,
+                event: QueryEvent::Complete(CommandComplete {
+                    tag: format!("{state:?}").to_ascii_uppercase(),
+                    rows_affected: 0,
+                }),
+            })
+        }
+        ConnectorResponseV3::Error { request_id, error } => Ok(ConnectorResponseV1::Error {
+            request_id,
+            error: error.into_db_error(),
+        }),
+        ConnectorResponseV3::Shutdown => Ok(ConnectorResponseV1::Shutdown),
+    }
+}
+
+fn query_event_v3(
+    request_id: &str,
+    event: ConnectorResultEventV3,
+    query_schemas: &mut BTreeMap<String, Schema>,
+) -> Result<QueryEvent> {
+    match event {
+        ConnectorResultEventV3::Schema { columns } => {
+            let schema = Schema::new(
+                columns
+                    .into_iter()
+                    .map(|column| {
+                        Field::new(column.name, scalar_type(&column.data_type), column.nullable)
+                    })
+                    .collect(),
+            );
+            query_schemas.insert(request_id.to_owned(), schema.clone());
+            Ok(QueryEvent::Schema(schema))
+        }
+        ConnectorResultEventV3::Batch {
+            batch: ConnectorResultBatchV3::Rows { rows },
+        } => {
+            let schema = query_schemas.get(request_id).cloned().ok_or_else(|| {
+                DbError::new(
+                    "08P01",
+                    "connector sent a row batch before the query schema",
+                )
+            })?;
+            let rows = rows
+                .into_iter()
+                .map(|values| {
+                    values
+                        .into_iter()
+                        .map(value_v1)
+                        .collect::<Result<Vec<_>>>()
+                        .map(Row::new)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if rows
+                .iter()
+                .any(|row| row.values.len() != schema.fields.len())
+            {
+                return Err(DbError::new(
+                    "08P01",
+                    "connector row width does not match the query schema",
+                ));
+            }
+            Ok(QueryEvent::Batch(Batch { schema, rows }))
+        }
+        ConnectorResultEventV3::Batch {
+            batch:
+                ConnectorResultBatchV3::Documents { .. } | ConnectorResultBatchV3::KeyValues { .. },
+        } => Err(DbError::unsupported(
+            "document or key/value results through the legacy SQL event adapter",
+        )),
+        ConnectorResultEventV3::Progress { items_processed } => {
+            Ok(QueryEvent::Progress(QueryProgress {
+                rows_processed: items_processed,
+            }))
+        }
+        ConnectorResultEventV3::Notice { notice } => Ok(QueryEvent::Notice(DbNotice {
+            severity: ordadb_types::DbNoticeSeverity::Notice,
+            sql_state: notice.code.unwrap_or_else(|| "00000".into()),
+            message: notice.message,
+            detail: None,
+            hint: None,
+            position: None,
+            object_identity: None,
+        })),
+        ConnectorResultEventV3::Complete {
+            command_tag,
+            affected_items,
+        } => {
+            query_schemas.remove(request_id);
+            Ok(QueryEvent::Complete(CommandComplete {
+                tag: command_tag,
+                rows_affected: affected_items.unwrap_or(0),
+            }))
+        }
     }
 }
 
@@ -882,6 +1525,29 @@ const fn catalog_kind(kind: ConnectorCatalogObjectKindV2) -> &'static str {
     }
 }
 
+const fn catalog_kind_v3(kind: ConnectorCatalogNodeKindV3) -> &'static str {
+    match kind {
+        ConnectorCatalogNodeKindV3::Server => "server",
+        ConnectorCatalogNodeKindV3::Cluster => "cluster",
+        ConnectorCatalogNodeKindV3::Database => "database",
+        ConnectorCatalogNodeKindV3::Schema => "schema",
+        ConnectorCatalogNodeKindV3::Table => "table",
+        ConnectorCatalogNodeKindV3::View => "view",
+        ConnectorCatalogNodeKindV3::MaterializedView => "materializedView",
+        ConnectorCatalogNodeKindV3::Column => "column",
+        ConnectorCatalogNodeKindV3::Index => "index",
+        ConnectorCatalogNodeKindV3::Constraint => "constraint",
+        ConnectorCatalogNodeKindV3::Sequence => "sequence",
+        ConnectorCatalogNodeKindV3::Function => "function",
+        ConnectorCatalogNodeKindV3::Procedure => "procedure",
+        ConnectorCatalogNodeKindV3::Collection => "collection",
+        ConnectorCatalogNodeKindV3::Keyspace => "keyspace",
+        ConnectorCatalogNodeKindV3::Key => "key",
+        ConnectorCatalogNodeKindV3::Stream => "stream",
+        ConnectorCatalogNodeKindV3::Other => "other",
+    }
+}
+
 fn request_id(request: &ConnectorRequestV1) -> Option<&str> {
     match request {
         ConnectorRequestV1::Catalog { request_id, .. }
@@ -932,14 +1598,41 @@ fn helper_exit_error(status: std::io::Result<ExitStatus>) -> DbError {
 #[cfg(test)]
 mod tests {
     use ordadb_connector_sdk::{
-        ConnectorCapabilitiesV2, ConnectorErrorV2, ConnectorResponseV2, ConnectorTlsModeV2,
-        ProtocolReadyV2,
+        ConnectorCapabilitiesV2, ConnectorCapabilitiesV3, ConnectorCatalogNodeV3,
+        ConnectorCatalogPageV3, ConnectorColumnV2, ConnectorCommandInputModeV3,
+        ConnectorCommandLanguageV3, ConnectorErrorV2, ConnectorKindV3, ConnectorLogicalTypeV2,
+        ConnectorResponseV2, ConnectorResponseV3, ConnectorTlsModeV2, ConnectorTypeV2,
+        ProtocolReadyV2, ProtocolReadyV3,
     };
     use ordadb_types::{PgArray, PgInterval, TypeId};
     use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
 
     use super::*;
     use crate::ProtocolReady;
+
+    fn capabilities_v3(kind: ConnectorKindV3) -> ConnectorCapabilitiesV3 {
+        let (id, input_modes) = match kind {
+            ConnectorKindV3::Sql => ("postgresql-sql", vec![ConnectorCommandInputModeV3::Text]),
+            ConnectorKindV3::Document => ("mql", vec![ConnectorCommandInputModeV3::Document]),
+            ConnectorKindV3::KeyValue => ("resp3", vec![ConnectorCommandInputModeV3::Arguments]),
+        };
+        ConnectorCapabilitiesV3 {
+            kind,
+            command_languages: vec![ConnectorCommandLanguageV3 {
+                id: id.into(),
+                display_name: id.into(),
+                input_modes,
+            }],
+            catalog: true,
+            cancellation: true,
+            transactions: true,
+            savepoints: false,
+            batch_query: true,
+            maximum_batch_rows: 1024,
+            maximum_catalog_page_size: 256,
+            tls_modes: vec![ConnectorTlsModeV2::Disable, ConnectorTlsModeV2::Require],
+        }
+    }
 
     #[tokio::test]
     async fn restricted_pipe_negotiates_protocol_v1_with_current_process_client() {
@@ -1048,6 +1741,275 @@ mod tests {
             NegotiatedProtocol::V2
         );
         client.await.expect("client task");
+    }
+
+    #[tokio::test]
+    async fn restricted_pipe_negotiates_protocol_v3_with_current_process_client() {
+        let pipe_name = connector_pipe_name();
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .max_instances(1)
+            .write_dac(true)
+            .create(&pipe_name)
+            .expect("server pipe");
+        ordadb_windows::restrict_named_pipe_acl(&server).expect("pipe ACL");
+        let expected = capabilities_v3(ConnectorKindV3::Sql);
+        let client = tokio::spawn({
+            let pipe_name = pipe_name.clone();
+            let expected = expected.clone();
+            async move {
+                let mut client = ClientOptions::new().open(&pipe_name).expect("client pipe");
+                let hello: ConnectorRequestV3 =
+                    read_connector_frame_v3(&mut client).await.expect("hello");
+                let ConnectorRequestV3::Hello { hello } = hello else {
+                    panic!("expected hello");
+                };
+                write_connector_frame_v3(
+                    &mut client,
+                    &ConnectorResponseV3::Ready {
+                        ready: ProtocolReadyV3 {
+                            api_version: CONNECTOR_PROTOCOL_V3,
+                            plugin_id: hello.plugin_id,
+                            plugin_version: hello.plugin_version,
+                            capabilities: expected,
+                        },
+                    },
+                )
+                .await
+                .expect("ready");
+            }
+        });
+        server.connect().await.expect("connect");
+        assert_eq!(
+            negotiate(&mut server, "postgresql-v3", "1.0.0", CONNECTOR_PROTOCOL_V3)
+                .await
+                .expect("negotiate"),
+            NegotiatedProtocol::V3(expected)
+        );
+        client.await.expect("client task");
+    }
+
+    #[test]
+    fn v3_legacy_adapter_accepts_sql_and_rejects_non_sql() {
+        let sql = capabilities_v3(ConnectorKindV3::Sql);
+        let translated = translate_request_v3(
+            &ConnectorRequestV1::Execute {
+                request_id: "request-1".into(),
+                connection_id: "connection-1".into(),
+                sql: "SELECT 1".into(),
+                params: Vec::new(),
+            },
+            "postgresql-v3",
+            &sql,
+        )
+        .expect("translate")
+        .expect("supported request");
+        assert!(matches!(
+            translated,
+            ConnectorRequestV3::Execute {
+                command: ConnectorCommandV3::Text { text, .. },
+                ..
+            } if text == "SELECT 1"
+        ));
+
+        let document = capabilities_v3(ConnectorKindV3::Document);
+        assert_eq!(
+            ensure_legacy_sql_v3(&document)
+                .expect_err("document must use native v3")
+                .sql_state,
+            "0A000"
+        );
+    }
+
+    #[test]
+    fn v3_host_state_binds_response_ids_and_request_limits() {
+        let capabilities = capabilities_v3(ConnectorKindV3::Sql);
+        let mut pending = BTreeMap::new();
+        let mut validators = BTreeMap::new();
+        let catalog_request = ConnectorRequestV3::Catalog {
+            request_id: "catalog-1".into(),
+            connection_id: "connection-1".into(),
+            parent_id: None,
+            page_size: 1,
+            cursor: None,
+        };
+        let (request_id, request) = prepare_v3_request(&catalog_request, &pending)
+            .expect("prepare Catalog")
+            .expect("tracked Catalog");
+        pending.insert(request_id, request);
+
+        let node = ConnectorCatalogNodeV3 {
+            id: "public/items".into(),
+            parent_id: Some("public".into()),
+            kind: ConnectorCatalogNodeKindV3::Table,
+            name: "items".into(),
+            namespace: Some("public".into()),
+            has_children: false,
+            columns: Vec::new(),
+            attributes: BTreeMap::new(),
+        };
+        let oversized = ConnectorResponseV3::CatalogPage {
+            request_id: "catalog-1".into(),
+            page: ConnectorCatalogPageV3 {
+                nodes: vec![
+                    node.clone(),
+                    ConnectorCatalogNodeV3 {
+                        id: "public/other".into(),
+                        name: "other".into(),
+                        ..node.clone()
+                    },
+                ],
+                next_cursor: None,
+            },
+        };
+        assert_eq!(
+            validate_v3_response(&oversized, &capabilities, &mut pending, &mut validators,)
+                .expect_err("requested page size is authoritative")
+                .sql_state,
+            "54000"
+        );
+        assert!(pending.contains_key("catalog-1"));
+
+        let valid = ConnectorResponseV3::CatalogPage {
+            request_id: "catalog-1".into(),
+            page: ConnectorCatalogPageV3 {
+                nodes: vec![node],
+                next_cursor: None,
+            },
+        };
+        validate_v3_response(&valid, &capabilities, &mut pending, &mut validators)
+            .expect("valid Catalog response");
+        assert!(pending.is_empty());
+        assert_eq!(
+            validate_v3_response(&valid, &capabilities, &mut pending, &mut validators)
+                .expect_err("repeated response ID")
+                .sql_state,
+            "08P01"
+        );
+        assert_eq!(
+            prepare_v3_request(
+                &ConnectorRequestV3::Cancel {
+                    request_id: "unknown".into(),
+                },
+                &pending,
+            )
+            .expect_err("unknown cancellation")
+            .sql_state,
+            "42704"
+        );
+
+        for index in 0..MAX_HOST_ACTIVE_V3_REQUESTS {
+            pending.insert(format!("request-{index}"), PendingV3Request::Transaction);
+        }
+        let overflow = ConnectorRequestV3::Begin {
+            request_id: "overflow".into(),
+            connection_id: "connection-1".into(),
+            isolation: None,
+        };
+        assert_eq!(
+            prepare_v3_request(&overflow, &pending)
+                .expect_err("active request limit")
+                .sql_state,
+            "54000"
+        );
+    }
+
+    #[test]
+    fn v3_sql_results_preserve_the_legacy_query_event_contract() {
+        let column_type = ConnectorTypeV2 {
+            vendor_name: "text".into(),
+            logical_type: ConnectorLogicalTypeV2::Text,
+            element_type: None,
+            precision: None,
+            scale: None,
+            length: None,
+        };
+        let mut schemas = BTreeMap::new();
+        let schema = translate_response_v3(
+            ConnectorResponseV3::ResultEvent {
+                request_id: "request-1".into(),
+                event: ConnectorResultEventV3::Schema {
+                    columns: vec![ConnectorColumnV2 {
+                        name: "value".into(),
+                        data_type: column_type,
+                        nullable: false,
+                    }],
+                },
+            },
+            &mut schemas,
+        )
+        .expect("schema response");
+        assert!(matches!(
+            schema,
+            ConnectorResponseV1::QueryEvent {
+                event: QueryEvent::Schema(_),
+                ..
+            }
+        ));
+
+        let batch = translate_response_v3(
+            ConnectorResponseV3::ResultEvent {
+                request_id: "request-1".into(),
+                event: ConnectorResultEventV3::Batch {
+                    batch: ConnectorResultBatchV3::Rows {
+                        rows: vec![vec![ConnectorValueV2::Text("one".into())]],
+                    },
+                },
+            },
+            &mut schemas,
+        )
+        .expect("batch response");
+        assert!(matches!(
+            batch,
+            ConnectorResponseV1::QueryEvent {
+                event: QueryEvent::Batch(Batch { rows, .. }),
+                ..
+            } if rows[0].values == vec![Value::Text("one".into())]
+        ));
+
+        let complete = translate_response_v3(
+            ConnectorResponseV3::ResultEvent {
+                request_id: "request-1".into(),
+                event: ConnectorResultEventV3::Complete {
+                    command_tag: "SELECT".into(),
+                    affected_items: Some(1),
+                },
+            },
+            &mut schemas,
+        )
+        .expect("complete response");
+        assert!(matches!(
+            complete,
+            ConnectorResponseV1::QueryEvent {
+                event: QueryEvent::Complete(CommandComplete {
+                    rows_affected: 1,
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert!(schemas.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unsupported_protocol_version_fails_without_pipe_or_credentials() {
+        let pipe_name = connector_pipe_name();
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .max_instances(1)
+            .create(&pipe_name)
+            .expect("server pipe");
+        let error = negotiate(
+            &mut server,
+            "future-connector",
+            "1.0.0",
+            CONNECTOR_PROTOCOL_V3 + 1,
+        )
+        .await
+        .expect_err("future protocol must fail");
+        assert_eq!(error.sql_state, "0A000");
     }
 
     #[test]

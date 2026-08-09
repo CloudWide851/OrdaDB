@@ -3344,6 +3344,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "ed25519-dalek",
+ "ordadb-connector-sdk",
  "ordadb-connectors",
  "ordadb-windows",
  "rand 0.8.7",

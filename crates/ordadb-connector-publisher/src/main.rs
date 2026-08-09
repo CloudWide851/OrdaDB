@@ -9,10 +9,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{SecondsFormat, Utc};
 use ed25519_dalek::{Signer, SigningKey};
+use ordadb_connector_sdk::CONNECTOR_PROTOCOL_V2;
 use ordadb_connectors::{
-    CONNECTOR_API_VERSION, CONNECTOR_MANIFEST_VERSION, ConnectorArchitecture, ConnectorDialect,
-    ConnectorPermission, CredentialVault, PluginManifestV1, RegistryCatalogV1,
-    manifest_signing_payload,
+    CONNECTOR_MANIFEST_VERSION, ConnectorArchitecture, ConnectorDialect, ConnectorPermission,
+    CredentialVault, PluginManifestV1, RegistryCatalogV1, manifest_signing_payload,
 };
 use rand::RngCore as _;
 use rand::rngs::OsRng;
@@ -86,6 +86,7 @@ struct ConnectorDescriptor {
     package: &'static str,
     dialect: ConnectorDialect,
     permissions: &'static [ConnectorPermission],
+    api_version: u32,
 }
 
 const NETWORK: &[ConnectorPermission] = &[ConnectorPermission::Network];
@@ -97,6 +98,7 @@ const CONNECTORS: &[ConnectorDescriptor] = &[
         package: "ordadb-connector-postgresql",
         dialect: ConnectorDialect::PostgreSql,
         permissions: NETWORK,
+        api_version: CONNECTOR_PROTOCOL_V2,
     },
     ConnectorDescriptor {
         id: "mysql",
@@ -104,6 +106,7 @@ const CONNECTORS: &[ConnectorDescriptor] = &[
         package: "ordadb-connector-mysql",
         dialect: ConnectorDialect::MySql,
         permissions: NETWORK,
+        api_version: CONNECTOR_PROTOCOL_V2,
     },
     ConnectorDescriptor {
         id: "sqlite",
@@ -111,6 +114,7 @@ const CONNECTORS: &[ConnectorDescriptor] = &[
         package: "ordadb-connector-sqlite",
         dialect: ConnectorDialect::Sqlite,
         permissions: LOCAL_FILE,
+        api_version: CONNECTOR_PROTOCOL_V2,
     },
     ConnectorDescriptor {
         id: "sql-server",
@@ -118,6 +122,7 @@ const CONNECTORS: &[ConnectorDescriptor] = &[
         package: "ordadb-connector-sql-server",
         dialect: ConnectorDialect::SqlServer,
         permissions: NETWORK,
+        api_version: CONNECTOR_PROTOCOL_V2,
     },
 ];
 
@@ -181,7 +186,7 @@ fn sign_bundle(options: SignOptions) -> AppResult<()> {
             id: descriptor.id.into(),
             display_name: descriptor.display_name.into(),
             version: options.version.to_string(),
-            api_version: CONNECTOR_API_VERSION,
+            api_version: descriptor.api_version,
             architecture: ConnectorArchitecture::WindowsX64,
             dialect: descriptor.dialect,
             publisher: "OrdaDB".into(),
@@ -600,6 +605,11 @@ mod tests {
                 .collect::<BTreeSet<_>>()
                 .len(),
             4
+        );
+        assert!(
+            CONNECTORS
+                .iter()
+                .all(|descriptor| descriptor.api_version == CONNECTOR_PROTOCOL_V2)
         );
     }
 
