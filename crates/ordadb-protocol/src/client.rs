@@ -28,6 +28,8 @@ pub struct ClientConfig {
     pub database: String,
     pub password: Zeroizing<String>,
     pub application_name: String,
+    pub query_memory_bytes: Option<usize>,
+    pub timeout: Option<Duration>,
 }
 
 pub struct PgClient {
@@ -117,13 +119,20 @@ pub struct CopyOutResult {
 
 impl PgClient {
     pub fn connect(config: ClientConfig) -> Result<Self> {
-        let mut stream = TcpStream::connect_timeout(&config.address, CLIENT_TIMEOUT)
+        let timeout = config.timeout.unwrap_or(CLIENT_TIMEOUT);
+        if timeout.is_zero() || timeout > CLIENT_TIMEOUT {
+            return Err(DbError::new(
+                "22023",
+                "PostgreSQL client timeout must be between 1 millisecond and 60 seconds",
+            ));
+        }
+        let mut stream = TcpStream::connect_timeout(&config.address, timeout)
             .map_err(|error| io_error("failed to connect to OrdaDB", error))?;
         stream
-            .set_read_timeout(Some(CLIENT_TIMEOUT))
+            .set_read_timeout(Some(timeout))
             .map_err(|error| io_error("failed to set client read timeout", error))?;
         stream
-            .set_write_timeout(Some(CLIENT_TIMEOUT))
+            .set_write_timeout(Some(timeout))
             .map_err(|error| io_error("failed to set client write timeout", error))?;
         write_startup(&mut stream, &config)?;
 
@@ -640,6 +649,10 @@ fn write_startup(stream: &mut TcpStream, config: &ClientConfig) -> Result<()> {
     ] {
         push_cstring(&mut payload, name)?;
         push_cstring(&mut payload, value)?;
+    }
+    if let Some(query_memory_bytes) = config.query_memory_bytes {
+        push_cstring(&mut payload, "ordadb_query_memory_bytes")?;
+        push_cstring(&mut payload, &query_memory_bytes.to_string())?;
     }
     payload.push(0);
     let length = u32::try_from(payload.len() + 4)

@@ -10,6 +10,11 @@ import {
   type DbmsClient,
   type DbmsQueryOperation,
 } from "../lib/dbmsClient";
+import {
+  PreviewAiClient,
+  type AiRunOperation,
+  type AiRunRequest,
+} from "../lib/aiClient";
 import { createWorkbenchStore, type DataSourceValues } from "./workbench";
 
 describe("workbench store", () => {
@@ -331,6 +336,7 @@ describe("workbench store", () => {
         database: "ordadb",
         tlsMode: "disable",
         credentialId: "ordadb-local",
+        credentialAccess: "unspecified",
       },
       suggestedUsername: "ordadb_admin",
     });
@@ -375,6 +381,7 @@ describe("workbench store", () => {
       database: "app",
       tlsMode: "verifyFull",
       credentialId: "postgresql-app",
+      credentialAccess: "unspecified",
     });
     expect(promptCredential).toHaveBeenCalledWith({
       credentialId: "postgresql-app",
@@ -886,7 +893,99 @@ describe("workbench store", () => {
     expect(execute).not.toHaveBeenCalled();
     expect(store.getState().notice).toContain("已取消");
   });
+
+  it("projects a bounded Preview AI run without claiming database execution", async () => {
+    const store = createWorkbenchStore(
+      new PreviewDbmsClient(),
+      new PreviewConsoleClient(),
+      new PreviewAiClient(),
+    );
+
+    await store.getState().startAiRun("解释当前 Schema");
+
+    expect(store.getState()).toMatchObject({
+      inspectorMode: "ai",
+      inspectorVisible: true,
+      aiRunId: null,
+      aiRunStatus: "completed",
+      aiError: null,
+    });
+    expect(store.getState().aiMessages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ role: "user", text: "解释当前 Schema" }),
+        expect.objectContaining({
+          role: "assistant",
+          text: expect.stringContaining("Browser Preview"),
+        }),
+      ]),
+    );
+    expect(store.getState().aiTools).toEqual([
+      expect.objectContaining({
+        toolName: "validate_sql",
+        status: "completed",
+        summary: expect.stringContaining("未访问数据库"),
+      }),
+    ]);
+  });
+
+  it("keeps an AI mutation paused until the opaque approval is denied", async () => {
+    const store = createWorkbenchStore(
+      new PreviewDbmsClient(),
+      new PreviewConsoleClient(),
+      new PreviewAiClient(),
+    );
+    const running = store.getState().startAiRun("删除旧记录");
+    await vi.waitFor(() => {
+      expect(store.getState().aiRunStatus).toBe("waitingApproval");
+      expect(store.getState().aiApproval?.approvalId).toMatch(
+        /^preview-approval-/,
+      );
+    });
+
+    await store.getState().decideAiApproval(false);
+    await running;
+
+    expect(store.getState().aiApproval).toBeNull();
+    expect(store.getState().aiRunStatus).toBe("completed");
+    expect(store.getState().aiMessages.at(-1)?.text).toContain(
+      "Preview 未执行任何数据库命令",
+    );
+  });
+
+  it("fails closed when an AI event stream ends before a terminal event", async () => {
+    const store = createWorkbenchStore(
+      new PreviewDbmsClient(),
+      new PreviewConsoleClient(),
+      new IncompleteAiClient(),
+    );
+
+    await store.getState().startAiRun("不完整事件流");
+
+    expect(store.getState()).toMatchObject({
+      aiRunId: null,
+      aiRunStatus: "error",
+      aiError: {
+        sqlState: "XX000",
+        message: "AI 事件流在终态之前结束",
+      },
+    });
+  });
 });
+
+class IncompleteAiClient extends PreviewAiClient {
+  override async start(request: AiRunRequest): Promise<AiRunOperation> {
+    return {
+      runId: request.runId,
+      events: (async function* () {
+        yield {
+          runId: request.runId,
+          sequence: 1,
+          kind: "started" as const,
+        };
+      })(),
+    };
+  }
+}
 
 async function connectPreview(
   store: ReturnType<typeof createWorkbenchStore>,

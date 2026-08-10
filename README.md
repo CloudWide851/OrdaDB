@@ -22,9 +22,12 @@ OrdaDB 是一个以 Rust 构建的单机持久化关系数据库与 Windows SQL
 - SQL 工作台支持未命名/工作区/外部文件、首次保存时 Save As、拖放、最近文件、
   冲突恢复、命令注册表快捷键，以及可搜索的六类 `ConsoleSettingsV2`
 - 官方签名的 Windows x64 隔离连接插件；未配置 Registry 时默认拒绝下载
+- 受控 AI Agent：官方 OpenAI Responses、OpenAI-compatible、Ollama、严格工具
+  Schema、只读三重门、一次性写入审批、披露审计与有界本地可见历史
 
 浏览器开发预览始终显示 `Preview fixture`，不会伪装真实数据库、文件写入或服务操作。
-AI 面板仍是后续入口，不执行模型推理。
+浏览器 AI Preview 同样是确定性、内存内且明确“不执行”；只有 Windows Desktop 在配置
+原生 Credential Manager 凭据并连接数据源后才创建真实 provider 和受控数据库工具。
 
 数据库密码由 Rust 调用 Windows 原生安全提示并直接写入 Credential Manager；密码
 不会进入 React、Zustand、Tauri 请求 DTO、日志或 LocalAppData 状态文件。结果分页、
@@ -168,7 +171,8 @@ $credential.GetNetworkCredential().Password |
   静态矩阵通过不代表尚未执行的 psql、pgJDBC、DataGrip 或 Hibernate 已通过。
 - DML 使用持久化 MVCC 与多 writer；DDL、全库维护和其他全局候选发布仍使用排他边界，
   不提供分布式事务。
-- 不提供复制、物理备份、WAL 归档、PITR、任意第三方插件或 AI 模型推理。
+- 不提供复制、物理备份、WAL 归档、PITR、任意第三方插件、未确认写入、hosted
+  数据库工具执行或云端会话存储；本地门禁不包含真实付费模型调用。
 - MySQL、SQLite、SQL Server 方言只处理可靠的引号、参数、分页、类型别名和常用
   DDL；无法归一化的厂商特性返回 `0A000`。
 - 当前可写数据格式为 v2；v1 只作为显式离线迁移输入。逻辑归档格式仍为 v1；未知

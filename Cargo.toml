@@ -3,6 +3,7 @@ members = [
   "apps/desktop/src-tauri",
   "crates/ordadb-catalog",
   "crates/ordadb-admin",
+  "crates/ordadb-ai",
   "crates/ordadb-backup",
   "crates/ordadb-cli",
   "crates/ordadb-cluster",

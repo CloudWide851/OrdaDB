@@ -17,6 +17,7 @@ export type WorkbenchCommandId =
   | "database-view"
   | "files-view"
   | "object-inspector"
+  | "ai-workbench"
   | "command-palette"
   | "recent-files"
   | "go-to-file"
@@ -111,6 +112,12 @@ export const workbenchCommands: WorkbenchCommand[] = [
     label: "对象检查器",
     group: "视图",
     shortcut: "Alt+3",
+  },
+  {
+    id: "ai-workbench",
+    label: "AI 助手",
+    group: "视图",
+    shortcut: "Ctrl+Alt+A",
   },
   {
     id: "command-palette",
@@ -257,6 +264,7 @@ export const workbenchMenus: WorkbenchMenu[] = [
       "database-view",
       "files-view",
       "object-inspector",
+      "ai-workbench",
       "separator",
       "toggle-explorer",
       "toggle-inspector",

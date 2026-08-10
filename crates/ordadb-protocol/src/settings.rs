@@ -656,7 +656,12 @@ fn validate_startup_parameters(parameters: &BTreeMap<String, String>) -> Result<
             ));
         }
         match name.as_str() {
-            "user" | "database" | "application_name" | "client_encoding" | "options" => {}
+            "user"
+            | "database"
+            | "application_name"
+            | "client_encoding"
+            | "options"
+            | "ordadb_query_memory_bytes" => {}
             "replication" if matches!(value.as_str(), "false" | "0" | "off") => {}
             "replication" => {
                 return Err(DbError::new(

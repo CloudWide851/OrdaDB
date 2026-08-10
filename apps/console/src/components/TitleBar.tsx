@@ -1,6 +1,7 @@
 import { Minus, Square, X } from "lucide-react";
 import logoUrl from "../../../../logo.svg?url";
 import type { WorkbenchCommandId } from "../data/commands";
+import type { InspectorMode } from "../store/workbench";
 import { runWindowAction } from "../lib/tauri";
 import { CommandToolbar } from "./CommandToolbar";
 import { IconAction } from "./IconAction";
@@ -9,12 +10,14 @@ import { MenuBar } from "./MenuBar";
 interface TitleBarProps {
   schemaVisible: boolean;
   inspectorVisible: boolean;
+  inspectorMode: InspectorMode;
   onCommand: (commandId: WorkbenchCommandId) => void;
 }
 
 export function TitleBar({
   schemaVisible,
   inspectorVisible,
+  inspectorMode,
   onCommand,
 }: TitleBarProps) {
   return (
@@ -28,6 +31,7 @@ export function TitleBar({
       <CommandToolbar
         schemaVisible={schemaVisible}
         inspectorVisible={inspectorVisible}
+        inspectorMode={inspectorMode}
         onCommand={onCommand}
       />
       <div

@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { Route, Routes } from "react-router-dom";
 import { CommandPalette } from "./components/CommandPalette";
+import { AiWorkbench } from "./components/AiWorkbench";
 import { ConnectorManager } from "./components/ConnectorManager";
 import { DataSourceDialog } from "./components/DataSourceDialog";
 import { EditorPane } from "./components/EditorPane";
@@ -98,6 +99,7 @@ function Workbench() {
   const inspectorVisible = useWorkbenchStore(
     (state) => state.inspectorVisible,
   );
+  const inspectorMode = useWorkbenchStore((state) => state.inspectorMode);
   const commandPaletteOpen = useWorkbenchStore(
     (state) => state.commandPaletteOpen,
   );
@@ -118,6 +120,7 @@ function Workbench() {
   const setInspectorVisible = useWorkbenchStore(
     (state) => state.setInspectorVisible,
   );
+  const setInspectorMode = useWorkbenchStore((state) => state.setInspectorMode);
   const setSidebarView = useWorkbenchStore((state) => state.setSidebarView);
   const setQuickOpenMode = useWorkbenchStore(
     (state) => state.setQuickOpenMode,
@@ -196,7 +199,11 @@ function Workbench() {
         return;
       }
       if (commandId === "object-inspector") {
-        setInspectorVisible(true);
+        setInspectorMode("object");
+        return;
+      }
+      if (commandId === "ai-workbench") {
+        setInspectorMode("ai");
         return;
       }
       if (commandId === "command-palette") {
@@ -287,6 +294,7 @@ function Workbench() {
       setCommandPaletteOpen,
       setDataSourceOpen,
       setInspectorVisible,
+      setInspectorMode,
       setQuickOpenMode,
       setSchemaVisible,
       setSidebarView,
@@ -366,6 +374,7 @@ function Workbench() {
       <TitleBar
         schemaVisible={schemaVisible}
         inspectorVisible={inspectorVisible}
+        inspectorMode={inspectorMode}
         onCommand={handleCommand}
       />
       <NavigationBar />
@@ -373,7 +382,9 @@ function Workbench() {
       <main
         className={`workbench ${
           schemaVisible ? "" : "workbench--schema-hidden"
-        } ${inspectorVisible ? "" : "workbench--inspector-hidden"}`}
+        } ${inspectorVisible ? "" : "workbench--inspector-hidden"} ${
+          inspectorVisible && inspectorMode === "ai" ? "workbench--ai-pane" : ""
+        }`}
       >
         <div
           className="pane-slot pane-slot--schema island"
@@ -391,7 +402,8 @@ function Workbench() {
           className="pane-slot pane-slot--inspector island"
           aria-hidden={!inspectorVisible}
         >
-          {inspectorVisible && <ObjectInspector />}
+          {inspectorVisible &&
+            (inspectorMode === "ai" ? <AiWorkbench /> : <ObjectInspector />)}
         </div>
       </main>
 

@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
+use ordadb_ai::AiToolLimits;
 use ordadb_connector_sdk::{
     CONNECTOR_PROTOCOL_V2, CONNECTOR_PROTOCOL_V3, ConnectorCapabilitiesV2, ConnectorCapabilitiesV3,
     ConnectorCatalogNodeKindV3, ConnectorCatalogNodeV3, ConnectorCommandV3, ConnectorCredentialV2,
@@ -32,6 +33,8 @@ use uuid::Uuid;
 use windows_service::service::{ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use zeroize::Zeroizing;
+
+use crate::workspace::CredentialAccess;
 
 pub const DBMS_QUERY_EVENT: &str = "dbms://query";
 const NATIVE_CONNECTOR_ID: &str = "ordadb-native";
@@ -81,6 +84,8 @@ pub struct ConnectRequest {
     database: Option<String>,
     tls_mode: ConnectorTlsModeV2,
     credential_id: String,
+    #[serde(default)]
+    credential_access: CredentialAccess,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -290,6 +295,7 @@ pub struct ConnectionSnapshot {
     dialect: Option<String>,
     endpoint: String,
     database: String,
+    credential_access: CredentialAccess,
     mode: &'static str,
     capabilities: DbmsCapabilities,
 }
@@ -439,6 +445,162 @@ pub struct QueryUpdate {
     event: DbmsQueryEvent,
 }
 
+#[derive(Debug)]
+pub(crate) struct BoundedAiQueryResult {
+    pub content: JsonValue,
+    pub columns: Vec<String>,
+    pub rows_retained: usize,
+    pub total_rows: usize,
+    pub bytes_retained: usize,
+    pub truncated: bool,
+    pub command_tag: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AiConnectionPolicy {
+    pub connector_kind: String,
+    pub command_language: String,
+    pub credential_access: CredentialAccess,
+    pub native: bool,
+}
+
+struct BoundedAiCollector {
+    limits: AiToolLimits,
+    columns: Vec<QueryColumn>,
+    items: Vec<JsonValue>,
+    notices: Vec<JsonValue>,
+    result_kind: &'static str,
+    item_bytes: usize,
+    total_rows: usize,
+    truncated: bool,
+    command_tag: String,
+}
+
+impl BoundedAiCollector {
+    fn new(limits: AiToolLimits) -> Self {
+        Self {
+            limits,
+            columns: Vec::new(),
+            items: Vec::new(),
+            notices: Vec::new(),
+            result_kind: "rows",
+            item_bytes: 0,
+            total_rows: 0,
+            truncated: false,
+            command_tag: String::new(),
+        }
+    }
+
+    fn push(&mut self, event: DbmsQueryEvent) {
+        match event {
+            DbmsQueryEvent::Schema { columns } => self.columns = columns,
+            DbmsQueryEvent::Batch { rows } => {
+                self.result_kind = "rows";
+                for row in rows {
+                    self.push_item(JsonValue::Array(
+                        row.into_iter()
+                            .map(|value| value.map_or(JsonValue::Null, JsonValue::String))
+                            .collect(),
+                    ));
+                }
+            }
+            DbmsQueryEvent::Documents { documents } => {
+                self.result_kind = "documents";
+                for document in documents {
+                    self.push_item(document);
+                }
+            }
+            DbmsQueryEvent::KeyValues { entries } => {
+                self.result_kind = "keyValues";
+                for entry in entries {
+                    self.push_item(serde_json::json!({
+                        "key": entry.key,
+                        "value": entry.value,
+                    }));
+                }
+            }
+            DbmsQueryEvent::Progress { rows_processed } => {
+                self.total_rows = self
+                    .total_rows
+                    .max(usize::try_from(rows_processed).unwrap_or(usize::MAX));
+            }
+            DbmsQueryEvent::Notice {
+                severity,
+                sql_state,
+                message,
+            } => {
+                if self.notices.len() < 64 {
+                    self.notices.push(serde_json::json!({
+                        "severity": severity,
+                        "sqlState": sql_state,
+                        "message": message,
+                    }));
+                } else {
+                    self.truncated = true;
+                }
+            }
+            DbmsQueryEvent::Complete { command_tag, .. } => self.command_tag = command_tag,
+            DbmsQueryEvent::Error { .. } => {}
+        }
+    }
+
+    fn push_item(&mut self, item: JsonValue) {
+        self.total_rows = self.total_rows.saturating_add(1);
+        if self.items.len() >= self.limits.max_rows {
+            self.truncated = true;
+            return;
+        }
+        let item_bytes = serde_json::to_vec(&item).map_or(usize::MAX, |bytes| bytes.len());
+        if self.item_bytes.saturating_add(item_bytes) > self.limits.max_result_bytes {
+            self.truncated = true;
+            return;
+        }
+        self.item_bytes = self.item_bytes.saturating_add(item_bytes);
+        self.items.push(item);
+    }
+
+    fn finish(mut self) -> Result<BoundedAiQueryResult, DbError> {
+        loop {
+            let content = serde_json::json!({
+                "kind": self.result_kind,
+                "columns": self.columns,
+                "items": self.items,
+                "notices": self.notices,
+                "commandTag": self.command_tag,
+            });
+            let bytes_retained = serde_json::to_vec(&content)
+                .map_err(|error| {
+                    DbError::internal("failed to encode bounded AI query result")
+                        .with_detail(error.to_string())
+                })?
+                .len();
+            if bytes_retained <= self.limits.max_result_bytes {
+                return Ok(BoundedAiQueryResult {
+                    columns: self
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect(),
+                    rows_retained: self.items.len(),
+                    total_rows: self.total_rows,
+                    truncated: self.truncated,
+                    command_tag: self.command_tag,
+                    content,
+                    bytes_retained,
+                });
+            }
+            if self.items.pop().is_some() {
+                self.truncated = true;
+                continue;
+            }
+            return Err(DbError::new(
+                "54000",
+                "AI query metadata exceeds the 2 MiB result limit",
+            ));
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineStatus {
@@ -553,12 +715,12 @@ pub enum AdministrationTransferFormat {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StartAdministrationOperationRequest {
-    connection_id: String,
-    kind: AdministrationOperationKind,
-    path: String,
-    schema: Option<String>,
-    table: Option<String>,
-    format: Option<AdministrationTransferFormat>,
+    pub(crate) connection_id: String,
+    pub(crate) kind: AdministrationOperationKind,
+    pub(crate) path: String,
+    pub(crate) schema: Option<String>,
+    pub(crate) table: Option<String>,
+    pub(crate) format: Option<AdministrationTransferFormat>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -621,10 +783,21 @@ pub struct AdministrationServiceStatus {
     operations_root: String,
 }
 
+impl AdministrationServiceStatus {
+    pub(crate) fn data_dir(&self) -> &str {
+        &self.data_dir
+    }
+
+    pub(crate) fn operations_root(&self) -> &str {
+        &self.operations_root
+    }
+}
+
 #[derive(Debug)]
 struct ConnectionHandle {
     connector_kind: String,
     command_language: String,
+    credential_access: CredentialAccess,
     transport: ConnectionTransport,
 }
 
@@ -638,6 +811,9 @@ struct NativeConnection {
     pg: Arc<Mutex<PgClient>>,
     cancel: PgCancelToken,
     admin: AdminSession,
+    address: SocketAddr,
+    database: String,
+    credential_id: String,
 }
 
 impl std::fmt::Debug for NativeConnection {
@@ -769,6 +945,19 @@ impl DbmsRuntime {
             .ok_or_else(|| DbError::new("08003", "database connection does not exist"))
     }
 
+    pub(crate) fn ai_connection_policy(
+        &self,
+        connection_id: &str,
+    ) -> Result<AiConnectionPolicy, DbError> {
+        let connection = self.connection(connection_id)?;
+        Ok(AiConnectionPolicy {
+            connector_kind: connection.connector_kind.clone(),
+            command_language: connection.command_language.clone(),
+            credential_access: connection.credential_access,
+            native: matches!(&connection.transport, ConnectionTransport::Native(_)),
+        })
+    }
+
     async fn connect(&self, request: ConnectRequest) -> Result<ConnectionSnapshot, DbError> {
         validate_connect_request(&request)?;
         let stored = self.credentials.load(&request.credential_id)?;
@@ -805,6 +994,8 @@ impl DbmsRuntime {
                     database: pg_database,
                     password: pg_password,
                     application_name: "OrdaDB Console".into(),
+                    query_memory_bytes: None,
+                    timeout: None,
                 })
             })
             .await
@@ -840,6 +1031,9 @@ impl DbmsRuntime {
                     pg: Arc::new(Mutex::new(pg)),
                     cancel,
                     admin,
+                    address,
+                    database: database.clone(),
+                    credential_id: request.credential_id.clone(),
                 }),
                 "native",
                 DbmsCapabilities::native(),
@@ -915,12 +1109,14 @@ impl DbmsRuntime {
             dialect: request.dialect,
             endpoint: request.endpoint,
             database,
+            credential_access: request.credential_access,
             mode,
             capabilities,
         };
         let handle = Arc::new(ConnectionHandle {
             connector_kind,
             command_language,
+            credential_access: request.credential_access,
             transport,
         });
         write_lock(&self.connections)?.insert(connection_id, handle);
@@ -1127,6 +1323,8 @@ impl DbmsRuntime {
                     database,
                     password: pg_password,
                     application_name: "OrdaDB Console Probe".into(),
+                    query_memory_bytes: None,
+                    timeout: None,
                 })
             })
             .await;
@@ -1310,7 +1508,7 @@ impl DbmsRuntime {
         Ok(())
     }
 
-    async fn catalog(&self, connection_id: &str) -> Result<CatalogSnapshot, DbError> {
+    pub(crate) async fn catalog(&self, connection_id: &str) -> Result<CatalogSnapshot, DbError> {
         let connection = self.connection(connection_id)?;
         let objects = match &connection.transport {
             ConnectionTransport::Native(native) => {
@@ -1561,6 +1759,201 @@ impl DbmsRuntime {
         Ok(())
     }
 
+    pub(crate) async fn execute_ai_command(
+        &self,
+        connection_id: &str,
+        command: DesktopCommand,
+        limits: AiToolLimits,
+        cancellation: CancellationToken,
+        isolated_read: bool,
+    ) -> Result<BoundedAiQueryResult, DbError> {
+        if limits.max_rows == 0
+            || limits.max_rows > 1_000
+            || limits.max_result_bytes == 0
+            || limits.max_result_bytes > 2 * 1024 * 1024
+            || limits.query_memory_bytes == 0
+            || limits.query_memory_bytes > 64 * 1024 * 1024
+        {
+            return Err(DbError::new(
+                "22023",
+                "AI query limits exceed the desktop safety contract",
+            ));
+        }
+        let connection = self.connection(connection_id)?;
+        validate_command_for_connection(
+            &command,
+            &connection.connector_kind,
+            &connection.command_language,
+        )?;
+        match &connection.transport {
+            ConnectionTransport::Native(native) => {
+                let DesktopCommand::Text {
+                    text: sql, params, ..
+                } = command
+                else {
+                    return Err(DbError::unsupported(
+                        "native OrdaDB accepts only SQL text commands",
+                    ));
+                };
+                let stored = self.credentials.load(&native.credential_id)?;
+                let config = ClientConfig {
+                    address: native.address,
+                    user: stored.username,
+                    database: native.database.clone(),
+                    password: stored.password,
+                    application_name: "OrdaDB AI".to_owned(),
+                    query_memory_bytes: Some(limits.query_memory_bytes),
+                    timeout: Some(Duration::from_millis(limits.timeout_ms)),
+                };
+                let client = tokio::select! {
+                    () = cancellation.cancelled() => return Err(ai_cancelled()),
+                    client = tokio::task::spawn_blocking(move || PgClient::connect(config)) => {
+                        client.map_err(join_error)??
+                    }
+                };
+                let cancel = client.cancellation_token();
+                let task = tokio::task::spawn_blocking(move || {
+                    run_native_ai_query(client, sql, params, limits, isolated_read)
+                });
+                tokio::pin!(task);
+                tokio::select! {
+                    result = &mut task => result.map_err(join_error)?,
+                    () = cancellation.cancelled() => {
+                        let cancel_result = tokio::task::spawn_blocking(move || cancel.cancel())
+                            .await
+                            .map_err(join_error)?;
+                        let _ = (&mut task).await;
+                        cancel_result?;
+                        Err(ai_cancelled())
+                    }
+                }
+            }
+            ConnectionTransport::Plugin(plugin) => {
+                let mut collector = BoundedAiCollector::new(limits);
+                let request_id = Uuid::new_v4().to_string();
+                let mut host = plugin.host.lock().await;
+                let host = host
+                    .as_mut()
+                    .ok_or_else(|| DbError::new("08003", "connector host is closed"))?;
+                if plugin.capabilities_v3.is_some() {
+                    host.send_v3(&ConnectorRequestV3::Execute {
+                        request_id: request_id.clone(),
+                        connection_id: connection_id.to_owned(),
+                        command: desktop_command_v3(command),
+                        batch_size: QUERY_BATCH_ROWS as u32,
+                    })
+                    .await?;
+                    let mut cancel_sent = false;
+                    loop {
+                        let response = if cancel_sent {
+                            host.receive_v3().await?
+                        } else {
+                            tokio::select! {
+                                response = host.receive_v3() => response?,
+                                () = cancellation.cancelled() => {
+                                    host.send_v3(&ConnectorRequestV3::Cancel {
+                                        request_id: request_id.clone(),
+                                    }).await?;
+                                    cancel_sent = true;
+                                    continue;
+                                }
+                            }
+                        };
+                        match response {
+                            ConnectorResponseV3::ResultEvent {
+                                request_id: actual,
+                                event,
+                            } if actual == request_id => {
+                                let terminal =
+                                    matches!(event, ConnectorResultEventV3::Complete { .. });
+                                collector.push(map_connector_event_v3(event, Duration::ZERO)?);
+                                if terminal {
+                                    return collector.finish();
+                                }
+                            }
+                            ConnectorResponseV3::Cancelled { request_id: actual }
+                                if actual == request_id =>
+                            {
+                                return Err(ai_cancelled());
+                            }
+                            ConnectorResponseV3::Error {
+                                request_id: actual,
+                                error,
+                            } if actual.as_deref().is_none_or(|actual| actual == request_id) => {
+                                return Err(error.into_db_error());
+                            }
+                            _ => {
+                                return Err(DbError::new(
+                                    "08P01",
+                                    "connector returned an unexpected v3 AI result response",
+                                ));
+                            }
+                        }
+                    }
+                }
+                let DesktopCommand::Text {
+                    text: sql, params, ..
+                } = command
+                else {
+                    return Err(DbError::unsupported(
+                        "connector protocols v1 and v2 accept only SQL text commands",
+                    ));
+                };
+                host.send(&ConnectorRequestV1::Execute {
+                    request_id: request_id.clone(),
+                    connection_id: connection_id.to_owned(),
+                    sql,
+                    params: params
+                        .into_iter()
+                        .map(|value| value.map_or(Value::Null, Value::Text))
+                        .collect(),
+                })
+                .await?;
+                let mut cancel_sent = false;
+                loop {
+                    let response = if cancel_sent {
+                        host.receive().await?
+                    } else {
+                        tokio::select! {
+                            response = host.receive() => response?,
+                            () = cancellation.cancelled() => {
+                                host.send(&ConnectorRequestV1::Cancel {
+                                    request_id: request_id.clone(),
+                                }).await?;
+                                cancel_sent = true;
+                                continue;
+                            }
+                        }
+                    };
+                    match response {
+                        ConnectorResponseV1::QueryEvent {
+                            request_id: actual,
+                            event,
+                        } if actual == request_id => {
+                            let terminal = matches!(event, QueryEvent::Complete(_));
+                            collector.push(map_connector_event(event, Duration::ZERO));
+                            if terminal {
+                                return collector.finish();
+                            }
+                        }
+                        ConnectorResponseV1::Error {
+                            request_id: actual,
+                            error,
+                        } if actual.as_deref().is_none_or(|actual| actual == request_id) => {
+                            return Err(error);
+                        }
+                        _ => {
+                            return Err(DbError::new(
+                                "08P01",
+                                "connector returned an unexpected AI query response",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     async fn cancel(&self, request_id: &str) -> Result<(), DbError> {
         validate_id(request_id, "request ID")?;
         let cancellation = read_lock(&self.requests)?
@@ -1732,7 +2125,7 @@ impl DbmsRuntime {
         }
     }
 
-    async fn checkpoint(&self, connection_id: &str) -> Result<EngineStatus, DbError> {
+    pub(crate) async fn checkpoint(&self, connection_id: &str) -> Result<EngineStatus, DbError> {
         let connection = self.connection(connection_id)?;
         let ConnectionTransport::Native(native) = &connection.transport else {
             return Err(DbError::new(
@@ -1766,7 +2159,7 @@ impl DbmsRuntime {
         Ok(operations.into_iter().map(Into::into).collect())
     }
 
-    async fn start_administration_operation(
+    pub(crate) async fn start_administration_operation(
         &self,
         request: StartAdministrationOperationRequest,
     ) -> Result<AdministrationOperation, DbError> {
@@ -1838,7 +2231,7 @@ impl DbmsRuntime {
         Ok(operation.into())
     }
 
-    async fn administration_service(
+    pub(crate) async fn administration_service(
         &self,
         connection_id: &str,
     ) -> Result<AdministrationServiceStatus, DbError> {
@@ -2928,6 +3321,86 @@ fn catalog_entry(entry: CatalogEntry) -> CatalogObject {
     }
 }
 
+fn run_native_ai_query(
+    mut client: PgClient,
+    sql: String,
+    params: Vec<Option<String>>,
+    limits: AiToolLimits,
+    isolated_read: bool,
+) -> Result<BoundedAiQueryResult, DbError> {
+    if isolated_read {
+        client.query("BEGIN TRANSACTION READ ONLY")?;
+    }
+    let mut collector = BoundedAiCollector::new(limits);
+    let mut processed = 0_u64;
+    let mut on_event = |event| {
+        collect_native_pg_event(&mut collector, event, &mut processed);
+        Ok(())
+    };
+    let params = params
+        .into_iter()
+        .map(|value| value.map(String::into_bytes))
+        .collect::<Vec<_>>();
+    let query_result = if params.is_empty() {
+        client.query_batches(&sql, QUERY_BATCH_ROWS, &mut on_event)
+    } else {
+        client.query_prepared_batches(&sql, &[], &params, QUERY_BATCH_ROWS as u32, &mut on_event)
+    };
+    let rollback_result = isolated_read.then(|| client.query("ROLLBACK"));
+    match (query_result, rollback_result) {
+        (Ok(_), None | Some(Ok(_))) => collector.finish(),
+        (Ok(_), Some(Err(error))) => Err(error),
+        (Err(error), None | Some(Ok(_))) => Err(error),
+        (Err(error), Some(Err(rollback))) => Err(error.with_hint(format!(
+            "the read-only query failed and rollback also failed: {}",
+            rollback.message
+        ))),
+    }
+}
+
+fn collect_native_pg_event(
+    collector: &mut BoundedAiCollector,
+    event: PgQueryEvent,
+    processed: &mut u64,
+) {
+    let event = match event {
+        PgQueryEvent::Schema(columns) => DbmsQueryEvent::Schema {
+            columns: columns
+                .into_iter()
+                .map(|name| QueryColumn {
+                    name,
+                    data_type: "text".into(),
+                })
+                .collect(),
+        },
+        PgQueryEvent::Batch(rows) => {
+            *processed = processed.saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
+            collector.push(DbmsQueryEvent::Batch { rows });
+            DbmsQueryEvent::Progress {
+                rows_processed: *processed,
+            }
+        }
+        PgQueryEvent::Notice(notice) => DbmsQueryEvent::Notice {
+            severity: notice.severity.as_str().into(),
+            sql_state: notice.sql_state,
+            message: notice.message,
+        },
+        PgQueryEvent::Complete(command_tag) => DbmsQueryEvent::Complete {
+            command_tag,
+            duration_ms: 0,
+        },
+        PgQueryEvent::Notification(notification) => DbmsQueryEvent::Notice {
+            severity: "NOTICE".into(),
+            sql_state: "00000".into(),
+            message: format!(
+                "notification {} from backend {}: {}",
+                notification.channel, notification.sender_process_id, notification.payload
+            ),
+        },
+    };
+    collector.push(event);
+}
+
 fn emit_native_pg_event(
     app: &AppHandle,
     request_id: &str,
@@ -3319,6 +3792,10 @@ fn network_error(context: &str, error: impl std::fmt::Display) -> DbError {
     DbError::new("08006", context).with_detail(error.to_string())
 }
 
+fn ai_cancelled() -> DbError {
+    DbError::new("57014", "AI database operation was cancelled")
+}
+
 fn join_error(error: tokio::task::JoinError) -> DbError {
     DbError::new("XX000", "database worker task failed").with_detail(error.to_string())
 }
@@ -3520,6 +3997,7 @@ fn connection_fingerprint(request: &ConnectRequest) -> [u8; 32] {
         request.database.as_deref(),
         Some(connector_tls_mode_name(request.tls_mode)),
         Some(request.credential_id.as_str()),
+        Some(request.credential_access.as_str()),
     ] {
         match value {
             Some(value) => {
@@ -3846,6 +4324,7 @@ mod tests {
                     ConnectorTlsModeV2::Require
                 },
                 credential_id: format!("credential-{connector_id}"),
+                credential_access: CredentialAccess::Unspecified,
             };
             validate_connect_request(&request).expect(connector_id);
 
@@ -4097,6 +4576,7 @@ mod tests {
             database: Some("ordadb".into()),
             tls_mode: ConnectorTlsModeV2::Disable,
             credential_id: "ordadb-local".into(),
+            credential_access: CredentialAccess::Unspecified,
         }
     }
 

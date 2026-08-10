@@ -26,6 +26,8 @@ fn client_as(address: SocketAddr, user: &str, password: &str) -> ordadb_types::R
         database: "ordadb".into(),
         password: Zeroizing::new(password.into()),
         application_name: "ordadb-service-e2e".into(),
+        query_memory_bytes: None,
+        timeout: None,
     })
 }
 

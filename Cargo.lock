@@ -3694,6 +3694,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ordadb-ai"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "futures-util",
+ "ordadb-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "ordadb-backup"
 version = "0.1.0"
 dependencies = [
@@ -3960,10 +3978,13 @@ dependencies = [
 name = "ordadb-desktop"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "ordadb-ai",
  "ordadb-connector-sdk",
  "ordadb-connectors",
  "ordadb-protocol",
  "ordadb-server",
+ "ordadb-sql",
  "ordadb-types",
  "ordadb-windows",
  "reqwest",

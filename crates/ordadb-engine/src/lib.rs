@@ -23,8 +23,8 @@ use ordadb_catalog::{
 use ordadb_execution::{
     AdvancedExecutionCursor, AdvancedExecutionPlan, ApplyExecutionKind, ApplyExecutionPlan,
     DEFAULT_BATCH_ROWS, DEFAULT_HARD_MEMORY_BYTES, DEFAULT_SOFT_MEMORY_BYTES, ExecutionContext,
-    ExecutionCursor, JoinExecutionPlan, JoinExecutionSource, LeasedDataChunk, MemoryGrant,
-    QueryExecutionPlan, Reservation, TableProvider, TableScan,
+    ExecutionCursor, ExecutionOptions, JoinExecutionPlan, JoinExecutionSource, LeasedDataChunk,
+    MemoryGrant, QueryExecutionPlan, Reservation, TableProvider, TableScan,
     coerce_value as coerce_execution_value, compare_values as compare_execution_values,
     estimated_row_bytes, evaluate as evaluate_scalar,
     predicate_matches as execution_predicate_matches,
@@ -950,6 +950,7 @@ impl Engine {
             sql_transaction: SqlTransactionState::Idle,
             sequence_currvals: BTreeMap::new(),
             options,
+            execution_options: ExecutionOptions::default(),
             authorization,
             runtime_metadata,
         })
@@ -1134,6 +1135,7 @@ pub struct Session {
     sql_transaction: SqlTransactionState,
     sequence_currvals: BTreeMap<SequenceId, i64>,
     options: SessionOptions,
+    execution_options: ExecutionOptions,
     authorization: Option<SessionAuthorization>,
     runtime_metadata: SessionRuntimeMetadata,
 }
@@ -1830,6 +1832,18 @@ impl Session {
         self.options
     }
 
+    pub fn set_query_memory_limit(&mut self, hard_memory_bytes: usize) -> Result<()> {
+        if hard_memory_bytes == 0 || hard_memory_bytes > DEFAULT_HARD_MEMORY_BYTES {
+            return Err(DbError::new(
+                "22023",
+                "query memory limit must be between 1 byte and the server default",
+            ));
+        }
+        self.execution_options.hard_memory_bytes = hard_memory_bytes;
+        self.execution_options.soft_memory_bytes = DEFAULT_SOFT_MEMORY_BYTES.min(hard_memory_bytes);
+        Ok(())
+    }
+
     fn statement_snapshot(&self) -> Result<DatabaseState> {
         if let SqlTransactionState::Active(transaction) = &self.sql_transaction {
             if let Some(working) = &transaction.working {
@@ -2265,9 +2279,13 @@ impl Session {
             &snapshot.rows,
             snapshot.system_catalog.as_deref(),
         );
-        if let Some(stream) =
-            prepare_read_stream(&snapshot, statement.clone(), params, Some(&table_provider))?
-        {
+        if let Some(stream) = prepare_read_stream_with_options(
+            &snapshot,
+            statement.clone(),
+            params,
+            Some(&table_provider),
+            &self.execution_options,
+        )? {
             return Ok(stream);
         }
         let compacts_transaction_status =
@@ -2466,7 +2484,13 @@ impl Session {
                 ssi.record_read(predicate)?;
             }
         }
-        if let Some(stream) = prepare_read_stream(&snapshot, statement.clone(), params, None)? {
+        if let Some(stream) = prepare_read_stream_with_options(
+            &snapshot,
+            statement.clone(),
+            params,
+            None,
+            &self.execution_options,
+        )? {
             return Ok(stream);
         }
         let has_conflict_action = matches!(
@@ -4523,6 +4547,22 @@ fn prepare_read_stream(
     params: &[Value],
     table_provider: Option<&dyn TableProvider>,
 ) -> Result<Option<TryQueryStream>> {
+    prepare_read_stream_with_options(
+        state,
+        statement,
+        params,
+        table_provider,
+        &ExecutionOptions::default(),
+    )
+}
+
+fn prepare_read_stream_with_options(
+    state: &DatabaseState,
+    statement: BoundStatement,
+    params: &[Value],
+    table_provider: Option<&dyn TableProvider>,
+    options: &ExecutionOptions,
+) -> Result<Option<TryQueryStream>> {
     match statement {
         BoundStatement::Select {
             table_id,
@@ -4546,6 +4586,7 @@ fn prepare_read_stream(
                 },
                 params,
                 table_provider,
+                options,
             )?;
             Ok(Some(TryQueryStream::select(
                 schema,
@@ -4588,6 +4629,7 @@ fn prepare_read_stream(
                     aggregate,
                 },
                 params,
+                options,
             )?;
             Ok(Some(TryQueryStream::select(
                 schema,
@@ -9623,7 +9665,8 @@ fn execute_select(
     execution: SelectExecution,
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
-    let (schema, mut cursor) = prepare_select_cursor(state, execution, params, None)?;
+    let (schema, mut cursor) =
+        prepare_select_cursor(state, execution, params, None, &ExecutionOptions::default())?;
     let mut events = vec![QueryEvent::Schema(schema.clone())];
     let mut count = 0_u64;
     let mut emitted_batch = false;
@@ -10178,6 +10221,7 @@ fn prepare_select_cursor(
     execution: SelectExecution,
     params: &[Value],
     table_provider: Option<&dyn TableProvider>,
+    options: &ExecutionOptions,
 ) -> Result<(Schema, ExecutionCursor)> {
     let SelectExecution {
         table_id,
@@ -10202,13 +10246,14 @@ fn prepare_select_cursor(
         params,
     };
     let cursor = match table_provider {
-        Some(table_provider) => ExecutionCursor::new_with_table_provider(
+        Some(table_provider) => ExecutionCursor::with_options_and_table_provider(
             &plan,
             &context,
             schema.clone(),
-            table_provider,
+            options.clone(),
+            Some(table_provider),
         )?,
-        None => ExecutionCursor::new(&plan, &context, schema.clone())?,
+        None => ExecutionCursor::with_options(&plan, &context, schema.clone(), options.clone())?,
     };
     Ok((schema, cursor))
 }
@@ -10218,7 +10263,8 @@ fn execute_advanced_select(
     execution: AdvancedExecution,
     params: &[Value],
 ) -> Result<(Vec<QueryEvent>, bool)> {
-    let (schema, mut cursor) = prepare_advanced_cursor(state, execution, params)?;
+    let (schema, mut cursor) =
+        prepare_advanced_cursor(state, execution, params, &ExecutionOptions::default())?;
     let mut events = vec![QueryEvent::Schema(schema.clone())];
     let mut count = 0_u64;
     let mut emitted_batch = false;
@@ -10247,6 +10293,7 @@ fn prepare_advanced_cursor(
     state: &DatabaseState,
     execution: AdvancedExecution,
     params: &[Value],
+    options: &ExecutionOptions,
 ) -> Result<(Schema, AdvancedExecutionCursor)> {
     let AdvancedExecution {
         table,
@@ -10277,7 +10324,7 @@ fn prepare_advanced_cursor(
         .into_iter()
         .map(|join| build_join_execution_plan(state, join, params.len(), &[]))
         .collect::<Result<Vec<_>>>()?;
-    let cursor = AdvancedExecutionCursor::new_with_cancellation(
+    let cursor = AdvancedExecutionCursor::with_options_and_cancellation(
         AdvancedExecutionPlan {
             table,
             joins,
@@ -10295,6 +10342,7 @@ fn prepare_advanced_cursor(
             aggregate,
         },
         &context,
+        options.clone(),
         state.cancellation.clone(),
     )?;
     Ok((schema, cursor))

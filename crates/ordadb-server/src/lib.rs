@@ -433,6 +433,8 @@ mod tests {
                 database: "ordadb".to_owned(),
                 password: Zeroizing::new("StrongWirePassword-29".to_owned()),
                 application_name: "ready-status-test".to_owned(),
+                query_memory_bytes: None,
+                timeout: None,
             })?;
             assert_eq!(client.transaction_status(), PgTransactionStatus::Idle);
             client.query("BEGIN")?;
@@ -482,6 +484,8 @@ mod tests {
                 database: "ordadb".to_owned(),
                 password: Zeroizing::new("StrongWirePassword-29".to_owned()),
                 application_name: "ready-status-concurrent".to_owned(),
+                query_memory_bytes: None,
+                timeout: None,
             })?;
             client.query("BEGIN ISOLATION LEVEL REPEATABLE READ")?;
             client.query("SELECT value FROM wire_conflicts WHERE id = 1")?;
