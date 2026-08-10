@@ -18,10 +18,13 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+async-trait.workspace = true
+ordadb-ai = { path = "../../../crates/ordadb-ai" }
 ordadb-connector-sdk = { path = "../../../crates/ordadb-connector-sdk" }
 ordadb-connectors = { path = "../../../crates/ordadb-connectors" }
 ordadb-protocol = { path = "../../../crates/ordadb-protocol" }
 ordadb-server = { path = "../../../crates/ordadb-server" }
+ordadb-sql = { path = "../../../crates/ordadb-sql" }
 ordadb-types = { path = "../../../crates/ordadb-types" }
 ordadb-windows = { path = "../../../crates/ordadb-windows" }
 reqwest.workspace = true

@@ -983,7 +983,7 @@ impl AdvancedExecutionCursor {
         Self::with_options_and_cancellation(plan, context, options, None)
     }
 
-    fn with_options_and_cancellation(
+    pub fn with_options_and_cancellation(
         plan: AdvancedExecutionPlan,
         context: &ExecutionContext<'_>,
         options: ExecutionOptions,

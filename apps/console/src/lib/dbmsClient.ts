@@ -1,6 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { ConnectorDescriptor, ConnectorKind } from "./consoleClient";
+import type {
+  ConnectorDescriptor,
+  ConnectorKind,
+  CredentialAccess,
+} from "./consoleClient";
 import type { SqlDialect } from "../types";
 import { isTauriRuntime } from "./tauri";
 
@@ -34,6 +38,7 @@ export interface DbmsConnectionRequest {
   database?: string;
   tlsMode: ConnectorDescriptor["defaultTlsMode"];
   credentialId: string;
+  credentialAccess?: CredentialAccess;
 }
 
 export type ConnectionProbeStageName =
@@ -96,6 +101,7 @@ export interface DbmsConnectionSnapshot {
   dialect: SqlDialect | null;
   endpoint: string;
   database: string;
+  credentialAccess: CredentialAccess;
   mode: "native" | "plugin" | "preview";
   capabilities: DbmsCapabilities;
 }
@@ -323,6 +329,7 @@ export const previewConnection: DbmsConnectionSnapshot = {
   dialect: "postgresql",
   endpoint: "Preview fixture",
   database: "ordadb_preview",
+  credentialAccess: "unspecified",
   mode: "preview",
   capabilities: previewCapabilities,
 };
@@ -542,6 +549,7 @@ export class PreviewDbmsClient implements DbmsClient {
     commandLanguage: request.commandLanguage,
     dialect: request.dialect ?? null,
     database: request.database ?? previewConnection.database,
+    credentialAccess: request.credentialAccess ?? "unspecified",
     capabilities: previewCapabilitiesFor(request.connectorKind),
   });
 

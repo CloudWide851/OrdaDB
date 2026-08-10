@@ -100,6 +100,8 @@ fn sql(mut options: BTreeMap<String, Option<String>>) -> Result<Value> {
         database,
         password,
         application_name: "ordadb-cli".into(),
+        query_memory_bytes: None,
+        timeout: None,
     })?;
     let result = client.query(&sql)?;
     Ok(json!({

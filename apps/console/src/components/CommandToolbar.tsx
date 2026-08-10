@@ -1,4 +1,5 @@
 import {
+  Bot,
   Command,
   PanelLeftClose,
   PanelLeftOpen,
@@ -6,17 +7,20 @@ import {
   PanelRightOpen,
 } from "lucide-react";
 import type { WorkbenchCommandId } from "../data/commands";
+import type { InspectorMode } from "../store/workbench";
 import { IconAction } from "./IconAction";
 
 interface CommandToolbarProps {
   schemaVisible: boolean;
   inspectorVisible: boolean;
+  inspectorMode: InspectorMode;
   onCommand: (commandId: WorkbenchCommandId) => void;
 }
 
 export function CommandToolbar({
   schemaVisible,
   inspectorVisible,
+  inspectorMode,
   onCommand,
 }: CommandToolbarProps) {
   return (
@@ -33,7 +37,13 @@ export function CommandToolbar({
         onClick={() => onCommand("toggle-explorer")}
       />
       <IconAction
-        label={inspectorVisible ? "隐藏对象检查器" : "显示对象检查器"}
+        label={
+          inspectorVisible
+            ? inspectorMode === "ai"
+              ? "隐藏 AI 助手"
+              : "隐藏对象检查器"
+            : "显示右侧面板"
+        }
         icon={
           inspectorVisible ? (
             <PanelRightClose size={17} aria-hidden="true" />
@@ -42,6 +52,12 @@ export function CommandToolbar({
           )
         }
         onClick={() => onCommand("toggle-inspector")}
+      />
+      <IconAction
+        label="打开 AI 助手"
+        tone={inspectorVisible && inspectorMode === "ai" ? "brand" : "plain"}
+        icon={<Bot size={16} aria-hidden="true" />}
+        onClick={() => onCommand("ai-workbench")}
       />
       <span className="command-divider" aria-hidden="true" />
       <IconAction

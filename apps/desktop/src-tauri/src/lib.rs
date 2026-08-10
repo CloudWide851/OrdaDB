@@ -10,6 +10,7 @@ use ordadb_types::DbError;
 use serde::Serialize;
 use tauri::{Emitter, Manager, Runtime, State, webview::PageLoadEvent};
 
+mod ai;
 mod dbms;
 mod workspace;
 
@@ -135,11 +136,11 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            let plugin_root = app
+            let local_data_root = app
                 .path()
                 .app_local_data_dir()
-                .map_err(|error| format!("failed to resolve OrdaDB local data path: {error}"))?
-                .join("connectors");
+                .map_err(|error| format!("failed to resolve OrdaDB local data path: {error}"))?;
+            let plugin_root = local_data_root.join("connectors");
             let bundled_root = app
                 .path()
                 .resource_dir()
@@ -164,16 +165,18 @@ pub fn run() {
             });
             let dbms = dbms::DbmsRuntime::new(Arc::clone(&manager))
                 .map_err(|error| format!("failed to initialize DBMS runtime: {error}"))?;
-            let console = workspace::ConsoleRuntime::open(
-                app.path()
-                    .app_local_data_dir()
-                    .map_err(|error| format!("failed to resolve OrdaDB local data path: {error}"))?
-                    .join("console"),
+            let console = workspace::ConsoleRuntime::open(local_data_root.join("console"))
+                .map_err(|error| format!("failed to initialize Console runtime: {error}"))?;
+            let ai = ai::DesktopAiRuntime::open(
+                Arc::clone(&dbms),
+                Arc::clone(&console),
+                &local_data_root,
             )
-            .map_err(|error| format!("failed to initialize Console runtime: {error}"))?;
+            .map_err(|error| format!("failed to initialize AI runtime: {error}"))?;
             app.manage(manager);
             app.manage(dbms);
             app.manage(console);
+            app.manage(ai);
             show_main_window(app)?;
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -213,6 +216,13 @@ pub fn run() {
             dbms::dbms_service,
             dbms::dbms_probe_connection,
             dbms::dbms_bootstrap_admin,
+            ai::ai_start_run,
+            ai::ai_cancel_run,
+            ai::ai_decide,
+            ai::ai_state,
+            ai::ai_prompt_credential,
+            ai::ai_credential_status,
+            ai::ai_delete_credential,
             workspace::console_bootstrap,
             workspace::console_save_settings,
             workspace::workspace_open,

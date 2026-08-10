@@ -38,6 +38,7 @@ const defaults: DataSourceValues = {
   adminEndpoint: "http://127.0.0.1:9080",
   database: "ordadb",
   credentialId: "ordadb-local",
+  credentialAccess: "unspecified",
   username: "ordadb_admin",
   tlsMode: "disable",
 };
@@ -256,6 +257,7 @@ export function DataSourceDialog({
                         connector.id === "ordadb-native"
                           ? "ordadb-local"
                           : `${connector.id}-default`,
+                      credentialAccess: "unspecified",
                     }))
                   }
                 >
@@ -383,6 +385,29 @@ export function DataSourceDialog({
                 }))
               }
             />
+          </label>
+
+          <label className="form-field form-field--wide">
+            <span>凭据权限</span>
+            <select
+              value={values.credentialAccess ?? "unspecified"}
+              onChange={(event) =>
+                setValues((current) => ({
+                  ...current,
+                  credentialAccess: event.target
+                    .value as DataSourceValues["credentialAccess"],
+                }))
+              }
+            >
+              <option value="unspecified">未声明 · AI 读取也需确认</option>
+              <option value="readOnly">只读凭据 · 允许受控自动读取</option>
+              <option value="readWrite">读写凭据 · 写入始终需确认</option>
+            </select>
+            <small>
+              {native
+                ? "OrdaDB 自动读取仍由 AST、RBAC 与只读事务共同校验。"
+                : "只有明确的只读凭据才允许 AI 自动执行外部读取。"}
+            </small>
           </label>
 
           {connectionError && (

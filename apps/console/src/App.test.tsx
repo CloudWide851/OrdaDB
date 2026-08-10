@@ -16,6 +16,7 @@ import {
   resetPreviewPluginManagerForTests,
   setPreviewRegistryAvailabilityForTests,
 } from "./lib/pluginManager";
+import { resetPreviewAiClientForTests } from "./lib/aiClient";
 import { useWorkbenchStore } from "./store/workbench";
 
 const tauriMocks = vi.hoisted(() => ({
@@ -133,6 +134,7 @@ describe("OrdaDB workbench", () => {
 
   beforeEach(async () => {
     resetPreviewPluginManagerForTests();
+    resetPreviewAiClientForTests();
     tauriMocks.fileDropSubscribers.length = 0;
     useWorkbenchStore.setState(initialWorkbenchState, true);
     await useWorkbenchStore.getState().discardRecovery();
@@ -242,6 +244,11 @@ describe("OrdaDB workbench", () => {
     const settingsSearch = within(dialog).getByLabelText("搜索设置");
     await user.type(settingsSearch, "模型");
     expect(within(dialog).getByLabelText("模型")).toHaveValue("gpt-5.6");
+    expect(within(dialog).queryByLabelText("凭据引用")).not.toBeInTheDocument();
+    expect(within(dialog).getByLabelText("AI API Key 状态")).toHaveTextContent(
+      "Browser Preview 不读取或保存系统凭据",
+    );
+    expect(within(dialog).getByRole("button", { name: "设置" })).toBeDisabled();
     await user.clear(settingsSearch);
     await user.click(
       within(dialog).getByRole("button", { name: "保存设置" }),
@@ -249,6 +256,38 @@ describe("OrdaDB workbench", () => {
     expect(document.documentElement.style.getPropertyValue("--font-ui")).toBe(
       "11px",
     );
+  });
+
+  it("runs the auditable AI Preview and keeps mutations behind focused approval", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(screen.getByRole("button", { name: "打开 AI 助手" }));
+    const pane = screen.getByRole("complementary", { name: "AI 助手" });
+    expect(within(pane).getByText("Preview · 不执行")).toBeVisible();
+    const prompt = within(pane).getByRole("textbox", {
+      name: "询问 OrdaDB AI",
+    });
+    await user.type(prompt, "解释当前 Schema");
+    await user.click(within(pane).getByRole("button", { name: "发送" }));
+    expect(
+      await within(pane).findByText(/这是确定性 Browser Preview/),
+    ).toBeVisible();
+    expect(within(pane).getByLabelText("AI 工具审计")).toHaveTextContent(
+      "未访问数据库",
+    );
+
+    await user.type(prompt, "删除旧记录");
+    await user.click(within(pane).getByRole("button", { name: "发送" }));
+    const approval = await within(pane).findByRole("alert", {
+      name: "需要确认",
+    });
+    const deny = within(approval).getByRole("button", { name: "拒绝" });
+    expect(deny).toHaveFocus();
+    await user.click(deny);
+    expect(
+      await within(pane).findByText(/Preview 未执行任何数据库命令/),
+    ).toBeVisible();
   });
 
   it("supports menus, command palette, and keyboard navigation", async () => {

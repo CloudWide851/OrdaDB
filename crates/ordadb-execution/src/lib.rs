@@ -740,7 +740,7 @@ impl ExecutionCursor {
         Self::with_options_and_table_provider(plan, context, schema, options, None)
     }
 
-    fn with_options_and_table_provider(
+    pub fn with_options_and_table_provider(
         plan: &PlanNode,
         context: &ExecutionContext<'_>,
         schema: Schema,

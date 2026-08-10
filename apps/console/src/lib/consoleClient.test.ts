@@ -86,6 +86,7 @@ describe("PreviewConsoleClient", () => {
       database: "ordadb",
       tlsMode: "disable",
       credentialId: "credential-reference",
+      credentialAccess: "unspecified",
       autoReconnect: true,
     };
 

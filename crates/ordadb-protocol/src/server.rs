@@ -276,12 +276,20 @@ fn serve_tcp_connection_inner(
         secret_key,
     )?;
     let _guard = SessionGuard::new(Arc::clone(&registry), handle.process_id());
-    write_startup_responses(&mut stream, &settings, &handle)?;
-
     let mut session = connect_postgresql_session(&engine, &principal, bypass_ownership)?;
+    if let Some(query_memory_bytes) = parameters.get("ordadb_query_memory_bytes") {
+        let query_memory_bytes = query_memory_bytes.parse::<usize>().map_err(|_| {
+            DbError::new(
+                "22023",
+                "ordadb_query_memory_bytes must be a positive integer",
+            )
+        })?;
+        session.set_query_memory_limit(query_memory_bytes)?;
+    }
     session.set_backend_process_id(handle.process_id())?;
     session.set_runtime_metadata(session_runtime_metadata(&settings, &database, &principal)?);
     refresh_system_catalog_metadata(&mut session, &auth, &settings, &principal, &database)?;
+    write_startup_responses(&mut stream, &settings, &handle)?;
     stream.enable_frontend_polling()?;
     let mut connection = Connection {
         stream,

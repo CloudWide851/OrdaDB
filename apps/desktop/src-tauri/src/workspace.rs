@@ -6,6 +6,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ordadb_ai::{
+    AiPersistenceV1, MAX_PERSISTED_STATE_BYTES, decode_persistence, project_persistence,
+};
 use ordadb_types::DbError;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -25,6 +28,7 @@ const RECENT_FILES_FILE: &str = "recent-files-v1.json";
 const PROFILES_FILE: &str = "connection-profiles-v3.json";
 const LEGACY_PROFILES_V2_FILE: &str = "connection-profiles-v2.json";
 const LEGACY_PROFILES_FILE: &str = "connection-profiles-v1.json";
+const AI_STATE_FILE: &str = "ai-state-v1.json";
 const SETTINGS_VERSION: u32 = 2;
 const SESSION_VERSION: u32 = 1;
 const PROFILES_VERSION: u32 = 3;
@@ -469,6 +473,25 @@ pub enum ConnectorKind {
     KeyValue,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CredentialAccess {
+    #[default]
+    Unspecified,
+    ReadOnly,
+    ReadWrite,
+}
+
+impl CredentialAccess {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::ReadOnly => "readOnly",
+            Self::ReadWrite => "readWrite",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ConnectionProfileV2 {
@@ -518,6 +541,8 @@ pub struct ConnectionProfileV3 {
     database: Option<String>,
     tls_mode: String,
     credential_id: String,
+    #[serde(default)]
+    credential_access: CredentialAccess,
     auto_reconnect: bool,
 }
 
@@ -554,6 +579,7 @@ impl From<ConnectionProfileV2> for ConnectionProfileV3 {
             database: legacy.database,
             tls_mode: legacy.tls_mode,
             credential_id: legacy.credential_id,
+            credential_access: CredentialAccess::Unspecified,
             auto_reconnect: legacy.auto_reconnect,
         }
     }
@@ -1037,6 +1063,33 @@ impl ConsoleRuntime {
         };
         validate_profiles_v3(&document)?;
         Ok((document, true))
+    }
+
+    pub(crate) fn load_ai_state(&self) -> Result<AiPersistenceV1, DbError> {
+        let path = self.root.join(AI_STATE_FILE);
+        if !path.exists() {
+            return Ok(AiPersistenceV1::default());
+        }
+        let metadata =
+            fs::metadata(&path).map_err(|error| io_error("failed to inspect AI state", error))?;
+        if metadata.len() > MAX_PERSISTED_STATE_BYTES as u64 {
+            return Err(resource("AI state exceeds the 2 MiB limit"));
+        }
+        let bytes = fs::read(&path).map_err(|error| io_error("failed to read AI state", error))?;
+        decode_persistence(&bytes)
+    }
+
+    pub(crate) fn save_ai_state(
+        &self,
+        state: &AiPersistenceV1,
+    ) -> Result<AiPersistenceV1, DbError> {
+        let projected = project_persistence(state.history.clone(), state.audit.clone())?;
+        if projected != *state {
+            return Err(invalid("AI state exceeds a retention limit"));
+        }
+        let _guard = self.lock_writes()?;
+        write_json_atomic(&self.root.join(AI_STATE_FILE), &projected)?;
+        Ok(projected)
     }
 
     fn snapshot(&self, root_path: &str) -> Result<WorkspaceSnapshot, DbError> {
@@ -2460,9 +2513,15 @@ mod tests {
             migrated.profiles[0].credential_id, "credential-reference",
             "the Credential Manager reference must survive ID migration"
         );
+        assert_eq!(
+            migrated.profiles[0].credential_access,
+            CredentialAccess::Unspecified,
+            "legacy credentials must never be assumed read-only"
+        );
         let persisted =
             fs::read_to_string(runtime.root.join(PROFILES_FILE)).expect("persisted migration");
         assert!(persisted.contains("\"connectorId\": \"ordadb-native\""));
+        assert!(persisted.contains("\"credentialAccess\": \"unspecified\""));
         assert!(!persisted.contains("ordadb-postgresql"));
     }
 
@@ -2510,6 +2569,7 @@ mod tests {
             database: Some("postgres".into()),
             tls_mode: "prefer".into(),
             credential_id: "external-credential".into(),
+            credential_access: CredentialAccess::ReadOnly,
             auto_reconnect: false,
         };
         validate_profile_v3(&profile).expect("valid external PostgreSQL");
@@ -2564,6 +2624,7 @@ mod tests {
             database: Some("admin".into()),
             tls_mode: "prefer".into(),
             credential_id: "mongodb-credential".into(),
+            credential_access: CredentialAccess::Unspecified,
             auto_reconnect: false,
         };
         validate_profile_v3(&profile).expect("native MongoDB profile");

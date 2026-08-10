@@ -927,6 +927,279 @@ pub enum ParsedStatement {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StatementEffect {
+    ReadOnly,
+    RequiresApproval,
+}
+
+const MAX_STATEMENT_EFFECT_DEPTH: usize = 64;
+const MAX_STATEMENT_EFFECT_NODES: usize = 65_536;
+
+#[must_use]
+pub fn classify_statement_effect(statement: &ParsedStatement) -> StatementEffect {
+    let mut pending = vec![(EffectNode::Statement(statement), 0_usize)];
+    let mut visited = 0_usize;
+    while let Some((node, depth)) = pending.pop() {
+        visited = visited.saturating_add(1);
+        if depth > MAX_STATEMENT_EFFECT_DEPTH || visited > MAX_STATEMENT_EFFECT_NODES {
+            return StatementEffect::RequiresApproval;
+        }
+        let child_depth = depth.saturating_add(1);
+        match node {
+            EffectNode::Statement(statement) => match statement {
+                ParsedStatement::ScalarSelect { projection } => {
+                    push_effect_projections(&mut pending, projection, child_depth);
+                }
+                ParsedStatement::Select {
+                    projection,
+                    filter,
+                    order_by,
+                    offset,
+                    limit,
+                    ..
+                } => {
+                    push_effect_projections(&mut pending, projection, child_depth);
+                    push_effect_optional_expr(&mut pending, filter.as_ref(), child_depth);
+                    push_effect_orders(&mut pending, order_by, child_depth);
+                    push_effect_optional_expr(&mut pending, offset.as_ref(), child_depth);
+                    push_effect_optional_expr(&mut pending, limit.as_ref(), child_depth);
+                }
+                ParsedStatement::AdvancedSelect {
+                    joins,
+                    projection,
+                    filter,
+                    group_by,
+                    having,
+                    order_by,
+                    offset,
+                    limit,
+                    ..
+                } => {
+                    for join in joins {
+                        if let ParsedJoinSource::Derived { query, .. } = &join.source {
+                            pending.push((EffectNode::Statement(query), child_depth));
+                        }
+                        pending.push((EffectNode::Expr(&join.on), child_depth));
+                    }
+                    push_effect_projections(&mut pending, projection, child_depth);
+                    push_effect_optional_expr(&mut pending, filter.as_ref(), child_depth);
+                    push_effect_exprs(&mut pending, group_by, child_depth);
+                    push_effect_optional_expr(&mut pending, having.as_ref(), child_depth);
+                    push_effect_orders(&mut pending, order_by, child_depth);
+                    push_effect_optional_expr(&mut pending, offset.as_ref(), child_depth);
+                    push_effect_optional_expr(&mut pending, limit.as_ref(), child_depth);
+                }
+                ParsedStatement::With { ctes, body, .. } => {
+                    pending.push((EffectNode::Statement(body), child_depth));
+                    pending.extend(
+                        ctes.iter()
+                            .map(|cte| (EffectNode::Statement(cte.query.as_ref()), child_depth)),
+                    );
+                }
+                ParsedStatement::SetOperation {
+                    left,
+                    right,
+                    order_by,
+                    offset,
+                    limit,
+                    ..
+                } => {
+                    pending.push((EffectNode::Statement(left), child_depth));
+                    pending.push((EffectNode::Statement(right), child_depth));
+                    push_effect_orders(&mut pending, order_by, child_depth);
+                    push_effect_optional_expr(&mut pending, offset.as_ref(), child_depth);
+                    push_effect_optional_expr(&mut pending, limit.as_ref(), child_depth);
+                }
+                ParsedStatement::Explain { statement } => {
+                    pending.push((EffectNode::Statement(statement), child_depth));
+                }
+                ParsedStatement::Begin { .. }
+                | ParsedStatement::Commit { .. }
+                | ParsedStatement::Rollback { .. }
+                | ParsedStatement::Savepoint { .. }
+                | ParsedStatement::RollbackTo { .. }
+                | ParsedStatement::ReleaseSavepoint { .. }
+                | ParsedStatement::Analyze { .. }
+                | ParsedStatement::Vacuum { .. }
+                | ParsedStatement::Reindex { .. }
+                | ParsedStatement::Listen { .. }
+                | ParsedStatement::Unlisten { .. }
+                | ParsedStatement::Notify { .. }
+                | ParsedStatement::Do { .. }
+                | ParsedStatement::DiscardAll
+                | ParsedStatement::DeallocateAll
+                | ParsedStatement::CreateSchema { .. }
+                | ParsedStatement::CreateEnumType { .. }
+                | ParsedStatement::CreateDomain { .. }
+                | ParsedStatement::AlterEnumAddValue { .. }
+                | ParsedStatement::AlterEnumRenameValue { .. }
+                | ParsedStatement::AlterDomain { .. }
+                | ParsedStatement::AlterSchemaRename { .. }
+                | ParsedStatement::DropObjects { .. }
+                | ParsedStatement::CreateTable { .. }
+                | ParsedStatement::AlterTable { .. }
+                | ParsedStatement::CreateIndex(_)
+                | ParsedStatement::AlterIndexRename { .. }
+                | ParsedStatement::CreateSequence { .. }
+                | ParsedStatement::AlterSequenceRename { .. }
+                | ParsedStatement::AlterSequence { .. }
+                | ParsedStatement::CreateView { .. }
+                | ParsedStatement::AlterViewRename { .. }
+                | ParsedStatement::RefreshMaterializedView { .. }
+                | ParsedStatement::CreateRoutine { .. }
+                | ParsedStatement::DropRoutine { .. }
+                | ParsedStatement::Call { .. }
+                | ParsedStatement::RoutineSelect { .. }
+                | ParsedStatement::PgNotify { .. }
+                | ParsedStatement::SequenceValue { .. }
+                | ParsedStatement::CreateTrigger { .. }
+                | ParsedStatement::DropTrigger { .. }
+                | ParsedStatement::Insert { .. }
+                | ParsedStatement::Merge(_)
+                | ParsedStatement::Update { .. }
+                | ParsedStatement::Delete { .. } => {
+                    return StatementEffect::RequiresApproval;
+                }
+            },
+            EffectNode::Expr(expr) => match &expr.kind {
+                ParsedExprKind::Column(_)
+                | ParsedExprKind::Literal(_)
+                | ParsedExprKind::Parameter(_)
+                | ParsedExprKind::ResolvedParameter { .. }
+                | ParsedExprKind::ApplyValue { .. }
+                | ParsedExprKind::WindowValue { .. } => {}
+                ParsedExprKind::Unary { expr, .. } | ParsedExprKind::Cast { expr, .. } => {
+                    pending.push((EffectNode::Expr(expr), child_depth));
+                }
+                ParsedExprKind::Array { elements, .. } => {
+                    push_effect_exprs(&mut pending, elements, child_depth);
+                }
+                ParsedExprKind::Function { arguments, .. } => {
+                    push_effect_exprs(&mut pending, arguments, child_depth);
+                }
+                ParsedExprKind::Binary { left, right, .. } => {
+                    pending.push((EffectNode::Expr(left), child_depth));
+                    pending.push((EffectNode::Expr(right), child_depth));
+                }
+                ParsedExprKind::InList { expr, list, .. } => {
+                    pending.push((EffectNode::Expr(expr), child_depth));
+                    push_effect_exprs(&mut pending, list, child_depth);
+                }
+                ParsedExprKind::ScalarSubquery(query)
+                | ParsedExprKind::Exists {
+                    subquery: query, ..
+                } => pending.push((EffectNode::Statement(query), child_depth)),
+                ParsedExprKind::InSubquery { expr, subquery, .. }
+                | ParsedExprKind::QuantifiedSubquery {
+                    left: expr,
+                    subquery,
+                    ..
+                } => {
+                    pending.push((EffectNode::Expr(expr), child_depth));
+                    pending.push((EffectNode::Statement(subquery), child_depth));
+                }
+                ParsedExprKind::RowSubquery { left, subquery, .. } => {
+                    push_effect_exprs(&mut pending, left, child_depth);
+                    pending.push((EffectNode::Statement(subquery), child_depth));
+                }
+                ParsedExprKind::Aggregate {
+                    argument, filter, ..
+                } => {
+                    push_effect_optional_expr(&mut pending, argument.as_deref(), child_depth);
+                    push_effect_optional_expr(&mut pending, filter.as_deref(), child_depth);
+                }
+                ParsedExprKind::Window { call, spec } => {
+                    push_effect_exprs(&mut pending, &call.arguments, child_depth);
+                    push_effect_optional_expr(&mut pending, call.filter.as_deref(), child_depth);
+                    push_effect_exprs(&mut pending, &spec.partition_by, child_depth);
+                    push_effect_orders(&mut pending, &spec.order_by, child_depth);
+                    if let Some(frame) = &spec.frame {
+                        push_effect_window_bound(&mut pending, &frame.start_bound, child_depth);
+                        push_effect_window_bound(&mut pending, &frame.end_bound, child_depth);
+                    }
+                }
+                ParsedExprKind::NamedWindow { call, .. } => {
+                    push_effect_exprs(&mut pending, &call.arguments, child_depth);
+                    push_effect_optional_expr(&mut pending, call.filter.as_deref(), child_depth);
+                }
+            },
+        }
+    }
+    StatementEffect::ReadOnly
+}
+
+enum EffectNode<'a> {
+    Statement(&'a ParsedStatement),
+    Expr(&'a ParsedExpr),
+}
+
+fn push_effect_projections<'a>(
+    pending: &mut Vec<(EffectNode<'a>, usize)>,
+    projections: &'a [ParsedProjection],
+    depth: usize,
+) {
+    pending.extend(
+        projections
+            .iter()
+            .filter_map(|projection| match projection {
+                ParsedProjection::Wildcard => None,
+                ParsedProjection::Expression { expr, .. } => Some((EffectNode::Expr(expr), depth)),
+            }),
+    );
+}
+
+fn push_effect_orders<'a>(
+    pending: &mut Vec<(EffectNode<'a>, usize)>,
+    orders: &'a [ParsedOrder],
+    depth: usize,
+) {
+    pending.extend(
+        orders
+            .iter()
+            .map(|order| (EffectNode::Expr(&order.expr), depth)),
+    );
+}
+
+fn push_effect_exprs<'a>(
+    pending: &mut Vec<(EffectNode<'a>, usize)>,
+    expressions: &'a [ParsedExpr],
+    depth: usize,
+) {
+    pending.extend(
+        expressions
+            .iter()
+            .map(|expr| (EffectNode::Expr(expr), depth)),
+    );
+}
+
+fn push_effect_optional_expr<'a>(
+    pending: &mut Vec<(EffectNode<'a>, usize)>,
+    expression: Option<&'a ParsedExpr>,
+    depth: usize,
+) {
+    if let Some(expression) = expression {
+        pending.push((EffectNode::Expr(expression), depth));
+    }
+}
+
+fn push_effect_window_bound<'a>(
+    pending: &mut Vec<(EffectNode<'a>, usize)>,
+    bound: &'a ParsedWindowFrameBound,
+    depth: usize,
+) {
+    match bound {
+        ParsedWindowFrameBound::Preceding(expression)
+        | ParsedWindowFrameBound::Following(expression) => {
+            pending.push((EffectNode::Expr(expression), depth));
+        }
+        ParsedWindowFrameBound::UnboundedPreceding
+        | ParsedWindowFrameBound::CurrentRow
+        | ParsedWindowFrameBound::UnboundedFollowing => {}
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedReindexTarget {
     Index(ParsedObjectName),

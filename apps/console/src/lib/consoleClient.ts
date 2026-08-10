@@ -169,6 +169,8 @@ export interface ConnectorDescriptor {
     | "oracle";
 }
 
+export type CredentialAccess = "unspecified" | "readOnly" | "readWrite";
+
 export interface ConnectionProfileV3 {
   formatVersion: 3;
   profileId: string;
@@ -183,6 +185,7 @@ export interface ConnectionProfileV3 {
   database?: string;
   tlsMode: ConnectorDescriptor["defaultTlsMode"];
   credentialId: string;
+  credentialAccess: CredentialAccess;
   autoReconnect: boolean;
 }
 

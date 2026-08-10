@@ -1,11 +1,15 @@
 import {
   Bot,
   Braces,
+  Check,
+  CircleAlert,
   Database,
   FileCode2,
+  KeyRound,
   Palette,
   Search,
   ShieldCheck,
+  Trash2,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -535,78 +539,200 @@ function SettingsCategoryPanel({
         </SettingsSection>
       );
     case "ai":
-      return (
-        <SettingsSection title="AI">
-          <SelectField
-            label="Provider"
-            value={draft.ai.provider}
-            onChange={(provider) =>
-              update("ai", {
-                provider: provider as ConsoleSettingsV2["ai"]["provider"],
-              })
-            }
-            options={[
-              ["openai", "OpenAI"],
-              ["openaiCompatible", "OpenAI-compatible"],
-              ["ollama", "Ollama"],
-            ]}
-          />
-          <TextField
-            label="模型"
-            value={draft.ai.model}
-            onChange={(model) => update("ai", { model })}
-          />
-          <TextField
-            label="端点"
-            value={draft.ai.endpoint ?? ""}
-            placeholder="使用 Provider 默认端点"
-            onChange={(endpoint) =>
-              update("ai", { endpoint: endpoint || undefined })
-            }
-          />
-          <SelectField
-            label="Reasoning"
-            value={draft.ai.reasoning}
-            onChange={(reasoning) =>
-              update("ai", {
-                reasoning: reasoning as ConsoleSettingsV2["ai"]["reasoning"],
-              })
-            }
-            options={[
-              ["low", "Low"],
-              ["medium", "Medium"],
-              ["high", "High"],
-            ]}
-          />
-          <SelectField
-            label="数据共享"
-            value={draft.ai.dataSharing}
-            onChange={(dataSharing) =>
-              update("ai", {
-                dataSharing:
-                  dataSharing as ConsoleSettingsV2["ai"]["dataSharing"],
-              })
-            }
-            options={[
-              ["schemaOnly", "仅 Schema、SQL 与错误"],
-              ["askEachTime", "样例数据逐次确认"],
-              ["allowSamples", "允许脱敏样例"],
-            ]}
-          />
-          <TextField
-            label="凭据引用"
-            value={draft.ai.credentialId ?? ""}
-            placeholder="未配置"
-            onChange={(credentialId) =>
-              update("ai", { credentialId: credentialId || undefined })
-            }
-          />
-          <p className="settings-note">
-            API Key 由 Windows Credential Manager 保存，本页不显示密钥。
-          </p>
-        </SettingsSection>
-      );
+      return <AiSettingsSection draft={draft} setDraft={setDraft} />;
   }
+}
+
+function AiSettingsSection({
+  draft,
+  setDraft,
+}: {
+  draft: ConsoleSettingsV2;
+  setDraft: Dispatch<SetStateAction<ConsoleSettingsV2>>;
+}) {
+  const runtimeMode = useWorkbenchStore((state) => state.aiRuntimeMode);
+  const credentialStatus = useWorkbenchStore(
+    (state) => state.aiCredentialStatus,
+  );
+  const credentialBusy = useWorkbenchStore((state) => state.aiCredentialBusy);
+  const credentialError = useWorkbenchStore(
+    (state) => state.aiCredentialError,
+  );
+  const refreshCredential = useWorkbenchStore(
+    (state) => state.refreshAiCredentialStatus,
+  );
+  const promptCredential = useWorkbenchStore(
+    (state) => state.promptAiCredential,
+  );
+  const deleteCredential = useWorkbenchStore(
+    (state) => state.deleteAiCredential,
+  );
+  const credentialId = draft.ai.credentialId;
+  const providerLabel =
+    draft.ai.provider === "openai"
+      ? "OpenAI"
+      : draft.ai.provider === "openaiCompatible"
+        ? "OpenAI-compatible"
+        : "Ollama";
+
+  useEffect(() => {
+    void refreshCredential(credentialId);
+  }, [credentialId, refreshCredential]);
+
+  const updateAi = (values: Partial<ConsoleSettingsV2["ai"]>) => {
+    setDraft((current) => ({
+      ...current,
+      ai: { ...current.ai, ...values },
+    }));
+  };
+
+  const setProvider = (value: string) => {
+    const provider = value as ConsoleSettingsV2["ai"]["provider"];
+    if (provider === "openai") {
+      updateAi({ provider, endpoint: undefined });
+    } else if (provider === "ollama") {
+      updateAi({ provider, endpoint: undefined, credentialId: undefined });
+    } else {
+      updateAi({ provider });
+    }
+  };
+
+  const configureCredential = async () => {
+    const targetId = credentialId ?? `provider-${draft.ai.provider}-default`;
+    const status = await promptCredential(targetId, providerLabel).catch(
+      () => null,
+    );
+    if (status) updateAi({ credentialId: status.credentialId });
+  };
+
+  const removeCredential = async () => {
+    if (!credentialId) return;
+    const removed = await deleteCredential(credentialId)
+      .then(() => true)
+      .catch(() => false);
+    if (removed) updateAi({ credentialId: undefined });
+  };
+
+  const configured =
+    credentialId !== undefined &&
+    credentialStatus?.credentialId === credentialId &&
+    credentialStatus.configured;
+
+  return (
+    <SettingsSection title="AI">
+      <SelectField
+        label="Provider"
+        value={draft.ai.provider}
+        onChange={setProvider}
+        options={[
+          ["openai", "OpenAI"],
+          ["openaiCompatible", "OpenAI-compatible"],
+          ["ollama", "Ollama"],
+        ]}
+      />
+      <TextField
+        label="模型"
+        value={draft.ai.model}
+        onChange={(model) => updateAi({ model })}
+      />
+      {draft.ai.provider !== "openai" && (
+        <TextField
+          label="端点"
+          value={draft.ai.endpoint ?? ""}
+          placeholder={
+            draft.ai.provider === "ollama"
+              ? "http://127.0.0.1:11434"
+              : "https://example.com/v1/responses"
+          }
+          onChange={(endpoint) =>
+            updateAi({ endpoint: endpoint || undefined })
+          }
+        />
+      )}
+      <SelectField
+        label="Reasoning"
+        value={draft.ai.reasoning}
+        onChange={(reasoning) =>
+          updateAi({
+            reasoning: reasoning as ConsoleSettingsV2["ai"]["reasoning"],
+          })
+        }
+        options={[
+          ["low", "Low"],
+          ["medium", "Medium"],
+          ["high", "High"],
+        ]}
+      />
+      <SelectField
+        label="数据共享"
+        value={draft.ai.dataSharing}
+        onChange={(dataSharing) =>
+          updateAi({
+            dataSharing:
+              dataSharing as ConsoleSettingsV2["ai"]["dataSharing"],
+          })
+        }
+        options={[
+          ["schemaOnly", "仅 Schema、SQL 与错误"],
+          ["askEachTime", "样例数据逐次确认"],
+          ["allowSamples", "允许脱敏样例"],
+        ]}
+      />
+
+      <div className="settings-credential" aria-label="AI API Key 状态">
+        <div>
+          {configured ? (
+            <Check size={14} aria-hidden="true" />
+          ) : (
+            <KeyRound size={14} aria-hidden="true" />
+          )}
+          <span>
+            <strong>{configured ? "API Key 已安全保存" : "API Key 未配置"}</strong>
+            <small>
+              {runtimeMode === "preview"
+                ? "Browser Preview 不读取或保存系统凭据"
+                : configured
+                  ? credentialStatus.accountLabel ?? "Windows Credential Manager"
+                  : "仅通过 Windows 原生凭据窗口设置"}
+            </small>
+          </span>
+        </div>
+        {draft.ai.provider !== "ollama" && (
+          <div>
+            <button
+              className="secondary-action"
+              type="button"
+              disabled={credentialBusy || runtimeMode === "preview"}
+              onClick={() => void configureCredential()}
+            >
+              <KeyRound size={12} aria-hidden="true" />
+              {configured ? "替换" : "设置"}
+            </button>
+            {credentialId && (
+              <button
+                className="danger-action"
+                type="button"
+                disabled={credentialBusy || runtimeMode === "preview"}
+                onClick={() => void removeCredential()}
+              >
+                <Trash2 size={12} aria-hidden="true" />
+                删除
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+      {credentialError && (
+        <p className="settings-credential-error" role="alert">
+          <CircleAlert size={13} aria-hidden="true" />
+          {credentialError.sqlState} · {credentialError.message}
+        </p>
+      )}
+      <p className="settings-note">
+        API Key 永远不会进入 React 状态、设置文件或 JavaScript 请求载荷。
+      </p>
+    </SettingsSection>
+  );
 }
 
 function SettingsSection({
