@@ -35,7 +35,7 @@
     "icon": ["icons/icon.ico"],
     "resources": {
       "staging/windows-x64/ordadb-server.exe": "ordadb-server.exe",
-      "staging/windows-x64/ordadb.exe": "ordadb.exe",
+      "staging/windows-x64/ordadb-cli.exe": "ordadb-cli.exe",
       "staging/windows-x64/ordadb-cli.cmd": "ordadb-cli.cmd",
       "staging/windows-x64/connectors/v1/catalog-v1.json": "connectors/v1/catalog-v1.json",
       "staging/windows-x64/connectors/v1/ordadb-connector-postgresql.exe": "connectors/v1/ordadb-connector-postgresql.exe",

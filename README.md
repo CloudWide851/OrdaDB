@@ -79,6 +79,40 @@ Cargo 检查必须串行运行；Playwright 应独占运行，避免与 release/
 DataGrip 或 Hibernate 的运行通过证据；真实验收使用 `Preflight`/`Run` 和隔离的
 verify-full TLS 数据库。
 
+## PostgreSQL 18 与产品验收状态
+
+`acceptance/` 是版本化、机器可读的产品验收源。状态严格区分：
+
+- `passed`：所需运行时或参考证据已实际执行并通过；
+- `regressionOnly`：OrdaDB 本地回归通过，但没有固定 PostgreSQL 18 参考结果，不能
+  宣称参考一致；
+- `unsupported`：明确拒绝的能力及 SQLSTATE；
+- `notRunMissingInputs` / `notRunManual` / `resourceBlocked`：分别表示缺少隔离外部
+  输入、需要人工 UI/提权证据或固定规模资源预检失败。
+
+离线验证会检查矩阵边界、证据路径、状态提升规则、性能阈值和客户端非通过基线；它不
+连接数据库、启动客户端或安装程序：
+
+```powershell
+pnpm acceptance:validate:x64
+```
+
+产品预检只记录缺失的环境变量名称以及磁盘/内存数值，不记录任何值、密码、证书内容
+或连接串。当前机器缺少完整的 PostgreSQL 18/九连接器隔离输入，且可用物理内存低于
+Full 门的 80 GiB，因此该命令会写出有界 blocked JSON 并以非零退出，这是预期的
+真实性门禁：
+
+```powershell
+pnpm acceptance:preflight:x64
+```
+
+当前声明的 SQL、类型、事务、Catalog、PL/pgSQL 与 Wire 能力是有本地回归覆盖的
+PostgreSQL 18 子集；尚未运行的参考差分、psql、pgJDBC、DataGrip、Hibernate、九个
+真实远端连接器和付费模型评测均明确未宣称通过。PostgreSQL 磁盘格式、C 扩展 ABI、
+FDW、复制、两阶段提交与 PITR 明确不支持。详细状态见
+`acceptance/postgres18-conformance.v1.json` 和
+`acceptance/product-acceptance.v1.json`。
+
 ## 最终规模门禁
 
 规模门禁是独立的 Windows x64 Rust example，不属于安装布局，因此不会增加第四个交付
@@ -118,8 +152,8 @@ target\x86_64-pc-windows-msvc\release\bundle\nsis\OrdaDB_0.1.0_x64-setup.exe
 
 - `OrdaDB.exe` — 桌面 Console
 - `ordadb-server.exe` — PostgreSQL/管理 API 与 Windows 服务
-- `ordadb.exe` — 默认进入自然语言全屏终端，也保留 SQL、管理与数据操作子命令
-- `ordadb-cli.cmd` — 兼容入口，转发到同目录的 `ordadb.exe`
+- `ordadb-cli.exe` — 默认进入自然语言全屏终端，也保留 SQL、管理与数据操作子命令
+- `ordadb-cli.cmd` — 兼容入口，转发到同目录的 `ordadb-cli.exe`
 
 安装器注册 `OrdaDB` own-process 服务，使用 `NT AUTHORITY\LocalService`、延迟自动
 启动及 5/15/60 秒失败重启策略。升级会幂等更新并重启服务；默认卸载删除程序与服务
@@ -139,7 +173,7 @@ target\x86_64-pc-windows-msvc\release\bundle\nsis\OrdaDB_0.1.0_x64-setup.exe
 
 ## 全屏终端 Agent
 
-在交互式 Windows 终端中直接运行 `ordadb.exe`（不带参数）会进入全屏工作台。默认是
+在交互式 Windows 终端中直接运行 `ordadb-cli.exe`（不带参数）会进入全屏工作台。默认是
 自然语言模式；`F2`、`/sql` 和 `/agent` 可切换 SQL/Agent 模式。只读 SQL 会在连接用户
 的 RBAC 权限下自动放入独立的 `READ ONLY` 事务并回滚；DML、DDL 和其他写入必须在
 高亮审批面板中确认，默认焦点始终为“拒绝”。
@@ -166,20 +200,20 @@ target\x86_64-pc-windows-msvc\release\bundle\nsis\OrdaDB_0.1.0_x64-setup.exe
 ```powershell
 $credential = Get-Credential -UserName dba
 $credential.GetNetworkCredential().Password |
-  .\ordadb.exe backup --user dba --password-stdin --path nightly.ordbak
+  .\ordadb-cli.exe backup --user dba --password-stdin --path nightly.ordbak
 
 $credential.GetNetworkCredential().Password |
-  .\ordadb.exe operations --user dba --password-stdin
+  .\ordadb-cli.exe operations --user dba --password-stdin
 
 $credential.GetNetworkCredential().Password |
-  .\ordadb.exe restore --user dba --password-stdin --path nightly.ordbak
+  .\ordadb-cli.exe restore --user dba --password-stdin --path nightly.ordbak
 
 $credential.GetNetworkCredential().Password |
-  .\ordadb.exe export --user dba --password-stdin `
+  .\ordadb-cli.exe export --user dba --password-stdin `
     --schema public --table documents --format csv --path documents.csv
 
 $credential.GetNetworkCredential().Password |
-  .\ordadb.exe import --user dba --password-stdin `
+  .\ordadb-cli.exe import --user dba --password-stdin `
     --schema public --table documents --format json-lines --path documents.jsonl
 ```
 

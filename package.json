@@ -13,6 +13,8 @@
     "installer:hooks:test": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-installer-hooks.ps1",
     "installer:hooks:compile": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-installer-hooks.ps1 -Compile",
     "package:stage:x64": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stage-windows-x64.ps1",
+    "acceptance:validate:x64": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-product-acceptance.ps1 -Mode Validate -SelfTest",
+    "acceptance:preflight:x64": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-product-acceptance.ps1 -Mode Preflight",
     "scale:smoke:x64": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-final-scale.ps1 -Profile Smoke",
     "scale:full:x64": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-final-scale.ps1 -Profile Full -ConfirmFullScale -RetainData",
     "desktop:dev": "pnpm --filter @ordadb/desktop dev",

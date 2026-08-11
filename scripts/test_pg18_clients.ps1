@@ -46,9 +46,20 @@ function Test-ContainedPath {
         [string]$Candidate
     )
 
-    $resolvedRoot = [IO.Path]::GetFullPath($Root).TrimEnd("\", "/") + [IO.Path]::DirectorySeparatorChar
+    $resolvedRoot = [IO.Path]::GetFullPath($Root).TrimEnd("\", "/")
     $resolvedCandidate = [IO.Path]::GetFullPath($Candidate)
-    return $resolvedCandidate.StartsWith($resolvedRoot, [StringComparison]::OrdinalIgnoreCase)
+    if ([string]::Equals(
+        $resolvedRoot,
+        $resolvedCandidate,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        return $true
+    }
+    $rootPrefix = $resolvedRoot + [IO.Path]::DirectorySeparatorChar
+    return $resolvedCandidate.StartsWith(
+        $rootPrefix,
+        [StringComparison]::OrdinalIgnoreCase
+    )
 }
 
 function Assert-NoReparseDirectory {
@@ -60,12 +71,21 @@ function Assert-NoReparseDirectory {
         [string]$Directory
     )
 
-    if (-not (Test-ContainedPath -Root $Root -Candidate (Join-Path $Directory "containment.probe"))) {
-        throw "A generated directory escaped its containment root."
-    }
     $resolvedRoot = [IO.Path]::GetFullPath($Root)
     $resolvedDirectory = [IO.Path]::GetFullPath($Directory)
-    $relative = [IO.Path]::GetRelativePath($resolvedRoot, $resolvedDirectory)
+    if (-not (Test-ContainedPath -Root $resolvedRoot -Candidate $resolvedDirectory)) {
+        throw "A generated directory escaped its containment root."
+    }
+    $rootPrefix = $resolvedRoot.TrimEnd("\", "/") + [IO.Path]::DirectorySeparatorChar
+    $relative = if ([string]::Equals(
+        $resolvedRoot,
+        $resolvedDirectory,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        ""
+    } else {
+        $resolvedDirectory.Substring($rootPrefix.Length)
+    }
     $current = $resolvedRoot
     if (Test-Path -LiteralPath $current) {
         $rootItem = Get-Item -LiteralPath $current -Force
@@ -166,6 +186,9 @@ function Write-AtomicJson {
     if ([IO.Path]::GetExtension($resolvedPath) -ne ".json") {
         throw "Evidence output must use a .json extension."
     }
+    if (Test-Path -LiteralPath $resolvedPath) {
+        throw "Client compatibility evidence is create-only and already exists."
+    }
     $directory = [IO.Path]::GetDirectoryName($resolvedPath)
     Assert-NoReparseDirectory -Root $evidenceRoot -Directory $directory
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
@@ -197,7 +220,7 @@ function Write-AtomicJson {
         $stream.Flush($true)
         $stream.Dispose()
         $stream = $null
-        [IO.File]::Move($temporaryPath, $resolvedPath, $true)
+        [IO.File]::Move($temporaryPath, $resolvedPath)
     } finally {
         if ($null -ne $stream) {
             $stream.Dispose()
