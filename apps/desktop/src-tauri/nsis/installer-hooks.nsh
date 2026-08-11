@@ -1,4 +1,4 @@
-!define ORDA_INSTALLER_CLI_SOURCE "${__FILEDIR__}\..\staging\windows-x64\ordadb-cli.exe"
+!define ORDA_INSTALLER_CLI_SOURCE "${__FILEDIR__}\..\staging\windows-x64\ordadb.exe"
 
 Var OrdaInstallerCli
 Var OrdaInstallerDataDir

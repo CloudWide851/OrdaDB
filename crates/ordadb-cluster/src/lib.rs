@@ -1009,7 +1009,7 @@ pub fn legacy_requires_migration(root: &Path) -> DbError {
     )
     .with_detail(format!("legacy cluster root: {}", root.display()))
     .with_hint(format!(
-        "run ordadb-cli storage-migrate --data-dir \"{}\" --dry-run, then rerun without --dry-run",
+        "run ordadb storage-migrate --data-dir \"{}\" --dry-run, then rerun without --dry-run",
         root.display()
     ))
 }

@@ -25,7 +25,7 @@ pub fn authenticate<S: Read + Write>(
     if !auth.has_users()? {
         return Err(
             DbError::new("55000", "OrdaDB administrator bootstrap is required")
-                .with_hint("run `ordadb-cli bootstrap` on the local machine"),
+                .with_hint("run `ordadb bootstrap` on the local machine"),
         );
     }
     let found = auth.scram_verifier(username).ok().flatten();

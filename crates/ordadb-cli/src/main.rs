@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 mod installer_storage;
+mod tui;
 
 const MAX_STDIN_SECRET_BYTES: u64 = 1024;
 
@@ -34,7 +35,11 @@ async fn main() {
 
 async fn run(arguments: Vec<String>) -> Result<()> {
     let Some(command) = arguments.first() else {
-        return Err(usage());
+        require_interactive_terminal(
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+        )?;
+        return tui::run().await;
     };
     let options = parse_options(&arguments[1..])?;
     let output = match command.as_str() {
@@ -420,8 +425,18 @@ fn ensure_empty(options: &BTreeMap<String, Option<String>>) -> Result<()> {
 
 fn usage() -> DbError {
     invalid(
-        "usage: ordadb-cli <bootstrap|sql|health|checkpoint|backup|restore|import|export|operations|service|storage-migrate|storage-rollback|installer-storage|validate-config> [options]",
+        "usage: ordadb <bootstrap|sql|health|checkpoint|backup|restore|import|export|operations|service|storage-migrate|storage-rollback|installer-storage|validate-config> [options]",
     )
+}
+
+fn require_interactive_terminal(stdin: bool, stdout: bool) -> Result<()> {
+    if !stdin || !stdout {
+        return Err(invalid(
+            "the full-screen terminal requires interactive stdin and stdout; use an explicit subcommand for redirected automation",
+        )
+        .with_hint("run `ordadb` in an interactive console or choose a CLI subcommand"));
+    }
+    Ok(())
 }
 
 fn invalid(message: impl Into<String>) -> DbError {
@@ -472,6 +487,23 @@ mod tests {
             .is_err()
         );
         assert!(parse_options(&["dba".into()]).is_err());
+    }
+
+    #[test]
+    fn redirected_zero_argument_startup_fails_before_terminal_input() {
+        assert_eq!(
+            require_interactive_terminal(false, true)
+                .expect_err("redirected stdin")
+                .sql_state,
+            "22023"
+        );
+        assert_eq!(
+            require_interactive_terminal(true, false)
+                .expect_err("redirected stdout")
+                .sql_state,
+            "22023"
+        );
+        require_interactive_terminal(true, true).expect("interactive");
     }
 
     #[test]

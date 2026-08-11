@@ -239,7 +239,13 @@ mod tests {
         directory.write_pe(AMD64_PE_MACHINE);
         let location = inspect_amd64_oracle_client_directories([directory.0.clone()])
             .expect("discover AMD64 OCI");
-        assert_eq!(location.directory(), directory.0);
+        assert_eq!(
+            location.directory(),
+            directory
+                .0
+                .canonicalize()
+                .expect("canonical test directory")
+        );
         assert_eq!(location.candidates_examined(), 1);
         let debug = format!("{location:?}");
         assert!(!debug.contains(directory.0.to_string_lossy().as_ref()));

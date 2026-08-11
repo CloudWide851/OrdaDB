@@ -116,9 +116,10 @@ target\x86_64-pc-windows-msvc\release\bundle\nsis\OrdaDB_0.1.0_x64-setup.exe
 
 安装目录包含且只交付三个主程序：
 
-- `ordadb.exe` — Console
+- `OrdaDB.exe` — 桌面 Console
 - `ordadb-server.exe` — PostgreSQL/管理 API 与 Windows 服务
-- `ordadb-cli.exe` — SQL、管理与数据操作 CLI
+- `ordadb.exe` — 默认进入自然语言全屏终端，也保留 SQL、管理与数据操作子命令
+- `ordadb-cli.cmd` — 兼容入口，转发到同目录的 `ordadb.exe`
 
 安装器注册 `OrdaDB` own-process 服务，使用 `NT AUTHORITY\LocalService`、延迟自动
 启动及 5/15/60 秒失败重启策略。升级会幂等更新并重启服务；默认卸载删除程序与服务
@@ -136,6 +137,27 @@ target\x86_64-pc-windows-msvc\release\bundle\nsis\OrdaDB_0.1.0_x64-setup.exe
 
 这些命令需要管理员权限；重复启停、安装或卸载是安全的。
 
+## 全屏终端 Agent
+
+在交互式 Windows 终端中直接运行 `ordadb.exe`（不带参数）会进入全屏工作台。默认是
+自然语言模式；`F2`、`/sql` 和 `/agent` 可切换 SQL/Agent 模式。只读 SQL 会在连接用户
+的 RBAC 权限下自动放入独立的 `READ ONLY` 事务并回滚；DML、DDL 和其他写入必须在
+高亮审批面板中确认，默认焦点始终为“拒绝”。
+
+常用命令：
+
+```text
+/connect [127.0.0.1:54329] [dba] [ordadb]
+/provider openai [gpt-5.6]
+/provider compatible <https://host/v1/responses> [model]
+/provider ollama [http://127.0.0.1:11434] [model]
+/help  /history  /clear  /cancel  /quit
+```
+
+数据库密码和 Provider API Key 只通过原生 Windows 凭据窗口进入 Credential Manager，
+不会写入设置、终端历史或命令行。将 stdin/stdout 重定向时，无参数启动会在五秒内返回
+结构化用法错误，不会等待交互输入；自动化继续使用下面的显式子命令。
+
 ## 备份、恢复与文件交换
 
 原生文件操作只接受服务 operations root 下的相对路径。密码只能从 stdin 进入 CLI，
@@ -144,20 +166,20 @@ target\x86_64-pc-windows-msvc\release\bundle\nsis\OrdaDB_0.1.0_x64-setup.exe
 ```powershell
 $credential = Get-Credential -UserName dba
 $credential.GetNetworkCredential().Password |
-  .\ordadb-cli.exe backup --user dba --password-stdin --path nightly.ordbak
+  .\ordadb.exe backup --user dba --password-stdin --path nightly.ordbak
 
 $credential.GetNetworkCredential().Password |
-  .\ordadb-cli.exe operations --user dba --password-stdin
+  .\ordadb.exe operations --user dba --password-stdin
 
 $credential.GetNetworkCredential().Password |
-  .\ordadb-cli.exe restore --user dba --password-stdin --path nightly.ordbak
+  .\ordadb.exe restore --user dba --password-stdin --path nightly.ordbak
 
 $credential.GetNetworkCredential().Password |
-  .\ordadb-cli.exe export --user dba --password-stdin `
+  .\ordadb.exe export --user dba --password-stdin `
     --schema public --table documents --format csv --path documents.csv
 
 $credential.GetNetworkCredential().Password |
-  .\ordadb-cli.exe import --user dba --password-stdin `
+  .\ordadb.exe import --user dba --password-stdin `
     --schema public --table documents --format json-lines --path documents.jsonl
 ```
 

@@ -115,7 +115,7 @@ pub(crate) async fn run_bootstrap_listener_with_ready(
                                     request.format_version
                                 ),
                             )
-                            .with_hint("upgrade ordadb-cli to the server version"),
+                            .with_hint("upgrade ordadb to the server version"),
                         ),
                     }
                 } else {

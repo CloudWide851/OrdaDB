@@ -1,9 +1,11 @@
 #![cfg(windows)]
 
+mod atomic_file;
 mod credential;
 mod oracle_client;
 mod pipe_security;
 
+pub use atomic_file::write_file_atomic;
 pub use credential::{
     CredentialVault, PromptedCredential, StoredCredential, prompt_for_credential,
 };
