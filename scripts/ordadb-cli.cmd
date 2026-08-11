@@ -1,3 +1,3 @@
 @echo off
-"%~dp0ordadb.exe" %*
+"%~dp0ordadb-cli.exe" %*
 exit /b %errorlevel%

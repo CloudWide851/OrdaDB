@@ -59,10 +59,23 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 New-Item -ItemType Directory -Path $stagingDirectory -Force | Out-Null
-$binaries = @("ordadb-server.exe", "ordadb.exe")
+$binaries = @(
+    [pscustomobject]@{
+        Source = "ordadb-server.exe"
+        Destination = "ordadb-server.exe"
+    },
+    [pscustomobject]@{
+        Source = "ordadb.exe"
+        Destination = "ordadb-cli.exe"
+    }
+)
+$legacyCliPath = Join-Path $stagingDirectory "ordadb.exe"
+if (Test-Path -LiteralPath $legacyCliPath -PathType Leaf) {
+    Remove-Item -LiteralPath $legacyCliPath -Force
+}
 foreach ($binary in $binaries) {
-    $source = Join-Path $targetDirectory $binary
-    $destination = Join-Path $stagingDirectory $binary
+    $source = Join-Path $targetDirectory $binary.Source
+    $destination = Join-Path $stagingDirectory $binary.Destination
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
         throw "Expected release executable was not produced: $source"
     }
@@ -77,8 +90,8 @@ if (-not (Test-Path -LiteralPath $launcherSource -PathType Leaf)) {
 }
 Copy-Item -LiteralPath $launcherSource -Destination $launcherDestination -Force
 $launcher = Get-Content -LiteralPath $launcherDestination -Raw
-if ($launcher -notmatch '(?i)%~dp0ordadb\.exe') {
-    throw "CLI compatibility launcher must resolve ordadb.exe beside itself"
+if ($launcher -notmatch '(?i)%~dp0ordadb-cli\.exe') {
+    throw "CLI compatibility launcher must resolve ordadb-cli.exe beside itself"
 }
 
 $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
@@ -129,7 +142,9 @@ if ((Get-ChildItem -LiteralPath $connectorDirectory -File).Count -ne $expectedCo
 }
 
 $unexpected = Get-ChildItem -LiteralPath $stagingDirectory -File |
-    Where-Object { $_.Name -notin (@($binaries) + @("ordadb-cli.cmd")) }
+    Where-Object {
+        $_.Name -notin (@($binaries.Destination) + @("ordadb-cli.cmd"))
+    }
 if ($unexpected) {
     throw "Windows staging contains unexpected files: $($unexpected.Name -join ', ')"
 }

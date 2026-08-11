@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "evidenceId": "ordadb-query-storage-performance-9f69f4b",
+  "recordedAt": "2026-08-11",
+  "target": "x86_64-pc-windows-msvc",
+  "baselineCommit": "9f69f4b",
+  "storageCandidateCommit": "42b703c",
+  "queryCandidateCommit": "2b7e5d4",
+  "policy": {
+    "maxProtectedRegressionPercent": 5.0,
+    "minPageScanImprovementPercent": 20.0,
+    "minSpillMergeImprovementPercent": 20.0,
+    "queryMemoryLimitBytes": 67108864
+  },
+  "observations": [
+    {
+      "id": "spill-sort-median",
+      "kind": "comparison",
+      "direction": "lowerIsBetter",
+      "metric": "medianMs",
+      "unit": "ms",
+      "baseline": 20047.5426,
+      "candidate": 4805.1548,
+      "maxRegressionPercent": 5.0,
+      "minImprovementPercent": 20.0,
+      "status": "passed",
+      "provenance": "Five-run 1M-input/500k-output spill sort with a 64 KiB soft limit; candidate query peak 135752 bytes."
+    },
+    {
+      "id": "spill-sort-allocations",
+      "kind": "comparison",
+      "direction": "lowerIsBetter",
+      "metric": "medianAllocations",
+      "unit": "allocations",
+      "baseline": 51022796,
+      "candidate": 51522797,
+      "maxRegressionPercent": 5.0,
+      "minImprovementPercent": 0.0,
+      "status": "passed",
+      "provenance": "Candidate allocation count increased about 0.98 percent and stayed inside the protected 5 percent line."
+    },
+    {
+      "id": "page-projected-scan-median",
+      "kind": "comparison",
+      "direction": "lowerIsBetter",
+      "metric": "medianMs",
+      "unit": "ms",
+      "baseline": 18.0,
+      "candidate": 6.0,
+      "maxRegressionPercent": 5.0,
+      "minImprovementPercent": 20.0,
+      "status": "passed",
+      "provenance": "Five-run provider-backed id projection over the same 100000-row persisted v2 fixture."
+    },
+    {
+      "id": "page-full-row-scan-median",
+      "kind": "comparison",
+      "direction": "lowerIsBetter",
+      "metric": "medianMs",
+      "unit": "ms",
+      "baseline": 21.0,
+      "candidate": 18.0,
+      "maxRegressionPercent": 5.0,
+      "minImprovementPercent": 0.0,
+      "status": "passed",
+      "provenance": "Protected full-row scan over the same persisted fixture did not regress."
+    },
+    {
+      "id": "ten-million-query-memory",
+      "kind": "limit",
+      "metric": "queryPeakBytes",
+      "unit": "bytes",
+      "observed": 106496,
+      "maximum": 67108864,
+      "status": "passed",
+      "provenance": "10M-row scan median 912.8434 ms, p95 988.7673 ms and process peak RSS 1221484544 bytes."
+    },
+    {
+      "id": "explicit-stack-guard",
+      "kind": "guard",
+      "metric": "minimumReleaseThreadStack",
+      "unit": "bytes",
+      "observed": 131072,
+      "maximum": 131072,
+      "status": "passed",
+      "provenance": "Release tests return SQLSTATE 54001 before native stack overflow for bounded plan/routine/trigger paths."
+    }
+  ]
+}

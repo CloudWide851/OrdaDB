@@ -1,0 +1,380 @@
+{
+  "schemaVersion": 1,
+  "matrixId": "ordadb-postgresql18-native-conformance",
+  "semanticTarget": "PostgreSQL 18.0",
+  "recordedAt": "2026-08-11",
+  "policy": {
+    "referenceConformantRequires": "passed",
+    "regressionOnlyIsNotConformance": true,
+    "unsupportedMustHaveSqlState": true
+  },
+  "capabilities": [
+    {
+      "id": "query-scan-filter-project",
+      "category": "query",
+      "capability": "SELECT scan, projection, predicates, ordering, LIMIT and nonzero OFFSET",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Native regression and performance tests pass; no pinned PostgreSQL 18 differential result is recorded.",
+      "regressionEvidence": ["crates/ordadb-engine/src/lib.rs", "crates/ordadb-execution/src/lib.rs"]
+    },
+    {
+      "id": "query-join-aggregate-sort",
+      "category": "query",
+      "capability": "INNER/LEFT joins, grouped aggregates, HAVING and bounded spill sort/hash execution",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Operator regressions and memory/spill gates pass without reference execution.",
+      "regressionEvidence": ["crates/ordadb-execution/src/advanced.rs", "crates/ordadb-execution/examples/execution_bench.rs"]
+    },
+    {
+      "id": "query-cte-recursive",
+      "category": "query",
+      "capability": "Non-recursive and iterative recursive CTEs with bounded depth and rows",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "CTE semantics and 54000/54001 bounds have local tests only.",
+      "regressionEvidence": ["crates/ordadb-sql/src/lib.rs", "crates/ordadb-engine/src/lib.rs"]
+    },
+    {
+      "id": "query-subquery-lateral",
+      "category": "query",
+      "capability": "Scalar/correlated subqueries, EXISTS, IN, ANY/ALL and derived LATERAL INNER/LEFT apply",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Local binder/executor tests pass; table-function and first-FROM LATERAL gaps remain unsupported.",
+      "regressionEvidence": ["crates/ordadb-sql/src/lib.rs", "crates/ordadb-execution/src/advanced.rs"]
+    },
+    {
+      "id": "query-set-operations",
+      "category": "query",
+      "capability": "UNION, INTERSECT and EXCEPT with ALL/DISTINCT semantics",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Local result, NULL and ordering regressions pass without live reference capture.",
+      "regressionEvidence": ["crates/ordadb-sql/src/lib.rs", "crates/ordadb-execution/src/advanced.rs"]
+    },
+    {
+      "id": "query-window-functions",
+      "category": "query",
+      "capability": "Named/inherited windows, rank/offset/value functions, aggregate FILTER and ROWS/RANGE frames",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Bounded in-memory/spilled window tests pass; PostgreSQL 18 differential rows/types are absent.",
+      "regressionEvidence": ["crates/ordadb-execution/src/advanced.rs", "crates/ordadb-sql/src/lib.rs"]
+    },
+    {
+      "id": "dml-returning-conflict-merge",
+      "category": "dml",
+      "capability": "INSERT/UPDATE/DELETE RETURNING, ON CONFLICT and MERGE",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Atomic candidate and command-tag regressions pass; client/reference replay is not run.",
+      "regressionEvidence": ["crates/ordadb-engine/src/lib.rs", "crates/ordadb-server/tests/client_compat/sql_corpus.v1.json"]
+    },
+    {
+      "id": "types-numeric-character-bytea",
+      "category": "types",
+      "capability": "Numeric/decimal, character/text and bytea scalar behavior and wire mapping",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Scalar, cast and NUMERIC wire regressions pass without differential reference execution.",
+      "regressionEvidence": ["crates/ordadb-types/src/lib.rs", "crates/ordadb-protocol/src/value.rs"]
+    },
+    {
+      "id": "types-temporal-uuid-interval",
+      "category": "types",
+      "capability": "Date, time, timestamp/time zone, interval and UUID",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Local parsing, storage and wire mapping tests pass; full PostgreSQL temporal edge corpus is not run.",
+      "regressionEvidence": ["crates/ordadb-types/src/lib.rs", "crates/ordadb-sql/src/lib.rs"]
+    },
+    {
+      "id": "types-array-enum-domain",
+      "category": "types",
+      "capability": "Arrays, enum evolution and domains",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Catalog/storage/index/wire regressions pass without a reference server.",
+      "regressionEvidence": ["crates/ordadb-catalog/src/lib.rs", "crates/ordadb-types/src/lib.rs"]
+    },
+    {
+      "id": "types-json-jsonb",
+      "category": "types",
+      "capability": "JSON/JSONB values, equality, casts and common functions",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Typed JSON tests pass; ordering and PostgreSQL's complete JSONB operator surface are not claimed.",
+      "regressionEvidence": ["crates/ordadb-types/src/lib.rs", "crates/ordadb-sql/src/lib.rs"]
+    },
+    {
+      "id": "types-casts-functions-operators",
+      "category": "types",
+      "capability": "Implicit/explicit casts, comparison/arithmetic operators and common built-ins",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Binder/evaluator tests pass for the declared subset; complete PostgreSQL built-ins are not claimed.",
+      "regressionEvidence": ["crates/ordadb-sql/src/lib.rs", "crates/ordadb-execution/src/lib.rs"]
+    },
+    {
+      "id": "ddl-schema-table-index-sequence-view",
+      "category": "ddl",
+      "capability": "Schema/table/column/constraint/index/sequence/view/materialized-view DDL",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Dependency, rollback, reopen and Catalog regressions pass; unrepresented clauses fail explicitly.",
+      "regressionEvidence": ["crates/ordadb-catalog/src/lib.rs", "crates/ordadb-engine/src/lib.rs"]
+    },
+    {
+      "id": "ddl-role-privilege-ownership",
+      "category": "ddl",
+      "capability": "Roles, grants/revokes, ownership and Manage bypass",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Deny-by-default RBAC and ownership tests pass without PostgreSQL role differential execution.",
+      "regressionEvidence": ["crates/ordadb-admin/src/rbac.rs", "crates/ordadb-catalog/src/lib.rs"]
+    },
+    {
+      "id": "transaction-read-committed",
+      "category": "transactions",
+      "capability": "MVCC Read Committed statement snapshots and concurrent unrelated writers",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Visibility and multi-writer regressions pass without differential anomaly replay.",
+      "regressionEvidence": ["crates/ordadb-transaction/src/lib.rs", "crates/ordadb-engine/src/lib.rs"]
+    },
+    {
+      "id": "transaction-repeatable-serializable",
+      "category": "transactions",
+      "capability": "Repeatable Read, Serializable SSI and read-only DEFERRABLE",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "SSI/read-set/anomaly regressions pass; PostgreSQL 18 differential schedules were not run.",
+      "regressionEvidence": ["crates/ordadb-transaction/src/lib.rs", "crates/ordadb-engine/src/lib.rs"]
+    },
+    {
+      "id": "transaction-savepoint-failed-state",
+      "category": "transactions",
+      "capability": "Savepoints/subtransactions, AND CHAIN and failed-transaction recovery",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Engine and ReadyForQuery I/T/E regressions pass without external differential execution.",
+      "regressionEvidence": ["crates/ordadb-engine/src/lib.rs", "crates/ordadb-protocol/src/server.rs"]
+    },
+    {
+      "id": "transaction-lock-deadlock-timeout",
+      "category": "transactions",
+      "capability": "Row/index/table locks, FIFO waits, cancellation, timeouts and deadlock victim selection",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Deterministic lock manager tests pass; timing behavior was not compared with PostgreSQL 18.",
+      "regressionEvidence": ["crates/ordadb-transaction/src/lib.rs", "crates/ordadb-admin/src/api.rs"]
+    },
+    {
+      "id": "maintenance-vacuum-analyze-recovery",
+      "category": "maintenance",
+      "capability": "VACUUM, ANALYZE, visibility reclamation, WAL checkpoint and crash recovery",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Fault-injection/reopen tests pass; PostgreSQL storage format and PITR are not claimed.",
+      "regressionEvidence": ["crates/ordadb-transaction/src/wal.rs", "crates/ordadb-engine/src/lib.rs"]
+    },
+    {
+      "id": "catalog-pg-information-schema",
+      "category": "catalog",
+      "capability": "Queryable pg_catalog and information_schema virtual relations with privilege filtering",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Projection/join/filter/OID tests pass; pinned DataGrip/PostgreSQL result capture is absent.",
+      "regressionEvidence": ["crates/ordadb-catalog/src/system.rs", "crates/ordadb-server/tests/client_compat/sql_corpus.v1.json"]
+    },
+    {
+      "id": "wire-startup-tls-scram",
+      "category": "wire",
+      "capability": "PostgreSQL v3 startup, verify-full TLS policy, SCRAM-SHA-256 and ParameterStatus",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Protocol/auth regressions pass; pinned external client TLS execution is missing.",
+      "regressionEvidence": ["crates/ordadb-protocol/src/server.rs", "crates/ordadb-protocol/src/scram.rs"]
+    },
+    {
+      "id": "wire-simple-extended-portal",
+      "category": "wire",
+      "capability": "Simple/Extended Query, prepared statements, Describe, suspension, Sync/Flush/Close",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Codec and E2E regressions pass; psql/pgJDBC/DataGrip runtime evidence is absent.",
+      "regressionEvidence": ["crates/ordadb-protocol/src/server.rs", "crates/ordadb-server/tests/service_e2e.rs"]
+    },
+    {
+      "id": "wire-copy",
+      "category": "wire",
+      "capability": "Bounded atomic COPY text/CSV IN and OUT",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Multi-batch, rollback and codec regressions pass without pinned psql/JDBC execution.",
+      "regressionEvidence": ["crates/ordadb-protocol/src/server.rs", "crates/ordadb-backup/src/lib.rs"]
+    },
+    {
+      "id": "wire-cancel-notice-notify",
+      "category": "wire",
+      "capability": "CancelRequest, NoticeResponse, LISTEN/NOTIFY and idle NotificationResponse",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Cancellation/notification tests pass; external client behavior has not been run.",
+      "regressionEvidence": ["crates/ordadb-protocol/src/server.rs", "crates/ordadb-engine/src/lib.rs"]
+    },
+    {
+      "id": "plpgsql-control-exception",
+      "category": "plpgsql",
+      "capability": "PL/pgSQL blocks, labels, loops, conditions, RAISE/ASSERT and exception handlers",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Compiler/VM regressions pass; complete PostgreSQL language parity is not claimed.",
+      "regressionEvidence": ["crates/ordadb-plpgsql/src/lib.rs"]
+    },
+    {
+      "id": "plpgsql-dynamic-cursor-record",
+      "category": "plpgsql",
+      "capability": "Dynamic EXECUTE, INTO/STRICT/USING, record/ROWTYPE and bounded cursors",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "VM/cursor spill tests pass without reference procedure execution.",
+      "regressionEvidence": ["crates/ordadb-plpgsql/src/lib.rs"]
+    },
+    {
+      "id": "plpgsql-trigger-procedure",
+      "category": "plpgsql",
+      "capability": "Row/statement triggers, INSTEAD OF views and eligible top-level procedure transaction control",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Trigger/procedure rollback and stack tests pass; unsupported trigger variants remain explicit.",
+      "regressionEvidence": ["crates/ordadb-plpgsql/src/lib.rs", "crates/ordadb-engine/src/lib.rs"]
+    },
+    {
+      "id": "core-reindex-listen-notify",
+      "category": "maintenance",
+      "capability": "REINDEX scopes, LISTEN/UNLISTEN/NOTIFY, DEALLOCATE ALL and DISCARD ALL",
+      "claimLevel": "implementedSubset",
+      "status": "regressionOnly",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Local atomicity/session cleanup tests pass without external client differential execution.",
+      "regressionEvidence": ["crates/ordadb-engine/src/lib.rs", "crates/ordadb-protocol/src/server.rs"]
+    },
+    {
+      "id": "resource-memory-stack-iterator",
+      "category": "resources",
+      "capability": "RAII query grants, bounded chunks/spill/iterators and explicit 54001 frame stacks",
+      "claimLevel": "productContract",
+      "status": "passed",
+      "referenceTarget": "OrdaDB Windows x64 hard-limit contract",
+      "reason": "Paired performance, 10M scan, cancellation/drop and 128 KiB release-stack tests passed.",
+      "regressionEvidence": ["acceptance/performance-evidence.v1.json", "crates/ordadb-execution/src/lib.rs"]
+    },
+    {
+      "id": "unsupported-database-ddl",
+      "category": "unsupported",
+      "capability": "Physical CREATE/ALTER/DROP DATABASE SQL commands",
+      "claimLevel": "notSupported",
+      "status": "unsupported",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "The v2 cluster owns real database boundaries, but physical database DDL is not exposed through SQL.",
+      "sqlState": "0A000",
+      "regressionEvidence": ["crates/ordadb-sql/src/lib.rs"]
+    },
+    {
+      "id": "unsupported-inheritance-partition-generated",
+      "category": "unsupported",
+      "capability": "Table inheritance, partitioning and generated columns",
+      "claimLevel": "notSupported",
+      "status": "unsupported",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "These accepted PostgreSQL clauses are outside the declared DDL subset and fail explicitly.",
+      "sqlState": "0A000",
+      "regressionEvidence": ["crates/ordadb-sql/src/lib.rs"]
+    },
+    {
+      "id": "unsupported-extensions-c-abi",
+      "category": "unsupported",
+      "capability": "PostgreSQL extensions and C extension ABI",
+      "claimLevel": "notSupported",
+      "status": "unsupported",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "OrdaDB does not load PostgreSQL C extensions or claim ABI compatibility.",
+      "sqlState": "0A000",
+      "regressionEvidence": ["README.md"]
+    },
+    {
+      "id": "unsupported-fdw",
+      "category": "unsupported",
+      "capability": "Foreign Data Wrappers",
+      "claimLevel": "notSupported",
+      "status": "unsupported",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "External databases use signed connector helpers, not PostgreSQL FDW APIs.",
+      "sqlState": "0A000",
+      "regressionEvidence": ["crates/ordadb-connectors/src/lib.rs"]
+    },
+    {
+      "id": "unsupported-replication",
+      "category": "unsupported",
+      "capability": "Physical/logical replication and hot standby",
+      "claimLevel": "notSupported",
+      "status": "unsupported",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "No replication protocol or standby product claim exists.",
+      "sqlState": "0A000",
+      "regressionEvidence": ["README.md"]
+    },
+    {
+      "id": "unsupported-two-phase-pitr",
+      "category": "unsupported",
+      "capability": "Two-phase commit, WAL archive and point-in-time recovery",
+      "claimLevel": "notSupported",
+      "status": "unsupported",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "Transactions and checkpoints are durable, but 2PC/WAL archive/PITR are not implemented.",
+      "sqlState": "0A000",
+      "regressionEvidence": ["crates/ordadb-transaction/src/wal.rs"]
+    },
+    {
+      "id": "unsupported-security-definer-events",
+      "category": "unsupported",
+      "capability": "SECURITY DEFINER, event/constraint/transition triggers and autonomous transactions",
+      "claimLevel": "notSupported",
+      "status": "unsupported",
+      "referenceTarget": "PostgreSQL 18.0",
+      "reason": "The procedural subset rejects these security/trigger/transaction behaviors explicitly.",
+      "sqlState": "0A000",
+      "regressionEvidence": ["crates/ordadb-plpgsql/src/lib.rs"]
+    }
+  ]
+}

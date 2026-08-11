@@ -1,0 +1,263 @@
+{
+  "schemaVersion": 1,
+  "acceptanceId": "ordadb-postgresql18-windows-x64-product",
+  "recordedAt": "2026-08-11",
+  "baselineCommit": "7d78a2b8203173e2fe66387d79a8b67e58f67741",
+  "target": {
+    "operatingSystem": "Windows",
+    "architecture": "AMD64",
+    "rustTarget": "x86_64-pc-windows-msvc",
+    "bundle": "nsis"
+  },
+  "limits": {
+    "maxSuites": 64,
+    "maxCapabilities": 256,
+    "maxEvidencePathsPerItem": 16,
+    "maxPrerequisiteNames": 128,
+    "maxStringBytes": 4096,
+    "maxInputBytes": 2097152,
+    "maxEvidenceBytes": 524288
+  },
+  "statusPolicy": {
+    "allowed": [
+      "passed",
+      "regressionOnly",
+      "unsupported",
+      "notRunMissingInputs",
+      "notRunManual",
+      "resourceBlocked",
+      "notApplicable"
+    ],
+    "referenceClaimRequires": "passed",
+    "presenceIsNotExecution": true,
+    "staticValidationIsNotExecution": true,
+    "preflightIsNotExecution": true
+  },
+  "sources": {
+    "conformance": "acceptance/postgres18-conformance.v1.json",
+    "performance": "acceptance/performance-evidence.v1.json",
+    "clientMatrix": "crates/ordadb-server/tests/client_compat/capability_matrix.v1.json",
+    "clientCorpus": "crates/ordadb-server/tests/client_compat/sql_corpus.v1.json"
+  },
+  "suites": [
+    {
+      "id": "postgres18-conformance",
+      "status": "regressionOnly",
+      "reason": "Native regression coverage is extensive, but the pinned PostgreSQL 18 differential corpus has not been executed against a reference server.",
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-product-acceptance.ps1 -Mode Validate",
+      "evidencePaths": [
+        "acceptance/postgres18-conformance.v1.json",
+        "crates/ordadb-server/tests/client_compat/sql_corpus.v1.json"
+      ]
+    },
+    {
+      "id": "postgres18-clients",
+      "status": "notRunMissingInputs",
+      "reason": "Pinned isolated verify-full TLS endpoint, credentials, psql 18 and complete ORM runtime inputs are not all available; DataGrip is manual.",
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_pg18_clients.ps1 -Mode Run",
+      "evidencePaths": [
+        "crates/ordadb-server/tests/client_compat/capability_matrix.v1.json",
+        "crates/ordadb-server/tests/client_compat/sql_corpus.v1.json",
+        "scripts/test_pg18_clients.ps1"
+      ]
+    },
+    {
+      "id": "signed-connectors",
+      "status": "notRunMissingInputs",
+      "reason": "The nine real remote services, TLS credentials and AMD64 Oracle OCI are not configured on this workstation.",
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-connectors-real-windows-x64.ps1",
+      "evidencePaths": [
+        "scripts/test-connectors-real-windows-x64.ps1",
+        "crates/ordadb-connectors/src/manifest.rs"
+      ]
+    },
+    {
+      "id": "query-performance",
+      "status": "passed",
+      "reason": "Paired milestone evidence meets the protected 5 percent regression line, page/spill improvement targets and hard query memory/stack bounds.",
+      "command": "cargo run --locked --release --target x86_64-pc-windows-msvc -p ordadb-execution --example execution_bench",
+      "evidencePaths": [
+        "acceptance/performance-evidence.v1.json",
+        "crates/ordadb-execution/examples/execution_bench.rs"
+      ]
+    },
+    {
+      "id": "mvcc-recovery",
+      "status": "regressionOnly",
+      "reason": "Isolation, SSI, lock, deadlock, savepoint, vacuum and crash regressions passed locally but were not differentially replayed against PostgreSQL 18.",
+      "command": "cargo test --locked -p ordadb-engine --target x86_64-pc-windows-msvc",
+      "evidencePaths": [
+        "crates/ordadb-transaction/src/lib.rs",
+        "crates/ordadb-engine/src/lib.rs"
+      ]
+    },
+    {
+      "id": "controlled-ai-safety",
+      "status": "regressionOnly",
+      "reason": "Deterministic provider, approval, disclosure, cancellation and secret-boundary tests passed; no paid-provider quality run was performed.",
+      "command": "cargo test --locked -p ordadb-ai --target x86_64-pc-windows-msvc",
+      "evidencePaths": [
+        "crates/ordadb-ai/src/lib.rs",
+        "apps/console/src/lib/aiClient.test.ts"
+      ]
+    },
+    {
+      "id": "terminal-agent",
+      "status": "passed",
+      "reason": "Unit, packaging and real isolated ConPTY render/resize/mode/quit/restoration evidence passed.",
+      "command": "cargo test --locked -p ordadb-cli --bins --target x86_64-pc-windows-msvc",
+      "evidencePaths": [
+        "crates/ordadb-cli/src/tui/mod.rs",
+        "crates/ordadb-cli/src/tui/terminal.rs",
+        "scripts/ordadb-cli.cmd"
+      ]
+    },
+    {
+      "id": "frontend-workbench",
+      "status": "passed",
+      "reason": "Frozen install, lint, typecheck, single-worker Vitest, exclusive Playwright and production build passed for the merged baseline.",
+      "command": "pnpm test",
+      "evidencePaths": [
+        "apps/console/package.json",
+        "apps/console/playwright.config.ts"
+      ]
+    },
+    {
+      "id": "windows-packaging-static",
+      "status": "passed",
+      "reason": "The current isolated Windows x64 package run produced one NSIS installer with three case-insensitively unique product executables and the exact nine-helper AMD64 inventory.",
+      "command": "pnpm desktop:build:x64",
+      "evidencePaths": [
+        "apps/desktop/src-tauri/tauri.conf.json",
+        "scripts/stage-windows-x64.ps1",
+        "scripts/test-installer-hooks.ps1"
+      ]
+    },
+    {
+      "id": "installer-runtime",
+      "status": "notRunManual",
+      "reason": "A disposable elevated install, upgrade and uninstall was not executed; static hooks, migration and unpacked payload evidence are separate passed gates.",
+      "command": "manual isolated elevated NSIS install/upgrade/uninstall",
+      "evidencePaths": [
+        "apps/desktop/src-tauri/nsis/installer-hooks.nsh",
+        "scripts/test-installer-hooks.ps1"
+      ]
+    },
+    {
+      "id": "full-scale",
+      "status": "resourceBlocked",
+      "reason": "The fixed Full profile requires 80 GiB free physical memory for the current snapshot path; this workstation has about 8.6 GiB available.",
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-final-scale.ps1 -Profile Full -ConfirmFullScale -RetainData",
+      "evidencePaths": [
+        "scripts/run-final-scale.ps1",
+        "crates/ordadb-engine/examples/final_scale.rs"
+      ]
+    },
+    {
+      "id": "governance-release",
+      "status": "notApplicable",
+      "reason": "This task is product acceptance, not a formal release; CHANGELOG, tags and GitHub Releases intentionally remain unchanged.",
+      "command": "git diff -- CHANGELOG.md",
+      "evidencePaths": [
+        "README.md"
+      ]
+    }
+  ],
+  "prerequisiteGroups": [
+    {
+      "id": "postgres18Clients",
+      "requiredInputNames": [
+        "ORDADB_PG18_HOST",
+        "ORDADB_PG18_PORT",
+        "ORDADB_PG18_DATABASE",
+        "ORDADB_PG18_USER",
+        "ORDADB_PG18_PASSWORD",
+        "ORDADB_PG18_SSLMODE",
+        "ORDADB_PG18_ROOT_CERT",
+        "ORDADB_PG18_ISOLATED_CONFIRM"
+      ]
+    },
+    {
+      "id": "realConnectors",
+      "requiredInputNames": [
+        "ORDADB_TEST_POSTGRESQL_HOST",
+        "ORDADB_TEST_POSTGRESQL_USER",
+        "ORDADB_TEST_POSTGRESQL_PASSWORD",
+        "ORDADB_TEST_POSTGRESQL_TLS",
+        "ORDADB_TEST_MYSQL_HOST",
+        "ORDADB_TEST_MYSQL_USER",
+        "ORDADB_TEST_MYSQL_PASSWORD",
+        "ORDADB_TEST_MYSQL_TLS",
+        "ORDADB_TEST_SQL_SERVER_HOST",
+        "ORDADB_TEST_SQL_SERVER_USER",
+        "ORDADB_TEST_SQL_SERVER_PASSWORD",
+        "ORDADB_TEST_SQL_SERVER_TLS",
+        "ORDADB_TEST_MONGODB_HOST",
+        "ORDADB_TEST_MONGODB_DATABASE",
+        "ORDADB_TEST_MONGODB_USER",
+        "ORDADB_TEST_MONGODB_PASSWORD",
+        "ORDADB_TEST_MONGODB_TLS",
+        "ORDADB_TEST_REDIS_HOST",
+        "ORDADB_TEST_REDIS_PASSWORD",
+        "ORDADB_TEST_REDIS_TLS",
+        "ORDADB_TEST_REDIS_MODE",
+        "ORDADB_TEST_MARIADB_HOST",
+        "ORDADB_TEST_MARIADB_USER",
+        "ORDADB_TEST_MARIADB_PASSWORD",
+        "ORDADB_TEST_MARIADB_TLS",
+        "ORDADB_TEST_CLICKHOUSE_HOST",
+        "ORDADB_TEST_CLICKHOUSE_USER",
+        "ORDADB_TEST_CLICKHOUSE_PASSWORD",
+        "ORDADB_TEST_CLICKHOUSE_TLS",
+        "ORDADB_TEST_ORACLE_HOST",
+        "ORDADB_TEST_ORACLE_SERVICE",
+        "ORDADB_TEST_ORACLE_USERNAME",
+        "ORDADB_TEST_ORACLE_PASSWORD",
+        "ORDADB_TEST_ORACLE_CLIENT_DIR"
+      ]
+    }
+  ],
+  "fullScale": {
+    "targetBytes": 21474836480,
+    "rows": 10000000,
+    "connections": 32,
+    "requiredFreeDiskBytes": 64424509440,
+    "requiredFreeMemoryBytes": 85899345920,
+    "overridesAllowed": false
+  },
+  "artifacts": {
+    "topLevelExecutables": [
+      "OrdaDB.exe",
+      "ordadb-server.exe",
+      "ordadb-cli.exe"
+    ],
+    "topLevelLaunchers": [
+      "ordadb-cli.cmd"
+    ],
+    "connectorDirectory": "connectors/v1",
+    "connectorExecutables": [
+      "ordadb-connector-postgresql.exe",
+      "ordadb-connector-mysql.exe",
+      "ordadb-connector-sqlite.exe",
+      "ordadb-connector-sql-server.exe",
+      "ordadb-connector-mongodb.exe",
+      "ordadb-connector-redis.exe",
+      "ordadb-connector-mariadb.exe",
+      "ordadb-connector-clickhouse.exe",
+      "ordadb-connector-oracle.exe"
+    ],
+    "connectorCatalog": "catalog-v1.json",
+    "peMachine": 34404,
+    "installerPattern": "OrdaDB_*_x64-setup.exe",
+    "forbiddenBundleExtensions": [
+      ".msi",
+      ".msix",
+      ".appx",
+      ".appxbundle",
+      ".dmg",
+      ".deb",
+      ".rpm",
+      ".appimage"
+    ]
+  }
+}

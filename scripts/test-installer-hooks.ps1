@@ -48,6 +48,8 @@ function Assert-Before {
 
 Assert-Contains $hooks 'File "/oname=$PLUGINSDIR\ordadb-installer-cli.exe"' `
     "Installer CLI must be extracted only to the NSIS plugin directory"
+Assert-Contains $hooks 'staging\windows-x64\ordadb-cli.exe' `
+    "Installer-private CLI must use the distinct staged CLI executable"
 Assert-Contains $hooks "installer-storage --preflight" `
     "Installer must run storage preflight"
 Assert-Contains $hooks "installer-storage --apply" `
@@ -105,12 +107,26 @@ $topLevelResourceExecutables = @(
         } |
         ForEach-Object { [string]$_.Value }
 )
-$expected = @("ordadb-server.exe", "ordadb.exe")
+$expected = @("ordadb-server.exe", "ordadb-cli.exe")
 if (
     $topLevelResourceExecutables.Count -ne $expected.Count -or
     @($topLevelResourceExecutables | Where-Object { $_ -notin $expected }).Count -ne 0
 ) {
     throw "Tauri resources must add exactly the server and CLI beside the main OrdaDB executable"
+}
+
+$installedExecutableNames = @("$($config.mainBinaryName).exe") +
+    $topLevelResourceExecutables
+$caseInsensitiveNames = [Collections.Generic.HashSet[string]]::new(
+    [StringComparer]::OrdinalIgnoreCase
+)
+foreach ($name in $installedExecutableNames) {
+    if (-not $caseInsensitiveNames.Add($name)) {
+        throw "Installed executable names must be unique on a case-insensitive Windows filesystem"
+    }
+}
+if ($caseInsensitiveNames.Count -ne 3) {
+    throw "Tauri must install exactly three case-insensitively unique executables"
 }
 
 $launcherResources = @(
@@ -119,6 +135,12 @@ $launcherResources = @(
 )
 if ($launcherResources.Count -ne 1) {
     throw "Tauri resources must contain exactly one ordadb-cli.cmd compatibility launcher"
+}
+
+$launcherPath = Join-Path $repositoryRoot "scripts\ordadb-cli.cmd"
+$launcher = Get-Content -LiteralPath $launcherPath -Raw
+if ($launcher -notmatch '(?i)%~dp0ordadb-cli\.exe') {
+    throw "CLI compatibility launcher must resolve the distinct ordadb-cli.exe"
 }
 
 Write-Output "Installer hook ordering, migration safety, unique desktop target, NSIS-only target, and three-EXE layout are valid."
