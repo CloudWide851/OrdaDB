@@ -59,7 +59,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 New-Item -ItemType Directory -Path $stagingDirectory -Force | Out-Null
-$binaries = @("ordadb-server.exe", "ordadb-cli.exe")
+$binaries = @("ordadb-server.exe", "ordadb.exe")
 foreach ($binary in $binaries) {
     $source = Join-Path $targetDirectory $binary
     $destination = Join-Path $stagingDirectory $binary
@@ -69,6 +69,16 @@ foreach ($binary in $binaries) {
     Assert-Amd64Pe -Path $source
     Copy-Item -LiteralPath $source -Destination $destination -Force
     Assert-Amd64Pe -Path $destination
+}
+$launcherSource = Join-Path $repositoryRoot "scripts\ordadb-cli.cmd"
+$launcherDestination = Join-Path $stagingDirectory "ordadb-cli.cmd"
+if (-not (Test-Path -LiteralPath $launcherSource -PathType Leaf)) {
+    throw "Expected CLI compatibility launcher is missing: $launcherSource"
+}
+Copy-Item -LiteralPath $launcherSource -Destination $launcherDestination -Force
+$launcher = Get-Content -LiteralPath $launcherDestination -Raw
+if ($launcher -notmatch '(?i)%~dp0ordadb\.exe') {
+    throw "CLI compatibility launcher must resolve ordadb.exe beside itself"
 }
 
 $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
@@ -119,7 +129,7 @@ if ((Get-ChildItem -LiteralPath $connectorDirectory -File).Count -ne $expectedCo
 }
 
 $unexpected = Get-ChildItem -LiteralPath $stagingDirectory -File |
-    Where-Object { $_.Name -notin $binaries }
+    Where-Object { $_.Name -notin (@($binaries) + @("ordadb-cli.cmd")) }
 if ($unexpected) {
     throw "Windows staging contains unexpected files: $($unexpected.Name -join ', ')"
 }
@@ -129,4 +139,4 @@ if ($unexpectedDirectories) {
     throw "Windows staging contains unexpected directories: $($unexpectedDirectories.Name -join ', ')"
 }
 
-Write-Output "Staged AMD64 product binaries and nine signed connector resources in $stagingDirectory"
+Write-Output "Staged AMD64 product binaries, CLI launcher, and nine signed connector resources in $stagingDirectory"

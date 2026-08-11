@@ -7,8 +7,10 @@ $ErrorActionPreference = "Stop"
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $hooksPath = Join-Path $repositoryRoot "apps\desktop\src-tauri\nsis\installer-hooks.nsh"
 $configPath = Join-Path $repositoryRoot "apps\desktop\src-tauri\tauri.conf.json"
+$manifestPath = Join-Path $repositoryRoot "apps\desktop\src-tauri\Cargo.toml"
 $hooks = Get-Content -LiteralPath $hooksPath -Raw
 $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+$manifest = Get-Content -LiteralPath $manifestPath -Raw
 
 function Assert-Contains {
     param(
@@ -79,6 +81,21 @@ if ($targets.Count -ne 1 -or $targets[0] -ne "nsis") {
     throw "Tauri bundle targets must contain only NSIS"
 }
 
+if ($manifest -notmatch '(?ms)\[\[bin\]\]\s*name\s*=\s*"([^"]+)"') {
+    throw "Desktop Cargo manifest must declare one explicit binary target"
+}
+$desktopBinaryName = $Matches[1]
+if ($config.mainBinaryName -ne "OrdaDB") {
+    throw "Tauri must rename the internal desktop Cargo target to OrdaDB.exe"
+}
+if (
+    $desktopBinaryName -eq "ordadb" -or
+    $desktopBinaryName.Replace("-", "_") -eq "ordadb_desktop" -or
+    $desktopBinaryName -eq $config.mainBinaryName
+) {
+    throw "Desktop Cargo target must not collide with the CLI executable or desktop library"
+}
+
 $topLevelResourceExecutables = @(
     $config.bundle.resources.PSObject.Properties |
         Where-Object {
@@ -88,7 +105,7 @@ $topLevelResourceExecutables = @(
         } |
         ForEach-Object { [string]$_.Value }
 )
-$expected = @("ordadb-server.exe", "ordadb-cli.exe")
+$expected = @("ordadb-server.exe", "ordadb.exe")
 if (
     $topLevelResourceExecutables.Count -ne $expected.Count -or
     @($topLevelResourceExecutables | Where-Object { $_ -notin $expected }).Count -ne 0
@@ -96,7 +113,15 @@ if (
     throw "Tauri resources must add exactly the server and CLI beside the main OrdaDB executable"
 }
 
-Write-Output "Installer hook ordering, migration safety, NSIS-only target, and three-EXE layout are valid."
+$launcherResources = @(
+    $config.bundle.resources.PSObject.Properties |
+        Where-Object { $_.Value -eq "ordadb-cli.cmd" }
+)
+if ($launcherResources.Count -ne 1) {
+    throw "Tauri resources must contain exactly one ordadb-cli.cmd compatibility launcher"
+}
+
+Write-Output "Installer hook ordering, migration safety, unique desktop target, NSIS-only target, and three-EXE layout are valid."
 
 if ($Compile) {
     $makeNsis = Join-Path $env:LOCALAPPDATA "tauri\NSIS\makensis.exe"
