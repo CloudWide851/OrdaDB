@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 1,
+  "retrievedAt": "2026-08-12",
+  "trademarkNotice": "All third-party product names, logos, and brands are property of their respective owners. Inclusion identifies a compatible connector and does not imply endorsement.",
+  "assets": [
+    {
+      "connectorId": "ordadb-native",
+      "vendor": "OrdaDB",
+      "assetPath": "../../../../logo.svg",
+      "officialSource": "https://github.com/siyez/OrdaDB/blob/main/logo.svg",
+      "retrievedAt": "2026-08-12",
+      "upstreamRevision": "project canonical logo",
+      "sha256": "19cfedc4bfc2a421984040abeb6d816abad16b4aefa421440c735df84483752b",
+      "trademarkNotice": "OrdaDB project logo."
+    },
+    {
+      "connectorId": "postgresql",
+      "vendor": "PostgreSQL Global Development Group",
+      "assetPath": "../assets/connectors/postgresql.png",
+      "officialSource": "https://www.postgresql.org/media/img/about/press/elephant.png",
+      "retrievedAt": "2026-08-12",
+      "upstreamRevision": "PostgreSQL Press FAQ asset retrieved 2026-08-12",
+      "sha256": "ff92fb5d12a7fa6b23c2eb403d2edf4fbc58ced802021e1f02c3583cb70957be",
+      "trademarkNotice": "PostgreSQL and the PostgreSQL elephant logo are trademarks of the PostgreSQL Community Association of Canada."
+    },
+    {
+      "connectorId": "mysql",
+      "vendor": "Oracle Corporation / MySQL",
+      "assetPath": "../assets/connectors/mysql.png",
+      "officialSource": "https://www.mysql.com/common/logos/logo-mysql-170x115.png",
+      "retrievedAt": "2026-08-12",
+      "upstreamRevision": "MySQL Logo Downloads asset retrieved 2026-08-12",
+      "sha256": "2d59bc428916752528280eac03330d712164163e2f3c476409f5c25d8a7c2778",
+      "trademarkNotice": "MySQL and the MySQL dolphin logo are trademarks of Oracle and/or its affiliates."
+    },
+    {
+      "connectorId": "sqlite",
+      "vendor": "SQLite",
+      "assetPath": "../assets/connectors/sqlite.svg",
+      "officialSource": "https://github.com/sqlite/sqlite/blob/d004268b2766a5a9ae8a8c627da69fd3afaa5d26/art/sqlite370.svg",
+      "retrievedAt": "2026-08-12",
+      "upstreamRevision": "d004268b2766a5a9ae8a8c627da69fd3afaa5d26",
+      "sha256": "462c4ce8229b585dd6880cd308b121d9de63eb619db05e469598594e80d7b151",
+      "trademarkNotice": "SQLite name and official artwork are owned by their respective project owners."
+    },
+    {
+      "connectorId": "sql-server",
+      "vendor": "Microsoft",
+      "assetPath": "../assets/connectors/sql-server.png",
+      "officialSource": "https://github.com/MicrosoftDocs/sql-docs/blob/c8e798979d06345d51d0c628fa97e53928b4ee1e/docs/sql-server/media/sql-database-engine.png",
+      "retrievedAt": "2026-08-12",
+      "upstreamRevision": "c8e798979d06345d51d0c628fa97e53928b4ee1e",
+      "sha256": "6b6f2455d706b2898a4578de2f0d2d564ba47e1c60cc913f1e823a09a87456bf",
+      "trademarkNotice": "Microsoft and SQL Server are trademarks of the Microsoft group of companies."
+    },
+    {
+      "connectorId": "mongodb",
+      "vendor": "MongoDB, Inc.",
+      "assetPath": "../assets/connectors/mongodb.png",
+      "officialSource": "https://github.com/mongodb-js/compass/blob/bb2b22297c498e293424af6585ce32a05b488fd4/packages/compass/app-icons/linux/mongodb-compass-logo-stable.png",
+      "retrievedAt": "2026-08-12",
+      "upstreamRevision": "bb2b22297c498e293424af6585ce32a05b488fd4",
+      "sha256": "f02fe14a9cb9a825760d94c252c22ec6953abd059a4fe9823dd697515470e1e7",
+      "trademarkNotice": "MongoDB and the leaf logo are registered trademarks of MongoDB, Inc."
+    },
+    {
+      "connectorId": "redis",
+      "vendor": "Redis Ltd.",
+      "assetPath": "../assets/connectors/redis.svg",
+      "officialSource": "https://github.com/redis/docs/blob/dfd368914771bc609864baecfbe2951b21e04f73/assets/icons/logo.svg",
+      "retrievedAt": "2026-08-12",
+      "upstreamRevision": "dfd368914771bc609864baecfbe2951b21e04f73",
+      "sha256": "a67dc854323a15e48cd49b56c44204d192a8a4f073190b43681fc4d7e9f3c255",
+      "trademarkNotice": "Redis and the Redis logo are trademarks of Redis Ltd."
+    },
+    {
+      "connectorId": "mariadb",
+      "vendor": "MariaDB plc",
+      "assetPath": "../assets/connectors/mariadb.svg",
+      "officialSource": "https://mariadb.org/wp-content/uploads/2019/10/mariadb_logo.svg",
+      "retrievedAt": "2026-08-12",
+      "upstreamRevision": "MariaDB Foundation About page asset retrieved 2026-08-12",
+      "sha256": "f640fd15c0f6782ea40ec984bb8335cacf3c624fa8300dfc33f9c84557cd409f",
+      "trademarkNotice": "MariaDB is a trademark of MariaDB plc and/or its affiliates."
+    },
+    {
+      "connectorId": "clickhouse",
+      "vendor": "ClickHouse, Inc.",
+      "assetPath": "../assets/connectors/clickhouse.svg",
+      "officialSource": "https://github.com/ClickHouse/ClickHouse/blob/40b7156a46c174c15f0aac19947b2166e483e21b/docs/img/clickhouse-logo-mark.svg",
+      "retrievedAt": "2026-08-12",
+      "upstreamRevision": "40b7156a46c174c15f0aac19947b2166e483e21b",
+      "sha256": "99037fb343a0e32887d258c88f142c4f97124f8964ba1dfddf08f159bcdd1bf7",
+      "trademarkNotice": "ClickHouse and the ClickHouse logo are trademarks of ClickHouse, Inc."
+    },
+    {
+      "connectorId": "oracle",
+      "vendor": "Oracle Corporation",
+      "assetPath": "../assets/connectors/oracle.png",
+      "officialSource": "https://github.com/oracle-samples/oracle-db-examples/blob/d82112b30eb260b844d2f953d71b2df3b1a5dde3/sagas/CloudBank-DEMO/Website/static/images/oracle.png",
+      "retrievedAt": "2026-08-12",
+      "upstreamRevision": "d82112b30eb260b844d2f953d71b2df3b1a5dde3",
+      "sha256": "5e41f87c44544ec3ccb1583b3ec6432135fcc018b1d760e5c7eef7ebcfeb8e87",
+      "trademarkNotice": "Oracle and the Oracle logo are registered trademarks of Oracle and/or its affiliates."
+    }
+  ]
+}

@@ -10,6 +10,7 @@ use ordadb_types::{DbError, Result};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
+mod installer_service;
 mod installer_storage;
 mod tui;
 
@@ -56,6 +57,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "storage-migrate" => storage_migrate(options)?,
         "storage-rollback" => storage_rollback(options)?,
         "installer-storage" => installer_storage::run(options)?,
+        "installer-service" => installer_service::run(options)?,
         "validate-config" => validate_config(options)?,
         _ => return Err(usage()),
     };
@@ -425,7 +427,7 @@ fn ensure_empty(options: &BTreeMap<String, Option<String>>) -> Result<()> {
 
 fn usage() -> DbError {
     invalid(
-        "usage: ordadb <bootstrap|sql|health|checkpoint|backup|restore|import|export|operations|service|storage-migrate|storage-rollback|installer-storage|validate-config> [options]",
+        "usage: ordadb <bootstrap|sql|health|checkpoint|backup|restore|import|export|operations|service|storage-migrate|storage-rollback|installer-storage|installer-service|validate-config> [options]",
     )
 }
 

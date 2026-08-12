@@ -90,7 +90,9 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_Security_Credentials",
   "Win32_Storage_FileSystem",
   "Win32_System_ProcessStatus",
+  "Win32_System_Services",
   "Win32_System_Threading",
+  "Win32_UI_Shell",
 ] }
 zeroize = { version = "1.9.0", features = ["derive"] }
 mysql_async = { version = "0.37.0", default-features = false, features = ["default-rustls-ring", "chrono", "rust_decimal"] }

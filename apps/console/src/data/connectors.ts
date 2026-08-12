@@ -1,13 +1,13 @@
 import ordadbLogoUrl from "../../../../logo.svg?url";
-import mysqlLogoUrl from "../assets/connectors/mysql.svg?url";
+import mysqlLogoUrl from "../assets/connectors/mysql.png?url";
 import clickhouseLogoUrl from "../assets/connectors/clickhouse.svg?url";
 import mariadbLogoUrl from "../assets/connectors/mariadb.svg?url";
-import mongodbLogoUrl from "../assets/connectors/mongodb.svg?url";
-import oracleLogoUrl from "../assets/connectors/oracle.svg?url";
-import postgresqlLogoUrl from "../assets/connectors/postgresql.svg?url";
+import mongodbLogoUrl from "../assets/connectors/mongodb.png?url";
+import oracleLogoUrl from "../assets/connectors/oracle.png?url";
+import postgresqlLogoUrl from "../assets/connectors/postgresql.png?url";
 import redisLogoUrl from "../assets/connectors/redis.svg?url";
 import sqliteLogoUrl from "../assets/connectors/sqlite.svg?url";
-import sqlServerLogoUrl from "../assets/connectors/sql-server.svg?url";
+import sqlServerLogoUrl from "../assets/connectors/sql-server.png?url";
 import type {
   ConnectorDescriptor,
   DataSourceKind,

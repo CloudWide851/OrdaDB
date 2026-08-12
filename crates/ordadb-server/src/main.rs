@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use ordadb_server::{
     ServerConfig, ServiceCommand, TlsPaths, default_data_dir, dispatch_windows_service,
-    manage_windows_service, start_server,
+    manage_windows_service, run_foreground_server,
 };
 use ordadb_types::{DbError, Result};
 
@@ -31,28 +31,7 @@ fn run() -> Result<()> {
         return dispatch_windows_service();
     }
     let config = parse_config(&arguments)?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| {
-            DbError::new("XX000", "failed to create server runtime").with_detail(error.to_string())
-        })?;
-    runtime.block_on(async move {
-        let server = start_server(config).await?;
-        println!(
-            "{{\"state\":\"ready\",\"pgAddress\":\"{}\",\"adminAddress\":\"{}\",\"bootstrapPipe\":{}}}",
-            server.pg_address,
-            server.admin_address,
-            server
-                .bootstrap_pipe
-                .as_ref()
-                .map_or_else(|| "null".to_owned(), |pipe| format!("{pipe:?}"))
-        );
-        tokio::signal::ctrl_c().await.map_err(|error| {
-            DbError::new("58030", "failed to wait for Ctrl+C").with_detail(error.to_string())
-        })?;
-        server.shutdown().await
-    })
+    run_foreground_server(config)
 }
 
 fn run_service_command(arguments: &[String]) -> Result<()> {

@@ -3,6 +3,53 @@ import { expect, test, type Page } from "@playwright/test";
 test.describe("OrdaDB SQL workbench", () => {
   test.setTimeout(60_000);
 
+  test("renders every bundled official connector logo without cropping or remote requests", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const remoteImageRequests: string[] = [];
+    page.on("request", (request) => {
+      if (request.resourceType() === "image") {
+        const source = new URL(request.url());
+        if (
+          ["http:", "https:"].includes(source.protocol) &&
+          source.hostname !== "127.0.0.1"
+        ) {
+          remoteImageRequests.push(request.url());
+        }
+      }
+    });
+    await gotoWorkbench(page);
+
+    await page.keyboard.press("Control+Alt+Shift+S");
+    const sources = page.getByRole("dialog", { name: "数据源" });
+    await expect(sources).toBeVisible();
+    await expectContainedLocalLogos(
+      page,
+      sources.locator(".data-source-choice img"),
+      10,
+    );
+
+    await sources.getByRole("button", { name: "PostgreSQL", exact: true }).click();
+    await sources.getByRole("button", { name: "连接插件" }).click();
+    const manager = page.getByRole("dialog", { name: "连接插件" });
+    await expect(manager).toBeVisible();
+    await expectContainedLocalLogos(page, manager.locator(".connector-mark img"), 9);
+    await page.keyboard.press("Escape");
+
+    await sources.getByRole("button", { name: "OrdaDB", exact: true }).click();
+    await sources.getByRole("button", { name: "连接", exact: true }).click();
+    await page.keyboard.press("Control+Alt+Shift+S");
+    const connectedSources = page.getByRole("dialog", { name: "数据源" });
+    await expect(connectedSources).toBeVisible();
+    await expectContainedLocalLogos(
+      page,
+      connectedSources.locator(".active-connection-mark img"),
+      1,
+    );
+    expect(remoteImageRequests).toEqual([]);
+  });
+
   test("opens the Windows shell, navigates menus, and runs preview SQL", async ({
     page,
   }) => {
@@ -512,4 +559,44 @@ async function openPreviewConnectorManager(page: Page) {
   const manager = page.getByRole("dialog", { name: "连接插件" });
   await expect(manager).toBeVisible();
   return manager;
+}
+
+async function expectContainedLocalLogos(
+  page: Page,
+  logos: ReturnType<Page["locator"]>,
+  expectedCount: number,
+) {
+  await expect(logos).toHaveCount(expectedCount);
+  await expect
+    .poll(async () =>
+      logos.evaluateAll((images) =>
+        images.every(
+          (image) =>
+            image instanceof HTMLImageElement &&
+            image.complete &&
+            image.naturalWidth > 0 &&
+            image.naturalHeight > 0,
+        ),
+      ),
+    )
+    .toBe(true);
+  const states = await logos.evaluateAll((images) =>
+    images.map((image) => {
+      if (!(image instanceof HTMLImageElement)) {
+        return null;
+      }
+      const source = new URL(image.currentSrc || image.src, document.baseURI);
+      return {
+        objectFit: getComputedStyle(image).objectFit,
+        local:
+          source.protocol === "data:" || source.origin === window.location.origin,
+      };
+    }),
+  );
+  expect(states).toEqual(
+    Array.from({ length: expectedCount }, () => ({
+      objectFit: "contain",
+      local: true,
+    })),
+  );
 }
