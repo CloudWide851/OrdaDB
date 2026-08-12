@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "pnpm --filter @ordadb/console dev",
     "source:size:test": "node scripts/source-size-policy.test.mjs",
+    "source:split:test": "node --test scripts/split-rust-source.test.mjs",
     "source:size": "pnpm source:size:test && node scripts/check-source-size.mjs",
     "lint": "pnpm --filter @ordadb/console lint",
     "typecheck": "pnpm --filter @ordadb/console typecheck",

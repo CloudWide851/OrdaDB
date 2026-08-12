@@ -24,5 +24,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.89.0"
+          target: x86_64-pc-windows-msvc
+      - name: Verify Rust source splitter
+        run: pnpm source:split:test
       - name: Verify tracked source sizes
         run: pnpm source:size
