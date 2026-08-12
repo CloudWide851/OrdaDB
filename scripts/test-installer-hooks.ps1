@@ -54,6 +54,12 @@ Assert-Contains $hooks "installer-storage --preflight" `
     "Installer must run storage preflight"
 Assert-Contains $hooks "installer-storage --apply" `
     "Installer must apply a safe receipt before service startup"
+Assert-Contains $hooks "installer-service --prepare" `
+    "Installer must prepare a service transaction before the service starts"
+Assert-Contains $hooks "installer-service --commit" `
+    "Installer must commit service recovery only after startup succeeds"
+Assert-Contains $hooks "installer-service --rollback" `
+    "Installer must restore the previous service configuration on startup failure"
 Assert-Contains $hooks 'MessageBox MB_ICONEXCLAMATION|MB_YESNO|MB_DEFBUTTON2' `
     "Interactive legacy migration must require explicit confirmation"
 Assert-Contains $hooks '${AndIfNot} ${Silent}' `
@@ -73,6 +79,22 @@ Assert-Before $hooks "Call OrdaDBConfirmLegacyPlan" `
 Assert-Before $hooks "Call OrdaDBApplyStorage" `
     '!macro NSIS_HOOK_POSTINSTALL' `
     "Storage apply must run before binaries are registered and the service starts"
+Assert-Before $hooks '!macro NSIS_HOOK_POSTINSTALL' `
+    "Call OrdaDBPrepareServiceTransaction" `
+    "Service transaction preparation must run in post-install"
+Assert-Before $hooks "Call OrdaDBPrepareServiceTransaction" `
+    'nsExec::ExecToStack ''"$INSTDIR\ordadb-server.exe" service start --data-dir' `
+    "Service transaction preparation must run before service startup"
+Assert-Before $hooks 'service start --data-dir' `
+    'installer-service --commit' `
+    "The service must reach Running before recovery actions are committed"
+Assert-Before $hooks 'installer-service --rollback' `
+    'Abort "OrdaDB service start failed.' `
+    "Startup failure must roll back the service configuration before aborting"
+
+if ($hooks -match '(?s)!macro NSIS_HOOK_POSTINSTALL.*OrdaDBRunServiceCommand "install"') {
+    throw "Post-install must not use the non-transactional service install command"
+}
 
 if ($hooks -match '(?i)RMDir\s+/r\s+.*ProgramData') {
     throw "Installer hooks must not recursively delete ProgramData"

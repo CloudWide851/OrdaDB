@@ -357,8 +357,8 @@ async fn pgwire_management_copy_and_restart_are_end_to_end() {
         right_rows.push_str(&format!("{id},1\n"));
     }
     pg = tokio::task::spawn_blocking(move || {
-        pg.query("CREATE TABLE cancel_left (id BIGINT PRIMARY KEY, match_id BIGINT NOT NULL)")?;
-        pg.query("CREATE TABLE cancel_right (id BIGINT PRIMARY KEY, match_id BIGINT NOT NULL)")?;
+        pg.query("CREATE TABLE cancel_left (id BIGINT NOT NULL, match_id BIGINT NOT NULL)")?;
+        pg.query("CREATE TABLE cancel_right (id BIGINT NOT NULL, match_id BIGINT NOT NULL)")?;
         pg.copy_from_stdin("cancel_left", left_rows.as_bytes())?;
         pg.copy_from_stdin("cancel_right", right_rows.as_bytes())?;
         Ok::<PgClient, ordadb_types::DbError>(pg)

@@ -31,10 +31,14 @@ pub use bootstrap::{
 pub use ordadb_protocol::TlsPaths;
 #[cfg(windows)]
 pub use windows_service::{
-    SERVICE_ACCOUNT, SERVICE_DISPLAY_NAME, SERVICE_FAILURE_ACTIONS, SERVICE_NAME,
-    SERVICE_START_MODE, ServiceCommand, ServiceStartupFailureV1, ServiceStartupPhase,
-    WindowsServiceStatus, dispatch_windows_service, manage_windows_service,
+    InstallerServiceTransactionStatus, SERVICE_ACCOUNT, SERVICE_DISPLAY_NAME,
+    SERVICE_FAILURE_ACTIONS, SERVICE_NAME, SERVICE_START_MODE, ServiceCommand,
+    ServiceStartupFailureV1, ServiceStartupPhase, WindowsServiceStatus, commit_installer_service,
+    dispatch_windows_service, manage_windows_service, prepare_installer_service,
+    rollback_installer_service,
 };
+
+pub(crate) const SERVER_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 pub const DEFAULT_PG_PORT: u16 = 54_329;
 pub const DEFAULT_ADMIN_PORT: u16 = 9_080;
@@ -139,6 +143,67 @@ impl RunningServer {
     pub fn shutdown_token(&self) -> CancellationToken {
         self.shutdown.clone()
     }
+}
+
+pub fn run_foreground_server(config: ServerConfig) -> Result<()> {
+    let worker = spawn_server_worker("ordadb-server-runtime", move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                DbError::new("XX000", "failed to create server runtime")
+                    .with_detail(error.to_string())
+            })?;
+        runtime.block_on(async move {
+            let server = start_server(config).await?;
+            println!(
+                "{{\"state\":\"ready\",\"pgAddress\":\"{}\",\"adminAddress\":\"{}\",\"bootstrapPipe\":{}}}",
+                server.pg_address,
+                server.admin_address,
+                server
+                    .bootstrap_pipe
+                    .as_ref()
+                    .map_or_else(|| "null".to_owned(), |pipe| format!("{pipe:?}"))
+            );
+            tokio::signal::ctrl_c().await.map_err(|error| {
+                DbError::new("58030", "failed to wait for Ctrl+C").with_detail(error.to_string())
+            })?;
+            server.shutdown().await
+        })
+    })?;
+    join_server_worker(worker, "foreground server worker")?
+}
+
+pub(crate) fn spawn_server_worker<T, F>(name: &str, work: F) -> Result<std::thread::JoinHandle<T>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(SERVER_WORKER_STACK_BYTES)
+        .spawn(work)
+        .map_err(server_worker_spawn_error)
+}
+
+fn server_worker_spawn_error(error: std::io::Error) -> DbError {
+    DbError::new("58030", "failed to create server worker").with_detail(error.to_string())
+}
+
+pub(crate) fn join_server_worker<T>(
+    worker: std::thread::JoinHandle<T>,
+    context: &str,
+) -> Result<T> {
+    worker.join().map_err(|panic| {
+        let reason = panic
+            .downcast_ref::<&str>()
+            .map(|reason| (*reason).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_owned());
+        DbError::new("XX000", format!("{context} panicked"))
+            .with_detail(reason)
+            .with_hint("restart the service before retrying")
+    })
 }
 
 pub async fn start_server(config: ServerConfig) -> Result<RunningServer> {
@@ -388,6 +453,52 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+
+    #[test]
+    fn server_worker_uses_the_declared_stack_and_returns_values() {
+        let worker = spawn_server_worker("ordadb-worker-return-test", || {
+            std::thread::current().name().map(str::to_owned)
+        })
+        .expect("spawn");
+        assert_eq!(
+            join_server_worker(worker, "test worker").expect("join"),
+            Some("ordadb-worker-return-test".to_owned())
+        );
+        assert_eq!(SERVER_WORKER_STACK_BYTES, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn server_worker_panic_is_a_structured_error() {
+        let worker = spawn_server_worker("ordadb-worker-panic-test", || {
+            panic!("bounded worker failure")
+        })
+        .expect("spawn");
+        let error = join_server_worker(worker, "test worker").expect_err("panic");
+        assert_eq!(error.sql_state, "XX000");
+        assert_eq!(error.message, "test worker panicked");
+        assert_eq!(error.detail.as_deref(), Some("bounded worker failure"));
+    }
+
+    #[test]
+    fn server_worker_returns_business_errors_and_maps_spawn_failures() {
+        let worker = spawn_server_worker("ordadb-worker-error-test", || {
+            Err::<(), DbError>(DbError::new("58030", "worker business failure"))
+        })
+        .expect("spawn");
+        let error = join_server_worker(worker, "test worker")
+            .expect("join")
+            .expect_err("business error");
+        assert_eq!(error.sql_state, "58030");
+        assert_eq!(error.message, "worker business failure");
+
+        let error = server_worker_spawn_error(std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            "thread allocation fixture",
+        ));
+        assert_eq!(error.sql_state, "58030");
+        assert_eq!(error.message, "failed to create server worker");
+        assert_eq!(error.detail.as_deref(), Some("thread allocation fixture"));
+    }
 
     #[test]
     fn remote_bind_requires_tls_and_ports_must_not_collide() {

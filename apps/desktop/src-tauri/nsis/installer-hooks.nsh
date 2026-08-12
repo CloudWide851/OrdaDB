@@ -23,6 +23,9 @@ Var OrdaInstallerOriginalDigest
 Var OrdaInstallerOriginalError
 Var OrdaInstallerConfirmed
 Var OrdaInstallerPassive
+Var OrdaInstallerServiceTransaction
+Var OrdaInstallerServiceDiagnostic
+Var OrdaInstallerServiceRollback
 
 !macro OrdaDBResolveDataDir
   ; Tauri sets ShellVarContext to all for this per-machine installer, so
@@ -58,10 +61,13 @@ Function OrdaDBExtractInstallerCli
   StrCpy $OrdaInstallerReceipt "$PLUGINSDIR\ordadb-installer-storage-receipt-v1.json"
   StrCpy $OrdaInstallerState "$PLUGINSDIR\ordadb-installer-storage-state-v1.ini"
   StrCpy $OrdaInstallerReport "$PLUGINSDIR\ordadb-installer-storage-report-v1.json"
+  StrCpy $OrdaInstallerServiceTransaction "$PLUGINSDIR\ordadb-installer-service-transaction-v1.json"
+  StrCpy $OrdaInstallerServiceDiagnostic "$APPDATA\OrdaDB\diagnostics\last-startup-failure-v1.json"
   Delete $OrdaInstallerCli
   Delete $OrdaInstallerReceipt
   Delete $OrdaInstallerState
   Delete $OrdaInstallerReport
+  Delete $OrdaInstallerServiceTransaction
   File "/oname=$PLUGINSDIR\ordadb-installer-cli.exe" "${ORDA_INSTALLER_CLI_SOURCE}"
 FunctionEnd
 
@@ -126,6 +132,26 @@ Function OrdaDBTryRestorePreviousService
   ${EndIf}
 FunctionEnd
 
+Function OrdaDBPrepareServiceTransaction
+  nsExec::ExecToStack '"$OrdaInstallerCli" installer-service --prepare "$OrdaInstallerServiceTransaction" --executable "$INSTDIR\ordadb-server.exe" --data-dir "$OrdaInstallerDataDir"'
+  Pop $OrdaInstallerExit
+  Pop $OrdaInstallerOutput
+FunctionEnd
+
+Function OrdaDBRollbackServiceTransaction
+  StrCpy $OrdaInstallerServiceRollback "rollback was not available"
+  ${If} ${FileExists} "$OrdaInstallerServiceTransaction"
+    nsExec::ExecToStack '"$OrdaInstallerCli" installer-service --rollback "$OrdaInstallerServiceTransaction"'
+    Pop $OrdaInstallerExit
+    Pop $OrdaInstallerServiceRollback
+    ${If} $OrdaInstallerExit == 0
+      StrCpy $OrdaInstallerServiceRollback "service configuration rollback completed; the previous service remains stopped"
+    ${Else}
+      StrCpy $OrdaInstallerServiceRollback "service configuration rollback failed (exit $OrdaInstallerExit): $OrdaInstallerServiceRollback"
+    ${EndIf}
+  ${EndIf}
+FunctionEnd
+
 !macro NSIS_HOOK_PREINSTALL
   !insertmacro OrdaDBResolveDataDir
   Call OrdaDBExtractInstallerCli
@@ -166,11 +192,34 @@ FunctionEnd
       Abort "OrdaDB storage migration failed after one safe replan. The service remains stopped to protect the authoritative data.$\r$\n$\r$\n$OrdaInstallerOutput"
     ${EndIf}
   ${EndIf}
+
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  !insertmacro OrdaDBRunServiceCommand "install"
-  !insertmacro OrdaDBRunServiceCommand "start"
+  Call OrdaDBPrepareServiceTransaction
+  ${If} $OrdaInstallerExit != 0
+    StrCpy $OrdaInstallerOriginalError $OrdaInstallerOutput
+    Call OrdaDBRollbackServiceTransaction
+    Abort "OrdaDB service preparation failed.$\r$\nPhase: prepare$\r$\nReason: $OrdaInstallerOriginalError$\r$\nHint: review administrator rights and the existing Windows service configuration; $OrdaInstallerServiceRollback$\r$\nDiagnostic: $OrdaInstallerServiceDiagnostic"
+  ${EndIf}
+
+  nsExec::ExecToStack '"$INSTDIR\ordadb-server.exe" service start --data-dir "$OrdaInstallerDataDir"'
+  Pop $OrdaInstallerExit
+  Pop $OrdaInstallerOutput
+  ${If} $OrdaInstallerExit != 0
+    StrCpy $OrdaInstallerOriginalError $OrdaInstallerOutput
+    Call OrdaDBRollbackServiceTransaction
+    Abort "OrdaDB service start failed.$\r$\nPhase: start$\r$\nReason: $OrdaInstallerOriginalError$\r$\nHint: inspect the startup diagnostic; $OrdaInstallerServiceRollback$\r$\nDiagnostic: $OrdaInstallerServiceDiagnostic"
+  ${EndIf}
+
+  nsExec::ExecToStack '"$OrdaInstallerCli" installer-service --commit "$OrdaInstallerServiceTransaction"'
+  Pop $OrdaInstallerExit
+  Pop $OrdaInstallerOutput
+  ${If} $OrdaInstallerExit != 0
+    StrCpy $OrdaInstallerOriginalError $OrdaInstallerOutput
+    Call OrdaDBRollbackServiceTransaction
+    Abort "OrdaDB service recovery-policy commit failed.$\r$\nPhase: commit$\r$\nReason: $OrdaInstallerOriginalError$\r$\nHint: service startup succeeded but the recovery policy was not committed; $OrdaInstallerServiceRollback$\r$\nDiagnostic: $OrdaInstallerServiceDiagnostic"
+  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
