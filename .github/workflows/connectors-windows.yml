@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/connectors-windows.yml"
+      - "package.json"
       - "apps/console/**"
       - "apps/desktop/src-tauri/**"
       - "connectors/**"
@@ -11,6 +12,9 @@ on:
       - "crates/ordadb-connectors/**"
       - "crates/ordadb-windows/**"
       - "scripts/*connector*.ps1"
+      - "scripts/check-source-size.mjs"
+      - "scripts/source-size-*.mjs"
+      - "scripts/source-size-baseline.json"
       - "scripts/stage-windows-x64.ps1"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -55,6 +59,8 @@ jobs:
           cache: pnpm
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
+      - name: Verify tracked source sizes
+        run: pnpm source:size
       - name: Verify frontend lint
         run: pnpm lint
       - name: Verify frontend types
