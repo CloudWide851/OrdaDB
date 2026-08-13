@@ -7,17 +7,6 @@
     { "path": "apps/console/src/styles.css", "bytes": 71984 },
     { "path": "apps/desktop/src-tauri/src/dbms.rs", "bytes": 161576 },
     { "path": "apps/desktop/src-tauri/src/workspace.rs", "bytes": 93737 },
-    { "path": "crates/ordadb-connector-clickhouse/src/main.rs", "bytes": 56867 },
-    { "path": "crates/ordadb-connector-mongodb/src/main.rs", "bytes": 37813 },
-    { "path": "crates/ordadb-connector-mysql/src/lib.rs", "bytes": 51818 },
-    { "path": "crates/ordadb-connector-oracle/src/main.rs", "bytes": 50631 },
-    { "path": "crates/ordadb-connector-postgresql/src/main.rs", "bytes": 33627 },
-    { "path": "crates/ordadb-connector-redis/src/main.rs", "bytes": 38231 },
-    { "path": "crates/ordadb-connector-sdk/src/protocol_v3.rs", "bytes": 46428 },
-    { "path": "crates/ordadb-connector-sdk/src/runtime_v3.rs", "bytes": 37355 },
-    { "path": "crates/ordadb-connector-sql-server/src/main.rs", "bytes": 42162 },
-    { "path": "crates/ordadb-connectors/src/host.rs", "bytes": 81248 },
-    { "path": "crates/ordadb-connectors/src/manager.rs", "bytes": 70621 },
     { "path": "scripts/test-product-acceptance.ps1", "bytes": 49609 },
     { "path": "scripts/test_pg18_clients.ps1", "bytes": 46505 }
   ]
