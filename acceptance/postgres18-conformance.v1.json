@@ -207,7 +207,7 @@
       "status": "regressionOnly",
       "referenceTarget": "PostgreSQL 18.0",
       "reason": "Projection/join/filter/OID tests pass; pinned DataGrip/PostgreSQL result capture is absent.",
-      "regressionEvidence": ["crates/ordadb-catalog/src/system.rs", "crates/ordadb-server/tests/client_compat/sql_corpus.v1.json"]
+      "regressionEvidence": ["crates/ordadb-catalog/src/catalog/system.rs", "crates/ordadb-server/tests/client_compat/sql_corpus.v1.json"]
     },
     {
       "id": "wire-startup-tls-scram",
