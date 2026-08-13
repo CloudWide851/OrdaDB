@@ -5,11 +5,8 @@
     { "path": "apps/console/src/store/workbench.test.ts", "bytes": 35254 },
     { "path": "apps/console/src/store/workbench.ts", "bytes": 79127 },
     { "path": "apps/console/src/styles.css", "bytes": 71984 },
-    { "path": "apps/desktop/src-tauri/src/ai.rs", "bytes": 57926 },
     { "path": "apps/desktop/src-tauri/src/dbms.rs", "bytes": 161576 },
     { "path": "apps/desktop/src-tauri/src/workspace.rs", "bytes": 93737 },
-    { "path": "crates/ordadb-ai/src/provider.rs", "bytes": 40066 },
-    { "path": "crates/ordadb-ai/src/runner.rs", "bytes": 35575 },
     { "path": "crates/ordadb-connector-clickhouse/src/main.rs", "bytes": 56867 },
     { "path": "crates/ordadb-connector-mongodb/src/main.rs", "bytes": 37813 },
     { "path": "crates/ordadb-connector-mysql/src/lib.rs", "bytes": 51818 },
@@ -21,10 +18,6 @@
     { "path": "crates/ordadb-connector-sql-server/src/main.rs", "bytes": 42162 },
     { "path": "crates/ordadb-connectors/src/host.rs", "bytes": 81248 },
     { "path": "crates/ordadb-connectors/src/manager.rs", "bytes": 70621 },
-    { "path": "crates/ordadb-protocol/src/client.rs", "bytes": 44039 },
-    { "path": "crates/ordadb-protocol/src/server.rs", "bytes": 126585 },
-    { "path": "crates/ordadb-protocol/src/value.rs", "bytes": 70706 },
-    { "path": "crates/ordadb-server/src/windows_service.rs", "bytes": 78822 },
     { "path": "scripts/test-product-acceptance.ps1", "bytes": 49609 },
     { "path": "scripts/test_pg18_clients.ps1", "bytes": 46505 }
   ]
