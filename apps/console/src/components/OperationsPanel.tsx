@@ -26,6 +26,7 @@ import {
   useWorkbenchStore,
   type OperationView,
 } from "../store/workbench";
+import { usePresence } from "../lib/motion";
 import { IconAction } from "./IconAction";
 
 interface OperationsPanelProps {
@@ -78,6 +79,7 @@ export function OperationsPanel({ open, onClose }: OperationsPanelProps) {
   );
   const openOperations = useWorkbenchStore((state) => state.openOperations);
   const checkpoint = useWorkbenchStore((state) => state.checkpoint);
+  const presence = usePresence(open);
 
   useEffect(() => {
     if (!open) return;
@@ -103,7 +105,7 @@ export function OperationsPanel({ open, onClose }: OperationsPanelProps) {
     return () => window.clearInterval(interval);
   }, [open, operations, refreshAdministration]);
 
-  if (!open) return null;
+  if (!presence.mounted) return null;
 
   const close = () => {
     onClose();
@@ -113,6 +115,8 @@ export function OperationsPanel({ open, onClose }: OperationsPanelProps) {
   return (
     <div
       className="dbms-dialog-backdrop"
+      data-motion-presence="panel"
+      data-motion-state={presence.phase}
       role="presentation"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) close();

@@ -25,6 +25,7 @@ import {
   normalizePluginError,
   type PluginManagerClient,
 } from "../lib/pluginManager";
+import { usePresence } from "../lib/motion";
 import { IconAction } from "./IconAction";
 
 interface ConnectorManagerProps {
@@ -96,6 +97,7 @@ export function ConnectorManager({ open, onClose }: ConnectorManagerProps) {
   const [pendingPluginId, setPendingPluginId] = useState<string | null>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const presence = usePresence(open);
 
   const refreshCatalog = useCallback(async () => {
     const next = await client.catalog();
@@ -138,7 +140,7 @@ export function ConnectorManager({ open, onClose }: ConnectorManagerProps) {
     };
   }, [client, open, refreshCatalog]);
 
-  if (!open) return null;
+  if (!presence.mounted) return null;
 
   const close = () => {
     onClose();
@@ -180,6 +182,8 @@ export function ConnectorManager({ open, onClose }: ConnectorManagerProps) {
   return (
     <div
       className="connector-manager-backdrop"
+      data-motion-presence="panel"
+      data-motion-state={presence.phase}
       role="presentation"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) close();

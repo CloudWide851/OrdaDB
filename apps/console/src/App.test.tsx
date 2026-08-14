@@ -325,9 +325,15 @@ describe("OrdaDB workbench", () => {
     await user.type(screen.getByRole("textbox", { name: "搜索命令" }), "备份");
     expect(screen.getByRole("option", { name: /备份与恢复/ })).toBeVisible();
     await user.keyboard("{Escape}");
-    expect(
-      screen.queryByRole("dialog", { name: "命令面板" }),
-    ).not.toBeInTheDocument();
+    expect(palette.closest("[data-motion-presence]")).toHaveAttribute(
+      "data-motion-state",
+      "exiting",
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "命令面板" }),
+      ).not.toBeInTheDocument(),
+    );
   });
 
   it("supports keyboard execution and accessible pane controls", async () => {
@@ -525,16 +531,30 @@ describe("OrdaDB workbench", () => {
       screen.getByRole("dialog", { name: "最近文件" }),
     ).toBeVisible();
     fireEvent.keyDown(window, { key: "Escape" });
-    expect(
-      screen.queryByRole("dialog", { name: "最近文件" }),
-    ).not.toBeInTheDocument();
+    const recentDialog = screen.getByRole("dialog", { name: "最近文件" });
+    expect(recentDialog.closest("[data-motion-presence]")).toHaveAttribute(
+      "data-motion-state",
+      "exiting",
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "最近文件" }),
+      ).not.toBeInTheDocument(),
+    );
 
     await user.keyboard("{Control>}{Shift>}n{/Shift}{/Control}");
     expect(screen.getByRole("dialog", { name: "转到文件" })).toBeVisible();
     fireEvent.keyDown(window, { key: "Escape" });
-    expect(
-      screen.queryByRole("dialog", { name: "转到文件" }),
-    ).not.toBeInTheDocument();
+    const filesDialog = screen.getByRole("dialog", { name: "转到文件" });
+    expect(filesDialog.closest("[data-motion-presence]")).toHaveAttribute(
+      "data-motion-state",
+      "exiting",
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "转到文件" }),
+      ).not.toBeInTheDocument(),
+    );
 
     await user.keyboard("{Alt>}{Home}{/Alt}");
     expect(screen.getByRole("navigation", { name: "导航栏" })).toHaveFocus();
@@ -554,11 +574,18 @@ describe("OrdaDB workbench", () => {
     );
 
     await user.keyboard("{Shift}{Shift}");
-    expect(screen.getByRole("dialog", { name: "全局搜索" })).toBeVisible();
+    const globalSearch = screen.getByRole("dialog", { name: "全局搜索" });
+    expect(globalSearch).toBeVisible();
     fireEvent.keyDown(window, { key: "Escape" });
-    expect(
-      screen.queryByRole("dialog", { name: "全局搜索" }),
-    ).not.toBeInTheDocument();
+    expect(globalSearch.closest("[data-motion-presence]")).toHaveAttribute(
+      "data-motion-state",
+      "exiting",
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "全局搜索" }),
+      ).not.toBeInTheDocument(),
+    );
 
     tauriMocks.fileDropSubscribers[0]([
       "C:\\SQL\\dropped.sql",
@@ -650,9 +677,15 @@ describe("OrdaDB workbench", () => {
     expect(await pluginView.findByText(/已安装 v0\.9\.0/)).toBeVisible();
 
     await user.keyboard("{Escape}");
-    expect(
-      screen.queryByRole("dialog", { name: "连接插件" }),
-    ).not.toBeInTheDocument();
+    expect(dialog.closest("[data-motion-presence]")).toHaveAttribute(
+      "data-motion-state",
+      "exiting",
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "连接插件" }),
+      ).not.toBeInTheDocument(),
+    );
   });
 
   it("fails closed when the official plugin registry is not configured", async () => {

@@ -2,9 +2,6 @@
   "schemaVersion": 1,
   "maximumBytes": 32768,
   "entries": [
-    { "path": "apps/console/src/store/workbench.test.ts", "bytes": 35254 },
-    { "path": "apps/console/src/store/workbench.ts", "bytes": 79127 },
-    { "path": "apps/console/src/styles.css", "bytes": 71984 },
     { "path": "apps/desktop/src-tauri/src/dbms.rs", "bytes": 161576 },
     { "path": "apps/desktop/src-tauri/src/workspace.rs", "bytes": 93737 },
     { "path": "scripts/test-product-acceptance.ps1", "bytes": 49609 },
