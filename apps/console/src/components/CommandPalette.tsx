@@ -4,6 +4,7 @@ import {
   workbenchCommands,
   type WorkbenchCommandId,
 } from "../data/commands";
+import { usePresence } from "../lib/motion";
 
 interface CommandPaletteProps {
   open: boolean;
@@ -20,6 +21,7 @@ export function CommandPalette({
   const [activeIndex, setActiveIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const presence = usePresence(open);
 
   const filteredCommands = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -40,7 +42,7 @@ export function CommandPalette({
     window.setTimeout(() => inputRef.current?.focus());
   }, [open]);
 
-  if (!open) return null;
+  if (!presence.mounted) return null;
 
   const close = () => {
     onClose();
@@ -55,6 +57,8 @@ export function CommandPalette({
   return (
     <div
       className="command-palette-backdrop"
+      data-motion-presence="panel"
+      data-motion-state={presence.phase}
       role="presentation"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) close();

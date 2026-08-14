@@ -27,6 +27,7 @@ import {
   cloneConsoleSettings,
   type ConsoleSettingsV2,
 } from "../lib/consoleClient";
+import { usePresence } from "../lib/motion";
 import { useWorkbenchStore } from "../store/workbench";
 import { IconAction } from "./IconAction";
 
@@ -101,6 +102,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const [saving, setSaving] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const presence = usePresence(open);
 
   const visibleCategories = useMemo(() => {
     const query = search.trim().toLocaleLowerCase("zh-CN");
@@ -130,7 +132,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     }
   }, [category, visibleCategories]);
 
-  if (!open) return null;
+  if (!presence.mounted) return null;
 
   const close = () => {
     onClose();
@@ -153,6 +155,8 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   return (
     <div
       className="dbms-dialog-backdrop"
+      data-motion-presence="panel"
+      data-motion-state={presence.phase}
       role="presentation"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) close();

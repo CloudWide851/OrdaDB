@@ -244,7 +244,20 @@ test.describe("OrdaDB SQL workbench", () => {
       })
       .click();
     await expect(connectorManager.getByText(/已安装 v0\.9\.0/)).toBeVisible();
+    const connectorBackdrop = page.locator(
+      '[data-motion-presence="panel"]:has(.connector-manager)',
+    );
     await page.keyboard.press("Escape");
+    await expect(connectorBackdrop).toHaveAttribute(
+      "data-motion-state",
+      "exiting",
+    );
+    const exitDurations = await connectorBackdrop.evaluate((element) =>
+      element
+        .getAnimations({ subtree: true })
+        .map((animation) => Number(animation.effect?.getTiming().duration ?? 0)),
+    );
+    expect(Math.max(...exitDurations)).toBeLessThanOrEqual(135);
     await expect(connectorManager).toHaveCount(0);
     const sourceDialog = page.getByRole("dialog", { name: "数据源" });
     await sourceDialog.getByRole("button", { name: "MongoDB", exact: true }).click();
@@ -426,6 +439,10 @@ test.describe("OrdaDB SQL workbench", () => {
       ".result-table tbody tr:not(.result-spacer)",
     );
     expect(await renderedRows.count()).toBeLessThan(100);
+    const animatedRows = await renderedRows.evaluateAll((rows) =>
+      rows.filter((row) => row.getAnimations().length > 0).length,
+    );
+    expect(animatedRows).toBe(0);
 
     const viewport = page.locator(".table-scroll");
     await viewport.evaluate((element) => {
@@ -481,6 +498,25 @@ test.describe("OrdaDB SQL workbench", () => {
       .click();
     await expect(sourceDialog).toHaveCount(0);
 
+    await page.keyboard.press("Control+,");
+    const settings = page.getByRole("dialog", { name: "设置" });
+    await settings.getByLabel("减少动态效果").check();
+    await settings.getByRole("button", { name: "保存设置" }).click();
+    await page.emulateMedia({ reducedMotion: "no-preference" });
+    const applicationReducedManager = await openPreviewConnectorManager(page);
+    await expect(applicationReducedManager).toHaveCSS(
+      "animation-duration",
+      "0.001s",
+    );
+    await page.keyboard.press("Escape");
+    await expect(applicationReducedManager).toHaveCount(0);
+    const applicationReducedSource = page.getByRole("dialog", {
+      name: "数据源",
+    });
+    await applicationReducedSource
+      .getByRole("button", { name: "关闭数据源" })
+      .click();
+
     await page.getByRole("button", { name: /^运行/ }).click();
     await expect(page.locator(".loading-orbit")).toBeVisible();
     await expect(page.getByText("5 项 · 36 ms")).toBeVisible();
@@ -522,9 +558,7 @@ async function connectPreviewDatabase(page: Page) {
       .getByRole("button", { name: "连接", exact: true })
       .click();
     await expect(page.getByLabel("连接状态：界面预览").first()).toBeVisible();
-    if (await dialog.isVisible()) {
-      await dialog.getByRole("button", { name: "关闭数据源" }).click();
-    }
+    await expect(dialog).toHaveCount(0);
   }
   await page.getByRole("tab", { name: "项目" }).click();
 }

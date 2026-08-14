@@ -17,6 +17,7 @@ import {
   getConnectorDefinition,
 } from "../data/connectors";
 import type { ConnectionProbeStageName } from "../lib/dbmsClient";
+import { usePresence } from "../lib/motion";
 import {
   useWorkbenchStore,
   type DataSourceValues,
@@ -52,6 +53,7 @@ export function DataSourceDialog({
   const [submitting, setSubmitting] = useState(false);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const presence = usePresence(open);
   const runtimeMode = useWorkbenchStore((state) => state.runtimeMode);
   const connection = useWorkbenchStore((state) => state.connection);
   const activeCredentialId = useWorkbenchStore(
@@ -79,7 +81,7 @@ export function DataSourceDialog({
     window.setTimeout(() => closeButtonRef.current?.focus());
   }, [open]);
 
-  if (!open) return null;
+  if (!presence.mounted) return null;
 
   const selectedConnector = getConnectorDefinition(values.connectorId);
   const native = selectedConnector.id === "ordadb-native";
@@ -132,6 +134,8 @@ export function DataSourceDialog({
   return (
     <div
       className="dbms-dialog-backdrop"
+      data-motion-presence="panel"
+      data-motion-state={presence.phase}
       role="presentation"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) close();

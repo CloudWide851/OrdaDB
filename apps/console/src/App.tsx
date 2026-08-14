@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useEffect } from "react";
 import { Route, Routes } from "react-router-dom";
 import { CommandPalette } from "./components/CommandPalette";
 import { AiWorkbench } from "./components/AiWorkbench";
@@ -22,13 +22,12 @@ import {
   type WorkbenchCommandId,
 } from "./data/commands";
 import { getAppStatus, subscribeFileDrops } from "./lib/tauri";
+import { useCenterWorkspaceFlip } from "./lib/motion";
 import {
   useWorkbenchStore,
   type OperationView,
 } from "./store/workbench";
 
-const PANEL_MOTION_MS = 180;
-const PANEL_EASING = "cubic-bezier(0.16, 1, 0.3, 1)";
 const operationCommands = new Map<WorkbenchCommandId, OperationView>([
   ["sessions", "sessions"],
   ["locks", "locks"],
@@ -39,60 +38,6 @@ const operationCommands = new Map<WorkbenchCommandId, OperationView>([
   ["import-export", "importExport"],
   ["service-manager", "service"],
 ]);
-
-function useCenterWorkspaceFlip(
-  schemaVisible: boolean,
-  inspectorVisible: boolean,
-) {
-  const centerRef = useRef<HTMLDivElement>(null);
-  const previousRectRef = useRef<DOMRect | null>(null);
-
-  useLayoutEffect(() => {
-    const element = centerRef.current;
-    if (!element) return;
-
-    const nextRect = element.getBoundingClientRect();
-    const previousRect = previousRectRef.current;
-    previousRectRef.current = nextRect;
-
-    const reducedMotion =
-      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
-    if (
-      !previousRect ||
-      reducedMotion ||
-      document.documentElement.dataset.reduceMotion === "true" ||
-      typeof element.animate !== "function" ||
-      nextRect.width === 0
-    ) {
-      return;
-    }
-
-    const deltaX = previousRect.left - nextRect.left;
-    const scaleX = previousRect.width / nextRect.width;
-    if (Math.abs(deltaX) < 0.5 && Math.abs(scaleX - 1) < 0.002) return;
-
-    const animation = element.animate(
-      [
-        {
-          transform: `translateX(${deltaX}px) scaleX(${scaleX})`,
-          transformOrigin: "left center",
-        },
-        {
-          transform: "translateX(0) scaleX(1)",
-          transformOrigin: "left center",
-        },
-      ],
-      {
-        duration: PANEL_MOTION_MS,
-        easing: PANEL_EASING,
-      },
-    );
-
-    return () => animation.cancel();
-  }, [inspectorVisible, schemaVisible]);
-
-  return centerRef;
-}
 
 function Workbench() {
   const schemaVisible = useWorkbenchStore((state) => state.schemaVisible);

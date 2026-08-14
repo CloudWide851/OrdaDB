@@ -4,6 +4,7 @@ import {
   workbenchCommands,
   type WorkbenchCommandId,
 } from "../data/commands";
+import { motionDurations, usePresence } from "../lib/motion";
 import { useWorkbenchStore } from "../store/workbench";
 import { IconAction } from "./IconAction";
 
@@ -43,6 +44,13 @@ export function QuickOpen({ onCommand }: QuickOpenProps) {
   const openDocument = useWorkbenchStore((state) => state.openDocument);
   const [query, setQuery] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  const lastModeRef = useRef(mode);
+  if (mode) lastModeRef.current = mode;
+  const renderedMode = mode ?? lastModeRef.current;
+  const presence = usePresence(Boolean(mode), {
+    enterDurationMs: motionDurations.feedback,
+    exitDurationMs: motionDurations.exitFeedback,
+  });
 
   useEffect(() => {
     if (!mode) return;
@@ -115,12 +123,14 @@ export function QuickOpen({ onCommand }: QuickOpenProps) {
     workspace,
   ]);
 
-  if (!mode) return null;
+  if (!presence.mounted || !renderedMode) return null;
 
   const close = () => setMode(null);
   return (
     <div
       className="quick-open-backdrop"
+      data-motion-presence="feedback"
+      data-motion-state={presence.phase}
       role="presentation"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) close();
@@ -130,7 +140,7 @@ export function QuickOpen({ onCommand }: QuickOpenProps) {
         className="quick-open"
         role="dialog"
         aria-modal="true"
-        aria-label={quickOpenLabel(mode)}
+        aria-label={quickOpenLabel(renderedMode)}
         onKeyDown={(event) => {
           if (event.key === "Enter" && items[0]) {
             event.preventDefault();
@@ -143,8 +153,8 @@ export function QuickOpen({ onCommand }: QuickOpenProps) {
           <Search size={16} aria-hidden="true" />
           <input
             ref={inputRef}
-            aria-label={quickOpenLabel(mode)}
-            placeholder={quickOpenPlaceholder(mode)}
+            aria-label={quickOpenLabel(renderedMode)}
+            placeholder={quickOpenPlaceholder(renderedMode)}
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
