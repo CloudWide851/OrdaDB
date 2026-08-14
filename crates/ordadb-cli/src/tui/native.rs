@@ -6,7 +6,7 @@ use ordadb_ai::{AiToolLimits, MAX_QUERY_MEMORY_BYTES};
 use ordadb_protocol::{ClientConfig, PgCancelToken, PgClient, PgQueryEvent};
 use ordadb_sql::{StatementEffect, classify_statement_effect, parse};
 use ordadb_types::{DbError, Result};
-use ordadb_windows::CredentialVault;
+use ordadb_windows::DatabaseCredentialStore;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -28,21 +28,28 @@ pub struct NativeQueryResult {
 #[derive(Clone)]
 pub struct NativeExecutor {
     settings: NativeConnectionSettings,
-    credentials: CredentialVault,
+    credentials: DatabaseCredentialStore,
 }
 
 impl NativeExecutor {
     pub fn new(settings: NativeConnectionSettings) -> Result<Self> {
+        Self::new_with_credentials(settings, DatabaseCredentialStore::open()?)
+    }
+
+    fn new_with_credentials(
+        settings: NativeConnectionSettings,
+        credentials: DatabaseCredentialStore,
+    ) -> Result<Self> {
         Ok(Self {
             settings,
-            credentials: CredentialVault::new("OrdaDB/Console")?,
+            credentials,
         })
     }
 
     pub fn connection_id(&self) -> String {
         format!(
-            "ordadb-native://{}/{}?user={}",
-            self.settings.address, self.settings.database, self.settings.user
+            "ordadb-native://{}/{}?credential={}",
+            self.settings.address, self.settings.database, self.settings.credential_id
         )
     }
 
@@ -68,16 +75,9 @@ impl NativeExecutor {
             .parse::<SocketAddr>()
             .map_err(|_| invalid("TUI native address must be an IP socket address"))?;
         let stored = self.credentials.load(&self.settings.credential_id)?;
-        if !stored.username.eq_ignore_ascii_case(&self.settings.user) {
-            return Err(DbError::new(
-                "28000",
-                "the saved native credential belongs to a different database user",
-            )
-            .with_hint("run /connect to replace the saved credential for this TUI profile"));
-        }
         let config = ClientConfig {
             address,
-            user: stored.username,
+            user: stored.username.to_string(),
             database: self.settings.database.clone(),
             password: stored.password,
             application_name: "ordadb-tui".to_owned(),
@@ -223,15 +223,28 @@ mod tests {
 
     #[test]
     fn connection_identity_contains_no_password_material() {
-        let executor = NativeExecutor::new(NativeConnectionSettings {
-            address: "127.0.0.1:54329".to_owned(),
-            user: "dba".to_owned(),
-            database: "ordadb".to_owned(),
-            credential_id: "ordadb-local".to_owned(),
-        })
+        let root = tempfile::tempdir().expect("credential fixture");
+        let credentials = DatabaseCredentialStore::open_path(
+            root.path()
+                .join("credentials")
+                .join("credentials-v1.sqlite3"),
+        )
+        .expect("credential store");
+        let executor = NativeExecutor::new_with_credentials(
+            NativeConnectionSettings {
+                address: "127.0.0.1:54329".to_owned(),
+                legacy_user: String::new(),
+                database: "ordadb".to_owned(),
+                credential_id: "ordadb-local".to_owned(),
+            },
+            credentials,
+        )
         .expect("executor");
         let identity = executor.connection_id();
-        assert_eq!(identity, "ordadb-native://127.0.0.1:54329/ordadb?user=dba");
+        assert_eq!(
+            identity,
+            "ordadb-native://127.0.0.1:54329/ordadb?credential=ordadb-local"
+        );
         assert!(!identity.contains("password"));
     }
 }

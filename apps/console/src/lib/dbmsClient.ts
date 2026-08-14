@@ -25,7 +25,6 @@ export interface PromptCredentialRequest {
 
 export interface CredentialSaved {
   credentialId: string;
-  username: string;
 }
 
 export interface DbmsConnectionRequest {
@@ -514,7 +513,6 @@ export class PreviewDbmsClient implements DbmsClient {
 
   promptCredential: DbmsClient["promptCredential"] = async (request) => ({
     credentialId: request.credentialId,
-    username: request.suggestedUsername,
   });
 
   deleteCredential: DbmsClient["deleteCredential"] = async () => {};

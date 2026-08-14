@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 ordadb-types = { path = "../ordadb-types" }
+rusqlite.workspace = true
 windows-sys.workspace = true
 zeroize.workspace = true
 
