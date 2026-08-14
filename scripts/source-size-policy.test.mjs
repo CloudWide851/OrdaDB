@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { loadBaseline } from "./check-source-size.mjs";
 import {
   MAX_SOURCE_BYTES,
   evaluateSourceSizes,
@@ -16,6 +17,35 @@ const emptyBaseline = {
 function baseline(entries) {
   return { ...emptyBaseline, entries };
 }
+
+test("treats only a missing baseline as an empty strict baseline", async () => {
+  const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
+  const denied = Object.assign(new Error("denied"), { code: "EACCES" });
+  const loaded = await loadBaseline("missing.json", async () => {
+    throw missing;
+  });
+
+  assert.deepEqual(loaded, emptyBaseline);
+  assert.deepEqual(
+    evaluateSourceSizes(
+      [{ path: "src/new.rs", bytes: MAX_SOURCE_BYTES + 1 }],
+      loaded,
+    ).errors,
+    [
+      `src/new.rs: ${MAX_SOURCE_BYTES + 1} bytes exceeds ${MAX_SOURCE_BYTES} without a baseline entry`,
+    ],
+  );
+  await assert.rejects(
+    loadBaseline("denied.json", async () => {
+      throw denied;
+    }),
+    (error) => error === denied,
+  );
+  await assert.rejects(
+    loadBaseline("invalid.json", async () => "not json"),
+    SyntaxError,
+  );
+});
 
 test("classifies handwritten sources and explicit exclusions", () => {
   assert.equal(isEligibleSourcePath("crates/example/src/lib.rs"), true);

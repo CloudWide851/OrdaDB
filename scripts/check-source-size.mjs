@@ -1,12 +1,30 @@
 import { spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
-import { evaluateSourceSizes } from "./source-size-policy.mjs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  evaluateSourceSizes,
+  MAX_SOURCE_BYTES,
+} from "./source-size-policy.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
 const baselinePath = fileURLToPath(
   new URL("./source-size-baseline.json", import.meta.url),
 );
+
+export async function loadBaseline(path = baselinePath, readText = readFile) {
+  try {
+    return JSON.parse(await readText(path, "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+    return {
+      schemaVersion: 1,
+      maximumBytes: MAX_SOURCE_BYTES,
+      entries: [],
+    };
+  }
+}
 
 function runGit(gitArguments, options = {}) {
   const result = spawnSync("git", gitArguments, {
@@ -78,7 +96,7 @@ function readIndexEntries() {
 }
 
 async function main() {
-  const baseline = JSON.parse(await readFile(baselinePath, "utf8"));
+  const baseline = await loadBaseline();
   const result = evaluateSourceSizes(readIndexEntries(), baseline);
   if (result.errors.length > 0) {
     console.error(
@@ -97,7 +115,9 @@ async function main() {
   );
 }
 
-main().catch((error) => {
-  console.error(`Source-size gate could not run: ${error.message}`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+  main().catch((error) => {
+    console.error(`Source-size gate could not run: ${error.message}`);
+    process.exitCode = 1;
+  });
+}
