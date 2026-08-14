@@ -165,7 +165,7 @@ impl DesktopAiRuntime {
             Ok(stored) => Ok(AiCredentialStatus {
                 credential_id: credential_id.to_owned(),
                 configured: true,
-                account_label: Some(stored.username),
+                account_label: Some(stored.username.to_string()),
             }),
             Err(error) if error.sql_state == "42704" => Ok(AiCredentialStatus {
                 credential_id: credential_id.to_owned(),

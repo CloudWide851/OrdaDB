@@ -8,7 +8,7 @@ use ordadb_ai::{
     AiRunEvent, AiRunEventPayload, AiRunEventSink, AiRunRequest,
 };
 use ordadb_types::{DbError, Result};
-use ordadb_windows::{CredentialVault, prompt_for_credential};
+use ordadb_windows::{CredentialVault, DatabaseCredentialStore, prompt_for_credential};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -304,7 +304,7 @@ fn handle_local_command(
         "/quit" | "/exit" => return Ok(true),
         "/help" => app.push_message(
             MessageRole::System,
-            "/connect [地址] [用户] [数据库] · /provider <openai|compatible|ollama|fake> [端点/模型] · /sql · /agent · /history · /clear · /cancel · /quit".to_owned(),
+            "/connect [地址] [数据库] · /provider <openai|compatible|ollama|fake> [端点/模型] · /sql · /agent · /history · /clear · /cancel · /quit".to_owned(),
             unix_time_millis(),
         ),
         "/sql" => {
@@ -336,29 +336,26 @@ fn handle_local_command(
             if let Some(address) = arguments.get(1) {
                 settings.connection.address = (*address).to_owned();
             }
-            if let Some(user) = arguments.get(2) {
-                settings.connection.user = (*user).to_owned();
-            }
-            if let Some(database) = arguments.get(3) {
+            if let Some(database) = arguments.get(2) {
                 settings.connection.database = (*database).to_owned();
             }
             settings.validate()?;
             terminal.suspend()?;
             let prompted = prompt_for_credential(
                 &format!("OrdaDB/Console/{}", settings.connection.credential_id),
-                &settings.connection.user,
+                "",
                 "OrdaDB 本地数据库凭据",
-                "凭据只会保存到 Windows Credential Manager，不会进入终端历史。",
+                "用户名和密码会由当前 Windows 用户加密保存到本地凭据数据库，不会进入终端历史。",
             );
             let resumed = terminal.resume();
             resumed?;
             if let Some(prompted) = prompted? {
-                settings.connection.user = prompted.username.clone();
-                CredentialVault::new("OrdaDB/Console")?.store(
+                DatabaseCredentialStore::open()?.store(
                     &settings.connection.credential_id,
                     &prompted.username,
                     &prompted.password,
                 )?;
+                settings.connection.legacy_user.clear();
                 store.save_settings(settings)?;
                 *kernel = build_kernel(settings)?;
                 app.status = format!("已保存本地凭据 · {}", settings.connection.address);
@@ -466,8 +463,10 @@ fn build_kernel(settings: &TuiSettingsV1) -> Result<TuiAgentKernel> {
 
 fn kernel_connection_id(settings: &TuiSettingsV1) -> String {
     format!(
-        "ordadb-native://{}/{}?user={}",
-        settings.connection.address, settings.connection.database, settings.connection.user
+        "ordadb-native://{}/{}?credential={}",
+        settings.connection.address,
+        settings.connection.database,
+        settings.connection.credential_id
     )
 }
 

@@ -20,7 +20,7 @@ use ordadb_connectors::{
 };
 use ordadb_protocol::{ClientConfig, PgCancelToken, PgClient, PgQueryEvent};
 use ordadb_types::{DbError, QueryEvent, Value};
-use ordadb_windows::{CredentialVault, PromptedCredential, prompt_for_credential};
+use ordadb_windows::DatabaseCredentialStore;
 use reqwest::{Client, Method, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,10 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use zeroize::Zeroizing;
 
 use crate::workspace::CredentialAccess;
+
+mod credentials;
+
+use credentials::{CredentialSaved, PromptCredentialRequest, prompt_database_credential};
 
 pub const DBMS_QUERY_EVENT: &str = "dbms://query";
 const NATIVE_CONNECTOR_ID: &str = "ordadb-native";
@@ -56,21 +60,6 @@ const VALID_CONNECTOR_IDS: [&str; 10] = [
     "clickhouse",
     "oracle",
 ];
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CredentialSaved {
-    credential_id: String,
-    username: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PromptCredentialRequest {
-    credential_id: String,
-    connector_id: String,
-    suggested_username: String,
-}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -876,7 +865,7 @@ struct BootstrapTicketRecord {
 
 #[derive(Debug)]
 pub struct DbmsRuntime {
-    credentials: CredentialVault,
+    credentials: DatabaseCredentialStore,
     plugin_manager: Arc<PluginManager>,
     connections: RwLock<BTreeMap<String, Arc<ConnectionHandle>>>,
     requests: RwLock<BTreeMap<String, ActiveRequest>>,
@@ -886,6 +875,13 @@ pub struct DbmsRuntime {
 
 impl DbmsRuntime {
     pub fn new(plugin_manager: Arc<PluginManager>) -> Result<Arc<Self>, DbError> {
+        Self::new_with_credentials(plugin_manager, DatabaseCredentialStore::open()?)
+    }
+
+    fn new_with_credentials(
+        plugin_manager: Arc<PluginManager>,
+        credentials: DatabaseCredentialStore,
+    ) -> Result<Arc<Self>, DbError> {
         let http = Client::builder()
             .timeout(HTTP_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
@@ -895,7 +891,7 @@ impl DbmsRuntime {
                     .with_detail(error.to_string())
             })?;
         Ok(Arc::new(Self {
-            credentials: CredentialVault::new("OrdaDB/Console")?,
+            credentials,
             plugin_manager,
             connections: RwLock::new(BTreeMap::new()),
             requests: RwLock::new(BTreeMap::new()),
@@ -933,7 +929,6 @@ impl DbmsRuntime {
         )?;
         Ok(Some(CredentialSaved {
             credential_id: request.credential_id,
-            username: prompted.username,
         }))
     }
 
@@ -984,7 +979,7 @@ impl DbmsRuntime {
                         "native OrdaDB connection requires an administration endpoint",
                     )
                 })?)?;
-            let username = stored.username.clone();
+            let username = stored.username.to_string();
             let pg_password = Zeroizing::new(stored.password.to_string());
             let pg_database = database.clone();
             let pg = tokio::task::spawn_blocking(move || {
@@ -1042,7 +1037,7 @@ impl DbmsRuntime {
             let mut host =
                 ConnectorHost::launch(&self.plugin_manager, &request.connector_id).await?;
             let protocol_version = host.protocol_version();
-            let username = stored.username;
+            let username = stored.username.to_string();
             let secret = stored.password.to_string();
             let (capabilities_v3, capabilities) = match protocol_version {
                 CONNECTOR_PROTOCOL_V3 => {
@@ -1053,7 +1048,10 @@ impl DbmsRuntime {
                             connection_id.clone(),
                             endpoint,
                             request.tls_mode,
-                            Some(ConnectorCredentialV2::new(Some(username), secret)),
+                            Some(ConnectorCredentialV2::new(
+                                Some(username.to_string()),
+                                secret,
+                            )),
                         )
                         .await?;
                     validate_negotiated_v3(&request, &negotiated)?;
@@ -1068,7 +1066,10 @@ impl DbmsRuntime {
                             connection_id.clone(),
                             endpoint,
                             request.tls_mode,
-                            Some(ConnectorCredentialV2::new(Some(username), secret)),
+                            Some(ConnectorCredentialV2::new(
+                                Some(username.to_string()),
+                                secret,
+                            )),
                         )
                         .await?;
                     (None, DbmsCapabilities::plugin_v2(&negotiated))
@@ -1083,7 +1084,7 @@ impl DbmsRuntime {
                         connection_id.clone(),
                         request.endpoint.clone(),
                         request.database.clone(),
-                        CredentialPayload::new(username, secret),
+                        CredentialPayload::new(username.to_string(), secret),
                     )
                     .await?;
                     (None, DbmsCapabilities::plugin())
@@ -1309,7 +1310,7 @@ impl DbmsRuntime {
         if let (Some(address), Some(endpoint), Some(stored)) =
             (address, admin_endpoint.as_deref(), stored)
         {
-            let username = stored.username.clone();
+            let username = stored.username.to_string();
             let password = Zeroizing::new(stored.password.to_string());
             let database = request
                 .database
@@ -1798,7 +1799,7 @@ impl DbmsRuntime {
                 let stored = self.credentials.load(&native.credential_id)?;
                 let config = ClientConfig {
                     address: native.address,
-                    user: stored.username,
+                    user: stored.username.to_string(),
                     database: native.database.clone(),
                     password: stored.password,
                     application_name: "OrdaDB AI".to_owned(),
@@ -3820,44 +3821,6 @@ fn write_lock<T>(lock: &RwLock<T>) -> Result<RwLockWriteGuard<'_, T>, DbError> {
         .map_err(|_| DbError::internal("desktop DBMS state lock was poisoned"))
 }
 
-async fn prompt_database_credential(
-    connector_id: String,
-    suggested_username: String,
-    first_administrator: bool,
-) -> Result<Option<PromptedCredential>, DbError> {
-    let (caption, message) = if first_administrator {
-        (
-            "创建 OrdaDB 首位管理员".to_owned(),
-            "请输入首位管理员用户名和密码。凭据只在受保护的本机窗口与 Windows 凭据库中处理。"
-                .to_owned(),
-        )
-    } else {
-        let display_name = match connector_id.as_str() {
-            NATIVE_CONNECTOR_ID => "OrdaDB",
-            "postgresql" => "PostgreSQL",
-            "mysql" => "MySQL",
-            "sqlite" => "SQLite",
-            "sql-server" => "SQL Server",
-            "mongodb" => "MongoDB",
-            "redis" => "Redis",
-            "mariadb" => "MariaDB",
-            "clickhouse" => "ClickHouse",
-            "oracle" => "Oracle",
-            _ => return Err(invalid("unknown connector ID")),
-        };
-        (
-            format!("连接 {display_name}"),
-            format!("请输入 {display_name} 用户名和密码。密码不会进入 OrdaDB 网页界面或状态文件。"),
-        )
-    };
-    let target = format!("OrdaDB Console/{connector_id}");
-    tauri::async_runtime::spawn_blocking(move || {
-        prompt_for_credential(&target, &suggested_username, &caption, &message)
-    })
-    .await
-    .map_err(|error| task_error("Windows credential prompt task failed", error))?
-}
-
 fn probe_windows_service() -> Result<ServiceIdentity, DbError> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|error| {
@@ -4040,7 +4003,17 @@ mod tests {
         };
         let debug = format!("{request:?}");
         assert!(debug.contains("suggested_username"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("dba"));
         assert!(!debug.contains("password"));
+
+        let saved = CredentialSaved {
+            credential_id: "local".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_value(saved).expect("serialize saved credential"),
+            serde_json::json!({"credentialId": "local"})
+        );
         assert!(
             serde_json::from_value::<PromptCredentialRequest>(serde_json::json!({
                 "credentialId": "local",
@@ -4585,7 +4558,14 @@ mod tests {
         let manager =
             PluginManager::open_https(ordadb_connectors::PluginManagerOptions::new(root.path()))
                 .expect("plugin manager");
-        let runtime = DbmsRuntime::new(manager).expect("DBMS runtime");
+        let credentials = DatabaseCredentialStore::open_path(
+            root.path()
+                .join("credentials")
+                .join("credentials-v1.sqlite3"),
+        )
+        .expect("credential store");
+        let runtime =
+            DbmsRuntime::new_with_credentials(manager, credentials).expect("DBMS runtime");
         (root, runtime)
     }
 }

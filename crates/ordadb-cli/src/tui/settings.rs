@@ -26,13 +26,26 @@ pub struct TuiSettingsV1 {
     pub ui: TuiUiSettings,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeConnectionSettings {
     pub address: String,
-    pub user: String,
+    #[serde(default, rename = "user", skip_serializing)]
+    pub legacy_user: String,
     pub database: String,
     pub credential_id: String,
+}
+
+impl std::fmt::Debug for NativeConnectionSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeConnectionSettings")
+            .field("address", &self.address)
+            .field("legacy_user", &"<redacted>")
+            .field("database", &self.database)
+            .field("credential_id", &self.credential_id)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,7 +62,7 @@ impl Default for TuiSettingsV1 {
             version: SETTINGS_VERSION,
             connection: NativeConnectionSettings {
                 address: "127.0.0.1:54329".to_owned(),
-                user: "dba".to_owned(),
+                legacy_user: String::new(),
                 database: "ordadb".to_owned(),
                 credential_id: DEFAULT_DATABASE_CREDENTIAL_ID.to_owned(),
             },
@@ -79,7 +92,14 @@ impl TuiSettingsV1 {
             .address
             .parse::<SocketAddr>()
             .map_err(|_| invalid("TUI native address must be an IP socket address"))?;
-        validate_text(&self.connection.user, 1, 256, "TUI database user")?;
+        if !self.connection.legacy_user.is_empty() {
+            validate_text(
+                &self.connection.legacy_user,
+                1,
+                256,
+                "legacy TUI database user",
+            )?;
+        }
         validate_text(&self.connection.database, 1, 256, "TUI database name")?;
         validate_text(
             &self.connection.credential_id,
@@ -124,10 +144,11 @@ impl TuiStateStore {
             return Ok(TuiSettingsV1::default());
         }
         let bytes = read_bounded(&path, MAX_SETTINGS_BYTES, "TUI settings")?;
-        let settings: TuiSettingsV1 = serde_json::from_slice(&bytes).map_err(|error| {
+        let mut settings: TuiSettingsV1 = serde_json::from_slice(&bytes).map_err(|error| {
             invalid("TUI settings JSON is invalid").with_detail(error.to_string())
         })?;
         settings.validate()?;
+        settings.connection.legacy_user.clear();
         Ok(settings)
     }
 
@@ -231,7 +252,21 @@ mod tests {
         let raw = fs::read_to_string(store.settings_path()).expect("raw settings");
         assert!(!raw.contains("apiKey"));
         assert!(!raw.contains("password"));
+        assert!(!raw.contains("\"user\""));
         assert!(raw.contains("credentialId"));
+
+        let legacy = raw.replace(
+            "\"address\": \"127.0.0.1:54329\"",
+            "\"address\": \"127.0.0.1:54329\",\n    \"user\": \"legacy-database-user\"",
+        );
+        fs::write(store.settings_path(), legacy).expect("legacy settings");
+        let loaded = store.load_settings().expect("migrate legacy username");
+        assert!(loaded.connection.legacy_user.is_empty());
+        store
+            .save_settings(&loaded)
+            .expect("save migrated settings");
+        let migrated = fs::read_to_string(store.settings_path()).expect("migrated settings");
+        assert!(!migrated.contains("legacy-database-user"));
     }
 
     #[test]

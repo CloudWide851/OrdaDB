@@ -48,7 +48,6 @@ describe("PreviewDbmsClient", () => {
       }),
     ).resolves.toEqual({
       credentialId: "preview-test",
-      username: "dba",
     });
     expect(connectionId.connectionId).toBe("preview-connection");
     expect(operation.requestId).toMatch(/^preview-/);

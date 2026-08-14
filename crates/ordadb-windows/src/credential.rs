@@ -18,7 +18,7 @@ const CREDUI_PASSWORD_BUFFER_UNITS: usize = 257;
 
 #[derive(Clone)]
 pub struct StoredCredential {
-    pub username: String,
+    pub username: Zeroizing<String>,
     pub password: Zeroizing<String>,
 }
 
@@ -26,7 +26,7 @@ impl Debug for StoredCredential {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("StoredCredential")
-            .field("username", &self.username)
+            .field("username", &"<redacted>")
             .field("password", &"<redacted>")
             .finish()
     }
@@ -41,7 +41,7 @@ impl Debug for PromptedCredential {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PromptedCredential")
-            .field("username", &self.username)
+            .field("username", &"<redacted>")
             .field("password", &"<redacted>")
             .finish()
     }
@@ -229,7 +229,7 @@ impl CredentialVault {
             invalid("stored connector credential is not valid UTF-8").with_detail(error.to_string())
         })?;
         Ok(StoredCredential {
-            username,
+            username: Zeroizing::new(username),
             password: Zeroizing::new(password),
         })
     }
@@ -379,10 +379,11 @@ mod tests {
         let password = Zeroizing::new("credential-test-secret".to_owned());
         vault.store(id, "dba", &password).expect("store");
         let loaded = vault.load(id).expect("load");
-        assert_eq!(loaded.username, "dba");
+        assert_eq!(loaded.username.as_str(), "dba");
         assert_eq!(loaded.password.as_str(), "credential-test-secret");
         let debug = format!("{loaded:?}");
         assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("dba"));
         assert!(!debug.contains("credential-test-secret"));
         vault.delete(id).expect("delete");
         assert_eq!(vault.load(id).expect_err("deleted").sql_state, "42704");
@@ -396,6 +397,7 @@ mod tests {
         };
         let debug = format!("{prompted:?}");
         assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("dba"));
         assert!(!debug.contains("prompt-secret"));
 
         assert_eq!(
